@@ -14,7 +14,7 @@ use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
@@ -159,6 +159,9 @@ struct Lower<'a> {
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
+    /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
+    /// result written over a value with no DXIL form keeps its high half.
+    low16: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
@@ -202,8 +205,8 @@ struct Lower<'a> {
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
-    /// dword, and the row packed after it.
-    half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    /// dword ([`packed_half`]).
+    half_outputs: HashMap<u8, bool>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
@@ -295,57 +298,55 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// Where half `h` (dword h / 2, the high half when odd) of a parameter
-/// packing 16-bit rows `a` and `b` two per dword comes from: a row and
-/// channel of `elements`, none for padding. Channel c of `a` is half c;
-/// `b` starts at the dword after `a`'s last channel.
-fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(u8, u8)> {
-    let extent = |r: u8| {
-        elements
-            .iter()
-            .filter(|e| e.row == Some(u32::from(r)))
-            .map(|e| e.col + e.cols)
-            .max()
-    };
-    let na = extent(a)?;
-    let a_halves = na.div_ceil(2) * 2;
-    if h < a_halves {
-        return (h < na).then_some((a, h));
+/// Where half `h` (dword h / 2, the high half when odd) of the parameter
+/// whose first element is in row `a` comes from, when the console packs
+/// 16-bit values two per dword: a row and channel of `elements`, none for
+/// padding. The console fills its parameters with the 16-bit elements taken
+/// by first channel, then row: each takes whole dwords of the first
+/// parameter with room for it (four dwords each), its channels in order.
+fn packed_half(elements: &[SigElement], a: u8, h: u8) -> Option<(u8, u8)> {
+    let mut halves: Vec<&SigElement> = elements
+        .iter()
+        .filter(|e| e.half && e.kind == 0 && e.row.is_some())
+        .collect();
+    halves.sort_by_key(|e| (e.col, e.row));
+    // (first element's row, (row, channel) per half)
+    type Param = (Option<u32>, Vec<Option<(u8, u8)>>);
+    let mut params: Vec<Param> = Vec::new();
+    for e in halves {
+        let need = usize::from(e.cols.div_ceil(2) * 2);
+        let i = match params.iter().position(|p| p.1.len() + need <= 8) {
+            Some(i) => i,
+            None => {
+                params.push((e.row, Vec::new()));
+                params.len() - 1
+            }
+        };
+        let row = u8::try_from(e.row?).ok()?;
+        let slots = &mut params[i].1;
+        slots.extend((0..e.cols).map(|c| Some((row, e.col + c))));
+        slots.resize(slots.len().next_multiple_of(2), None);
     }
-    let b = b?;
-    let c = h - a_halves;
-    (c < extent(b)?).then_some((b, c))
+    // Two parameters starting in one row would leave the half ambiguous.
+    let mut found = params.iter().filter(|p| p.0 == Some(u32::from(a)));
+    match (found.next(), found.next()) {
+        (Some(p), None) => p.1.get(usize::from(h)).copied().flatten(),
+        _ => None,
+    }
 }
 
-/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
-/// a packed row's partner is the next 16-bit row of the signature that no
-/// output entry names, taken in row order.
-fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
+/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
+/// by row: whether two per dword.
+fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
         _ => return HashMap::new(),
     };
-    let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
-    let mut free: Vec<u8> = outputs
+    entries
         .iter()
-        .filter(|e| e.half && e.kind == 0)
-        .filter_map(|e| u8::try_from(e.row?).ok())
-        .filter(|&r| !per_vertex().any(|o| o.row == r))
-        .collect();
-    free.sort_unstable();
-    free.dedup();
-    let mut halves: Vec<_> = per_vertex().filter(|o| o.fp16).collect();
-    halves.sort_by_key(|o| o.row);
-    halves
-        .into_iter()
-        .map(|o| {
-            let b = o
-                .pack2
-                .then(|| free.iter().position(|&r| r > o.row))
-                .flatten();
-            (o.row, (o.pack2, b.map(|i| free.remove(i))))
-        })
+        .filter(|o| o.param & 0x80 == 0 && o.fp16)
+        .map(|o| (o.row, o.pack2))
         .collect()
 }
 
@@ -467,6 +468,7 @@ impl<'a> Lower<'a> {
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
+            low16: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
@@ -501,7 +503,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             flat: None,
             no_barrier,
-            half_outputs: half_outputs(&x.native.io, &x.outputs),
+            half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
@@ -1298,6 +1300,20 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// VGPR source `k` read for its low 16 bits alone, when only those are
+    /// known (`low16`); the caller applies the modifiers and selects.
+    fn low16_src(&self, inst: &Inst, k: usize) -> Option<V> {
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        match v.src.get(k) {
+            Some(&Operand::Vector { reg, .. }) if v.dpp.is_none() => inst
+                .read(Reg::V(reg))
+                .and_then(|o| self.low16.get(&o).copied()),
+            _ => None,
+        }
+    }
+
     fn as_float(&mut self, x: V) -> V {
         self.s.m.cast(self.cur, Cast::Bitcast, x, self.s.t.f32)
     }
@@ -1394,8 +1410,14 @@ impl<'a> Lower<'a> {
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
-                let x = self.operand(inst, &op)?;
-                Ok(match Self::sdwa_src(inst, k) {
+                let sel = Self::sdwa_src(inst, k);
+                // A byte or word select within the low half.
+                let low = matches!(sel, Some((0 | 1 | 4, _)));
+                let x = match self.low16_src(inst, k).filter(|_| low) {
+                    Some(x) => x,
+                    None => self.operand(inst, &op)?,
+                };
+                Ok(match sel {
                     Some((sel, sext)) => self.select_bits(x, sel, sext),
                     None => x,
                 })
@@ -1779,6 +1801,20 @@ impl<'a> Lower<'a> {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
         }
+    }
+
+    /// Whether every lane outside the guard of the export at (b, i) runs
+    /// the `done` export later in block b without its own guard holding,
+    /// i.e. is discarded there.
+    fn discarded_at_done(&self, b: usize, i: usize) -> bool {
+        let guards = &self.x.st.guards[b];
+        let g = guards[i].unwrap_or(Bool::TRUE);
+        self.exports.iter().any(|(&(eb, ei), e)| {
+            e.done && eb == b && ei > i && {
+                let done = guards[ei].unwrap_or(Bool::TRUE);
+                !self.x.st.bools.meet(&[(done, true), (g, false)])
+            }
+        })
     }
 
     // ---- results ----
@@ -4352,7 +4388,11 @@ impl<'a> Lower<'a> {
                 let mut xs = Vec::new();
                 for i in 0..3 {
                     let op = v.src.get(i).ok_or("a missing operand")?;
-                    let x = self.operand(inst, op)?;
+                    let low = v.opsel_hi >> i & 1 != 0 && v.opsel >> i & 1 == 0;
+                    let x = match self.low16_src(inst, i).filter(|_| low) {
+                        Some(x) => x,
+                        None => self.operand(inst, op)?,
+                    };
                     let mut x = if v.opsel_hi >> i & 1 != 0 {
                         let h = if v.opsel >> i & 1 != 0 {
                             let k16 = self.s.m.i32(16);
@@ -4385,8 +4425,18 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
+                // A high half kept from a value with no DXIL form (a first
+                // interpolation half) stays unknown: only the low half is.
+                let mut unknown = None;
                 let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
+                    Some(o) => match self.i32_of(o) {
+                        Ok(x) => x,
+                        Err(w) if name == "v_fma_mixlo_f16" && guard.is_none() => {
+                            unknown = Some(w);
+                            self.s.m.i32(0)
+                        }
+                        Err(w) => return Err(w),
+                    },
                     None => self.s.m.i32(0),
                 };
                 let h = self
@@ -4402,6 +4452,10 @@ impl<'a> Lower<'a> {
                 let old = self.s.m.bin(c, Bin::And, old, keep);
                 let x = self.s.m.bin(c, Bin::Or, old, h);
                 self.write(inst, Reg::V(reg), x, guard);
+                if let (Some(w), Some(new)) = (unknown, inst.write(Reg::V(reg))) {
+                    self.vals.insert(new, Val::Missing(w));
+                    self.low16.insert(new, x);
+                }
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
@@ -4655,7 +4709,10 @@ impl<'a> Lower<'a> {
         }
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => self.f16_operand(inst, &op)?,
+            _ => match self.low16_src(inst, k).filter(|_| !high) {
+                Some(x) => x,
+                None => self.f16_operand(inst, &op)?,
+            },
         };
         let c = self.cur;
         let x = if high {
@@ -5272,7 +5329,18 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, a, ones)
             }
             "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => {
-                let (sh, a) = (s(self, 0)?, s(self, 1)?);
+                // A left shift by 16 or more reads the low half alone.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let by = v.src.first().and_then(|&o| crate::resource::lane_of(o));
+                let low =
+                    name == "v_lshlrev_b32" && v.sdwa.is_none() && by.is_some_and(|n| n & 31 >= 16);
+                let a = match self.low16_src(inst, 1).filter(|_| low) {
+                    Some(x) => x,
+                    None => s(self, 1)?,
+                };
+                let sh = s(self, 0)?;
                 let sh = m31(self, sh);
                 let op = match name {
                     "v_lshlrev_b32" => Bin::Shl,
@@ -5810,6 +5878,9 @@ impl<'a> Lower<'a> {
             return Err("the first half of an interpolation");
         };
         let (attribute, mode) = match interp {
+            Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
+                return Err("an interpolation with computed barycentrics");
+            }
             Interp::Interpolated {
                 attribute,
                 barycentric,
@@ -5860,19 +5931,19 @@ impl<'a> Lower<'a> {
             StageIo::Ps { inputs, .. } => inputs
                 .iter()
                 .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
+                .map(|i| i.pack2),
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
-            Some((pack2, b)) => {
+            Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, b, h)
+                        packed_half(&l.s.inputs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -5913,6 +5984,94 @@ impl<'a> Lower<'a> {
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);
         Ok(())
+    }
+
+    /// Whether no lane that runs the instruction at `site` has been where
+    /// `unless` says: a lane that came along such an edge or ran (skipped)
+    /// such an instruction meets its condition, which the instruction's must
+    /// contradict. Those lane bits must not change in between, so none of
+    /// those blocks is on a cycle. A lane mask joined where such an edge
+    /// enters holds, for the lanes that came along it, the edge's mask.
+    fn avoids(&self, (b, i): Site, unless: &[Elsewhere]) -> bool {
+        let st = self.x.st;
+        let runs = [
+            (st.reach[b], true),
+            (st.guards[b][i].unwrap_or(Bool::TRUE), true),
+        ];
+        let mut atoms = st.bools.support(runs[0].0);
+        atoms.extend(st.bools.support(runs[1].0));
+        unless.iter().all(|&u| {
+            let (mut all, at, mut links) = match u {
+                Elsewhere::Edge(q, to) => {
+                    let all = self.lane_edge(q, to);
+                    let block = &self.x.p.blocks[to];
+                    let n = block.preds.iter().position(|&p| p == q).expect("an edge");
+                    let links: Vec<(Bool, Bool)> = block
+                        .phis
+                        .iter()
+                        .filter(|ph| atoms.contains(&Atom::Phi(ph.value)))
+                        .filter_map(|ph| {
+                            Some((*st.masks.get(&ph.value)?, *st.masks.get(&ph.args[n])?))
+                        })
+                        .collect();
+                    (all, to, links)
+                }
+                Elsewhere::Write((w, k)) | Elsewhere::Skip((w, k)) => {
+                    let guard = st.guards[w][k].unwrap_or(Bool::TRUE);
+                    let ran = matches!(u, Elsewhere::Write(_));
+                    (vec![(st.reach[w], true), (guard, ran)], w, vec![])
+                }
+            };
+            all.extend(runs);
+            // Each joined mask equals the incoming one: try both values.
+            links.truncate(6);
+            let some_lane = (0..1u32 << links.len()).any(|bits| {
+                let mut all = all.clone();
+                for (k, &(joined, incoming)) in links.iter().enumerate() {
+                    let v = bits >> k & 1 != 0;
+                    all.extend([(joined, v), (incoming, v)]);
+                }
+                st.bools.meet(&all)
+            });
+            !self.on_cycle(at) && !some_lane
+        })
+    }
+
+    /// What holds in a lane that goes from IR block `q` to `b`.
+    fn lane_edge(&self, q: usize, b: usize) -> Vec<(Bool, bool)> {
+        let st = self.x.st;
+        let mut all = vec![(st.reach[q], true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = st.exits[q]
+            && taken != not_taken
+        {
+            all.push((when, taken == b));
+        }
+        all
+    }
+
+    /// Whether no lane goes from IR block `q` to `b`.
+    fn never_taken(&self, q: usize, b: usize) -> bool {
+        !self.x.st.bools.meet(&self.lane_edge(q, b))
+    }
+
+    /// Whether IR block `b` can reach itself.
+    fn on_cycle(&self, b: usize) -> bool {
+        let blocks = &self.x.p.blocks;
+        let mut seen = vec![false; blocks.len()];
+        let mut stack = blocks[b].exit.successors();
+        while let Some(x) = stack.pop() {
+            if x == b {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(blocks[x].exit.successors());
+            }
+        }
+        false
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
@@ -6299,7 +6458,10 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // A level query takes no array slice (the code may pass anything
+            // there, e.g. an unwritten register).
+            let read = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(read) {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
@@ -7199,8 +7361,12 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
         let c = self.cur;
+        // A pixel export whose lanes outside its guard the `done` export
+        // after it discards: what those lanes write is lost, so it stores in
+        // every lane.
         if let Some(g) = guard
             && !mesh
+            && !(self.s.pixel && !e.done && self.discarded_at_done(b, i))
         {
             if !(e.done && self.s.pixel) {
                 return Err("a conditional export");
@@ -7237,7 +7403,7 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        if let Some((row, (pack2, b))) = halves {
+        if let Some((row, pack2)) = halves {
             for ch in 0..4u8 {
                 let Some(value) = e.values[usize::from(ch)] else {
                     continue;
@@ -7245,7 +7411,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, row, b, h)
+                        packed_half(outputs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -7923,8 +8089,11 @@ impl<'a> Lower<'a> {
                 let read = live.contains(&(phi.value, n));
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // No lane from this edge reads it: any value will do.
-                    _ if read && self.dead_on_edge(b, n, phi.reg) => {
+                    // No lane from this edge reads it, or no lane comes
+                    // along it at all: any value will do.
+                    _ if read
+                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
+                    {
                         if bit {
                             self.s.m.bool(false)
                         } else {
@@ -7972,7 +8141,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -8526,5 +8695,54 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn packed_halves_fill_parameters_first_fit() {
+        // 16-bit rows as a title's signature has them: row 0 holds two
+        // elements (x y and z w), row 3 is 32-bit, row 4 has one channel at w.
+        let el = |row: u32, col: u8, cols: u8, half: bool| super::SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half,
+        };
+        let sig = [
+            el(0, 0, 2, true),
+            el(0, 2, 2, true),
+            el(1, 0, 4, true),
+            el(2, 0, 3, true),
+            el(3, 0, 4, false),
+            el(4, 0, 3, true),
+            el(4, 3, 1, true),
+            el(5, 0, 3, true),
+        ];
+        // Each half as row and channel ("-": padding or past the end).
+        let param = |a| {
+            (0..8)
+                .map(|h| match packed_half(&sig, a, h) {
+                    Some((r, c)) => format!("{r}{}", ["x", "y", "z", "w"][usize::from(c)]),
+                    None => "-".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // By first channel, then row: row 0's x y, all of row 1, then (last,
+        // as it starts at z) row 0's z w.
+        assert_eq!(param(0), "0x 0y 1x 1y 1z 1w 0z 0w");
+        // Three channels take two dwords; row 4's w fills the first
+        // parameter with room, after row 5.
+        assert_eq!(param(2), "2x 2y 2z - 4x 4y 4z -");
+        assert_eq!(param(5), "5x 5y 5z - 4w - - -");
+        // No parameter starts in rows 1, 3 or 4.
+        for a in [1, 3, 4] {
+            assert_eq!(param(a), "- - - - - - - -");
+        }
     }
 }

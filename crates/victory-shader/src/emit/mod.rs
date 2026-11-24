@@ -711,6 +711,244 @@ mod tests {
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
     }
 
+    /// Emits a pixel program of `words` with these inputs and signatures.
+    fn emit_pixel(
+        words: &[u32],
+        inputs: Vec<crate::native::PsInput>,
+        input_addr: u32,
+        isg1: &[u8],
+        osg1: &[u8],
+    ) -> Result<HostShader, ShaderError> {
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs,
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, isg1), (FourCC::OSG1, osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native)?;
+        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        // dxil.dll, where there is one, checks the module.
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        Ok(out)
+    }
+
+    /// A float4 element per row (16-bit ones declared so in the part).
+    fn rows(elements: &[(&str, u8, bool)], input: bool) -> Vec<u8> {
+        let els: Vec<SigElement> = elements
+            .iter()
+            .enumerate()
+            .map(|(row, &(name, kind, _))| SigElement {
+                name: name.into(),
+                index: if kind == 3 { 0 } else { row as u32 },
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(row as u32),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            })
+            .collect();
+        let mut part = container::signature(&els, input);
+        for (row, &(.., half)) in elements.iter().enumerate() {
+            if half {
+                part[8 + 32 * row + 16] = 6;
+            }
+        }
+        part
+    }
+
+    /// Attribute 0 in row 0, 16-bit (one value per dword) or not.
+    fn texcoord(fp16: bool) -> crate::native::PsInput {
+        crate::native::PsInput {
+            usage: crate::native::Usage::Generic,
+            row: 0,
+            mask: 1,
+            attr: 0,
+            flat: false,
+            fp16,
+            pack2: false,
+            row2: 0,
+        }
+    }
+
+    /// A 16-bit result written over a first interpolation half keeps that
+    /// half's high 16 bits, which have no host form: what reads only the low
+    /// half translates, a read of the whole dword does not.
+    #[test]
+    fn a_half_over_a_first_interpolation_half_reads_as_a_half() {
+        let program = |read: u32| {
+            let words = [
+                0xD742_0002u32,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xD75A_0003,
+                0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+                0xCC21_0002,
+                0x0A01_E503, // v_fma_mixlo_f16 v2, sel_lo(v3), 1.0, 0
+                read,        // v4 from v2
+                0xF800_180F,
+                0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(true)], 1 << 1, &isg1, &osg1)
+        };
+        program(0x7E08_1702).unwrap(); // v_cvt_f32_f16 v4, v2
+        program(0x3408_0490).unwrap(); // v_lshlrev_b32 v4, 16, v2
+        let whole = program(0x7E08_0302).unwrap_err(); // v_mov_b32 v4, v2
+        assert!(whole.to_string().contains("first half"), "{whole}");
+        let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
+        assert!(part.to_string().contains("first half"), "{part}");
+    }
+
+    /// A pixel export before the `done` one, both under a lane guard (EXEC
+    /// narrowed without a branch): the lanes outside it are discarded at the
+    /// `done` export, so the first one stores in every lane. With EXEC
+    /// restored before the `done` export those lanes would write only the
+    /// second target, which stays refused.
+    #[test]
+    fn an_export_before_a_discarding_done_export_stores_unguarded() {
+        let program = |restore: &[u32]| {
+            let mut words = vec![
+                0xBE80_037Eu32, // s_mov_b32 s0, exec_lo
+                0x7C22_0080,    // v_cmpx_lt_f32 exec, 0, v0
+                0xF800_000F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0
+            ];
+            words.extend(restore);
+            words.extend([
+                0xF800_181F,
+                0x0000_0000, // exp mrt1, v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ]);
+            let isg1 = rows(&[("SV_Position", 3, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false), ("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![], 1 << 8, &isg1, &osg1)
+        };
+        program(&[]).unwrap();
+        let e = program(&[0xBEFE_0300]).unwrap_err(); // s_mov_b32 exec_lo, s0
+        assert!(e.to_string().contains("a conditional export"), "{e}");
+    }
+
+    /// The compiler reuses the j register (`v_mov` under a kill's EXEC) and
+    /// interpolates in the other lanes: those still hold j, which
+    /// structurisation's lane conditions prove. Interpolating in the lanes
+    /// the copy ran in stays refused.
+    #[test]
+    fn an_interpolation_after_j_is_reused_in_other_lanes_translates() {
+        let program = |other_lanes: &[u32]| {
+            let mut words = vec![
+                0xBE80_037Eu32, // s_mov_b32 s0, exec_lo
+                0x7C22_0480,    // v_cmpx_lt_f32 exec, 0, v2
+                0x7E02_0280,    // v_mov_b32 v1, 0
+            ];
+            words.extend(other_lanes);
+            words.extend([
+                0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+                0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+                0xBEFE_0300, // s_mov_b32 exec_lo, s0
+                0xF800_180F,
+                0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+                0xBF81_0000,
+            ]);
+            let isg1 = rows(&[("TEXCOORD", 0, false), ("SV_Position", 3, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(false)], 1 << 1 | 1 << 8, &isg1, &osg1)
+        };
+        program(&[0x8A7E_7E00]).unwrap(); // s_andn2_b32 exec_lo, s0, exec_lo
+        let e = program(&[]).unwrap_err();
+        assert!(e.to_string().contains("computed barycentrics"), "{e}");
+    }
+
+    /// Two elements sharing a row, the one at the higher channels listed
+    /// first (as console signatures have them): the signature part keeps
+    /// them in element order within the row, as the validator does.
+    #[test]
+    fn elements_sharing_a_row_keep_their_order() {
+        let el = |index, col, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = container::signature(&[el(1, 1, 2), el(0, 0, 1)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+    }
+
+    /// An unread float input packed beside the front face (as console
+    /// signatures have it when the float was `nointerpolation`) takes the
+    /// row's constant mode: DXIL wants one mode per row.
+    #[test]
+    fn a_row_keeps_one_interpolation_mode() {
+        let el = |name: &str, kind, comp, row, col| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = container::signature(
+            &[
+                el("TEXCOORD", 0, 9, 0, 0),
+                el("SV_IsFrontFace", 13, 5, 0, 1),
+                el("COLOR", 0, 9, 1, 0),
+            ],
+            true,
+        );
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let color = crate::native::PsInput {
+            row: 1,
+            ..texcoord(false)
+        };
+        emit_pixel(&words, vec![color], 1 << 1, &isg1, &osg1).unwrap();
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow

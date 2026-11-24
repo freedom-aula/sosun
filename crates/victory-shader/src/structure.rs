@@ -229,22 +229,34 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    /// `refuted`: conditions no lane meets, so a split reaching them again
+    /// stops at once (diagrams sharing most atoms reach the same ones often).
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        refuted: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        if refuted.contains(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let met = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -252,8 +264,12 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, refuted)
+        });
+        if !met {
+            refuted.insert(all);
+        }
+        met
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
