@@ -13,6 +13,7 @@ pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
+pub mod range;
 pub mod resource;
 pub mod structure;
 
