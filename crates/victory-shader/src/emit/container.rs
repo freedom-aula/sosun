@@ -302,6 +302,41 @@ pub(crate) fn build(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
     out
 }
 
+/// The shader hash part (`HASH`): flags (0, no source included) and the
+/// MD5 of the program. Apple's D3DMetal keys its shader cache on this hash,
+/// so it must differ between shaders: with one shared value, two shaders of
+/// the same length got each other's compiled code.
+pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
+    let mut out = [0; 20];
+    out[4..].copy_from_slice(&md5(dxil));
+    out
+}
+
+/// Standard MD5.
+pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
+    let len = data.len();
+    let mut tail = data[len - len % 64..].to_vec();
+    tail.push(0x80);
+    while tail.len() % 64 != 56 {
+        tail.push(0);
+    }
+    tail.extend(((len as u64) << 3).to_le_bytes());
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+    for block in data[..len - len % 64]
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .chain(tail.as_chunks::<64>().0)
+    {
+        md5_block(&mut state, block);
+    }
+    let mut out = [0; 16];
+    for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        o.copy_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 /// The container hash D3D12 checks: MD5 whose last block carries the bit
 /// count first and `2 × bytes + 1` last instead of standard padding.
 pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
@@ -385,5 +420,42 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn md5_matches_rfc_1321() {
+        let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // RFC 1321's test suite: empty, one block, 55 and 56 bytes (where
+        // the padding spills into a second block), and two full blocks.
+        for (input, want) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ] {
+            assert_eq!(
+                hex(md5(input)),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(hex(md5(&[0x61; 55])), "ef1772b6dff9a122358552954ad0df65");
+        assert_eq!(hex(md5(&[0x61; 56])), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    #[test]
+    fn shader_hashes_differ_between_programs() {
+        let (a, b) = (shader_hash(b"program a"), shader_hash(b"program b"));
+        assert_eq!(a[..4], [0; 4], "flags");
+        assert_ne!(a, b);
+        assert_eq!(a, shader_hash(b"program a"));
     }
 }

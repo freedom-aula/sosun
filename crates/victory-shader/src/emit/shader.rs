@@ -603,7 +603,7 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        let hash = [0u8; 20];
+        let hash = container::shader_hash(&dxil);
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];

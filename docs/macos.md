@@ -68,6 +68,12 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
-## Open differences under D3DMetal
+## D3DMetal's shader cache needs unique shader hashes
 
-- Signed zero in minimums. VIctory's `max_and_min_order_negative_zero_below_positive_zero` test (added upstream on 24 November 2026) finds that a -0 input reaches the shader as +0 under D3DMetal, so `v_min_f32(-0, +0)` gives +0 where the console gives -0. Selecting on the integer bits did not help, which points at Apple's shader converter or Metal's fast math. The minimum cases of that test are skipped under Wine until a fix is found.
+D3DMetal keeps a compiled-shader cache for each executable, in `$(getconf DARWIN_USER_CACHE_DIR)d3dm/<exe name>/shaders.cache`. It finds shaders by the DXIL container's shader hash (the `HASH` part), apparently together with the shader's length: two shaders collided only when their lengths matched. VIctory used to write the same all-zero shader hash into every container. So two different shaders of the same length shared a cache entry, and the one compiled second ran the first one's code. The cache is on disk, so the wrong code also came back on every later run of that executable.
+
+This was the "signed zero in minimums" difference listed here before. Each `v_min_f32` and `v_min3_f32` test shader is the same length as the maximum built just before it, so the minimum ran the maximum's code and gave +0 where the console gives -0. Selecting on the integer bits could not help, because the shader that ran was never the one being changed. It also made `v_cmp_class_f16_matches_rdna2` fail whenever the max/min test ran before it, as it does with `--test-threads=1`. The `v_max3_f32` shader and that test's first shader are both 2316 bytes.
+
+`container::shader_hash` now writes the MD5 of the program into the `HASH` part. The minimum cases run under Wine again, and both tests pass in every order on an M5 Pro with D3DMetal 4.0 beta 3. Cache entries written under the old zero hash are never looked up again, so old caches need no cleaning.
+
+No open differences under D3DMetal are known at the moment.

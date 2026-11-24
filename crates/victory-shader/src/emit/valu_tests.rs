@@ -327,22 +327,11 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
         ("v_max3_f32", 0x154, pz),
         ("v_min3_f32", 0x151, nz),
     ];
-    // Under D3DMetal a -0 input reaches the shader as +0 (Apple's shader
-    // converter or Metal's fast math), so the minimums cannot be checked
-    // there. docs/macos.md lists this as an open difference.
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-    // SAFETY: ntdll is always loaded; both names end with a NUL.
-    let wine = unsafe {
-        GetProcAddress(
-            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
-            c"wine_get_version".as_ptr().cast(),
-        )
-    }
-    .is_some();
+    // The minimums once gave +0 under D3DMetal. Each minimum shader is the
+    // same length as the maximum before it, and every shader carried the same
+    // zero shader hash, so D3DMetal's cache returned the maximum's code.
+    // Unique shader hashes (container::shader_hash) fixed it.
     for (name, op, want) in ops {
-        if wine && want == nz {
-            continue;
-        }
         let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
         run_cases(&shader, &cases, |backend, _, inp, got| {
             assert_eq!(got, want, "{backend}: {name} {inp:x?}");
