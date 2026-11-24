@@ -23,7 +23,8 @@
 
 Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files is only a warm-up.
+Converting them ahead of time from files (`victory translate --cache`) is
+only a warm-up: it fills the same cache, under the same key.
 
 ## Crates
 

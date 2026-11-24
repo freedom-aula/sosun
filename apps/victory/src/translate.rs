@@ -183,6 +183,7 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
+    let started = std::time::Instant::now();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -197,27 +198,30 @@ pub fn run(
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
-                }
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut t = Tally {
+                                list,
+                                ..Tally::default()
+                            };
+                            let mut checks = Checks {
+                                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                validator: validate
+                                    .then(|| Validator::load(dll.as_deref()).ok())
+                                    .flatten(),
+                                host: pipelines
+                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                    .flatten(),
+                            };
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            }
+                            lock(&total).merge(t);
+                        })
+                    })
+                    .collect();
+                report(entry.path(), &jobs, &next, started, &workers, String::new);
             });
         }
     }
@@ -299,6 +303,145 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+/// The warm-up (`--cache`): every distinct container found goes through
+/// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
+/// same code, so a run finds it translated or refused.
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
+    let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
+        anyhow::bail!("no shader cache in {}", shaders.display());
+    };
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    // Containers already cached, translated now, refused now.
+    let counts = [const { AtomicUsize::new(0) }; 3];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| {
+                        s.spawn(|| {
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                let Some(bytes) = job.bytes() else { continue };
+                                // As the title passes it: the container's own size
+                                // (a raw source runs on to the end of the file).
+                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
+                                });
+                                let container = &bytes[..size.min(bytes.len())];
+                                let hash = blake3::hash(container);
+                                if !lock(&seen).insert(hash) {
+                                    continue;
+                                }
+                                let one = std::time::Instant::now();
+                                let (done, cached) =
+                                    victory_gpu::shader_cache::host_shader(container);
+                                let k = if cached {
+                                    0
+                                } else if done.is_ok() {
+                                    1
+                                } else {
+                                    2
+                                };
+                                counts[k].fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    hash = %&hash.to_hex()[..16],
+                                    ms = one.elapsed().as_millis() as u64,
+                                    cached,
+                                    ok = done.is_ok(),
+                                    "warm-up"
+                                );
+                            }
+                        })
+                    })
+                    .collect();
+                let [c, t, r] = &counts;
+                report(entry.path(), &jobs, &next, started, &workers, || {
+                    let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+                    format!(
+                        "; all files so far: {} cached, {} translated, {} refused",
+                        n(c),
+                        n(t),
+                        n(r)
+                    )
+                });
+            });
+        }
+    }
+    let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);
+    let bytes: u64 = walkdir::WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum();
+    println!("cache        {} ({} MB)", dir.display(), bytes >> 20);
+    println!(
+        "containers   {} in {:.1} s: {cached} already cached, {translated} translated, {refused} refused",
+        cached + translated + refused,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
+/// hands them out) until they finish: on a terminal one line rewritten
+/// every second, else a line every 10 s; then the file's last line.
+fn report<T>(
+    file: &Path,
+    jobs: &[Source],
+    next: &AtomicUsize,
+    started: std::time::Instant,
+    workers: &[std::thread::ScopedJoinHandle<'_, T>],
+    extra: impl Fn() -> String,
+) {
+    use std::io::IsTerminal;
+    if workers.is_empty() {
+        return;
+    }
+    let terminal = std::io::stderr().is_terminal();
+    let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
+    let line = || {
+        let done = next.load(Ordering::Relaxed).min(jobs.len());
+        format!(
+            "{}: {done} of {} containers ({}%), {:.0} s{}",
+            file.display(),
+            jobs.len(),
+            done * 100 / jobs.len(),
+            started.elapsed().as_secs_f64(),
+            extra()
+        )
+    };
+    let mut shown = std::time::Instant::now();
+    while !workers.iter().all(|w| w.is_finished()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if shown.elapsed() >= every {
+            shown = std::time::Instant::now();
+            if terminal {
+                eprint!("\r{}", line());
+            } else {
+                eprintln!("{}", line());
+            }
+        }
+    }
+    eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
 fn translate(

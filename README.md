@@ -66,8 +66,14 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
+target\release\victory.exe translate --cache <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
+
+The `translate --cache` step (minutes; again after a change of the shader
+translator) translates every shader the title can ask for into the cache
+(about 1.3 GB), so a run does not translate them while it plays; without it
+they are translated at first use, and their draws wait.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
@@ -101,6 +107,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] --cache [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config

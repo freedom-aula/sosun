@@ -7,10 +7,11 @@
 //!    signature, the graphics state). The library is saved under the cache
 //!    folder; the host refuses a library of another adapter or driver, and
 //!    an entry whose description differs, so neither is ever used.
-//! 2. The title pipelines a run drew or dispatched with are listed by a key
-//!    known when the title creates them (their shader containers and
-//!    graphics state); the next run hands those to the workers at
-//!    creation, during loading.
+//! 2. The title pipelines a run drew or dispatched with (made in time or
+//!    not) are listed by a key known when the title creates them (their
+//!    shader containers and graphics state); the next run hands those to
+//!    the workers at creation, during loading. A full list keeps the
+//!    latest run's first.
 //!
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
@@ -168,10 +169,12 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let (created, distinct) = created();
+    let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
@@ -179,6 +182,10 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            created,
+            distinct,
+            shaders_cached,
+            shaders_translated,
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -193,34 +200,64 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-/// Title pipeline keys drawn or dispatched with (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Title pipelines created, and their distinct keys.
+static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
+
+/// The title created a pipeline with `key`.
+pub(crate) fn note_created(key: &str) {
+    let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
+    created.0 += 1;
+    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+}
+
+/// Title pipelines created so far, and how many distinct ones.
+fn created() -> (u64, usize) {
+    let created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
+    (created.0, created.1.as_ref().map_or(0, HashSet::len))
+}
+
+/// Title pipeline keys drawn or dispatched with: in earlier runs (the
+/// list as loaded), and in this one.
+#[derive(Default)]
+struct Used {
+    before: HashSet<String>,
+    now: HashSet<String>,
+}
+
+impl Used {
+    /// The list to keep: this run's keys, then earlier runs' others, at
+    /// most `EARLY_MAX` (the oldest go once it is full).
+    fn list(&self) -> Vec<String> {
+        let earlier = self.before.iter().filter(|k| !self.now.contains(*k));
+        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+    }
+}
+
+static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
+        let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        tracing::info!(pipelines = before.len(), "title pipelines to start early");
+        *used = Some(Used { before, now: HashSet::new() });
     }
     used
 }
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().as_ref().is_some_and(|u| u.before.contains(key))
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -239,6 +276,17 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// This run's keys stay in the list; earlier runs' fill it up to the cap.
+    #[test]
+    fn the_early_list_keeps_this_run_first() {
+        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
+        let used = Used { before: keys(0..EARLY_MAX), now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let list = used.list();
+        assert_eq!(list.len(), EARLY_MAX);
+        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
     }
 
     #[test]
