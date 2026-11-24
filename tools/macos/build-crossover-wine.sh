@@ -26,7 +26,9 @@ SRC="$WORK/sources/wine"
 cd "$OBJ"
 if [[ ! -f Makefile ]]; then
   echo "configuring CrossOver Wine"
-  x86 "$SRC/configure" --prefix="$PREFIX" --enable-archs=x86_64 \
+  # The prefix has spaces in it, so autoconf's default site file path would
+  # be split at the first one. No site file is needed.
+  CONFIG_SITE=/dev/null x86 "$SRC/configure" --prefix="$PREFIX" --enable-archs=x86_64 \
     CC="clang -arch x86_64" CXX="clang++ -arch x86_64" \
     CFLAGS="-g -O2 -I$DEPS/include -Wno-error=incompatible-function-pointer-types -Wno-error=int-conversion" \
     LDFLAGS="-L$DEPS/lib -Wl,-rpath,@loader_path/../.." \
