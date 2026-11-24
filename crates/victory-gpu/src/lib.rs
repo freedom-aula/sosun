@@ -58,6 +58,10 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(test, windows))]
+mod test_bytecode;
+#[cfg(all(test, windows))]
+mod test_hlsl;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]

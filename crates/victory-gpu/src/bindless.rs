@@ -347,10 +347,7 @@ pub(crate) fn log(frames: f64) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D12::*;
-    use windows::core::s;
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
@@ -369,30 +366,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let bytes = crate::test_hlsl::compile(SOURCE, "heap", "cs_5_1", 0).unwrap();
+        let bytes = &bytes[..];
         let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("heap"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
         // SAFETY: a compiled shader with its root signature inside.
         unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();

@@ -1826,9 +1826,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
-    use windows::core::s;
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
@@ -1851,30 +1848,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A compute shader with its root signature inside (`RS`).
     fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let bytes = crate::test_hlsl::compile(source, "root", "cs_5_1", 0).unwrap();
+        let bytes = &bytes[..];
         let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("root"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
         // SAFETY: a compiled shader with its root signature inside.
         unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
