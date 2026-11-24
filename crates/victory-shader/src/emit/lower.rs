@@ -1457,7 +1457,12 @@ impl<'a> Lower<'a> {
         let at = self.s.m.f32(at.to_bits());
         let size = self.unary(6, part);
         let exact = self.s.m.cmp(c, pred::OEQ, size, at);
-        self.s.m.select(c, exact, zero, r)
+        let r = self.s.m.select(c, exact, zero, r);
+        // The hardware returns NaN for NaN and for infinity, whose reduced
+        // part is NaN. Metal's sin and cos give 0 there, so that NaN is
+        // passed through here instead of relying on the host.
+        let nan = self.s.m.cmp(c, pred::UNO, part, part);
+        self.s.m.select(c, nan, part, r)
     }
 
     /// The high dword of a 32 × 32-bit product.

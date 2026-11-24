@@ -514,9 +514,20 @@ mod tests {
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
+        // D3DMetal under Wine does not check the hash, so it accepts both.
+        // SAFETY: ntdll is always loaded; both names end with a NUL.
+        let wine = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            GetProcAddress(
+                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+                c"wine_get_version".as_ptr().cast(),
+            )
+        }
+        .is_some();
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
-        for digest in [&[0u8; 16][..], &wrong] {
+        let digests: &[&[u8]] = if wine { &[] } else { &[&[0u8; 16], &wrong] };
+        for &digest in digests {
             let mut other = ps.clone();
             other.dxil[4..20].copy_from_slice(digest);
             assert!(
