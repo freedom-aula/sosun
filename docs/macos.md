@@ -33,6 +33,20 @@ Wine 7.7 is too old for the rest of VIctory. The console memory tests (xmem and 
 WINE="/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64" WINEDLLOVERRIDES=winedbg.exe=d tools/macos/test-wine.sh --workspace --no-fail-fast
 ```
 
+## CrossOver Wine with D3DMetal, 24 November 2026
+
+`tools/macos/build-crossover-wine.sh` builds CodeWeavers' CrossOver 26.3 Wine (Wine 11.0) from its published source into `target/wine-cx`, using x86_64 FreeType and GnuTLS from `DEPS`. Copy the `redist/lib` folder of Apple's "Evaluation environment for Windows games" over `target/wine-cx/lib`, and run the tests with this command.
+
+```sh
+WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
+```
+
+On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored. Every loader, HLE, console memory and shader test passes on the same Wine. The policy test fails only because it runs git inside Wine. Three GPU tests show real D3DMetal differences that still need work.
+
+- `buffer_data_reaches_the_host_texture`: a copy from title memory into a host texture reads back as zeros.
+- `argument_clamp_builds`: the compute pipeline that clamps indirect arguments is not created, so indirect draws would be dropped.
+- `a_rejected_blob_gives_an_empty_library`: D3DMetal accepts a pipeline library blob that Windows rejects.
+
 ## Route A: next steps
 
 The first playable route is the upstream Windows build running under Wine, with D3D12 going to Metal through Apple's D3DMetal. DXMT cannot be used because it covers D3D11 only. Rosetta 2 runs the title's x86-64 code and has supported AVX2 since macOS 15.
