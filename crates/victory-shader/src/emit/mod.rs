@@ -27,20 +27,34 @@
 //!   a heap sampler it uses must be a comparison sampler on the host. One
 //!   of two immediate samplers chosen by uniform control flow takes two
 //!   entries; the sampling runs with both and the result is chosen.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
+//! * **Root CBVs** as root descriptors `b<i>` in [`ROOT_CBV_SPACE`], `i`
+//!   the title's root parameter index ([`HostShader::root_cbvs`]); the
 //!   address the title sets is the buffer's.
+//! * **Root SRVs and root UAVs** (raw buffers; changed 2026-11-24) are
+//!   resource-heap views the host makes: a raw SRV (UAV) of the whole host
+//!   copy holding the root address, at the heap index the host writes into
+//!   the [`HostShader::user_data`] entry marked [`ROOT_SRV_VIEW`]
+//!   ([`ROOT_UAV_VIEW`]) (dword `index` = the root descriptor's own first
+//!   user-data dword, which such a program never reads as data), and the
+//!   root address's byte offset in that copy into the entry marked
+//!   [`ROOT_VIEW_OFFSET`] (its second); the shader adds that offset to
+//!   every offset it reads at. Host root descriptors have no bounds, so a
+//!   shader reading past the copy read other memory or faulted; through
+//!   the view it reads 0 and its writes there are dropped. One view per
+//!   host copy (and kind) serves every draw of a list. In programs that
+//!   use title memory (below) root SRVs and UAVs are title memory instead;
+//!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`] now
+//!   hold only the host's own tables (`VIEW_STRIDES`).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
 //!   instruction, so the translation reads raw bytes and converts them
 //!   itself. Their descriptors are built around a root SRV (stride 1, no
-//!   record limit): the host binds the root SRV `t<slot>` above with the
-//!   address the title sets, nothing more. The vertex index, the stride
-//!   and the attribute offset are the shader's own arithmetic on data in
-//!   that buffer (per-stream headers), not descriptor fields.
+//!   record limit): the shader reads it as the root SRV view above. The
+//!   vertex index, the stride and the attribute offset are the shader's
+//!   own arithmetic on data in that buffer (per-stream headers), not
+//!   descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
@@ -69,6 +83,16 @@
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
 //!   reads nothing instead of faulting the device.
+//! * **Buffer views at computed heap indices** (added 2026-11-24): a
+//!   buffer read through a descriptor the shader takes from the resource
+//!   heap itself first looks up the view-stride table (root SRV
+//!   `t`[`VIEW_STRIDES`], which then covers every index below
+//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
+//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   unordered access the index below), which the host keeps a null raw
+//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
+//!   read as a buffer one is a wild address (the texture's shifted 8 bits
+//!   down: GPU faults at low addresses).
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
 //!   added 2026-11-24): whether the shader takes descriptors from the
 //!   resource heap itself, and unordered access views among them; the
@@ -89,9 +113,7 @@
 //!   loads the rest from memory whose 40-bit address is in user data 0-1;
 //!   the table starts with user-data dword 16. They are user data as any
 //!   other: the host fills dword `index` as above.
-//! * **Root UAVs** (raw buffers) as root descriptors `u<i>` in
-//!   [`ROOT_CBV_SPACE`] ([`HostShader::root_uavs`]); what shaders write there
-//!   is the title's to see.
+//! * What shaders write through a root UAV is the title's to see.
 //! * **Title memory** (added 2026-11-24, decision 0005's unified-memory
 //!   item): accesses at addresses the program computes (pointers in root
 //!   constants or loaded from memory, BVH nodes) go through a page table,
@@ -175,8 +197,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
-    VIEW_STRIDES,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    USER_DATA_SPACE, VIEW_STRIDES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -233,11 +255,12 @@ pub struct HostShader {
     /// Root CBVs the shader reads: root parameter indices, each bound as
     /// `b<index>` in [`ROOT_CBV_SPACE`].
     pub root_cbvs: Vec<u8>,
-    /// Root SRVs (raw buffers) the shader reads: `t<index>` in
-    /// [`ROOT_CBV_SPACE`].
+    /// Root SRVs (raw buffers) the host binds as root descriptors: `t<index>`
+    /// in [`ROOT_CBV_SPACE`] (the host's own tables, and title root SRVs in
+    /// programs using title memory; others are views, module notes).
     pub root_srvs: Vec<u8>,
-    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
-    /// [`ROOT_CBV_SPACE`].
+    /// Root UAVs (raw buffers) the host binds as root descriptors:
+    /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
     pub root_uavs: Vec<u8>,
     /// Whether the shader reads title memory at addresses it computes: the
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
@@ -273,6 +296,17 @@ impl HostShader {
     }
 }
 
+/// [`UserData::dword`] of a root descriptor's entry that takes the heap
+/// index of the host's raw SRV of it (module notes, "Root SRVs and root
+/// UAVs"); dwords 0 and 1 are its address (programs using title memory).
+pub const ROOT_SRV_VIEW: u32 = 2;
+/// As [`ROOT_SRV_VIEW`], for the raw UAV of a root UAV.
+pub const ROOT_UAV_VIEW: u32 = 3;
+/// [`UserData::dword`] of a root descriptor's entry that takes its
+/// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
+/// names.
+pub const ROOT_VIEW_OFFSET: u32 = 4;
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -280,10 +314,12 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants`, `Table` or, in a program using title memory,
-    /// `Descriptor` (see the module notes for the value).
+    /// `Constants`, `Table` or `Descriptor` (see the module notes for the
+    /// value).
     pub root: RootType,
-    /// Dword within the parameter.
+    /// Dword within the parameter; for a root descriptor
+    /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
+    /// its view's heap index or its offset in that view instead.
     pub dword: u32,
 }
 

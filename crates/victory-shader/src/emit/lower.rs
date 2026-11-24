@@ -187,6 +187,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Handles of root SRVs and UAVs read as bounded views, by user-data
+    /// dword ([`Lower::root_view`]).
+    root_views: HashMap<u32, V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -588,6 +591,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            root_views: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -913,6 +917,10 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+                    let off = match self.root_view_offset(&src) {
+                        Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
+                        None => off,
+                    };
                     (None, Some((h, off)))
                 }
             }
@@ -1575,15 +1583,66 @@ impl<'a> Lower<'a> {
     fn user_dword(&mut self, param: usize, dword: u32) -> V {
         let rp = self.x.native.layout[param];
         let index = u32::from(rp.user_data) + dword;
-        self.user_reads.insert(
+        self.user_at(UserData {
             index,
-            UserData {
-                index,
-                slot: rp.slot,
-                root: rp.root,
-                dword,
-            },
-        );
+            slot: rp.slot,
+            root: rp.root,
+            dword,
+        })
+    }
+
+    /// A root SRV or UAV (`uav`) of root parameter `param`, in a program
+    /// that does not read title memory: the resource-heap view the host
+    /// makes of the host copy holding the buffer, whose index comes in the
+    /// root descriptor's own first user-data dword (module notes, "Root SRVs
+    /// and root UAVs"); offsets from the root address move by
+    /// [`Lower::root_view_offset`]. Host root views have no bounds; a view's
+    /// reads past the copy give 0 and its writes there are dropped.
+    fn root_view(&mut self, param: usize, uav: bool) -> V {
+        let rp = self.x.native.layout[param];
+        // The descriptor's two user-data dwords hold its address on the
+        // console; such a program never reads them as data (`user`).
+        let index = u32::from(rp.user_data);
+        if let Some(&h) = self.root_views.get(&index) {
+            return h;
+        }
+        let i = self.user_at(UserData {
+            index,
+            slot: rp.slot,
+            root: RootType::Descriptor,
+            dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
+        });
+        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let h = self.s.heap_handle(self.s.entry, i, false, false, props);
+        self.root_views.insert(index, h);
+        h
+    }
+
+    /// For a root SRV or UAV read through the view of its host copy
+    /// ([`Lower::root_view`]): the root address's byte offset in that view,
+    /// from the descriptor's second user-data dword. None for other sources.
+    fn root_view_offset(&mut self, src: &Source) -> Option<V> {
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = *self.x.native.layout.get(address.param)?;
+        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        if self.root_memory || rp.root != RootType::Descriptor || cbv {
+            return None;
+        }
+        Some(self.user_at(UserData {
+            index: u32::from(rp.user_data) + 1,
+            slot: rp.slot,
+            root: RootType::Descriptor,
+            dword: super::ROOT_VIEW_OFFSET,
+        }))
+    }
+
+    /// User-data dword `u.index`, which the host fills as `u` says, loaded
+    /// in the entry block.
+    fn user_at(&mut self, u: UserData) -> V {
+        let index = u.index;
+        self.user_reads.insert(index, u);
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1642,7 +1701,12 @@ impl<'a> Lower<'a> {
         active: Option<V>,
     ) -> Result<(V, V), Why> {
         let Some((lo, hi)) = self.root_address(src) else {
-            return Ok((self.handle(site, src, false, props)?, off));
+            let h = self.handle(site, src, false, props)?;
+            let off = match self.root_view_offset(src) {
+                Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
+                None => off,
+            };
+            return Ok((h, off));
         };
         // The hardware adds the 32-bit offset to the 48-bit base.
         let (lo, hi) = self.add64(lo, hi, off, false);
@@ -4599,6 +4663,7 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -4649,8 +4714,17 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
+                    (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
+                        Ok(self.root_view(address.param, false))
+                    }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
+                    }
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
+                    | (RootType::Descriptor, Some(ResourceType::Uav), 11)
+                        if !self.root_memory =>
+                    {
+                        Ok(self.root_view(address.param, true))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
@@ -4706,7 +4780,8 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let index = self.buffer_guard(src, phi, sampler, props);
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -4724,6 +4799,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -4731,9 +4807,41 @@ impl<'a> Lower<'a> {
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
+                let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The heap index to read a buffer view at, for a descriptor `src` from
+    /// the resource heap itself (module notes, "Buffer views at computed
+    /// heap indices"): `index`, or the host's null raw buffer view when the
+    /// view-stride table says the slot holds no buffer view. Indices come
+    /// from data; one naming a texture slot read a texture descriptor as a
+    /// buffer one (a wild address: the texture's address shifted 8 bits
+    /// down) and faulted the device.
+    fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+        // Typed, raw and structured buffers (DXIL resource kinds 10-12).
+        if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
+            return index;
+        }
+        let c = self.cur;
+        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        let index = self.s.m.select(c, over, last, index);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(VIEW_STRIDES);
+        let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
+        let x = self.s.m.extract(c, r, 0);
+        let stride = self.as_int(x);
+        let zero = self.s.m.i32(0);
+        let none = self.s.m.cmp(c, pred::EQ, stride, zero);
+        // The null unordered access view sits just below the null SRV.
+        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = self.s.m.i32(null);
+        self.s.m.select(c, none, null, index)
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type

@@ -82,6 +82,13 @@ pub(crate) struct State {
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
+    /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
+    /// (view heap, host copy, unordered access) → dynamic slot.
+    root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
+    /// The run of dynamic slots root views take from (view heap, next
+    /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
+    /// do not break up the runs fresh tables need.
+    root_run: (usize, u32, u32),
 }
 
 impl Drop for State {
@@ -97,6 +104,16 @@ impl Drop for State {
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = usize::MAX;
+
+/// Dynamic slots taken at a time for root views.
+const ROOT_VIEW_RUN: u32 = 256;
+
+/// Dynamic slots taken for root views ([`State::root_view`]) since the last
+/// call.
+pub(crate) fn take_root_view_slots() -> u64 {
+    ROOT_VIEW_SLOTS.swap(0, Ordering::Relaxed)
+}
+static ROOT_VIEW_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
@@ -322,7 +339,9 @@ impl State {
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
-            (Some(Root::View(address)), RootType::Descriptor) => (address >> (32 * dword)) as u32,
+            (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
+                (address >> (32 * dword)) as u32
+            }
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
                 None => {
@@ -474,7 +493,8 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them. Title memory's views need a view heap: ours where
         // the title binds none (the BVH builder's dispatches may not).
-        let memory_heap = self.heaps[0] == 0 && p.stages.iter().any(|s| s.memory.is_some());
+        let memory_heap = self.heaps[0] == 0
+            && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
         self.bind_heaps(list, memory_heap);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -553,6 +573,25 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                            // Where the root address lies in the copy its view shows.
+                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
+                                _ => None,
+                            };
+                            match offset {
+                                Some(offset) => offset,
+                                None => return false,
+                            }
+                        }
+                        None if is_root_view(u) => {
+                            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+                            match self.root_view(list, compute, u.slot, uav) {
+                                Some((slot, _)) => slot,
+                                None => return false,
+                            }
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -666,6 +705,57 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
         true
+    }
+
+    /// The heap index of a raw view (`uav`: unordered access) of the host
+    /// copy holding the root view the title set at root parameter `slot`,
+    /// and the root address's byte offset in it: a dynamic slot of the view
+    /// heap the shader indexes, made once per list and copy; the range from
+    /// the root address brought up to date at submission
+    /// (`victory_shader::emit`, "Root SRVs and root UAVs"). None if the
+    /// draw must be dropped: no root view set, or no dynamic slot.
+    /// The copy is brought up to date from the root address to its end: a
+    /// shader reaches wherever data its root view leads to lie (a vertex
+    /// fetch's streams sit at offsets in the root view's own header).
+    /// shortcut: what shaders write through a root UAV goes back to title
+    /// memory for 1 MiB from its address, as before the views.
+    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            once!(slot, "a shader reads a root view the title did not set: dropped");
+            return None;
+        };
+        let shadow = crate::shadow::find(address, 1)?;
+        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        shadow.refresh(list, address, shadow.left(address));
+        if uav {
+            shadow.gpu_writes(list, address, shadow.left(address).min(1 << 20));
+        }
+        let (key, host) = match self.heaps[0] {
+            0 => (MEMORY_HEAP, crate::memory::heap()?),
+            h => (
+                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
+                crate::descriptor::heap(h as This).host()?,
+            ),
+        };
+        let copy = std::sync::Arc::as_ptr(&shadow) as usize;
+        if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
+            return Some((index, offset));
+        }
+        let (run_heap, next, end) = self.root_run;
+        if run_heap != key || next >= end {
+            let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
+                once!("no dynamic slots for root views: dropped");
+                return None;
+            };
+            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.root_run = (key, first, first + ROOT_VIEW_RUN);
+        }
+        let index = self.root_run.1;
+        self.root_run.1 += 1;
+        ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
+        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        self.root_slots.insert((key, copy, uav), index);
+        Some((index, offset))
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -804,7 +894,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
-            for u in &t.host.user_data {
+            for u in t.host.user_data.iter().filter(|u| !is_root_view(u)) {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
@@ -812,17 +902,25 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            let viewed = t.host.user_data.iter().filter(|u| is_root_view(u)).map(|u| u.slot);
+            let slots: std::collections::BTreeSet<u8> =
+                stage.root_cbvs.iter().chain(&stage.root_srvs).map(|r| r.0).chain(viewed).collect();
+            for slot in slots {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
-                    let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                    // Its first dwords (a vertex stream header, say).
+                    let mut head = [0u8; 16];
+                    let head = crate::host::read_into(*address as *const u8, &mut head)
+                        .then(|| head.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>());
+                    let _ = write!(text, " root{slot}={address:#x} host {host:x?} head {head:x?}");
                 }
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
     }
+
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
@@ -1426,6 +1524,16 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
+/// A user-data entry that takes the heap index of a root view's view.
+fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
+}
+
+/// Whether a shader reads root views through views the host makes.
+fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
+    t.user_data.iter().any(is_root_view)
+}
+
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
@@ -1452,4 +1560,162 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{HRESULT, S_OK};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    /// Reads 16 dwords 64 bytes apart from `offset` past the root view
+    /// (heap index in the table) as the translated shaders do: the root
+    /// address's offset in the view plus their own.
+    const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=2, b0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer c : register(b0) { uint root; uint offset; }
+[RootSignature(RS)]
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(root + offset + id.x * 64));
+}
+"#;
+
+    fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let host = crate::host::host().unwrap();
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names outlive the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("root"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: a compiled shader with its root signature inside.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        }
+    }
+
+    /// A title buffer of `bytes` in memory of its own.
+    fn buffer(bytes: u64) -> This {
+        let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut out = std::ptr::null();
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let made: HRESULT = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        out
+    }
+
+    /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
+    /// our device: a raw view of the host copy holding the root address,
+    /// brought up to date from there to the copy's end, so data 1.5 MiB past
+    /// the root address (past the 1 MiB the old root views brought up to
+    /// date) reads right; reads past the copy's end read 0 (a host root
+    /// descriptor read whatever lay there). Two root addresses in one copy
+    /// share its view.
+    #[test]
+    fn root_views_reach_their_copy_and_read_zeros_past_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const MIB: u64 = 1 << 20;
+        let (src, dst) = (buffer(4 * MIB), buffer(256));
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &uav, title_heap.start + 32);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        let src = src_bytes as u64;
+        let cases = [
+            // Data 1.5 MiB past the root address.
+            (src + 0x100, 0x18_0000u32, (0..16).map(|k| 0x5000 + k).collect::<Vec<u32>>()),
+            // The copy's last 256 bytes: four lanes inside, the rest past it.
+            (src + 4 * MIB - 256, 0, (0..16).map(|k| if k < 4 { 0x7000 + k } else { 0 }).collect()),
+        ];
+        for (round, (address, offset, want)) in cases.into_iter().enumerate() {
+            if round > 0 {
+                list.reset();
+            }
+            // The title writes after recording, before submitting.
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_view(true, 0, address);
+            let (index, at) = state.root_view(&list, true, 0, false).expect("a root view");
+            assert_eq!(u64::from(at), address - src, "the root address's offset in the copy");
+            state.set_view(true, 1, address - 0x40);
+            let other = state.root_view(&list, true, 1, false).expect("a root view");
+            assert_eq!(other, (index, at - 0x40), "one view per copy");
+            let constants = [at, offset];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            for k in 0..16u64 {
+                let at = address + u64::from(offset) + 64 * k;
+                if at + 4 <= src + 4 * MIB {
+                    let value = if round == 0 { 0x5000 + k as u32 } else { 0x7000 + k as u32 };
+                    // SAFETY: inside the title buffer.
+                    unsafe { (at as *mut u32).write(value) };
+                }
+            }
+            host.execute(&[&list]);
+            assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
+        }
+    }
 }

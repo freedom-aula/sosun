@@ -763,6 +763,104 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        use windows::core::Interface;
+        life::note(self.texture.as_raw() as usize, life::LET_GO, 0, life::holders(&self.texture));
+    }
+}
+
+/// Diagnostics: the last events in host textures' lives, for
+/// device-removed reports that find a fault inside a freed one (host
+/// textures are named with their address, `@0x...`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod life {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// The title released the resource the texture copies.
+    pub(crate) const RELEASED: u8 = 1;
+    /// A view heap slot (the value) stopped viewing it.
+    pub(crate) const SLOT: u8 = 2;
+    /// The shared host copy (title resource and lists) let go of it.
+    pub(crate) const LET_GO: u8 = 3;
+    /// A submission started (value: its number; no texture).
+    pub(crate) const SUBMITTED: u8 = 4;
+    /// That submission's lists have run.
+    pub(crate) const RAN: u8 = 5;
+
+    /// (texture, time, kind, value, references left after the event).
+    type Event = (usize, std::time::Instant, u8, u64, u32);
+    static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+    const KEPT: usize = 1 << 18;
+
+    /// The references `texture` has besides the one about to go.
+    pub(crate) fn holders(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+        use windows::core::Interface;
+        // SAFETY: a live COM object; one reference taken and given back.
+        unsafe {
+            let raw = texture.as_raw();
+            let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+            ((**unknown).AddRef)(raw);
+            ((**unknown).Release)(raw).saturating_sub(1)
+        }
+    }
+
+    /// `left`: the texture's references once the event's own is gone.
+    pub(crate) fn note(texture: usize, kind: u8, value: u64, left: u32) {
+        let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        if events.len() >= KEPT {
+            events.pop_front();
+        }
+        events.push_back((texture, std::time::Instant::now(), kind, value, left));
+    }
+
+    /// What happened to the texture named `name` (`...@0x<address>`), with
+    /// the submissions around it, times relative to now.
+    pub(crate) fn of(name: &str) -> String {
+        let Some(at) = name
+            .rsplit_once("@0x")
+            .and_then(|(_, a)| usize::from_str_radix(a.split(|c: char| !c.is_ascii_hexdigit()).next()?, 16).ok())
+        else {
+            return String::new();
+        };
+        let now = std::time::Instant::now();
+        let events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = Vec::new();
+        let mut last_submission = None;
+        for &(t, when, kind, value, left) in events.iter() {
+            let ago = now.duration_since(when).as_secs_f64() * 1e3;
+            match kind {
+                SUBMITTED | RAN => last_submission = Some((kind, value, ago)),
+                _ if t == at => {
+                    if let Some((k, n, a)) = last_submission.take() {
+                        let what = if k == SUBMITTED { "started" } else { "ran" };
+                        text.push(format!("(submission {n} {what} {a:.1} ms ago)"));
+                    }
+                    let what = match kind {
+                        RELEASED => "the title released its resource".to_owned(),
+                        SLOT => format!("view heap slot {value} stopped viewing it"),
+                        _ => "the shared host copy let go".to_owned(),
+                    };
+                    let freed = match (kind, left) {
+                        (SLOT, 0) => ", its last holder (freed after the submission running then)",
+                        (LET_GO, 0) => ", FREED",
+                        _ => "",
+                    };
+                    text.push(format!("{ago:.1} ms ago {what}{freed}"));
+                }
+                _ => {}
+            }
+        }
+        if let Some((k, n, a)) = last_submission {
+            let what = if k == SUBMITTED { "started" } else { "ran" };
+            text.push(format!("(last: submission {n} {what} {a:.1} ms ago)"));
+        }
+        format!(" [{name}: {}]", text.join("; "))
+    }
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
@@ -866,8 +964,10 @@ fn host_texture(
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
+        use windows::core::Interface;
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            // Its address, for the lifetime notes (`life`) of a freed one.
+            format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, t.as_raw() as usize)
         });
     }
     texture
@@ -972,6 +1072,11 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(h) = &self.host {
+            use windows::core::Interface;
+            life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);

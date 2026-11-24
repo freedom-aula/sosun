@@ -296,6 +296,57 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// A buffer read at a heap index from data whose slot holds no buffer view
+/// (the view-stride table holds 0 there; a texture here) reads the host's
+/// null buffer view instead (`emit`, "Buffer views at computed heap
+/// indices"): a texture descriptor read as a buffer one is a wild address.
+#[test]
+fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
+    let shader = build(
+        HEAP_ELEMENT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The texture at heap index 1, the UAV's table at 0.
+            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+        }
+        let dispatch = Dispatch {
+            // Heap index 1 holds no buffer view: stride 0.
+            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            views: &views,
+            samplers: &[],
+            groups: [1, 1, 1],
+        };
+        let words = host
+            .dispatch(&root, &pso, &dispatch)
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], [0; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// Constant data through the resource heap itself is read from a raw view
 /// (the host's constant buffer views need an alignment the title's lack).
 #[test]
@@ -311,6 +362,7 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         32,
     );
     assert!(shader.heap && !shader.heap_writes, "reads the heap itself, writes through a table");
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the guard's stride table");
     let data: Vec<u32> = vec![7, 8, 9, 10];
     let views = [
         View::RawUav(32),
@@ -345,7 +397,9 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    // User data, then the stride table: heap index 1 holds a
+                    // buffer view.
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],

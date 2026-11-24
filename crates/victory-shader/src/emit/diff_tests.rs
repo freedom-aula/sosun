@@ -791,6 +791,9 @@ fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec
 }
 
 /// Root arguments for a translated stage: user data from the root values.
+/// Where the compute cases' heap holds the view of their root SRV.
+const ROOT_SRV_AT: u32 = 18;
+
 fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     let mut data = vec![0; (s.user_data_dwords() as usize).max(1)];
     for u in &s.user_data {
@@ -803,6 +806,9 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
+            // The root SRV `rootraw` (compute) as the host's view of it.
+            (RootType::Descriptor, 5) if u.dword == super::ROOT_SRV_VIEW => ROOT_SRV_AT,
+            (RootType::Descriptor, 5) if u.dword == super::ROOT_VIEW_OFFSET => 0,
             other => panic!("unexpected user data {other:?}"),
         };
     }
@@ -1403,6 +1409,14 @@ fn translated_compute_matches_pc() {
         .collect();
     let root_cbv = floats(64, -0.125);
     let root_srv: Vec<u32> = (0..32u32).map(|i| i * 0x0001_0003 + 7).collect();
+    // The root SRV as the view the host makes of it (`emit`, "Root SRVs and
+    // root UAVs").
+    let mut views = views;
+    assert_eq!(views.len(), ROOT_SRV_AT as usize);
+    views.push(View::Buffer {
+        data: &root_srv,
+        stride: Stride::Raw,
+    });
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,

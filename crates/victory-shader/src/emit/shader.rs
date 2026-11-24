@@ -24,6 +24,11 @@ pub const MEMORY_SPACE: u32 = 2;
 /// indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+/// The heap index of the host's null raw buffer view (the null raw
+/// unordered access view at the index below), read instead of a slot that
+/// holds no buffer view where a shader reads one at an index it computes
+/// (`emit`, "Buffer views at computed heap indices").
+pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
