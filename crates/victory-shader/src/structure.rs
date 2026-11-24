@@ -11,6 +11,14 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
+//! the exit) is the exception: on the console a discarded lane whose quad
+//! has a live lane stays in EXEC (`s_wqm` of the live mask), a helper of
+//! the quad's derivatives, and no lane takes the exit while its wave has a
+//! live lane. Here it runs on as a live lane and is discarded at that point
+//! ([`Structured::discards`]): the host's `discard` keeps it as a helper
+//! (derivatives read it) and drops its outputs and stores.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
@@ -373,6 +381,9 @@ pub struct Structured {
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
+    /// A pixel's discards, by block and instruction: the lanes (EXEC there)
+    /// the instruction takes out of the live mask, which here stay in it.
+    pub discards: HashMap<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -387,7 +398,22 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true)
+}
+
+/// The per-lane form with a pixel's discarded lanes taken out of the live
+/// mask, as the console does: wrong for derivatives after a discard, but
+/// what a program needs whose discarded lanes would read values no
+/// surviving lane does (see [`Structured::discards`]).
+pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false)
+}
+
+fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    if !helpers {
+        l.kills.clear();
+    }
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -435,6 +461,9 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
+    /// A pixel's discards (see [`Structured::discards`]) by block and
+    /// instruction.
+    kills: HashSet<(usize, usize)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -499,7 +528,18 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             restored: Map::default(),
+            kills: HashSet::new(),
         };
+        for block in blocks {
+            if let Exit::Branch { taken, not_taken } = block.exit
+                && let Some(last) = block.insts.last()
+                && l.discards(last)
+                && (l.kill_exit(taken) || l.kill_exit(not_taken))
+                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+            {
+                l.kills.insert(*def);
+            }
+        }
         for inst in blocks.iter().flat_map(|b| &b.insts) {
             if let Fields::Valu(v) = &inst.fields
                 && inst.name() == "v_readlane_b32"
@@ -609,14 +649,44 @@ impl<'a> Lanes<'a> {
                     now = Some(e);
                 }
                 self.step(inst, now);
+                if self.kills.contains(&(b, i))
+                    && let Fields::Sop {
+                        dst: Some(Operand::Scalar { code, .. }),
+                        ..
+                    } = inst.fields
+                    && let (Some(old), Some(new)) = (
+                        self.key(|r| inst.read(r), code),
+                        self.key(|r| inst.write(r), code),
+                    )
+                {
+                    let m = self.mask(old).0;
+                    self.masks.insert(new, m);
+                    if let Some(scc) = inst.write(Reg::Scc) {
+                        self.scc_lane.insert(scc, m);
+                    }
+                }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
-            if let Exit::Branch { .. } = p.blocks[b].exit
+            if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                self.when[b] = Some(self.branch(last));
+                let mut w = self.branch(last);
+                // A discard's "no lane is left" exit: no lane takes it (the
+                // live mask keeps every lane, see `kills`).
+                if last
+                    .read(Reg::Scc)
+                    .and_then(|v| self.defs.get(&v))
+                    .is_some_and(|d| self.kills.contains(d))
+                {
+                    if self.kill_exit(taken) {
+                        w = Bool::FALSE;
+                    } else if self.kill_exit(not_taken) {
+                        w = Bool::TRUE;
+                    }
+                }
+                self.when[b] = Some(w);
             }
         }
         execs
@@ -712,6 +782,11 @@ impl<'a> Lanes<'a> {
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
+            discards: self
+                .kills
+                .iter()
+                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
+                .collect(),
             bools: self.b,
             exits,
             guards,
@@ -1099,6 +1174,53 @@ impl<'a> Lanes<'a> {
                 })
             })
         })
+    }
+
+    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
+    /// any lane is left in a pixel's live mask after a discard.
+    fn discards(&self, inst: &Inst) -> bool {
+        if !inst.name().starts_with("s_cbranch_scc") {
+            return false;
+        }
+        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
+            return false;
+        };
+        let def = &self.p.blocks[db].insts[di];
+        let Fields::Sop {
+            dst: Some(d), src, ..
+        } = &def.fields
+        else {
+            return false;
+        };
+        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+            && src.first() == Some(d)
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+    }
+
+    /// Whether a lane entering block `b` leaves the program doing nothing but
+    /// scalar work and a `done` export to `null` (a discard's exit).
+    fn kill_exit(&self, mut b: usize) -> bool {
+        for _ in 0..8 {
+            let block = &self.p.blocks[b];
+            let mut null_done = false;
+            for inst in &block.insts {
+                match inst.fields {
+                    Fields::Exp {
+                        target: 9,
+                        done: true,
+                        ..
+                    } => null_done = true,
+                    Fields::Sop { .. } | Fields::Sopp { .. } => {}
+                    _ => return false,
+                }
+            }
+            match block.exit {
+                Exit::End => return null_done,
+                Exit::Jump(next) if !null_done => b = next,
+                _ => return false,
+            }
+        }
+        false
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
