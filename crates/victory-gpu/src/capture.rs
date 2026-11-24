@@ -205,33 +205,116 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
-static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
-    std::sync::Mutex::new(Vec::new());
+/// Each with the first pipeline that wrote it as an unordered-access view
+/// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
+/// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
+/// a pipeline with one of them writes, the first frame it runs.
+#[allow(clippy::type_complexity)]
+static TARGETS: std::sync::Mutex<
+    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
+> = std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// The pipeline whose draw or dispatch this thread is binding.
+    static WRITER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Names the pipeline whose views this thread binds next (empty: none).
+pub(crate) fn binding(pipeline: &str) {
+    if dump_on() {
+        WRITER.with(|w| pipeline.clone_into(&mut w.borrow_mut()));
+    }
+}
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
+static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Buffers such a pipeline writes: title memory, its bytes when first
+/// bound in the frame, the pipeline. Logged at the present: dwords changed
+/// and dwords not zero.
+#[allow(clippy::type_complexity)]
+static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mutex::new(Vec::new());
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() {
         return;
     }
+    let by = WRITER.with(|w| w.borrow().clone());
+    if !listed(crate::queue::presented() + 1) {
+        let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let writers = writers.get_or_insert_with(|| {
+            let list = std::env::var("VICTORY_DUMP_WRITERS").unwrap_or_default();
+            list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+        });
+        if by.is_empty() || !writers.iter().any(|h| by.contains(h.as_str())) {
+            return;
+        }
+        if let Some((at, len)) = crate::resource::buffer_bytes(resource) {
+            let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+            if !buffers.iter().any(|b| b.0 == at as usize) {
+                let mut before = vec![0u8; (len as usize).min(64 << 20) & !3];
+                if crate::host::read_into(at, &mut before) {
+                    buffers.push((at as usize, before, by));
+                }
+            }
+            return;
+        }
+    }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
+    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy));
+        targets.push((resource as usize, copy, by));
     }
+}
+
+/// Whether textures wait to be dumped at this present.
+pub(crate) fn has_targets() -> bool {
+    !TARGETS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
+    // Writers dumped once.
+    if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        writers.retain(|h| {
+            !targets.iter().any(|t| t.2.contains(h.as_str()))
+                && !buffers.iter().any(|b| b.2.contains(h.as_str()))
+        });
+    }
+    for (at, before, by) in &buffers {
+        let mut after = vec![0u8; before.len()];
+        if !crate::host::read_into(*at as *const u8, &mut after) {
+            continue;
+        }
+        let dwords = |b: &[u8]| -> Vec<u32> {
+            b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect()
+        };
+        let (old, new) = (dwords(before), dwords(&after));
+        let changed = old.iter().zip(&new).filter(|(a, b)| a != b).count();
+        let set = new.iter().filter(|&&x| x != 0).count();
+        tracing::info!(
+            frame,
+            buffer = format_args!("{at:#x}"),
+            dwords = new.len(),
+            changed,
+            set,
+            by = by.as_str(),
+            "a buffer the named pipeline writes, at the present"
+        );
+    }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy)) in targets.iter().enumerate() {
+    for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -240,7 +323,8 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        let target = (i, *resource as crate::object::This, by.as_str());
+        dump_one(host, texture, state, frame, target, &d);
     }
 }
 
@@ -249,8 +333,7 @@ fn dump_one(
     texture: &ID3D12Resource,
     state: u32,
     frame: u64,
-    i: usize,
-    resource: crate::object::This,
+    (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
@@ -282,10 +365,20 @@ fn dump_one(
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
+            let mut name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
+            // The pipeline's hashes (its name is "[stage hash, ...]").
+            let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
+            if !by.is_empty() {
+                name.push_str("-by-");
+                name.push_str(&by);
+            }
+            // Whether anything but zeros is there (a dump is normalized).
+            if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
+                name.push_str("-black");
+            }
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
