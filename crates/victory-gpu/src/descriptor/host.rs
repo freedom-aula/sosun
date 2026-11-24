@@ -644,7 +644,10 @@ impl HostHeap {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
-        if key == 0 {
+        // A view the host could not make leaves a null view, its record
+        // noted all the same; it keeps no resource.
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
         let view = view_at(key as u32, (key >> 32) as u32)?;
@@ -821,6 +824,10 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// it, so that draws reading the view find and refresh that copy.
 type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
 
+/// Buffer views refused so far (diagnostics: the first are logged).
+#[cfg(feature = "diagnostics")]
+static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -836,10 +843,22 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let Some((shadow, own)) =
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+    else {
+        #[cfg(feature = "diagnostics")]
+        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
+        }
+        return None;
+    };
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
+        #[cfg(feature = "diagnostics")]
+        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+        }
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }

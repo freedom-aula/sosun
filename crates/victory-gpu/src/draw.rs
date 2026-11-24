@@ -914,8 +914,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1190,6 +1194,109 @@ impl State {
         }
     }
 
+    /// In a listed frame: each small buffer (64 bytes at most) the draw's
+    /// tables name, as title memory now and as its host copy when the list
+    /// is submitted (before the GPU runs it) and after it has run.
+    #[cfg(feature = "diagnostics")]
+    fn probe_small(&self, list: &HostList, compute: bool) {
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let range = match view {
+                    View::Constant(address, size) => Some((address, u64::from(size))),
+                    ref v => crate::descriptor::host::buffer_range(v),
+                };
+                let Some((at, len)) = range.filter(|r| r.1 <= 64) else {
+                    continue;
+                };
+                let Some(shadow) = crate::shadow::find(at, len) else { continue };
+                let who = format!("{} {:?} s{}+{} {at:#x}+{len}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                let (s, w) = (shadow.clone(), who.clone());
+                list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
+                list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
+            }
+        }
+    }
+
+    /// In a listed frame, right after a dispatch: each 1D or 3D texture it
+    /// writes through a table, read back in the list itself (what the
+    /// dispatch left there, before anything later in the frame).
+    #[cfg(feature = "diagnostics")]
+    fn probe_written(&self, list: &HostList) {
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
+            return;
+        };
+        for stage in &p.stages {
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+                    continue;
+                };
+                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                    continue;
+                }
+                const COPY_SOURCE: u32 = 0x800;
+                const UNORDERED: u32 = 0x8;
+                // All UAV writes done before the copy.
+                let all = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                    },
+                };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[all]) };
+                crate::list::ensure_state(list, r as This, COPY_SOURCE);
+                let read = crate::capture::read_back(&host.device, &list.list, t);
+                crate::list::ensure_state(list, r as This, UNORDERED);
+                let Some((buffer, f)) = read else { continue };
+                list.keep(&buffer);
+                struct Readback(ID3D12Resource);
+                // SAFETY: D3D12 objects are free-threaded.
+                unsafe impl Send for Readback {}
+                // SAFETY: as above.
+                unsafe impl Sync for Readback {}
+                let buffer = Readback(buffer);
+                let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
+                list.defer_after(move || {
+                    let mut data = std::ptr::null_mut();
+                    // SAFETY: the list has run; the mapping spans the first slice.
+                    unsafe {
+                        if buffer.0.Map(0, None, Some(&mut data)).is_err() {
+                            return;
+                        }
+                        let n = (f.Footprint.RowPitch * f.Footprint.Height) as usize / 4;
+                        let w = std::slice::from_raw_parts(data.cast::<u32>(), n);
+                        let set = w.iter().filter(|&&x| x != 0).count();
+                        let first: Vec<f32> = w.iter().take(8).map(|&x| f32::from_bits(x)).collect();
+                        tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set, first {first:?}");
+                        buffer.0.Unmap(0, None);
+                    }
+                });
+            }
+        }
+    }
+
     /// What a draw's shaders read, one line per used resource (diagnostics
     /// builds).
     #[cfg(feature = "diagnostics")]
@@ -1204,7 +1311,27 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = crate::descriptor::view(handle);
+                        let mut text = describe(view.as_ref());
+                        // The title's view words, and whether the host slot
+                        // the shader reads was made from a view.
+                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = &view {
+                            text.push_str(&format!(" words {w:?}"));
+                        }
+                        let slot = (self.heaps[0] != 0)
+                            .then(|| crate::descriptor::heap(self.heaps[0] as This))
+                            .and_then(|h| {
+                                let i = handle.checked_sub(h.start)? / 32;
+                                h.host()?.describe_slot(u32::try_from(i).ok()?)
+                            });
+                        let current: String = view.as_ref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
+                        text.push_str(match slot.as_deref() {
+                            Some("null") => " slot null",
+                            Some(s) if s.starts_with(&current) => " slot made",
+                            Some(_) => " slot stale",
+                            None => " slot unknown",
+                        });
+                        text
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -1244,6 +1371,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            self.probe_small(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1598,13 +1727,28 @@ fn describe(view: Option<&View>) -> String {
             format!("{}x{} f{} flags {:#x} mem {at:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
+    // Small buffers (exposure, counters): their title memory now, as floats.
+    let small = |range: Option<(u64, u64)>| match range {
+        Some((at, len)) if len <= 64 && crate::texture::committed(at as *const u8, len as usize) => {
+            // SAFETY: `len` committed bytes of title memory.
+            let b = unsafe { std::slice::from_raw_parts(at as *const u8, len as usize) };
+            let f: Vec<f32> = b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect();
+            format!(" = {f:?}")
+        }
+        _ => String::new(),
+    };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
+            let range = crate::descriptor::host::buffer_range(v);
+            format!("buffer {range:?}{}", small(range))
+        }),
         // A buffer has no host texture: its title range, as for a shader view.
         Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
-            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            || {
+                let range = crate::descriptor::host::buffer_range(v);
+                format!("uav buffer {range:?}{}", small(range))
+            },
             |t| format!("uav {t}"),
         ),
         Some(View::Placed(u, r, d)) => format!(

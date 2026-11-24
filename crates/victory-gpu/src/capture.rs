@@ -348,7 +348,7 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -365,6 +365,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
+    peek(&format!("frame-{frame}-s{sub:04}"));
     for (i, (resource, by)) in targets.iter().enumerate() {
         let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
             continue;
@@ -372,7 +373,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         let state = copy.state.load(Relaxed);
@@ -387,6 +388,38 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             let target = (i, *resource as crate::object::This, by.as_str());
             dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
+    }
+}
+
+/// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
+/// default): those bytes of title memory, as dwords and floats, after each
+/// submission of a listed frame.
+fn peek(when: &str) {
+    static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_PEEK")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let (a, n) = e.split_once(':').unwrap_or((e, "16"));
+                let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+                Some((a, n.trim().parse().ok()?))
+            })
+            .collect()
+    });
+    for &(at, len) in list {
+        let mut bytes = vec![0u8; len.min(256)];
+        if !crate::host::read_into(at as *const u8, &mut bytes) {
+            continue;
+        }
+        let words: Vec<String> = bytes
+            .chunks(4)
+            .map(|c| {
+                let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
+                format!("{w:#x}={}", f32::from_bits(w))
+            })
+            .collect();
+        tracing::info!("peek {when} {at:#x}: {}", words.join(" "));
     }
 }
 
@@ -523,6 +556,18 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // Tiny targets (exposure, averages): their values as they are.
+        if f.Width * f.Height <= 16 {
+            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
+            let words: Vec<String> = (0..f.Height as usize)
+                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+                .map(|c| {
+                    let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
+                    format!("{w:#x}={}", f32::from_bits(w))
+                })
+                .collect();
+            tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
+        }
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
         let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
