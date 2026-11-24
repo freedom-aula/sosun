@@ -147,8 +147,10 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    // Our own drawings for the README, as SVG text, and only in docs/images.
-    let readme_art = path.starts_with("docs/images/") && ext.as_deref() == Some("svg");
+    // Our own pictures for the README (drawings and screenshots of the Mac
+    // port, never game content), and only in docs/images.
+    let readme_art = path.starts_with("docs/images/")
+        && matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg" | "gif"));
     let allowed = readme_art
         || ALLOWED_NAMES.contains(&name)
         || ext
