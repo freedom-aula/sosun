@@ -17,6 +17,9 @@ printf '#!/bin/sh\nexec "%s" "$@"\n' "$WINE" > "$LINK"
 chmod +x "$LINK"
 export WINEPREFIX="${WINEPREFIX:-$ROOT/target/wineprefix}"
 export WINEDEBUG="${WINEDEBUG:--all}"
+# A new prefix would wait on hidden Mono and Gecko install prompts, and the
+# tests need neither. Wine's crash dialog is turned off for the same reason.
+export WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_RUNNER="$LINK"
 cargo build --quiet --manifest-path tests/fixtures/hle-probe/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET"
