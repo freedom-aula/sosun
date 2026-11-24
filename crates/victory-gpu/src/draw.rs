@@ -103,7 +103,7 @@ impl Drop for State {
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
-const MEMORY_HEAP: usize = usize::MAX;
+const MEMORY_HEAP: usize = crate::memory::OURS;
 
 /// Dynamic slots taken at a time for root views.
 const ROOT_VIEW_RUN: u32 = 256;
@@ -388,32 +388,20 @@ impl State {
         }
     }
 
-    /// The host addresses of the list's title-memory page table and page
-    /// bitmap for the bound view heap, made on first use and again when
-    /// one of `roots` (root view addresses) is in no copy it names.
-    fn memory_map(&mut self, list: &HostList, roots: &[u64]) -> Option<(u64, u64)> {
+    /// The host addresses of the bound view heap's title-memory page table
+    /// and the list's page bitmap for it, set up on first use (the table
+    /// names every host copy at each submission).
+    fn memory_map(&mut self, list: &HostList) -> Option<(u64, u64)> {
         let heap = match self.heaps[0] {
             0 => MEMORY_HEAP,
             h => h,
         };
         if let Some((h, map)) = &self.memory
             && *h == heap
-            && roots.iter().all(|&a| map.holds(a))
         {
             return Some((map.table, map.dirty));
         }
-        let host = if heap == MEMORY_HEAP {
-            crate::memory::heap()?
-        } else {
-            crate::descriptor::heap(heap as This).host()?
-        };
-        let mut slots = Vec::new();
-        let before = self.memory.as_ref().map(|m| &m.1);
-        let map = crate::memory::build(list, host, &mut slots, before);
-        if let [first, n] = slots[..] {
-            self.dynamic.push((heap, first, n));
-        }
-        let map = map?;
+        let map = crate::memory::bind(list, heap)?;
         let out = (map.table, map.dirty);
         self.memory = Some((heap, map));
         Some(out)
@@ -721,10 +709,9 @@ impl State {
                 }
             }
             if let Some(param) = stage.memory {
-                let addresses: Vec<u64> = roots.iter().map(|r| r.0).collect();
-                let Some((table, dirty)) = self.memory_map(list, &addresses) else {
-                    once!("a shader reading title memory dropped: no view heap or dynamic slots");
-                    not_run("title memory without a view heap or dynamic slots");
+                let Some((table, dirty)) = self.memory_map(list) else {
+                    once!("a shader reading title memory dropped: no view heap or page table");
+                    not_run("title memory without a view heap or page table");
                     return false;
                 };
                 crate::memory::note_use(&p.name);
@@ -1629,13 +1616,17 @@ fn describe(view: Option<&View>) -> String {
             r[11],
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
-        // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        // The first four values, as a colour rectangle's constants are, read
+        // through the kernel (asking `VirtualQuery` first cost milliseconds
+        // per draw in the title's pools, with every draw noted).
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0u8; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v: [f32; 4] = std::array::from_fn(|i| f32::from_le_bytes([0, 1, 2, 3].map(|k| bytes[4 * i + k])));
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("Constant({address:#x}, {size})")
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }

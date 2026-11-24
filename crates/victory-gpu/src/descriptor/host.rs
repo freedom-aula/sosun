@@ -33,6 +33,11 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Slot pairs kept for host copies' views (`crate::memory`), past the
+    /// dynamic slots and below the null buffer views: the next never
+    /// taken, those given back, and where they end.
+    pairs: Mutex<(u32, Vec<u32>)>,
+    pairs_end: u32,
     /// View heaps: the view-stride table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
     /// byte stride of the buffer view there, 0 for none. Mapped at the
@@ -172,6 +177,11 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            pairs: Mutex::new((count + extra, Vec::new())),
+            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+                null if !sampler && null > count + extra && null < total => null - 1,
+                _ => total,
+            },
             strides,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -297,6 +307,36 @@ impl HostHeap {
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Two consecutive slots (view heaps only) kept until
+    /// [`HostHeap::free_pair`]: past the dynamic slots where the heap has
+    /// room (a host copy's views, `crate::memory`, for as long as it
+    /// lives), else dynamic ones.
+    pub(crate) fn pair(&self) -> Option<u32> {
+        if self.sampler {
+            return None;
+        }
+        {
+            let mut pairs = self.pairs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = pairs.1.pop() {
+                return Some(index);
+            }
+            if pairs.0 + 2 <= self.pairs_end {
+                pairs.0 += 2;
+                return Some(pairs.0 - 2);
+            }
+        }
+        self.dynamic(2)
+    }
+
+    /// Gives back a pair [`HostHeap::pair`] returned.
+    pub(crate) fn free_pair(&self, index: u32) {
+        if index >= self.count + self.dynamic {
+            self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
+        } else {
+            self.release(index, 2);
+        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's

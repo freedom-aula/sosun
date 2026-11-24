@@ -54,6 +54,24 @@ struct Inner {
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
     hulls: Option<Vec<Hull>>,
+    /// Per copy and kind (unordered access): the copy, and how many ranges
+    /// start and end at each offset, so that the hulls are made from the
+    /// copies, not from every range (the title rewrites slots between most
+    /// lists, and remerging the world's 130,000 ranges each time cost 0.15
+    /// s per frame).
+    ends: HashMap<(usize, bool), Ends>,
+}
+
+/// A copy, and the counts of its ranges' starts and ends.
+type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
+
+/// One more (`add`) or one fewer of `at` in `counts`.
+fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
+    let n = counts.entry(at).or_insert(0);
+    *n = if add { *n + 1 } else { n.saturating_sub(1) };
+    if *n == 0 {
+        counts.remove(&at);
+    }
 }
 
 impl Inner {
@@ -63,13 +81,24 @@ impl Inner {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
                 let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
-                if e.0 == 0 {
-                    self.hulls = None;
-                }
+                let was = e.0;
                 step(&mut e.0);
-                if e.0 == 0 {
+                let now = e.0;
+                if now == 0 {
                     self.ranges.remove(&key);
+                }
+                // A range came or went: its copy's hull may change.
+                if (was == 0) != (now == 0) {
                     self.hulls = None;
+                    let ends = self
+                        .ends
+                        .entry((key.0, key.3))
+                        .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
+                    tally(&mut ends.1, key.1, now > 0);
+                    tally(&mut ends.2, key.2, now > 0);
+                    if ends.1.is_empty() {
+                        self.ends.remove(&(key.0, key.3));
+                    }
                 }
             }
             Seen::Texture(r) => {
@@ -106,23 +135,13 @@ impl Viewed {
         if let Some(hulls) = &inner.hulls {
             return hulls.clone();
         }
-        let mut merged: Vec<Hull> = Vec::new();
-        let mut at: HashMap<(usize, bool), usize> = HashMap::new();
-        for (&(copy, start, end, uav), (_, shadow)) in &inner.ranges {
-            match at.get(&(copy, uav)) {
-                Some(&i) => {
-                    let (_, from, to, _) = &mut merged[i];
-                    (*from, *to) = ((*from).min(start), (*to).max(end));
-                }
-                None => {
-                    at.insert((copy, uav), merged.len());
-                    merged.push((shadow.clone(), start, end, uav));
-                }
-            }
-        }
-        let hulls: Vec<_> = merged
-            .into_iter()
-            .map(|(s, from, to, uav)| (s, from, to - from, uav))
+        let hulls: Vec<Hull> = inner
+            .ends
+            .iter()
+            .filter_map(|(&(_, uav), (shadow, starts, ends))| {
+                let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
+                Some((shadow.clone(), from, to - from, uav))
+            })
             .collect();
         inner.hulls = Some(hulls.clone());
         hulls
@@ -448,6 +467,43 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const LINEAR: u32 = 0x100;
+
+    /// A copy's hull is its live ranges' first start to last end, kept as
+    /// slots come and go; a copy no slot views any more has none.
+    #[test]
+    fn hulls_follow_the_ranges() {
+        let memory = vec![0u8; 0x1000];
+        let at = memory.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, 0x1000);
+        let Some(copy) = crate::shadow::find(at, 0x1000) else {
+            crate::shadow::unregister(at as usize, at);
+            return; // no host GPU here
+        };
+        let viewed = Viewed::default();
+        let set = |slot: u32, range: Option<(u64, u64)>| {
+            let mut inner = viewed.inner.lock().unwrap();
+            if let Some(old) = inner.slots.remove(&slot) {
+                inner.count(&old, false);
+            }
+            if let Some((from, len)) = range {
+                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
+                inner.count(&seen, true);
+                inner.slots.insert(slot, seen);
+            }
+        };
+        let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
+        set(0, Some((0x100, 0x100)));
+        set(1, Some((0x800, 0x200)));
+        set(2, Some((0x100, 0x100)));
+        assert_eq!(hull(), [(0x100, 0x900)]);
+        set(1, None);
+        assert_eq!(hull(), [(0x100, 0x100)], "the far range gone");
+        set(0, None);
+        assert_eq!(hull(), [(0x100, 0x100)], "one slot still views it");
+        set(2, None);
+        assert!(hull().is_empty());
+        crate::shadow::unregister(at as usize, at);
+    }
 
     /// The title writes a buffer and a texture, and views of them and of an
     /// output buffer into its heap; a shader reaching them only through the

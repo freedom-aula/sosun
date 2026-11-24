@@ -23,8 +23,10 @@
 //! Physical pages may be mapped at several addresses (the title fills
 //! pages through a pool view and maps them into its heaps), so a write at
 //! one is a change at all of them: the runtime says where else memory is
-//! mapped ([`use_alias_resolver`]); taking a page guards every address
-//! showing it, and a write at any of them marks the trackers at all.
+//! mapped whenever it maps it ([`title_memory_aliased`]); taking a page
+//! guards every address showing it, and a write at any of them marks the
+//! trackers at all. (Asking the runtime at each take instead waited for
+//! its lock, which the title's page mappings hold: 4 s per world frame.)
 //! DirectStorage writing pages through views of the runtime's own reports
 //! the addresses showing them as written.
 //!
@@ -58,10 +60,10 @@ struct Guards {
     /// Pages `[first, last)` of writes the guards do not see that are under
     /// way ([`Writing`]): not guarded until they end, or the write fails.
     busy: Vec<(usize, usize)>,
-    /// Pages showing the same physical pages as guarded ones elsewhere, both
-    /// ways, as the runtime told when they were taken: a write at one marks
-    /// the others, with no question to the runtime (whose lock the fault
-    /// handler must not wait for: its page mappings hold it for long).
+    /// Pages showing the same physical pages elsewhere, both ways, as the
+    /// runtime told when it mapped them: a write at one marks the others,
+    /// with no question to the runtime (whose lock its page mappings hold
+    /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
@@ -81,57 +83,89 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+#[cfg(not(feature = "diagnostics"))]
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Pushes (page address, other address) for every other mapping of the
-/// physical pages title memory `[at, at + len)` shows.
-pub type AliasResolver = fn(usize, usize, &mut Vec<(usize, usize)>);
-
-static RESOLVER: std::sync::OnceLock<AliasResolver> = std::sync::OnceLock::new();
-
-/// The runtime tells where else title memory is mapped (`xmem`).
-pub fn use_alias_resolver(resolver: AliasResolver) {
-    let _ = RESOLVER.set(resolver);
+/// The guard lock, timed while held by the line that took it
+/// (diagnostics: [`held_times`]).
+#[cfg(feature = "diagnostics")]
+#[track_caller]
+fn guards() -> Held {
+    let line = std::panic::Location::caller().line();
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    Held(Some(guard), std::time::Instant::now(), line)
 }
 
-/// (page, other page) for the pages (page numbers) mapping the same
-/// physical pages as `pages` elsewhere. Never called holding the guard
-/// lock: the runtime takes its own lock, under which it reports mappings to
-/// us.
-fn aliases(pages: &[usize]) -> Vec<(usize, usize)> {
-    let Some(resolve) = RESOLVER.get() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < pages.len() {
-        let first = i;
-        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 {
-            i += 1;
-        }
-        resolve(pages[first] * PAGE, (pages[i] + 1 - pages[first]) * PAGE, &mut out);
-        i += 1;
+#[cfg(feature = "diagnostics")]
+struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32);
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.0.as_ref().expect("held until dropped")
     }
-    let mut out: Vec<(usize, usize)> = out.into_iter().map(|(p, a)| (p / PAGE, a / PAGE)).collect();
-    out.sort_unstable();
-    out.dedup();
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        self.0.as_mut().expect("held until dropped")
+    }
+}
+
+/// Per line taking the guard lock: the line, microseconds held in all, the
+/// longest hold (no allocation: the fault handler takes the lock).
+#[cfg(feature = "diagnostics")]
+static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 16];
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = self.1.elapsed().as_micros() as u64;
+        drop(self.0.take());
+        let line = u64::from(self.2);
+        if let Some(slot) = HELD
+            .iter()
+            .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
+        {
+            slot[1].fetch_add(us, Relaxed);
+            slot[2].fetch_max(us, Relaxed);
+        }
+    }
+}
+
+/// Since the last call, per line of this file taking the guard lock: (line,
+/// milliseconds held, longest hold in milliseconds), most held first.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out: Vec<(u64, f64, f64)> = HELD
+        .iter()
+        .filter(|s| s[0].load(Relaxed) != 0)
+        .map(|s| (s[0].load(Relaxed), s[1].swap(0, Relaxed) as f64 / 1e3, s[2].swap(0, Relaxed) as f64 / 1e3))
+        .collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out
 }
 
-/// Guards the other mappings of taken pages and notes the links both ways.
+/// (page, other page) for the pages (page numbers) showing the same memory
+/// as `pages` elsewhere.
+fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
+    pages
+        .iter()
+        .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
+        .collect()
+}
+
+/// Guards the other mappings of taken pages.
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
     protect(g, &others);
-    for &(p, a) in pairs {
-        for (x, y) in [(p, a), (a, p)] {
-            let links = g.alias_of.entry(x).or_default();
-            if !links.contains(&y) {
-                links.push(y);
-            }
-        }
-    }
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -228,7 +262,11 @@ impl Tracked {
             return Vec::new();
         }
         let pages: Vec<usize> = {
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
             let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
         };
         if pages.is_empty() {
@@ -241,10 +279,18 @@ impl Tracked {
             .collect();
         // Every address showing the same pages is guarded too. A write in
         // between marks them changed again; the copy, made after, has it.
-        let others = aliases(&whole);
+        #[cfg(feature = "diagnostics")]
+        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        drop(waited);
+        #[cfg(feature = "diagnostics")]
+        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+        let others = aliases(&g, &whole);
         guard_aliases(&mut g, &others);
+        #[cfg(feature = "diagnostics")]
+        drop(asked);
         for page in protect(&mut g, &whole) {
             changed.remove(&page);
         }
@@ -273,9 +319,9 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let others = aliases(pages);
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let others = aliases(&g, pages);
         guard_aliases(&mut g, &others);
         for page in protect(&mut g, pages) {
             changed.remove(&page);
@@ -432,25 +478,38 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     changed(&mut g, first, last);
-    // What it showed is not what it shows now.
+    // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
-        g.alias_of.remove(&page);
+        for other in g.alias_of.remove(&page).unwrap_or_default() {
+            if let Some(links) = g.alias_of.get_mut(&other) {
+                links.retain(|&p| p != page);
+                if links.is_empty() {
+                    g.alias_of.remove(&other);
+                }
+            }
+        }
     }
 }
 
-/// The runtime mapped the page at `at` where `others` show it already: if
-/// we guard it there, it is guarded here too (a write through the new
-/// mapping must not go unseen by the trackers there).
+/// The runtime mapped the page at `at` where `others` show it already: the
+/// pages are linked both ways, and if we guard it there, it is guarded here
+/// too (a write through the new mapping must not go unseen by the trackers
+/// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let mut g = guards();
-    let held: Vec<(usize, usize)> = others
-        .iter()
-        .map(|&o| o / PAGE)
-        .filter(|o| g.protected.contains(o))
-        .map(|o| (o, at / PAGE))
-        .collect();
-    guard_aliases(&mut g, &held);
+    let page = at / PAGE;
+    for &other in others {
+        for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
+            let links = g.alias_of.entry(x).or_default();
+            if !links.contains(&y) {
+                links.push(y);
+            }
+        }
+    }
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
+        protect(&mut g, &[page]);
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -526,7 +585,7 @@ pub(crate) mod tests {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
-    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
@@ -662,29 +721,11 @@ pub(crate) mod tests {
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
 
-    /// Title memory mapped twice for tests: (first view, second view, bytes),
-    /// told to the tracking by [`test_aliases`] in place of the runtime.
-    static TWINS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
-
-    fn test_aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
-        let end = at.saturating_add(len);
-        for &(a, b, n) in TWINS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            for (from, to) in [(a, b), (b, a)] {
-                for k in (0..n).step_by(PAGE) {
-                    if (at..end).contains(&(from + k)) {
-                        out.push((from + k, to + k));
-                    }
-                }
-            }
-        }
-    }
-
     /// `pages` pages of a fresh pagefile section mapped twice (as the
-    /// title's pool view and tiled heap show the same physical pages), the
-    /// runtime's part played by [`test_aliases`].
+    /// title's pool view and tiled heap show the same physical pages),
+    /// reported as the runtime does when it maps them.
     pub(crate) fn twin_views(pages: usize) -> (usize, usize) {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
-        let _ = RESOLVER.set(test_aliases);
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped read-write twice; the test
         // keeps both views.
@@ -704,7 +745,9 @@ pub(crate) mod tests {
             )
         };
         assert!(a != 0 && b != 0);
-        TWINS.lock().unwrap_or_else(|e| e.into_inner()).push((a, b, len));
+        for k in (0..len).step_by(PAGE) {
+            title_memory_aliased(b + k, &[a + k]);
+        }
         (a, b)
     }
 
@@ -726,7 +769,6 @@ pub(crate) mod tests {
         assert!(t.take(a, a + 2 * PAGE).is_empty());
         // A third mapping made later starts guarded, so its writes count.
         let (c, _) = twin_views(1);
-        TWINS.lock().unwrap_or_else(|e| e.into_inner()).push((a, c, PAGE));
         title_memory_aliased(c, &[a]);
         // SAFETY: a view of ours (another section: only the tracking
         // takes it for `a`'s pages here).

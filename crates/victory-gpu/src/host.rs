@@ -431,6 +431,10 @@ enum Step {
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
+    /// Shaders read title memory through a view heap's page table (the
+    /// heap's key, `crate::memory`): the table names every copy, each
+    /// brought up to date.
+    Memory(usize),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -605,9 +609,13 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
+        #[cfg(feature = "diagnostics")]
+        drop(uploading);
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -641,6 +649,8 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -732,6 +742,7 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         for list in runs {
             let deferred = list.deferred();
             // Shaders that read memory with no copy computed something else
@@ -740,12 +751,13 @@ impl Host {
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len) = step {
-                    match back
-                        .iter_mut()
-                        .find(|(s, a, l, _)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                    {
-                        Some(entry) => entry.3 &= !missed,
-                        None => back.push((shadow.clone(), *address, *len, !missed)),
+                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    match index.get(&key) {
+                        Some(&i) => back[i].3 &= !missed,
+                        None => {
+                            index.insert(key, back.len());
+                            back.push((shadow.clone(), *address, *len, !missed));
+                        }
                     }
                 }
             }
@@ -1375,6 +1387,12 @@ impl HostList {
         }
     }
 
+    /// Shaders of the list read title memory through the page table of
+    /// view heap `heap` (`crate::memory::prepare` at submission).
+    pub(crate) fn defer_memory(&self, heap: usize) {
+        self.deferred().copies.push(Step::Memory(heap));
+    }
+
     /// After the list has run, before its writes go back: `check` says
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
@@ -1496,6 +1514,19 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(
+                started,
+                match step {
+                    Step::Refresh(..) => C::StepRefreshUs,
+                    Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
+                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::GpuWrite(..) => C::StepGpuWriteUs,
+                    Step::Texture(_) => C::StepTextureUs,
+                    Step::Heap(_) => C::StepHeapUs,
+                    Step::Memory(_) => C::StepMemoryUs,
+                },
+            );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -1553,6 +1584,10 @@ impl HostList {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
+                &Step::Memory(heap) => {
+                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -1568,23 +1603,39 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+///
+/// A copy's range brought up to date is not copied again in the submission
+/// until a step writes title memory: every list of a world submission using
+/// title memory asks for every copy whole. What the title's threads write
+/// meanwhile is for later submissions (on the console it would race the
+/// GPU).
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Where each copy's refresh is in `refreshes`, by copy.
+    pending: std::collections::HashMap<usize, usize>,
+    /// The range of each copy brought up to date since the last title
+    /// write, by copy (held, so that its address names no other).
+    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+            return;
+        }
+        match self.pending.get(&key) {
+            Some(&i) => {
+                let (_, from, to) = &mut self.refreshes[i];
+                (*from, *to) = ((*from).min(address), (*to).max(end));
+            }
+            None => {
+                self.pending.insert(key, self.refreshes.len());
+                self.refreshes.push((shadow.clone(), address, end));
+            }
         }
     }
 
@@ -1599,9 +1650,15 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.current.clear();
     }
 
-    fn flush(&mut self) {
+    /// Does the refreshes; returns the bytes copied.
+    fn flush(&mut self) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        self.pending.clear();
+        let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -1610,7 +1667,18 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            total += copied;
+            // Kept: the union with what was current if they touch, else
+            // the larger.
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
+            if from <= *b && *a <= to {
+                (*a, *b) = ((*a).min(from), (*b).max(to));
+            } else if to - from > *b - *a {
+                (*a, *b) = (from, to);
+            }
         }
+        total
     }
 }
 
@@ -2439,6 +2507,42 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    /// A host copy of tracked title memory: a submission whose lists all ask
+    /// for it whole copies the one page the title wrote, once, and again
+    /// only after a step that writes title memory.
+    #[test]
+    fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), len, "all of it at first");
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
+        // The next submission: two lists ask for the copy.
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        batch.add(&copy, p + 100, 200);
+        assert_eq!(batch.flush(), PAGE, "the page written");
+        assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
+        // SAFETY: as above.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0, "nothing again in the submission");
+        batch.title_written();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// The hashing a submission does for textures in physical-page memory,

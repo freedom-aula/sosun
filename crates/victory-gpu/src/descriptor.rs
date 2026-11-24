@@ -203,6 +203,20 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Runs `f` on the host heap behind the title heap at `heap` while that
+/// heap cannot be released; None if it is gone or has no host heap.
+#[cfg(windows)]
+pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        return None;
+    }
+    // SAFETY: registered heaps are live (removed when dropped, which waits
+    // for the lock we hold).
+    let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_ref()?;
+    Some(f(host))
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
