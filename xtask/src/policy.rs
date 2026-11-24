@@ -188,6 +188,12 @@ mod tests {
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
     fn repository_passes_policy() {
+        // The check lists files with git. Where git cannot be started, as
+        // inside Wine on the macOS test runs, there is nothing to check.
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            eprintln!("git cannot be started here: policy not checked");
+            return;
+        }
         super::run(&crate::workspace_root(), false).unwrap();
     }
 
