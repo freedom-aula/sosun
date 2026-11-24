@@ -23,51 +23,10 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
-    uint at = id.x * stride;
-    uint cost;
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
-    }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
-    }
-}
-"#;
+/// The clamp shader. the clamp-bytecode workflow compiles it on a
+/// Windows runner, and `clamp_bytecode.rs` holds the result, because Wine's
+/// HLSL compiler (vkd3d-shader) cannot compile it.
+const SOURCE: &str = include_str!("clamp.hlsl");
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -92,8 +51,27 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
+/// FNV-1a of the shader source, which names the bytecode it was built into.
+pub(crate) fn source_hash() -> u64 {
+    SOURCE
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    // Prebuilt bytecode first, as long as it was built from this source.
+    if crate::clamp_bytecode::SOURCE_HASH == source_hash() {
+        for bytes in [crate::clamp_bytecode::DXIL, crate::clamp_bytecode::DXBC] {
+            if bytes.is_empty() {
+                continue;
+            }
+            match from_bytecode(device, bytes) {
+                Ok(c) => return Ok(c),
+                Err(e) => tracing::warn!(error = %e, "prebuilt argument clamp refused"),
+            }
+        }
+    }
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -123,9 +101,18 @@ fn make() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+    };
+    from_bytecode(device, bytes)
+}
+
+/// The root signature and pipeline of compiled clamp bytecode, whose root
+/// signature is inside it.
+fn from_bytecode(device: &ID3D12Device, bytes: &[u8]) -> windows::core::Result<Clamp> {
+    // SAFETY: the bytes live through both calls.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),

@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod embed_clamp;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,16 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Write crates/victory-gpu/src/clamp_bytecode.rs from the output of
+    /// the clamp-bytecode workflow (a folder with clamp.dxil and clamp.dxbc).
+    EmbedClamp { folder: PathBuf },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::EmbedClamp { folder } => embed_clamp::run(&root, &folder),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

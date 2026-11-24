@@ -30,6 +30,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod clamp_bytecode;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 pub mod object;
