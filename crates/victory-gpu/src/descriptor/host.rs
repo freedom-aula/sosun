@@ -803,8 +803,11 @@ fn buffer_srv(
 /// memory; the host removes the device for one.
 fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
     // SAFETY: a live buffer.
-    let width = unsafe { buffer.GetDesc() }.Width;
-    count > 0 && (first + u64::from(count)).saturating_mul(element) <= width
+    within(unsafe { buffer.GetDesc() }.Width, first, count, element)
+}
+
+fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
+    count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1221,6 +1224,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The world's 16-byte view of 0 elements removed the device.
+    #[test]
+    fn empty_and_overlong_buffer_views_are_refused() {
+        assert!(within(64, 0, 4, 16));
+        assert!(within(64, 3, 1, 16));
+        assert!(!within(64, 0, 0, 16));
+        assert!(!within(64, 3, 2, 16));
+        assert!(!within(64, u64::MAX, 1, 16));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
