@@ -1826,19 +1826,16 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use crate::compute::{Param, srv, uav};
     use windows::core::s;
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
     /// address's offset in the view plus their own.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=2, b0)"
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 cbuffer c : register(b0) { uint root; uint offset; }
-[RootSignature(RS)]
 [numthreads(16, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     dst.Store(id.x * 4, src.Load(root + offset + id.x * 64));
@@ -1846,49 +1843,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        compile_cs(SOURCE)
+        let constants = Param::Constants { register: 0, count: 2 };
+        compile_cs(SOURCE, &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)]), constants])
     }
 
-    /// A compute shader with its root signature inside (`RS`).
-    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("root"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: a compiled shader with its root signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+    /// A compute shader with a root signature of `params`.
+    fn compile_cs(source: &str, params: &[Param]) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        crate::compute::pipeline(source, s!("root"), 0, params).unwrap()
     }
 
     /// A title buffer of `bytes` in memory of its own.
@@ -2084,15 +2045,18 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const READ: &str = r#"
-#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<float4> t : register(t0);
 RWByteAddressBuffer o : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     o.Store4((id.y * 64 + id.x) * 16, asuint(t.Load(int3(id.xy, 0))));
 }
 "#;
+    /// The read shaders' root signature: a table of one shader view, and
+    /// the output buffer in `u1`.
+    const READS: &[Param] = &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 1 }];
+    /// The write shaders' root signature: a table of one unordered view.
+    const WRITES: &[Param] = &[Param::Table(&[uav(0, 1)])];
 
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
@@ -2105,7 +2069,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(4);
-        let read = compile_cs(READ);
+        let read = compile_cs(READ, READS);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Format written and size, what the shader writes, format read and
         // size, the texel expected, whether one host texture.
@@ -2145,9 +2109,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
             slots.make(1, &view);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
-            ));
+            let write = compile_cs(
+                &format!("{put}\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"),
+                WRITES,
+            );
             let list = host.new_list().unwrap();
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
             readable(&list, &used(ResourceType::Uav), &unordered);
@@ -2197,29 +2162,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make(3, &reads[1]);
         let write = compile_cs(
             r#"
-#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
 RWTexture2D<float> d : register(u0);
 RWTexture2D<uint> s : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     d[id.xy] = (1 + id.x + 64 * id.y) * (1.0 / 65535.0);
     s[id.xy] = (id.x ^ id.y) & 0xff;
 }
 "#,
+            &[Param::Table(&[uav(0, 2)])],
         );
         let read = compile_cs(
             r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
 Texture2D<float> d : register(t0);
 Texture2D<uint2> s : register(t1);
 RWByteAddressBuffer o : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     o.Store2((id.y * 64 + id.x) * 8, uint2(asuint(d.Load(int3(id.xy, 0))), s.Load(int3(id.xy, 0)).g));
 }
 "#,
+            &[Param::Table(&[srv(0, 2)]), Param::Uav { register: 1 }],
         );
         let (out, data) = host.shared_buffer(64 * 64 * 8).unwrap();
         // The depth texture's planes as bytes, read back after.
@@ -2369,12 +2332,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             let shader = View::Shader(texture as usize, Some(srv));
             slots.make(0, &unordered);
             slots.make(1, &shader);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"
-            ));
-            let read = compile_cs(&format!(
-                "#define RS \"DescriptorTable(SRV(t0)), UAV(u1)\"\n{get}\nRWByteAddressBuffer o : register(u1);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"
-            ));
+            let write = compile_cs(
+                &format!("{put}\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"),
+                WRITES,
+            );
+            let read = compile_cs(
+                &format!("{get}\nRWByteAddressBuffer o : register(u1);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"),
+                READS,
+            );
             let list = host.new_list().unwrap();
             readable(&list, &used(ResourceType::Uav), &unordered);
             run(&list, &slots, &write, 0, None, groups);
