@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::{
-    D3D_FEATURE_LEVEL_12_0, WKPDID_D3DDebugObjectName, WKPDID_D3DDebugObjectNameW,
-};
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -55,9 +53,6 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
-    /// With device-removed data on: the list that opens every submission
-    /// (see [`SENTINEL_MARKERS`]).
-    sentinel: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -212,26 +207,6 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let sentinel = if dred_on() {
-            // A list of nothing but markers, executed first in every
-            // submission: the device-removed report finds where the
-            // submission starts among the breadcrumb nodes by it.
-            let allocator: ID3D12CommandAllocator =
-                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
-            let text: Vec<u16> = "victory submission start"
-                .encode_utf16()
-                .chain([0])
-                .collect();
-            for _ in 0..SENTINEL_MARKERS {
-                list.SetMarker(0, Some(text.as_ptr().cast()), 2 * text.len() as u32);
-            }
-            list.Close()?;
-            Some((allocator, list))
-        } else {
-            None
-        };
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -247,7 +222,6 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
-            sentinel,
         })
     }
 }
@@ -318,6 +292,16 @@ mod tests {
         assert!(!is(Some(0x9999), Some("victory host list 70")));
         assert!(!is(Some(0x9999), None));
         assert!(!is(None, None));
+        // The debug layer appends its own note to the name we gave.
+        assert!(is(None, Some("victory host list 7 (debug layer indirect)")));
+        assert!(is(None, Some("victory host list 7 (x)")));
+        assert!(!is(
+            None,
+            Some("victory host list 70 (debug layer indirect)")
+        ));
+        assert!(!is(None, Some("victory host list 7 debug layer")));
+        assert!(!is(None, Some("victory host list 7(")));
+        assert!(is(None, Some("victory host list 7")));
         assert_eq!(list_name(70), "victory host list 70");
     }
 
@@ -361,82 +345,6 @@ mod tests {
         }
     }
 
-    fn shape(markers: u32, others: u32) -> Shape {
-        Shape { markers, others }
-    }
-
-    /// With the debug layer no pointer or name matches, so a submission is
-    /// found by its first list: the nodes after the last list of markers
-    /// are the submission's lists in order (preludes have no run), as far
-    /// as they started.
-    #[test]
-    fn nodes_after_the_last_sentinel_are_the_submissions_lists_in_order() {
-        let sentinel = shape(SENTINEL_MARKERS, 1);
-        let work = shape(0, 30);
-        // Two older submissions, then ours: a prelude, run 0, run 1, a
-        // prelude, run 2, and nothing for run 3 (it never started).
-        let shapes = [
-            work, sentinel, work, work, // an older submission
-            sentinel, work, work, work, work, work, // ours
-        ];
-        let order = [None, Some(0), Some(1), None, Some(2), Some(3)];
-        let ours = [None, None, Some(0), Some(1), None, Some(2)];
-        let found = positional(&shapes, &order);
-        assert_eq!(found[..4], [None; 4], "an older submission is not named");
-        assert_eq!(found[4..], ours);
-        // All of them started.
-        let all = [sentinel, work, work, work, work, work, work];
-        assert_eq!(
-            positional(&all, &order),
-            [None, None, Some(0), Some(1), None, Some(2), Some(3)]
-        );
-    }
-
-    /// Without a sentinel list nothing is guessed, and what looks like one
-    /// but is not (a marker short, or too many other commands) is not one.
-    #[test]
-    fn a_list_that_only_looks_like_the_sentinel_is_not_one() {
-        let order = [Some(0), Some(1)];
-        let work = shape(0, 3);
-        assert!(shape(SENTINEL_MARKERS, 0).is_sentinel());
-        assert!(shape(SENTINEL_MARKERS, 2).is_sentinel());
-        assert!(!shape(SENTINEL_MARKERS - 1, 1).is_sentinel());
-        assert!(!shape(SENTINEL_MARKERS + 1, 1).is_sentinel());
-        assert!(!shape(SENTINEL_MARKERS, 3).is_sentinel());
-        // A title list with many marker commands also has the commands
-        // they name: never "markers only".
-        assert!(!shape(SENTINEL_MARKERS, 17).is_sentinel());
-        let shapes = [work, shape(SENTINEL_MARKERS, 9), work, work];
-        assert_eq!(positional(&shapes, &order), [None, None, None, None]);
-        assert_eq!(positional(&[], &order), Vec::<Option<usize>>::new());
-        // A sentinel last, with its lists not started: nothing to name.
-        let last = [work, shape(SENTINEL_MARKERS, 1)];
-        assert_eq!(positional(&last, &order), [None, None]);
-        // More lists than nodes: the extra ones are not found, not an error.
-        let few = [shape(SENTINEL_MARKERS, 1), work];
-        assert_eq!(positional(&few, &order), [None, Some(0)]);
-    }
-
-    /// With device-removed data on, a submission runs the sentinel list
-    /// first and the lists still run: a smoke test of `execute` on the
-    /// software adapter (it shows no breadcrumb nodes, so the report
-    /// itself is not checked).
-    #[test]
-    fn a_submission_with_the_sentinel_list_runs() {
-        let Some(host) = host() else { return };
-        assert_eq!(host.sentinel.is_some(), dred_on());
-        if host.sentinel.is_none() {
-            return; // device-removed data is off
-        }
-        let Ok(list) = host.new_list() else { return };
-        list.close();
-        host.execute(&[&list]);
-        host.execute(&[&list, &list]);
-        // SAFETY: a plain query.
-        let reason = unsafe { host.device.GetDeviceRemovedReason() };
-        assert!(reason.is_ok());
-    }
-
     /// A node as the runtime gives it, built by hand: `HostList::is_node`
     /// reads the pointer and the copied name, and the name alone finds a
     /// list the runtime records under another object.
@@ -454,6 +362,21 @@ mod tests {
         other.push(0);
         node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
         assert!(!list.is_node(&node), "another list's name is no match");
+        // With the debug layer: our name and the layer's note, in either
+        // name field; and a list whose number only starts with ours is not it.
+        let note = std::ffi::CString::new(format!("{} (debug layer indirect)", list_name(list.id)))
+            .unwrap();
+        node.pCommandListDebugNameW = windows::core::PCWSTR::null();
+        node.pCommandListDebugNameA = note.as_ptr().cast();
+        assert!(
+            list.is_node(&node),
+            "found by its ANSI name with the layer's note"
+        );
+        let longer =
+            std::ffi::CString::new(format!("{}0 (debug layer indirect)", list_name(list.id)))
+                .unwrap();
+        node.pCommandListDebugNameA = longer.as_ptr().cast();
+        assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
 }
 
@@ -543,70 +466,6 @@ fn list_name(id: u64) -> String {
     format!("victory host list {id}")
 }
 
-/// Names a host list for the device-removed report, three ways: `SetName`,
-/// and the private data keys the runtime reads for the ANSI and the wide
-/// name of a breadcrumb node. With the debug layer on, the runtime keeps no
-/// name of the list we hold, and the names are not enough (see
-/// [`positional`]).
-fn name_list(list: &ID3D12GraphicsCommandList, id: u64) {
-    if !dred_on() {
-        return;
-    }
-    let text = list_name(id);
-    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    // SAFETY: plain calls on a live object; the data is copied.
-    unsafe {
-        let _ = list.SetName(&windows::core::HSTRING::from(text.as_str()));
-        let _ = list.SetPrivateData(
-            &WKPDID_D3DDebugObjectName,
-            text.len() as u32,
-            Some(text.as_ptr().cast()),
-        );
-        let _ = list.SetPrivateData(
-            &WKPDID_D3DDebugObjectNameW,
-            2 * wide.len() as u32,
-            Some(wide.as_ptr().cast()),
-        );
-    }
-}
-
-/// Markers in the list that opens every submission (device-removed data
-/// on). No list of the title's work has this many markers and so few other
-/// commands: a marker is noted before each command it names.
-const SENTINEL_MARKERS: u32 = 17;
-
-/// What the report needs of a breadcrumb node to find a submission's start.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Shape {
-    markers: u32,
-    others: u32,
-}
-
-impl Shape {
-    fn is_sentinel(self) -> bool {
-        self.markers == SENTINEL_MARKERS && self.others <= 2
-    }
-}
-
-/// The run each breadcrumb node belongs to when no pointer or name matches
-/// (the debug layer hands us its own list objects, and the runtime records
-/// others): nodes are linked in the order the lists ran, and a submission
-/// is the sentinel list followed by `order` (one entry per list it ran: the
-/// run it is, or `None` for a list that only moves textures). So the nodes
-/// after the last sentinel are the submission's lists, in order, as far as
-/// they started.
-fn positional(shapes: &[Shape], order: &[Option<usize>]) -> Vec<Option<usize>> {
-    let mut found = vec![None; shapes.len()];
-    if let Some(start) = shapes.iter().rposition(|s| s.is_sentinel()) {
-        for (at, run) in order.iter().enumerate() {
-            if let Some(slot) = found.get_mut(start + 1 + at) {
-                *slot = *run;
-            }
-        }
-    }
-    found
-}
-
 /// The pointers one of our list objects answers to: its own and the one each
 /// interface a runtime may record it by gives (COM identity is the
 /// `IUnknown` one). Only our live object is queried: a node of the
@@ -634,14 +493,21 @@ fn identities(list: &impl Interface) -> Vec<usize> {
 /// Whether a node of the device-removed data is a list: by pointer, or by the
 /// name the runtime copied when the list was submitted. With the debug layer
 /// on, the object we hold is its wrapper and the runtime records another
-/// one, so no pointer of ours matches; the name still does.
+/// one, so no pointer of ours matches, and it appends its own note to our
+/// name ("victory host list 158 (debug layer indirect)"). The name matches
+/// exactly or followed by " (": never as the start of another number.
 fn node_is_list(
     node_pointer: Option<usize>,
     node_name: Option<&str>,
     pointers: &[usize],
     name: &str,
 ) -> bool {
-    node_pointer.is_some_and(|p| pointers.contains(&p)) || node_name == Some(name)
+    node_pointer.is_some_and(|p| pointers.contains(&p))
+        || node_name.is_some_and(|n| {
+            n == name
+                || n.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(" ("))
+        })
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -764,7 +630,7 @@ impl Host {
             )?;
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
-            name_list(&list, id);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 list,
@@ -795,27 +661,13 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        // What each list after the sentinel is, for the device-removed report
-        // (see [`positional`]).
-        let mut order: Vec<Option<usize>> = Vec::with_capacity(2 * runs.len());
-        if let Some((_, sentinel)) = &self.sentinel {
-            lists.push(sentinel.cast().ok());
-        }
-        for (run, list) in runs.iter().enumerate() {
+        for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
-                order.push(None);
             }
             lists.push(list.list.cast().ok());
-            order.push(Some(run));
-        }
-        // The first group, if lists run one by one, starts with the sentinel.
-        if self.sentinel.is_some()
-            && let Some(first) = firsts.first_mut()
-        {
-            *first = 0;
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -878,7 +730,7 @@ impl Host {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
-                self.removal_data(runs, &order),
+                self.removal_data(runs),
                 last_notes(runs)
             ));
         }
@@ -919,7 +771,7 @@ impl Host {
     /// below it; for each list that did not finish, the command it stopped
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
-    fn removal_data(&self, runs: &[&HostList], order: &[Option<usize>]) -> String {
+    fn removal_data(&self, runs: &[&HostList]) -> String {
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
             return String::new();
         };
@@ -967,65 +819,35 @@ impl Host {
                     return text;
                 }
             };
-            // The nodes, oldest list first, and which run each is: by pointer
-            // or name, else (the debug layer) by position after the
-            // submission's sentinel list.
+            // The nodes, oldest list first, and which run each is.
             let mut nodes = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 nodes.push(p);
                 node = p.pNext;
             }
-            let mut index: Vec<Option<usize>> = nodes
+            let index: Vec<Option<usize>> = nodes
                 .iter()
                 .map(|p| runs.iter().position(|r| r.is_node(p)))
                 .collect();
-            let mut how = "";
-            if index.iter().all(Option::is_none) {
-                let shapes: Vec<Shape> = nodes
-                    .iter()
-                    .map(|p| {
-                        let ops = if p.pCommandHistory.is_null() || p.BreadcrumbCount > 1 << 20 {
-                            &[]
-                        } else {
-                            std::slice::from_raw_parts(
-                                p.pCommandHistory,
-                                p.BreadcrumbCount as usize,
-                            )
-                        };
-                        let markers = ops
-                            .iter()
-                            .filter(|op| **op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
-                            .count() as u32;
-                        Shape {
-                            markers,
-                            others: ops.len() as u32 - markers,
-                        }
-                    })
-                    .collect();
-                index = positional(&shapes, order);
-                how = if index.iter().any(Option::is_some) {
-                    " matched by position after the submission's first list"
-                } else {
-                    " none matched (no sentinel list found)"
+            if let Some(last) = nodes.last()
+                && index.iter().all(Option::is_none)
+            {
+                let name = |w: windows::core::PCWSTR, a: *const u8| {
+                    let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
+                    let a = (!a.is_null()).then(|| {
+                        std::ffi::CStr::from_ptr(a.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    format!("{w:?}/{a:?}")
                 };
-                if let Some(last) = nodes.last() {
-                    let name = |w: windows::core::PCWSTR, a: *const u8| {
-                        let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
-                        let a = (!a.is_null()).then(|| {
-                            std::ffi::CStr::from_ptr(a.cast())
-                                .to_string_lossy()
-                                .into_owned()
-                        });
-                        format!("{w:?}/{a:?}")
-                    };
-                    tracing::warn!(
-                        nodes = nodes.len(),
-                        last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
-                        last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
-                        "no breadcrumb node named one of our lists"
-                    );
-                }
+                tracing::warn!(
+                    nodes = nodes.len(),
+                    last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
+                    last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
+                    "no breadcrumb node named one of our lists"
+                );
             }
             // Every list's progress (done/count), in the runtime's order.
             let progress: Vec<String> = nodes
@@ -1036,9 +858,7 @@ impl Host {
                     format!("{done}/{} {index:?}", p.BreadcrumbCount)
                 })
                 .collect();
-            text.push_str(&format!(
-                "; breadcrumbs (done/count, list{how}) {progress:?}"
-            ));
+            text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
