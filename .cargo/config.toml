@@ -3,4 +3,4 @@ xtask = "run --quiet --package xtask --"
 
 # macOS cross build for running under Wine (see docs/macos.md).
 [target.x86_64-pc-windows-gnullvm]
-linker = "tools/macos/gnullvm-cc"
+linker = "tools/macos/gnullvm-cc.sh"
