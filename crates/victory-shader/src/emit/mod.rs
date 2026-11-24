@@ -121,12 +121,16 @@ mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
+#[cfg(all(test, windows))]
+mod semantics_tests;
 mod shader;
 #[cfg(all(test, windows))]
 mod stride_tests;
