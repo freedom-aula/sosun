@@ -679,6 +679,11 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if !in_buffer(&shadow.buffer, first, count, element) {
+        once!(first, count, element, "buffer view empty or past its host copy");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -686,6 +691,15 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// Whether `count` elements of `element` bytes from element `first` lie in
+/// `buffer`. The console takes a view that is empty or runs past its
+/// memory; the host removes the device for one.
+fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
+    // SAFETY: a live buffer.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    count > 0 && (first + u64::from(count)).saturating_mul(element) <= width
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -722,6 +736,11 @@ fn buffer_uav(
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if !in_buffer(&shadow.buffer, first, count, element) {
+        once!(first, count, element, "unordered buffer view empty or past its host copy");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
