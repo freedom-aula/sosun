@@ -33,6 +33,10 @@ Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite 
 | Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
 | Test suite | 265 tests across every crate | 265 passed, 0 failed |
 
+<p align="center"><img src="docs/images/tests.svg" width="640" alt="Terminal output of the test suite under CrossOver Wine with D3DMetal on an Apple M4: 265 passed and 0 failed"></p>
+
+This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
+
 Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
 
 ## How it works
