@@ -849,12 +849,7 @@ impl Shader {
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
         });
-        // The shader's identity, as DXC writes it: flags (0, no source in
-        // the digest), then a digest of the program. D3DMetal keys its
-        // shader caches on this, so all-zero bytes made different programs
-        // share one compiled shader there.
-        let mut hash = [0u8; 20];
-        hash[4..].copy_from_slice(&container::hash(&dxil));
+        let hash = container::shader_hash(&dxil);
         let psg1 = container::signature(&self.prims, false);
         let mut parts: Vec<(&[u8; 4], &[u8])> =
             vec![(b"SFI0", &sfi0), (b"ISG1", &isg1), (b"OSG1", &osg1)];
