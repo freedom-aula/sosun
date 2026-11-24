@@ -22,6 +22,11 @@ fn workspace_root() -> PathBuf {
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run).
 fn build_probe() -> PathBuf {
+    // A cross build runs the tests under Wine, where cargo cannot be
+    // started, so the fixture can be built beforehand and named here.
+    if let Some(prebuilt) = std::env::var_os("VICTORY_HLE_PROBE") {
+        return PathBuf::from(prebuilt);
+    }
     let root = workspace_root();
     let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
     let target = root.join("target/fixtures");

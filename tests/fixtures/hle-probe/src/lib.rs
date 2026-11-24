@@ -24,7 +24,8 @@ unsafe extern "system" {
 }
 
 // Delay-loaded (see build.rs): bound through the delay-load table.
-#[link(name = "victory-probe-delayed", kind = "raw-dylib")]
+#[cfg_attr(target_env = "msvc", link(name = "victory-probe-delayed", kind = "raw-dylib"))]
+#[cfg_attr(target_env = "gnu", link(name = "probe_delayed", kind = "static"))]
 unsafe extern "system" {
     fn VIctoryProbeDelayed() -> u32;
 }
