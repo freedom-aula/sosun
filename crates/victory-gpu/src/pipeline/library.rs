@@ -61,6 +61,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             let blob = DIR
                 .get()
                 .and_then(|d| std::fs::read(d.join(LIBRARY_FILE)).ok())
+                .and_then(unseal)
                 .unwrap_or_default();
             let library = open(&device, blob);
             if library.is_none() {
@@ -69,6 +70,32 @@ fn library() -> Option<&'static Mutex<Library>> {
             library.map(Mutex::new)
         })
         .as_ref()
+}
+
+/// The file's mark: "VPL1" and then an FNV-1a checksum of the library.
+const MAGIC: &[u8; 4] = b"VPL1";
+
+fn checksum(data: &[u8]) -> u64 {
+    data.iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// The library bytes with the mark in front.
+fn seal(blob: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(blob.len() + 12);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&checksum(blob).to_le_bytes());
+    out.extend_from_slice(blob);
+    out
+}
+
+/// The library bytes of a sealed file, or `None` if the mark or checksum is
+/// wrong. Not every host checks the bytes itself (D3DMetal accepts any), so
+/// a damaged file is refused here before the host sees it.
+fn unseal(file: Vec<u8>) -> Option<Vec<u8>> {
+    let (head, blob) = file.split_at_checked(12)?;
+    let sum = u64::from_le_bytes(head[4..12].try_into().ok()?);
+    (&head[..4] == MAGIC && sum == checksum(blob)).then(|| blob.to_vec())
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -170,7 +197,7 @@ pub(crate) fn save(now: bool) {
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &seal(&blob)))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
         Ok(()) => tracing::info!(
@@ -242,11 +269,24 @@ mod tests {
     }
 
     #[test]
+    fn sealed_files_round_trip_and_damage_is_refused() {
+        let blob = b"library bytes".to_vec();
+        let mut file = seal(&blob);
+        assert_eq!(unseal(file.clone()), Some(blob));
+        file[20] ^= 1;
+        assert_eq!(unseal(file), None);
+        assert_eq!(unseal(b"short".to_vec()), None);
+    }
+
+    #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        // A damaged file is refused by the mark check before the host sees
+        // it, because not every host checks the bytes itself.
+        let blob = unseal(b"not a pipeline library".repeat(16)).unwrap_or_default();
+        let library = open(&device, blob).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
