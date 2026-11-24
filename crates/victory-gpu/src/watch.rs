@@ -530,7 +530,7 @@ pub(crate) mod tests {
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
-    fn pool(pages: usize) -> usize {
+    pub(crate) fn pool(pages: usize) -> usize {
         // SAFETY: a fresh allocation, freed by the test.
         let p = unsafe {
             VirtualAlloc(
@@ -544,7 +544,7 @@ pub(crate) mod tests {
         p
     }
 
-    fn free(p: usize) {
+    pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

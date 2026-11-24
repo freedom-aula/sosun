@@ -614,6 +614,12 @@ impl HostHeap {
         }
         Some(text)
     }
+
+    /// Whether slot `index` was made from a record (tests).
+    #[cfg(test)]
+    pub(crate) fn made(&self, index: u32) -> bool {
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
 }
 
 /// Logs `what` the first time it happens.
@@ -743,6 +749,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// The host copy a buffer view's bytes are in (the one its host view
+/// reads, [`crate::shadow::for_view`]) and the view's title range.
+pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let (address, len) = buffer_range(view)?;
+    let shadow = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    Some((shadow, address, len))
+}
+
 /// [`buffer_range`] of an unordered access view of memory at `base`.
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
@@ -770,20 +784,17 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
+    if element == 0 {
+        once!(len, "buffer view of elements without a size");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // The copy its own bytes are in, its first element counted from there.
+    let start = address + buffer.FirstElement * element;
+    let shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "buffer view empty or past its host copy");
@@ -821,13 +832,6 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
-    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -837,12 +841,19 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+    if element == 0 {
+        once!(len, "unordered buffer view of elements without a size");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    let start = address + buffer.FirstElement * element;
+    let shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        once!("unordered access to a buffer whose host copy shaders cannot write");
+        return None;
+    }
+    buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {

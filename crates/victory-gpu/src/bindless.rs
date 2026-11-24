@@ -138,12 +138,18 @@ fn seen(view: &View) -> Option<Seen> {
     {
         return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
     }
-    let (address, len) = match *view {
-        View::Constant(address, size) => (address, u64::from(size)),
-        _ => crate::descriptor::host::buffer_range(view)?,
+    // The copy the host view reads.
+    let (shadow, address, len) = match *view {
+        View::Constant(address, size) => {
+            let len = u64::from(size);
+            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
+        }
+        _ => crate::descriptor::host::view_copy(view)?,
     };
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
-    let shadow = (len > 0).then(|| crate::shadow::find(address, len)).flatten()?;
+    if len == 0 {
+        return None;
+    }
     let len = len.min(shadow.left(address));
     Some(Seen::Buffer(shadow, address, len, uav))
 }

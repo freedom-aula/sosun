@@ -511,6 +511,84 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The copy a buffer view of `len` bytes at `address`, whose elements are
+/// `element` bytes, reads: the innermost title buffer's ([`find`]), unless
+/// the view does not start on an element of that copy. A host view counts
+/// its first element from its buffer's start; a console view starts at any
+/// address, and the title places structured views at ring positions inside
+/// its big GPU heap (the meshlet culling's 456-byte constants, the colour
+/// bakes' parameter blocks: refused, their slots read zeros, every meshlet
+/// culled). Such a view gets a copy of its own bytes, starting at its
+/// address.
+pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        return Some(shadow);
+    }
+    #[cfg(feature = "diagnostics")]
+    VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    exact(address, len)
+}
+
+/// Asks for, and copies made of, views off their copy's elements, the
+/// copies' bytes and the largest (diagnostics).
+#[cfg(feature = "diagnostics")]
+static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Logs [`VIEWS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_views(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    if asks > 0 {
+        tracing::info!(
+            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {kept} kept",
+            asks as f64 / frames,
+            made as f64 / frames,
+            bytes as f64 / frames / 1e3
+        );
+    }
+}
+
+/// Copies of single views' bytes ([`for_view`]), by (start, length), with
+/// the use that last asked for each.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Copies [`EXACT`] keeps: ring positions change every frame, so the least
+/// recently asked for go (lists and heap slots using one keep it alive).
+const EXACT_KEPT: usize = 1024;
+
+fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = *tick;
+        return Some(shadow.clone());
+    }
+    if map.len() >= EXACT_KEPT
+        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
+    {
+        map.remove(&oldest);
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), *tick));
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        VIEWS[1].fetch_add(1, Relaxed);
+        VIEWS[2].fetch_add(len, Relaxed);
+        VIEWS[3].fetch_max(len, Relaxed);
+    }
+    Some(shadow)
+}
+
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();

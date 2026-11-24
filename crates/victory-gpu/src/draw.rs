@@ -1551,15 +1551,17 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    // Constant buffers (raw views) to their copy's end at most.
+    // Constant buffers (raw views) to their copy's end at most; others in
+    // the copy their host view reads.
     let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1)
-            .map(|s| (address, u64::from(size).min(s.left(address)))),
-        _ => crate::descriptor::host::buffer_range(view),
+        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
+            let len = u64::from(size).min(s.left(address));
+            crate::shadow::find(address, len).map(|s| (s, address, len))
+        }),
+        _ => crate::descriptor::host::view_copy(view),
     };
-    if let Some((address, len)) = range
+    if let Some((shadow, address, len)) = range
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
@@ -2243,4 +2245,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A structured view the title places off its buffer's elements (the
+    /// culling constants at a ring position) is made over a copy of its own
+    /// bytes; one on an element views the buffer's copy.
+    #[test]
+    fn structured_views_off_their_buffers_elements_get_their_own_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let src = buffer(1 << 16);
+        let (bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let start = bytes as u64;
+        // SAFETY: a plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        // Four 456-byte elements placed at `address` (resource and view
+        // descriptions as the title passes them to device 0x230).
+        let view = |address: u64| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 4, 456, 0, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let width = |address: u64| {
+            let made = crate::descriptor::host::make_view(&view(address), at).expect("a view");
+            // SAFETY: a live buffer.
+            unsafe { made.GetDesc() }.Width
+        };
+        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
+        let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
+        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+    }
 }
