@@ -43,8 +43,8 @@ WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRID
 
 On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored. Every loader, HLE, console memory and shader test passes on the same Wine. The policy test fails only because it runs git inside Wine. Three GPU tests show real D3DMetal differences that still need work.
 
-- `buffer_data_reaches_the_host_texture`: a copy from title memory into a host texture reads back as zeros.
-- `argument_clamp_builds`: the compute pipeline that clamps indirect arguments is not created, so indirect draws would be dropped.
+- `buffer_data_reaches_the_host_texture`: fixed. The upload was queued as a copy into title memory, and that check uses VirtualQuery, which cannot see D3DMetal's mappings under Wine, so the copy was skipped. It is now queued as a fill of the list's upload memory.
+- `argument_clamp_builds`: the clamp shader is compiled at run time with D3DCompile, and Wine's compiler (vkd3d-shader) has no `Load` on `RWByteAddressBuffer`, no structured buffer stores and no `[RootSignature]` attribute. Without the clamp, indirect draws are dropped.
 - `a_rejected_blob_gives_an_empty_library`: D3DMetal accepts a pipeline library blob that Windows rejects.
 
 ## Route A: next steps
