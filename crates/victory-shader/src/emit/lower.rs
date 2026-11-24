@@ -7544,8 +7544,8 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -7634,6 +7634,58 @@ impl<'a> Lower<'a> {
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         61,
+                        &args,
+                    )
+                }
+                63 if kind == 5 => {
+                    // A cube's gradients are the face's: ds, dt per step in x,
+                    // then in y, in face coordinates (a face spans 1). The level
+                    // the hardware picks from them, isotropically: log2 of the
+                    // longer gradient in texels of a face, then the clamp.
+                    // shortcut: sampled at that level, so a sampler's
+                    // anisotropy is lost and its LOD bias comes after the
+                    // clamp (the console adds it before); D3D12 cube sampling
+                    // takes 3D gradients only. Upgrade if cube lookups blur or
+                    // a biased sampler meets a binding clamp.
+                    let mut g = [fu; 4];
+                    for (k, x) in g.iter_mut().enumerate() {
+                        let v = addr_val(self, first + k)?;
+                        *x = to_float(self, v);
+                    }
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let z = self.s.m.i32(0);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                    let w = self.s.m.extract(c, d, 0);
+                    let w = self.s.m.cast(c, Cast::UiToFp, w, self.s.t.f32);
+                    let mut len2 = [fu; 2];
+                    for (k, l) in len2.iter_mut().enumerate() {
+                        let a = self.s.m.bin(c, Bin::Mul, g[2 * k], g[2 * k]);
+                        let b = self.s.m.bin(c, Bin::Mul, g[2 * k + 1], g[2 * k + 1]);
+                        *l = self.s.m.bin(c, Bin::Add, a, b);
+                    }
+                    // FMax, Log (base 2): 0.5 log2(max(|dx|², |dy|²) w²).
+                    let m = self.binary(35, len2[0], len2[1]);
+                    let w2 = self.s.m.bin(c, Bin::Mul, w, w);
+                    let m = self.s.m.bin(c, Bin::Mul, m, w2);
+                    let half = self.s.m.f32(0.5f32.to_bits());
+                    let l = self.unary(23, m);
+                    let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
+                    if name.ends_with("_cl") {
+                        let x = addr_val(self, first + grads + coords)?;
+                        let clamp = to_float(self, x);
+                        lod = self.binary(35, lod, clamp);
+                    }
+                    args.extend(&os);
+                    args.push(lod);
+                    self.s.op(
+                        c,
+                        "sampleLevel.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        62,
                         &args,
                     )
                 }

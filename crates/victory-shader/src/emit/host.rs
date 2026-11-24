@@ -1154,6 +1154,9 @@ pub enum View<'a> {
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV with mips (face size, levels, texels of each
+    /// face's levels in turn).
+    MippedCube(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F square texture SRV (size, levels) whose texels in level
     /// `n` are all `n`.
     Levels(u32, u32),
@@ -1340,11 +1343,15 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) | View::Mipped(..) => {
+                    View::Texture(..)
+                    | View::Cube(..)
+                    | View::Mipped(..)
+                    | View::MippedCube(..) => {
                         let (w0, h0, mut texels, faces, levels) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
                             View::Mipped(w, h, l, t) => (w, h, t, 1, l),
                             View::Cube(n, t) => (n, n, t, 6, 1),
+                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
@@ -1400,7 +1407,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: levels,
                                     ..Default::default()
                                 },
                             },
