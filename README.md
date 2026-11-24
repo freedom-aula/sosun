@@ -1,156 +1,117 @@
-# VIctory for macOS
+<p align="center"><img src="docs/images/banner.svg" alt="VIctory for macOS: an Xbox Series runtime on Apple Silicon"></p>
 
-This project runs Grand Theft Auto VI (Xbox Series X|S build) on Apple Silicon Macs from files that the user supplies. It is a separate macOS project and is not meant to be merged back into any other repository.
+<h1 align="center">VIctory for macOS</h1>
 
-No game files are in this repository, and none ever will be. You need your own copy of the game.
+<p align="center">
+Grand Theft Auto VI is only out on consoles. This project runs the Xbox Series build on Apple Silicon Macs, from a copy of the game that you own.<br>
+It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which does the same on Windows, and it brings that work to the Mac through Wine and Metal.
+</p>
+
+<p align="center">
+<img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-black?logo=apple">
+<img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
+<img alt="Tests 265 passed on an M4" src="https://img.shields.io/badge/tests-265%20passed%20on%20M4-2ea44f">
+<img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
+</p>
+
+<p align="center">
+If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTRIBUTING.md">CONTRIBUTING.md</a>. Help is welcome at every level.
+</p>
+
+> [!IMPORTANT]
+> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus and loads the world, but the world does not render yet. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+
+## What works today
+
+Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite passes on a MacBook with an M4 chip.
+
+| Part | What it does | On the Mac |
+| --- | --- | --- |
+| Loader | Maps the game's executable and DLLs into one process and runs its code unchanged | Works |
+| Console runtime | Stands in for the Xbox: memory, files, saves, input, audio and network rules | Works |
+| GPU layer | Turns the console's Direct3D 12.X into desktop Direct3D 12 | Works on Metal through D3DMetal |
+| Shader recompiler | Recompiles the console GPU's shaders, checked against the hardware's results | All 69 checks pass on Metal |
+| Test suite | 265 tests across every crate | 265 passed, 0 failed |
+
+Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
 
 ## How it works
 
-The project builds the Windows runtime for `x86_64-pc-windows-gnullvm` on the Mac and runs it under a Wine built from CodeWeavers' CrossOver source, with Apple's D3DMetal turning Direct3D 12 into Metal. Rosetta 2 runs the game's x86-64 code. The current state, the build steps and the test results are in [docs/macos.md](docs/macos.md).
+<p align="center"><img src="docs/images/stack.svg" width="720" alt="The layers between the game and the Mac: the game's code, VIctory, CrossOver Wine and D3DMetal, Rosetta 2 and Metal, and the Apple Silicon Mac at the bottom"></p>
+
+The Xbox Series version of the game is x86-64 code, like a Windows program. VIctory loads that code and supplies everything the console would have supplied. On a Mac, VIctory itself runs as a Windows program:
+
+- **Rosetta 2** runs the x86-64 code, including the AVX2 instructions that the game uses.
+- **CrossOver Wine** provides Windows. The setup builds it from the source that CodeWeavers publishes, because Apple's D3DMetal only works with that branch of Wine.
+- **D3DMetal**, from Apple's Game Porting Toolkit, turns Direct3D 12 into Metal.
+
+## Set it up in three steps
+
+You need an Apple Silicon Mac (M1 or newer) on macOS 15 Sequoia or newer, [Homebrew](https://brew.sh), and about 15 GB of free space.
+
+**1. Get the code.**
+
+```bash
+git clone https://github.com/pragyaangaur/VIctory-macOS.git
+cd VIctory-macOS
+```
+
+**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it.
+
+**3. Run the setup.**
+
+```bash
+./setup.sh
+```
+
+The setup installs what it needs with Homebrew. It then builds the x86_64 libraries and CrossOver Wine, adds D3DMetal from the toolkit, and builds VIctory. The first run takes about an hour, almost all of it spent building Wine. If anything stops it, fix what it says and run it again, because finished steps are skipped.
+
+When it says **Setup finished**, you can check that VIctory starts:
+
+```bash
+tools/macos/victory.sh config
+```
+
+## Running the game
+
+Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it:
+
+```bash
+tools/macos/victory.sh run --execute <the game's executable>
+```
+
+For now this gets as far as VIctory does on Windows, as the note at the top explains.
+
+## Running the tests
+
+These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.
+
+```bash
+cargo test --workspace
+```
+
+```bash
+WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
+```
+
+## Where things are
+
+| Path | What it holds |
+| --- | --- |
+| `setup.sh` | The one-step setup |
+| `tools/macos/` | The Wine build, the library build, the launcher and the test runner |
+| `docs/macos.md` | The full story of the port, the problems found and how each was fixed |
+| `crates/` | VIctory's runtime: loader, console runtime, GPU layer, shader recompiler and formats |
+| `docs/architecture.md` | How VIctory itself is put together |
 
 ## Acknowledgement
 
-This project is built on [VIctory](https://github.com/Marvisak/VIctory) by Marvisak, which runs the game natively on Windows. The loader, the console runtime, the GPU layer and the shader recompiler come from VIctory, and its history is kept in this repository. VIctory is licensed under GPL-3.0, so this project is licensed under GPL-3.0 as well.
+This project is built on top of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak. The loader, the console runtime, the GPU layer and the shader recompiler all come from VIctory, and its full history is kept in this repository. This project adds the macOS side: the Mac build, the Wine and D3DMetal setup, and the fixes that the Mac needed. VIctory is licensed under GPL-3.0, so this project is too.
 
-D3DMetal is part of Apple's Game Porting Toolkit and is not included here. Each user downloads it from Apple.
+Thanks also go to CodeWeavers for publishing CrossOver's source, to the Wine project, and to Apple for the Game Porting Toolkit.
 
-## Notes from VIctory
+## Legal
 
-The text below is VIctory's own README, kept for reference. It describes the Windows version.
+This project is not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft or Apple. Grand Theft Auto is a trademark of Take-Two Interactive. This repository contains no game files, keys or code from the game, and it never will. It only runs a copy that you own. D3DMetal is not included, and each user downloads it from Apple under Apple's terms.
 
-# VIctory
-
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
-
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-```
-
-Run the title:
-
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+The code is licensed under the [GNU General Public License v3.0](LICENSE).
