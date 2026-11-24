@@ -326,9 +326,9 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     // Under D3DMetal a -0 input reaches the shader as +0 (Apple's shader
     // converter or Metal's fast math), so the minimums cannot be checked
     // there. docs/macos.md lists this as an open difference.
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: ntdll is always loaded; both names end with a NUL.
     let wine = unsafe {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        // SAFETY: ntdll is always loaded; both names end with a NUL.
         GetProcAddress(
             GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
             c"wine_get_version".as_ptr().cast(),

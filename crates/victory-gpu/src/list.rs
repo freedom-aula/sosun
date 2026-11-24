@@ -1459,8 +1459,8 @@ mod tests {
             "not a power of two"
         );
         assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
         assert!(
+            // SAFETY: the list is ours.
             unsafe { &(*list.cast::<List>()).uploads }
                 .lock()
                 .unwrap()
