@@ -1,3 +1,9 @@
+# VIctory for macOS
+
+This is a fork of [VIctory](https://github.com/Marvisak/VIctory) that works on running it on Apple Silicon Macs. The first route runs the Windows build of VIctory under Wine with Apple's D3DMetal, and the later route replaces the Windows host layer with a native macOS one that uses Metal. Upstream is GPL-3.0 and this fork keeps that licence. No game files are in this repository, and none ever will be.
+
+The upstream README follows.
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
