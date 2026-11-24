@@ -3,7 +3,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+    let gnu = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+    let llvm = env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("llvm");
+    if gnu && llvm {
+        // lld in MinGW mode delay-loads by name, like MSVC's /DELAYLOAD.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,--delayload=victory-probe-delayed.dll");
+    } else if gnu {
         // MinGW's linker has no /DELAYLOAD, so dlltool makes a delay-import
         // library for the one delay-loaded DLL instead.
         let out = PathBuf::from(env::var("OUT_DIR").unwrap());
