@@ -320,6 +320,12 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
+    // Wine's ws2_32 has no WSAConnectByList. FALSE is a failed connect,
+    // which an offline title already handles.
+    if crate::host::function("ws2_32.dll", "WSAConnectByList").is_none() {
+        tracing::warn!("WSAConnectByList is missing from the host ws2_32");
+        return 0;
+    }
     host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
         s, list, local_len, local, remote_len, remote, timeout, reserved,
     )
@@ -578,6 +584,11 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
+        return WSAHOST_NOT_FOUND;
+    }
+    // Wine's ws2_32 has only the wide GetAddrInfoExW.
+    if crate::host::function("ws2_32.dll", "GetAddrInfoExA").is_none() {
+        tracing::warn!("GetAddrInfoExA is missing from the host ws2_32");
         return WSAHOST_NOT_FOUND;
     }
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
@@ -1049,7 +1060,16 @@ mod tests {
             );
         }
         // Every override names a real export of its DLL.
-        for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+        // Exports that Wine's DLLs lack. Their overrides check at run time
+        // or never call the host.
+        let wine = crate::host::function("ntdll.dll", "wine_get_version").is_some();
+        let wine_lacks = ["WSAConnectByList", "GetAddrInfoExA", "WinHttpGetProxySettingsEx"];
+        for e in m
+            .exports
+            .iter()
+            .filter(|e| !e.name.starts_with('#'))
+            .filter(|e| !(wine && wine_lacks.contains(&e.name)))
+        {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
