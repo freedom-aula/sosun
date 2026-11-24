@@ -501,6 +501,19 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
+        // Shaders taking views from the heap itself read (or write) views no
+        // table names: everything the bound heap's views reach is brought up
+        // to date at submission (`crate::bindless`).
+        if p.stages.iter().any(|s| s.translated().host.heap) {
+            let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
+            if let Some(host) = (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                .flatten()
+            {
+                list.defer_heap(&host.viewed);
+            }
+            crate::bindless::note_draw(writes);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;

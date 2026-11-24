@@ -195,6 +195,8 @@ fn program() -> HostShader {
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");

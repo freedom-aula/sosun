@@ -152,6 +152,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -943,6 +945,8 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let (true, Ok(mut v)) = (
         validate,

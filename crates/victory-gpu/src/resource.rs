@@ -974,6 +974,7 @@ impl Drop for Resource {
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(

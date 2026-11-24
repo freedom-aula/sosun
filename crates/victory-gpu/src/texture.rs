@@ -5,15 +5,18 @@
 //! staging buffer when its content changed, and the staging buffer is
 //! copied into the host texture.
 //!
-//! "Changed" means a page of the memory was written since the last detiling
-//! ([`crate::watch`]), in write-watched memory; in physical-page views,
-//! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! "Changed" means a page of the memory changed since the last detiling
+//! ([`crate::watch`], which follows writes through every mapping of the
+//! same physical pages) in the runtime's memory; elsewhere, a content hash
+//! of the whole memory at every submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
-//! Only textures read through descriptor tables are brought up to date
-//! (directly indexed views are not known per draw); plane 0 is uploaded
-//! (every mip and array slice), depth and stencil planes are not.
+//! Textures read through descriptor tables are brought up to date, and for
+//! shaders that index the heap themselves every texture with a resource
+//! object the heap views (`crate::bindless`); textures the title placed in
+//! memory itself are not made for the heap (see `descriptor::host`). Plane
+//! 0 is uploaded (every mip and array slice), depth and stencil planes are
+//! not.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,16 +47,17 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
+    /// The memory's pages changed since detiled (none: not the runtime's
+    /// memory, hashed instead).
+    tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not tracked), with room to read tracked memory into.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    asked: u64,
     read: Vec<u8>,
 }
 
@@ -114,10 +118,43 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
+    record(list, resource, texture, &staging);
+    // Once per submission however many of its lists sample the texture.
+    list.defer_texture(staging);
+}
+
+/// For textures shaders reach through the heap itself, at submission
+/// (`crate::bindless::uploads`): brings the staging buffer up to date and
+/// records its copy into `list` only if the memory changed since (or was
+/// never uploaded). True if it recorded; the texture is then in the copy
+/// destination state.
+pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+    let host_written = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)));
+    if host_written {
+        return false;
+    }
+    let Some(staging) = staging(resource, texture) else {
+        return false;
+    };
+    if !staging.refresh() {
+        return false;
+    }
+    record(list, resource, texture, &staging);
+    list.keep(&staging.buffer);
+    true
+}
+
+/// Records the copy of every subresource of `staging` into `texture`,
+/// moving it to the copy destination state first.
+fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
+    const COPY_DEST: u32 = 0x400;
+    crate::list::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
@@ -165,33 +202,31 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
 }
 
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all): whether it did.
+    pub(crate) fn refresh(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let (read, changed) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        changed
     }
 
-    /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    /// Returns the bytes of title memory read, and whether it detiled.
+    fn refresh_now(&self) -> (usize, bool) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
+        if let Some(t) = &self.tracked {
+            if t.take(start, start + size).is_empty() {
+                return (0, false);
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
@@ -199,7 +234,7 @@ impl Staging {
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            return (size, true);
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -209,7 +244,7 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return 0;
+            return (0, false);
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -217,13 +252,13 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return size;
+            return (size, false);
         }
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        size
+        (size, true)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -327,6 +362,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -337,6 +373,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
+        tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
     map.insert(resource as usize, s.clone());

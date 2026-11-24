@@ -913,6 +913,8 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 struct Upload {
     #[cfg(windows)]
     at: usize,
+    #[cfg(windows)]
+    len: usize,
     #[cfg(not(windows))]
     block: Vec<u8>,
 }
@@ -951,7 +953,7 @@ impl Upload {
             return None;
         }
         crate::shadow::register(at, at as u64, len as u64);
-        Some(Upload { at })
+        Some(Upload { at, len })
     }
 
     #[cfg(not(windows))]
@@ -974,6 +976,8 @@ impl Drop for Upload {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         crate::shadow::unregister(self.at, self.at as u64);
+        // Not guarded any more: memory allocated here next is new.
+        crate::watch::title_memory_remapped(self.at, self.len);
         // SAFETY: our allocation; lists that still use its copy hold that.
         unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
     }

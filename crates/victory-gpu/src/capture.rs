@@ -17,16 +17,42 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level. `VICTORY_CAPTURE_WORLD`
+/// lists frames counted from the first one that ran 500 draws (the world's
+/// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
+        || WORLD
+            .get()
+            .is_some_and(|&w| world_offsets().iter().any(|&k| w + k == n))
+}
+
+fn numbers(var: &str) -> Vec<u64> {
+    let list = std::env::var(var).unwrap_or_default();
+    list.split(',')
+        .filter_map(|f| f.trim().parse().ok())
+        .collect()
+}
+
+fn world_offsets() -> &'static [u64] {
+    static OFFSETS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    OFFSETS.get_or_init(|| numbers("VICTORY_CAPTURE_WORLD"))
+}
+
+/// The first frame that ran 500 draws on the host.
+static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Frame `n` was presented: notes the world's first frame.
+pub(crate) fn presented(n: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
+    if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
+        let _ = WORLD.set(n);
+        tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+    }
 }
 
 /// Whether frame `n` is saved.

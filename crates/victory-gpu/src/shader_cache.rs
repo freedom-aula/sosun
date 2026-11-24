@@ -212,7 +212,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(
         &mut out,
-        u32::from(s.memory) | u32::from(s.memory_writes) << 1 | u32::from(s.view_addresses) << 2,
+        u32::from(s.memory)
+            | u32::from(s.memory_writes) << 1
+            | u32::from(s.view_addresses) << 2
+            | u32::from(s.heap) << 3
+            | u32::from(s.heap_writes) << 4,
     );
     out
 }
@@ -284,6 +288,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
+        heap: memory & 8 != 0,
+        heap_writes: memory & 16 != 0,
     })
 }
 
@@ -314,6 +320,8 @@ mod tests {
             memory: true,
             memory_writes: true,
             view_addresses: true,
+            heap: true,
+            heap_writes: true,
         }
     }
 

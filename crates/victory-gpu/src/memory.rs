@@ -85,6 +85,11 @@ struct Stats {
     uses: std::collections::BTreeMap<String, u64>,
     tables: u64,
     written: u64,
+    /// Pages shaders wrote that were not copied back: their list read
+    /// memory with no copy, so what they computed is not the console's.
+    withheld: u64,
+    /// The same for ranges written through views (bytes).
+    withheld_bytes: u64,
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
@@ -96,6 +101,12 @@ fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
     f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
+/// `bytes` of a range shaders wrote through a view did not go back into
+/// title memory: their list read memory with no copy.
+pub(crate) fn note_withheld(bytes: u64) {
+    stats(|s| s.withheld_bytes += bytes);
+}
+
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
     stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
@@ -105,7 +116,7 @@ pub(crate) fn note_use(pipeline: &str) {
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
@@ -114,11 +125,14 @@ pub(crate) fn log_frame() {
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
-         copied back, missed {} pages and {} 256 MiB regions with no copy (first: {})",
+         copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
+         and {} 256 MiB regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
         s.written,
+        s.withheld,
+        s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
         missed.join(" ")
@@ -219,11 +233,26 @@ pub(crate) fn build(
     stats(|s| s.tables += 1);
     let precise = before.map(|m| m.precise.clone()).unwrap_or_default();
     let byte_for_byte = precise.clone();
+    let (blocks, owner) = (Arc::new(blocks), Arc::new(owner));
+    {
+        let (blocks, owner) = (blocks.clone(), owner.clone());
+        list.defer_missed(move || {
+            // SAFETY: the bitmap is mapped and the list's run is over.
+            let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+            marks.iter().enumerate().any(|(w, &mark)| {
+                (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
+                    let entry = w * 32 + b;
+                    entry / BLOCK == 0 || blocks.get(entry / BLOCK).is_none() || owner.get(entry).is_none_or(|o| o.is_none())
+                })
+            })
+        });
+    }
     list.defer_after(move || {
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
-        let (mut written, mut pages, mut regions, mut missed) = (0, 0, 0, Vec::new());
+        let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             let mut bits = std::mem::take(mark);
             while bits != 0 {
@@ -239,16 +268,7 @@ pub(crate) fn build(
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(Some(k)) => {
-                        let n = copies[*k].copy_back_page(at as usize);
-                        tracing::debug!(
-                            page = format_args!("{at:#x}"),
-                            copy = format_args!("{:#x?}", copies[*k].range()),
-                            bytes = n,
-                            "title memory page written back"
-                        );
-                        written += 1;
-                    }
+                    Some(Some(k)) => writes.push((*k, at)),
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -256,8 +276,26 @@ pub(crate) fn build(
                 }
             }
         }
+        // What shaders computed from memory with no copy (read as zeros) is
+        // not the console's: it does not go into title memory, where it broke
+        // the title's own data (garbage pointers in title threads, run c1).
+        // shortcut: root UAV writes of such a list still go back (their
+        // bytes, `Shadow::gpu_writes`).
+        let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        let mut written = 0;
+        for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
+            let n = copies[k].copy_back_page(at as usize);
+            tracing::debug!(
+                page = format_args!("{at:#x}"),
+                copy = format_args!("{:#x?}", copies[k].range()),
+                bytes = n,
+                "title memory page written back"
+            );
+            written += 1;
+        }
         stats(|s| {
             s.written += written;
+            s.withheld += withheld;
             s.missed_pages += pages;
             s.missed_regions += regions;
             let room = 4usize.saturating_sub(s.first_missed.len());

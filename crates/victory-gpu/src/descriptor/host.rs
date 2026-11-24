@@ -43,6 +43,8 @@ pub(crate) struct HostHeap {
     /// address as data, `crate::memory`): the buffer, its mapping and host
     /// address, made on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
+    /// What the title slots view that title memory feeds (`crate::bindless`).
+    pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -111,17 +113,22 @@ impl HostHeap {
             .map(|(buffer, data)| (buffer, data as usize));
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
+        // Translated shaders clamp their indices below `HEAP_VIEWS` or
+        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
+        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if sampler {
-            match make(count) {
+            match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
+            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
+            // faults on an index past them, as before the clamp.
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
@@ -145,10 +152,12 @@ impl HostHeap {
         };
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
-        let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        let (gpu, total) = unsafe {
+            (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
+        };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -164,13 +173,17 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
             addresses: std::sync::OnceLock::new(),
+            viewed: Default::default(),
         };
+        if !sampler {
+            crate::bindless::register(&h.viewed);
+        }
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -315,6 +328,9 @@ impl HostHeap {
         }
         self.keep(index, None);
         self.set_stride(index, None);
+        if index < self.count {
+            self.viewed.set(index, None, false);
+        }
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
@@ -481,7 +497,13 @@ impl HostHeap {
         if made[index as usize] != key {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
-            let later = !for_draw && view.is_buffer();
+            // Shaders index the heap itself (`crate::bindless`): buffer views
+            // are made when written.
+            // shortcut: views of textures the title placed itself are made
+            // when a draw reads them through a table: a host texture (and a
+            // staging copy) for each of the ~20,000 the title has views of
+            // ran the host out of memory (run b2).
+            let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -490,6 +512,9 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+            }
+            if !self.sampler {
+                self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
         }
@@ -816,22 +841,27 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // Constant buffers in the title's slots are read by shaders that
+            // index the heap themselves (tables holding one are made afresh
+            // with the data copied), and those read them as raw buffers
+            // (`victory_shader::emit`, "Constant buffers in the heap"): the
+            // console needs 16-byte alignment, a host constant buffer view
+            // 256, which most of the title's do not have on the host.
             let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+            let bytes = u64::from(size).min(shadow.left(address));
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: (bytes / 4) as u32,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
             };
-            // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            buffer_srv(address, bytes, desc, at)
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -924,6 +954,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// Whether `view` is a view of a texture the title placed in memory itself.
+fn is_placed_texture(view: &View) -> bool {
+    matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -966,11 +1001,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        // Read as raw buffers, as made (`make`).
+        View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -1152,6 +1184,14 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
+        // Every index a translated shader can reach exists (clamped below
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // SAFETY: plain queries of live heaps.
+        unsafe {
+            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let samplers = HostHeap::new(true, 128).unwrap();
+            assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
+        }
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));

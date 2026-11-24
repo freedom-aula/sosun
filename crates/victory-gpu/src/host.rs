@@ -417,6 +417,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Brings every buffer range a view heap's views reach up to date
+    /// (`crate::bindless`).
+    Heap(std::sync::Arc<crate::bindless::Viewed>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -444,6 +447,10 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// Asked once the list has run, before anything goes back: whether its
+    /// shaders read title memory with no copy (`crate::memory`); then what
+    /// they wrote through views does not go back either.
+    missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
 
 impl Host {
@@ -562,7 +569,34 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Textures heap-indexing shaders may read, uploaded first by a list
+        // of ours where their title memory changed.
+        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::Heap(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let uploads = (!heaps.is_empty())
+            .then(|| crate::bindless::uploads(&heaps))
+            .flatten();
+        let runs: Vec<&HostList> = uploads
+            .as_ref()
+            .map(|u| u.list())
+            .into_iter()
+            .chain(runs.iter().copied())
+            .collect();
+        let runs = &runs[..];
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -577,6 +611,8 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -645,23 +681,37 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+            let deferred = list.deferred();
+            // Shaders that read memory with no copy computed something else
+            // than the console's: it stays out of title memory, where it broke
+            // the title's own data (runs c1, c4).
+            let missed = deferred.missed.iter().any(|check| check());
+            for step in &deferred.copies {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    match back
+                        .iter_mut()
+                        .find(|(s, a, l, _)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                    {
+                        Some(entry) => entry.3 &= !missed,
+                        None => back.push((shadow.clone(), *address, *len, !missed)),
+                    }
                 }
             }
         }
-        for (shadow, address, len) in &back {
+        for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            if *goes_back {
+                let written = shadow.copy_back(address, len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            } else {
+                shadow.keep_writes(address, len);
+                crate::memory::note_withheld(len as u64);
+            }
         }
         for list in runs {
             for work in &list.deferred().after {
@@ -669,6 +719,8 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1140,6 +1192,23 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Shaders of the list take views from the heap itself
+    /// (`crate::bindless`): what the heap's views reach is brought up to
+    /// date at submission (once until a title copy intervenes).
+    pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
+        if deferred.refreshed.insert(key) {
+            deferred.copies.push(Step::Heap(viewed.clone()));
+        }
+    }
+
+    /// After the list has run, before its writes go back: `check` says
+    /// whether its shaders read title memory with no copy.
+    pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
+        self.deferred().missed.push(Box::new(check));
+    }
+
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
@@ -1308,6 +1377,10 @@ impl HostList {
                     }
                     continue;
                 }
+                Step::Heap(viewed) => {
+                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -1392,10 +1465,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 || title_dst && !crate::texture::committed(dst, len) {
         return;
     }
-    if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
-    }
+    // The kernel writes the destination: it must not be guarded meanwhile.
+    let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -1583,6 +1654,8 @@ impl Meter {
         self.frames += 1;
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
+        crate::watch::frame_done();
+        #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
         }
@@ -1624,7 +1697,9 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::copystat::log(copy_frames);
+                crate::bindless::log(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

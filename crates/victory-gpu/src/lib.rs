@@ -16,6 +16,8 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -60,4 +62,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{
+    Writing as KernelWrite, title_memory_aliased, title_memory_remapped, use_alias_resolver,
+    writing as kernel_will_write,
+};

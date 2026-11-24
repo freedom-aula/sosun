@@ -606,6 +606,8 @@ fn build(wide: bool, memory: bool) -> HostShader {
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

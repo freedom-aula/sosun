@@ -76,6 +76,66 @@ const CHOSEN_SAMPLER_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 the heap index of a constant buffer (a root constant), s1
+/// the resource heap, s2 a table with a raw UAV. Each lane stores dword 2
+/// of the constant buffer (a scalar buffer load) to dword `lane` of the UAV.
+const HEAP_CONSTANT_WAVE32: &[u32] = &[
+    0x8F04_8500, // s_lshl_b32 s4, s0, 5
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF420_0504,
+    0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xE070_1000,
+    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s0 a table with a raw SRV, s2 a table with a raw UAV. Each
+/// lane loads the half at byte `2 × lane` and stores it to dword `lane`.
+const HALF_LOAD_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE028_1000,
+    0x8002_0201, // buffer_load_ushort v2, v1, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0xE070_1000,
+    0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// User data: s2 a table with a raw UAV. Each lane stores its index as the
+/// half at byte `2 × lane` (two lanes share each dword).
+const HALF_STORE_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x3402_0081, // v_lshlrev_b32 v1, 1, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE068_1000,
+    0x8004_0001, // buffer_store_short v0, v1, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
 fn param(root: RootType, user_data: u8) -> RootParam {
     RootParam {
         root,
@@ -151,6 +211,8 @@ fn build(
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -228,6 +290,167 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Constant data through the resource heap itself is read from a raw view
+/// (the host's constant buffer views need an alignment the title's lack).
+#[test]
+fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
+    let shader = build(
+        HEAP_CONSTANT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    assert!(shader.heap && !shader.heap_writes, "reads the heap itself, writes through a table");
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                // The constants are at heap index 1, the UAV's table at 0.
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// `buffer_load_ushort`: the half at its byte address, zero-extended (the
+/// BVH builder reads 16-bit fields this way).
+#[test]
+fn a_half_buffer_load_reads_the_half_at_its_address() {
+    let shader = build(
+        HALF_LOAD_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+        vec![entry(ResourceType::Srv, 4, 0), entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    // 32 halves 0x8000 + 3 × lane, two per dword (low half first).
+    let half = |l: u32| 0x8000 + 3 * l;
+    let data: Vec<u32> = (0..16).map(|k| half(2 * k) | half(2 * k + 1) << 16).collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            // The SRV's table at heap index 0, the UAV's at 1.
+            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..32).map(half).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// `buffer_store_short`: each lane's half lands at its byte address and
+/// leaves the other half of the dword alone.
+#[test]
+fn half_buffer_stores_leave_the_other_half_alone() {
+    let shader = build(
+        HALF_STORE_WAVE32,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(16)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let want: Vec<u32> = (0..16).map(|k| (2 * k) | ((2 * k + 1) << 16)).collect();
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }

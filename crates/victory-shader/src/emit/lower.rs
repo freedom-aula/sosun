@@ -44,6 +44,10 @@ pub(crate) struct Lowered {
     pub memory_writes: bool,
     /// Reads buffer views' addresses from descriptors (the view addresses).
     pub view_addresses: bool,
+    /// Takes descriptors from the resource heap itself (root type 5, not
+    /// a table), and whether as unordered access views.
+    pub heap: bool,
+    pub heap_writes: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -199,6 +203,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// [`Lowered::heap`], [`Lowered::heap_writes`].
+    heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -598,6 +604,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            heap: [false; 2],
             src0: None,
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -1300,6 +1307,8 @@ impl<'a> Lower<'a> {
             memory,
             memory_writes,
             view_addresses,
+            heap: self.heap[0],
+            heap_writes: self.heap[1],
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3751,7 +3760,11 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let srv = matches!(kind, Some(u) if u.kind == ResourceType::Srv);
+        // Constant data through the resource heap itself is a raw buffer: the
+        // host's constant buffer views need 256-byte alignment, the title's
+        // 16 (module notes, "Constant buffers in the heap").
+        let heap_constants = kind.is_none() && self.is_heap_direct(src);
+        let srv = heap_constants || matches!(kind, Some(u) if u.kind == ResourceType::Srv);
         // A root UAV is read as title memory in a program that uses it.
         let root_uav = self.root_memory
             && matches!(kind, Some(u) if u.kind == ResourceType::Uav)
@@ -4573,6 +4586,12 @@ impl<'a> Lower<'a> {
         } else {
             props
         };
+        // A descriptor from the resource heap itself: the host cannot tell
+        // which slots the program reads, or writes through unordered access.
+        if !sampler && self.is_heap_direct(src) {
+            self.heap[0] = true;
+            self.heap[1] |= props.0 & 0x1000 != 0;
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props.0);
@@ -4715,6 +4734,19 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| match l {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap),
+            _ => false,
+        })
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -8195,7 +8227,20 @@ impl<'a> Lower<'a> {
             Some("format_xy") => (true, 2),
             Some("format_xyz") => (true, 3),
             Some("format_xyzw") => (true, 4),
+            Some("ubyte" | "sbyte" | "ushort" | "sshort") if !store => (false, 1),
+            Some("byte" | "short") if store => (false, 1),
             _ => return Err(name),
+        };
+        // Loads or stores of a byte or a half: its width and whether signed.
+        let sub = match plain
+            .strip_prefix("buffer_load_")
+            .or(plain.strip_prefix("buffer_store_"))
+        {
+            Some("ubyte" | "byte") => Some((8, false)),
+            Some("sbyte") => Some((8, true)),
+            Some("ushort" | "short") => Some((16, false)),
+            Some("sshort") => Some((16, true)),
+            _ => None,
         };
         let Operand::Vector { reg: areg, .. } = *addr else {
             return Err("a buffer address");
@@ -8340,6 +8385,36 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        if let (true, Some((width, _))) = (store, sub) {
+            // The field of the dword holding it, by two atomics on that dword
+            // (clear, then set): other lanes' fields in it are left alone.
+            // shortcut: the field is taken not to cross a dword.
+            if index.is_some() {
+                return Err("a byte or half buffer store by index");
+            }
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let x = self.vgprs(inst, d, 1)?[0];
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
+            let x = self.s.m.bin(c, Bin::And, x, field);
+            let x = self.s.m.bin(c, Bin::Shl, x, sh);
+            let mask = self.s.m.bin(c, Bin::Shl, field, sh);
+            let all = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+            let begin = self.begin_guarded(guard);
+            let i32t = self.s.t.i32;
+            for (op, v) in [(1, keep), (2, x)] {
+                let args = [h, self.s.m.i32(op), at, iu, iu, v];
+                self.s
+                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.end_guarded(begin, &[]);
+            return Ok(());
+        }
         if store {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
@@ -8417,6 +8492,42 @@ impl<'a> Lower<'a> {
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
+            return Ok(());
+        }
+        if let Some((width, signed)) = sub {
+            // The dword holding the field, as `global_load_ubyte` and kin.
+            // shortcut: the field is taken not to cross a dword.
+            if index.is_some() {
+                return Err("a byte or half buffer load by index");
+            }
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let c = self.cur;
+            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, iu, mask, align],
+            );
+            let w = self.s.m.extract(c, r, 0);
+            let w = self.as_int(w);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let x = self.s.m.bin(c, Bin::LShr, w, sh);
+            let left = self.s.m.i32(32 - width);
+            let x = self.s.m.bin(c, Bin::Shl, x, left);
+            let x = self
+                .s
+                .m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         let r = if typed {

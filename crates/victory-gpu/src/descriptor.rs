@@ -295,22 +295,6 @@ pub(crate) enum View {
     Placed(bool, [u32; 14], [u32; 16]),
 }
 
-impl View {
-    /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
-    #[cfg(windows)]
-    fn is_buffer(&self) -> bool {
-        match self {
-            View::Constant(..) | View::Placed(..) => true,
-            View::Shader(r, _) | View::Unordered(r, _, _) => {
-                crate::resource::buffer_bytes(*r as This).is_some()
-            }
-            View::Sampler(_) | View::ConsoleSampler(_) => false,
-        }
-    }
-}
-
 /// Every distinct view in use; a descriptor holds a tag, an index into it
 /// and the entry's generation, which survive titles copying descriptors as
 /// bytes. A view of a resource lives as long as the resource: when the

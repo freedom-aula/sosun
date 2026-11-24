@@ -57,6 +57,23 @@
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
 //!   `i` the host keeps at the byte stride of the buffer view at heap
 //!   index `i`.
+//! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
+//!   loads through a descriptor taken from the resource heap itself (root
+//!   type 5, so no used-resource entry) read a raw buffer view, not a
+//!   constant buffer view: the title's constant buffers are 16-byte
+//!   aligned, the host's views 256. The host makes a raw view at the
+//!   constant buffer's address for each constant buffer view in the heap
+//!   (tables holding one are made afresh, so only such shaders read them).
+//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
+//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
+//!   many slots, those past its own null, so an index past the heap (data
+//!   still wrong; the console would read whatever memory follows its heap)
+//!   reads nothing instead of faulting the device.
+//! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
+//!   added 2026-11-24): whether the shader takes descriptors from the
+//!   resource heap itself, and unordered access views among them; the
+//!   host then keeps everything the heap's views reach current, and
+//!   copies back what such views may have written.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
@@ -157,7 +174,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES};
+pub use shader::{
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+    VIEW_STRIDES,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -230,6 +250,13 @@ pub struct HostShader {
     /// descriptors: the host binds the view addresses `t1` in
     /// [`MEMORY_SPACE`] (module notes, "Title memory").
     pub view_addresses: bool,
+    /// Whether it takes descriptors from the resource heap at indices it
+    /// computes (root type 5, not through a table): the host cannot tell
+    /// which views it reads, so every view in the heap must be current.
+    pub heap: bool,
+    /// Whether some of those are unordered access views: it may write
+    /// through any of the heap's.
+    pub heap_writes: bool,
 }
 
 impl HostShader {
@@ -399,6 +426,8 @@ pub fn emit(
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
     })
 }
 
@@ -660,6 +689,8 @@ mod tests {
             memory: false,
             memory_writes: false,
             view_addresses: false,
+            heap: false,
+            heap_writes: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -674,6 +705,8 @@ mod tests {
                 memory: false,
                 memory_writes: false,
                 view_addresses: false,
+                heap: false,
+                heap_writes: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

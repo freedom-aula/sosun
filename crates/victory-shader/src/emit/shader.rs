@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -19,6 +19,11 @@ pub const VIEW_STRIDES: u8 = 255;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
+/// Heap indices are clamped below these (views, samplers): the host's heaps
+/// are at least this large, the slots past their own null (`emit`, "Heap
+/// indices").
+pub const HEAP_VIEWS: u32 = 1 << 21;
+pub const HEAP_SAMPLERS: u32 = 2048;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -440,6 +445,11 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // An index past the host's heap faults the device (a console shader
+        // reads whatever memory follows its heap): the last slot instead.
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let over = self.m.cmp(block, pred::IUGT, index, last);
+        let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
