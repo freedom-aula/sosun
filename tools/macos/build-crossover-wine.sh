@@ -8,10 +8,18 @@
 set -eu
 VERSION="${CROSSOVER_VERSION:-26.3.0}"
 ROOT="${0:A:h:h:h}"
-WORK="$ROOT/target/crossover"
+DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
+# Wine's build splits flags at spaces, and both the project and the deps
+# can live under folders with spaces in their names. Space-free links to
+# them keep every path in the build free of spaces.
+ALIAS="$HOME/Library/Caches/victory-macos"
+mkdir -p "$ALIAS" "$ROOT/target"
+ln -sfn "$ROOT/target" "$ALIAS/target"
+ln -sfn "$DEPS_REAL" "$ALIAS/deps"
+DEPS="$ALIAS/deps"
+WORK="$ALIAS/target/crossover"
 OBJ="$WORK/build"
-PREFIX="$ROOT/target/wine-cx"
-DEPS="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
+PREFIX="$ALIAS/target/wine-cx"
 BREW="${BREW:-/opt/homebrew}"
 x86() { arch -x86_64 /usr/bin/env PATH="$BREW/opt/bison/bin:$BREW/opt/flex/bin:$BREW/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
 
