@@ -100,6 +100,86 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Records, once per list, the copy of `from`'s host texture into `to`'s:
+/// two title textures at one memory, `to` (a placed view's) reading what
+/// the GPU wrote through `from` in another format of the same size
+/// (`resource::alias_source`). Through a buffer, each subresource with its
+/// own format; `to` no longer takes its contents from title memory.
+pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+    const COPY_DEST: u32 = 0x400;
+    const COPY_SOURCE: u32 = 0x800;
+    let (Some(a), Some(b), Some(host)) = (
+        crate::resource::host_resource(from),
+        crate::resource::host_resource(to),
+        host(),
+    ) else {
+        return;
+    };
+    // An odd key: textures' own first uses are keyed by the resource.
+    if !list.first_use(to as usize | 1) {
+        return;
+    }
+    // SAFETY: live resources.
+    let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    let n = u32::from(da.MipLevels) * u32::from(da.DepthOrArraySize).max(1);
+    let n = if da.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(da.MipLevels) } else { n };
+    let mut fa = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
+    let mut fb = fa.clone();
+    let mut total = 0;
+    // SAFETY: outputs sized for `n` subresources.
+    unsafe {
+        host.device
+            .GetCopyableFootprints(&da, 0, n, 0, Some(fa.as_mut_ptr()), None, None, Some(&mut total));
+        host.device
+            .GetCopyableFootprints(&db, 0, n, 0, Some(fb.as_mut_ptr()), None, None, None);
+    }
+    let same = fa.iter().zip(&fb).all(|(x, y)| {
+        x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && x.Footprint.Height == y.Footprint.Height
+    });
+    if !same {
+        once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
+        return;
+    }
+    let Some(buffer) = host.default_buffer(total) else { return };
+    list.keep(&buffer);
+    crate::texture::host_written(to);
+    crate::list::ensure_state(list, from, COPY_SOURCE);
+    crate::list::ensure_state(list, to, COPY_DEST);
+    let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the copy does not release.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+    };
+    let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+    };
+    let l = &list.list;
+    // SAFETY: an open list; live resources in the states named.
+    unsafe {
+        for i in 0..n {
+            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
+        }
+        l.ResourceBarrier(&[crate::host::transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        for i in 0..n {
+            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        }
+    }
+    static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
+        logged.push((from as usize, to as usize));
+        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, "aliased texture copied");
+    }
+}
+
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy

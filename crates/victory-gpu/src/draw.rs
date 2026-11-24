@@ -141,13 +141,35 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
+/// Marks the last traced draw as not run on the host, counts it by why
+/// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
+/// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::note_drop(pipeline as This);
+fn dropped(list: &HostList, pipeline: usize, kind: &str) {
+    let why = NOT_RUN.with(|w| w.replace(""));
+    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
+        crate::pipeline::note_drop(pipeline as This);
+    } else {
+        crate::pipeline::note_why(format!("{kind}: {why}"));
+    }
+    list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Why the draw or dispatch this thread last prepared cannot run.
+    static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
+fn not_run(why: &'static str) {
+    #[cfg(feature = "diagnostics")]
+    NOT_RUN.with(|w| w.set(why));
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = why;
 }
 
 /// Dispatches run on the host so far.
@@ -312,7 +334,7 @@ impl State {
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            crate::capture::note_target(list, record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -320,7 +342,7 @@ impl State {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            crate::capture::note_target(list, record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -423,6 +445,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            not_run("another kind of pipeline");
             return false;
         }
         if !self.bind(list, p, false) {
@@ -459,6 +482,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                not_run("index buffer outside title buffers");
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -547,6 +571,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                not_run("no dynamic slots for its tables");
                 return false;
             }
             // Root views a shader reads as title memory: the copies holding
@@ -614,6 +639,7 @@ impl State {
                             .flatten();
                         let Some(table) = heap.and_then(|h| h.strides()) else {
                             once!("a shader reads view strides without a view heap: dropped");
+                            not_run("view strides without a view heap");
                             return false;
                         };
                         list.keep(table);
@@ -657,6 +683,7 @@ impl State {
                     .and_then(|h| h.view_addresses());
                 let Some(gpu) = gpu else {
                     once!("a shader reading a view's address dropped: no view heap");
+                    not_run("view addresses without a view heap");
                     return false;
                 };
                 // SAFETY: an open list; the heap's buffer lives with the heap.
@@ -672,6 +699,7 @@ impl State {
                 let addresses: Vec<u64> = roots.iter().map(|r| r.0).collect();
                 let Some((table, dirty)) = self.memory_map(list, &addresses) else {
                     once!("a shader reading title memory dropped: no view heap or dynamic slots");
+                    not_run("title memory without a view heap or dynamic slots");
                     return false;
                 };
                 crate::memory::note_use(&p.name);
@@ -849,7 +877,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            crate::pipeline::note_drop(self.pipeline as This);
+            dropped(list, self.pipeline, "dispatch");
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -859,7 +887,7 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            dropped(list, self.pipeline, "dispatch");
             return;
         };
         if !p.compute {
@@ -868,6 +896,8 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -900,6 +930,21 @@ impl State {
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
+                    // A slot the host never made: what the title's memory
+                    // holds there (our record, zeros, or words it wrote itself).
+                    if slot == "null" && self.heaps[0] != 0 {
+                        let at = crate::descriptor::heap(self.heaps[0] as This).start + u64::from(index) * 32;
+                        let mut words = [0u8; 32];
+                        if crate::host::read_into(at as *const u8, &mut words) {
+                            let w: Vec<u32> =
+                                words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let _ = write!(text, " (title words {w:x?}");
+                            if let Some(view) = crate::descriptor::view(at) {
+                                let _ = write!(text, ": {}", describe(Some(&view)));
+                            }
+                            let _ = write!(text, ")");
+                        }
+                    }
                 }
             }
             let viewed = t.host.user_data.iter().filter(|u| is_root_view(u)).map(|u| u.slot);
@@ -918,6 +963,11 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        if !compute {
+            let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
+            let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
+            let _ = write!(text, " targets {targets:?} depth {:#x} mem {:#x}", self.depth, mem(self.depth));
+        }
         text
     }
 
@@ -942,7 +992,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(list, self.pipeline, "mesh");
         }
     }
 
@@ -970,25 +1020,18 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// The descriptors a shader reads through tables, made from the
+    /// title's slots. Constant buffers there are raw views of their data
+    /// (translated shaders read them so: the host wants constant buffer
+    /// views 256-byte aligned, the console only 16), brought up to date at
+    /// submission like other buffer views. Returns the byte offsets of
+    /// tables made afresh in dynamic slots, by root parameter.
     ///
     /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// once.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -1077,14 +1120,6 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
@@ -1180,8 +1215,14 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        // Rectangles: completed by the pipeline's geometry shader, else
+        // expanded into vertex buffers of their own.
+        let rects = self.topology == RECTANGLES && !self.completes_rectangles();
+        let ran = self.prepare(list, false)
+            && (!rects || self.rectangles(list, vertices, first) || {
+                not_run("rectangle vertices outside their buffer");
+                false
+            });
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -1201,8 +1242,13 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(list, self.pipeline, "draw");
         }
+    }
+
+    /// Whether the bound pipeline's geometry shader completes rectangles.
+    fn completes_rectangles(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangles)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1271,10 +1317,12 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
-        if self.topology == RECTANGLES {
+        let rects = self.topology == RECTANGLES && !self.completes_rectangles();
+        if rects {
             once!("indexed rectangles not drawn");
+            not_run("indexed rectangles");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let ran = !rects && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
@@ -1288,7 +1336,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(list, self.pipeline, "indexed");
         }
     }
 }
@@ -1311,6 +1359,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
             return false;
         }
         const DRAW: u32 = 0;
@@ -1318,7 +1367,12 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let pipeline = self.pipeline as This;
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| {
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
+        };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -1355,7 +1409,12 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || self.completes_rectangles() || {
+                    not_run("rectangles");
+                    false
+                }) && self.prepare(list, kind == INDEXED)
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1367,8 +1426,16 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                None => {
+                    crate::pipeline::note_drop(self.pipeline as This);
+                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+                }
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {}): {}",
+                    p.compute,
+                    p.mesh,
+                    NOT_RUN.with(|w| w.replace(""))
+                )),
             }
             return false;
         }
@@ -1388,6 +1455,13 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        // A listed frame: what the records held (after the clamp).
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::dump_on() {
+            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let name = crate::pipeline::shaders_of(pipeline);
+            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+        }
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1442,10 +1516,23 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    // A placed view of memory the GPU writes through another title texture
+    // reads that one's host copy.
+    if let Some(View::Shader(b, _)) = &placed
+        && let Some(a) = crate::resource::alias_source(*b as This)
+    {
+        crate::texture::alias_copy(list, a, *b as This);
+    }
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    // Constant buffers (raw views) to their copy's end at most.
+    let range = match *view {
+        View::Constant(address, size) => crate::shadow::find(address, 1)
+            .map(|s| (address, u64::from(size).min(s.left(address)))),
+        _ => crate::descriptor::host::buffer_range(view),
+    };
+    if let Some((address, len)) = range
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
@@ -1477,7 +1564,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            crate::capture::note_target(list, *resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
@@ -1491,7 +1578,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            // Its console memory: another view of it (a placed one) is
+            // another host texture.
+            let at = crate::resource::texture_memory(r).map_or(0, |(p, _)| p as u64);
+            format!("{}x{} f{} flags {:#x} mem {at:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     match view {

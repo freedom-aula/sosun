@@ -3828,7 +3828,13 @@ impl<'a> Lower<'a> {
         // host's constant buffer views need 256-byte alignment, the title's
         // 16 (module notes, "Constant buffers in the heap").
         let heap_constants = kind.is_none() && self.is_heap_direct(src);
-        let srv = heap_constants || matches!(kind, Some(u) if u.kind == ResourceType::Srv);
+        // So is constant data in a table: the title's slot holds a raw view
+        // of it, so tables need no copies of their own per draw.
+        let table_constants =
+            matches!(kind, Some(u) if u.kind == ResourceType::Cbv && u.root == RootType::Table);
+        let srv = heap_constants
+            || table_constants
+            || matches!(kind, Some(u) if u.kind == ResourceType::Srv);
         // A root UAV is read as title memory in a program that uses it.
         let root_uav = self.root_memory
             && matches!(kind, Some(u) if u.kind == ResourceType::Uav)
@@ -8405,7 +8411,7 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let table = used.is_some_and(|u| u.root == RootType::Table);
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -8414,6 +8420,25 @@ impl<'a> Lower<'a> {
                 }
                 None => off,
             };
+            if table {
+                // A table's constant buffer is a raw view (scalar loads above).
+                let Some(Operand::Vector { reg, .. }) = *data else {
+                    return Err("a buffer result");
+                };
+                let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                    let u = self.s.m.undef(self.s.t.i32);
+                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+                    let x = self.s.m.extract(c, r, 0);
+                    let x = self.as_int(x);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };

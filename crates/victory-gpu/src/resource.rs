@@ -1048,8 +1048,46 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    } else if resource.host.is_some() {
+        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(resource.data() as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Title textures with a host copy, by the console memory they start at.
+/// Two title views of one memory in different formats (the console writes
+/// a packed format through a `R32_UINT` unordered view, then samples it)
+/// are two host textures; [`alias_source`] finds the one the GPU writes.
+#[cfg(windows)]
+static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// For a texture made for a placed view (`texture_at`): a title texture
+/// the GPU writes (render target, depth or unordered access) at the same
+/// memory with the same shape, layout and element size, if there is one:
+/// what the GPU wrote there lives in that one's host copy.
+/// shortcut: same start and shape only; overlapping ranges, other mips or
+/// slices of one memory, and views of buffers are not matched.
+#[cfg(windows)]
+pub(crate) fn alias_source(placed: This) -> Option<This> {
+    const WRITTEN: u32 = 0x7; // render target, depth, unordered access
+    let b = resource(placed);
+    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = |d: &ResourceDesc| {
+        (d.dimension, d.width, d.height, d.depth_or_array_size, d.mip_levels, d.sample_count, d.layout)
+    };
+    map.get(&(b.data() as u64))?
+        .iter()
+        .map(|&r| r as This)
+        .filter(|&r| r != placed)
+        .find(|&r| {
+            let a = resource(r);
+            a.desc.flags & WRITTEN != 0
+                && shape(&a.desc) == shape(&b.desc)
+                && element(a.desc.format) == element(b.desc.format)
+        })
 }
 
 #[cfg(windows)]
@@ -1080,6 +1118,16 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        if self.desc.dimension != BUFFER {
+            let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let at = self.data() as u64;
+            if let Some(list) = map.get_mut(&at) {
+                list.retain(|&r| r != std::ptr::from_ref::<Resource>(self) as usize);
+                if list.is_empty() {
+                    map.remove(&at);
+                }
+            }
+        }
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(

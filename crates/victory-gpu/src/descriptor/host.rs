@@ -520,22 +520,6 @@ impl HostHeap {
         self.write_stride(index + 1, 4);
     }
 
-    /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
-    }
-
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a live shader-visible heap.
@@ -937,9 +921,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            // Constant buffers in the title's slots are read by shaders that
-            // index the heap themselves (tables holding one are made afresh
-            // with the data copied), and those read them as raw buffers
+            // Constant buffers in the title's slots, through the heap itself
+            // or a table, are read as raw buffers by translated shaders
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
             // console needs 16-byte alignment, a host constant buffer view
             // 256, which most of the title's do not have on the host.

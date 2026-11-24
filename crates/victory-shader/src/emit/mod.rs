@@ -76,8 +76,12 @@
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
 //!   constant buffer view: the title's constant buffers are 16-byte
 //!   aligned, the host's views 256. The host makes a raw view at the
-//!   constant buffer's address for each constant buffer view in the heap
-//!   (tables holding one are made afresh, so only such shaders read them).
+//!   constant buffer's address for each constant buffer view in the heap.
+//!   Constant buffers in descriptor tables are read the same way (scalar
+//!   loads and per-lane rows), so tables are never copied per draw.
+//! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
+//!   vertex shader's outputs completes each rectangle with its fourth
+//!   corner `v0 + v2 - v1`, as the console's hardware does.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
@@ -173,6 +177,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rect;
+pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
