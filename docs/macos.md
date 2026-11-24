@@ -47,7 +47,7 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 - `argument_clamp_builds`: fixed. Wine's HLSL compiler (vkd3d-shader) cannot compile the clamp shader, so the `clamp bytecode` workflow compiles `clamp.hlsl` with FXC and DXC on a Windows runner, and `cargo xtask embed-clamp` embeds the result with a hash of the source.
 - `a_rejected_blob_gives_an_empty_library`: fixed. D3DMetal accepts any pipeline library bytes, so the cache file now carries a mark and a checksum that VIctory checks itself.
 
-After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 265 passed, 0 failed and 4 ignored.
+After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 312 passed, 0 failed and 4 ignored.
 
 ## Route A: next steps
 
@@ -66,7 +66,7 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 ## Running VIctory on a Mac
 
-Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (265 passed, 0 failed).
+Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (312 passed, 0 failed).
 
 ## Open differences under D3DMetal
 
