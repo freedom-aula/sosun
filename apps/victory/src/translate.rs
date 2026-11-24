@@ -419,7 +419,10 @@ fn report<T>(
     let terminal = std::io::stderr().is_terminal();
     let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
     let line = || {
-        let done = next.load(Ordering::Relaxed).min(jobs.len());
+        // `next` counts jobs handed out; a worker still running holds one.
+        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+        let taken = next.load(Ordering::Relaxed).min(jobs.len());
+        let done = taken.saturating_sub(busy);
         format!(
             "{}: {done} of {} containers ({}%), {:.0} s{}",
             file.display(),
