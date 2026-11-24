@@ -81,10 +81,17 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+    #[cfg(windows)]
     super::lifecycle::end_title(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
+    // Relaunch needs the Windows lifecycle code, so other hosts only stop.
+    #[cfg(not(windows))]
+    {
+        tracing::error!(?command, "relaunch is not available on this host");
+        std::process::exit(1);
+    }
     loop {
         std::thread::park();
     }
