@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -81,7 +82,10 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Also create a host D3D12 pipeline for each emitted shader. With
+        /// `--cache`: then make every pipeline of the title's shader pack
+        /// into the host pipeline library `run` reads (on this GPU and
+        /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
         /// Print one line per program and outcome.
@@ -91,8 +95,9 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
-        /// every container found, once, nothing else checked or listed.
-        #[arg(long, conflicts_with_all = ["validate", "pipelines", "list"])]
+        /// every container found, once, nothing else checked or listed
+        /// (with `--pipelines`, then the shader pack's pipelines).
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -160,9 +165,10 @@ fn main() -> Result<()> {
         Command::Translate {
             paths,
             jobs,
+            pipelines,
             cache: true,
             ..
-        } => translate::warm(paths, jobs),
+        } => translate::warm(paths, jobs, pipelines),
         Command::Translate {
             paths,
             validate,

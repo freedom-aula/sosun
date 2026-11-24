@@ -38,7 +38,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
-    key: String,
+    pub(crate) key: String,
     used: AtomicBool,
 }
 
@@ -50,20 +50,20 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key(&shaders, graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log("created", &key, || {
+            let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+            format!("{shaders:?}\t{state}")
+        });
         Pending {
+            key,
             shaders,
             graphics,
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
@@ -72,6 +72,8 @@ impl Pending {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
@@ -86,6 +88,18 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// What identifies a title pipeline across runs: its shader containers
+/// and graphics state.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -111,6 +125,39 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Logs the library name of the host pipeline this thread just made or
+/// loaded for `key` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_built(key: &str) {
+    if let Some((name, loaded)) = super::library::LAST.take() {
+        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+    }
+}
+
+/// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
+/// key created (`created`, its shaders, its state as described) and first
+/// drawn or dispatched with (`used`), and its host pipeline's library name
+/// once made or loaded (`built`, also from the pre-build), to compare what
+/// a run creates with what the pre-build makes.
+#[cfg(feature = "diagnostics")]
+fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
+        return;
+    };
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_none() {
+        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
+    }
+    let Some((file, seen)) = log.as_mut() else { return };
+    if seen.insert(format!("{what} {key}")) {
+        let _ = writeln!(file, "{what}\t{key}\t{}", rest());
+    }
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -132,6 +179,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // not: one a run never got made is the one it should start early.
     if !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        #[cfg(feature = "diagnostics")]
+        log("used", &p.key, String::new);
     }
     if p.made.get().is_none() {
         start(p, true);
