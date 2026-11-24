@@ -411,6 +411,27 @@ const CS_CASES: &[(&str, &str)] = &[
             outb.Store4(16 * n, o);
         }"#,
     ),
+    // A mask with lanes outside the branch read as a number (the complement
+    // of a ballot, `s_not_b64`: inactive lanes' bits set), the low dword of
+    // a 64-bit wave sum (`v_add_co_u32` steps) and a half sum (`v_add_f16`
+    // steps keeping the high half; exact values, so any order agrees). 32
+    // threads, one wave.
+    (
+        "complemented ballots and wide and half sums",
+        r#"[RootSignature(RS)] [numthreads(8, 4, 1)]
+        void cs(uint3 d : SV_DispatchThreadID, uint i : SV_GroupIndex) {
+            uint u = raw.Load(4 * (i & 31));
+            uint4 o = 0;
+            if (u & 3) {
+                uint4 b = WaveActiveBallot((u & 4) != 0);
+                uint64_t m = ~(b.x | (uint64_t(b.y) << 32));
+                o.xy = uint2(m, m >> 32);
+                o.z = uint(WaveActiveSum(uint64_t(u) << 20));
+                o.w = asuint(float(WaveActiveSum(half((u >> 8) & 15) * half(0.25))));
+            }
+            outb.Store4(16 * (d.y * 16 + d.x), o);
+        }"#,
+    ),
     // Atomics the console aggregates per wave (one add of the lane count,
     // each lane's offset from `v_mbcnt`), and texture atomics. Results
     // that depend on the lanes' order are left out.

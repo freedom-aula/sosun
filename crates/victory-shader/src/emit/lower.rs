@@ -963,6 +963,62 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
+            Shape::Half(_, src, mask, ident, hi) => {
+                // The high half is a console lane's: compute only.
+                if self.mask_data != MaskData::Console {
+                    return Err("a 16-bit wave reduction outside compute");
+                }
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let x = self.i32_of(src)?;
+                let id = self.s.m.i32(ident);
+                let x = self.s.m.select(c, on, x, id);
+                self.s.flags |= flags::WAVE_OPS;
+                // shortcut: the f16 sum is taken in f32 and rounded once; the
+                // console rounds each step, in its own order.
+                let low = self.s.m.i32(0xFFFF);
+                let h = self.s.m.bin(c, Bin::And, x, low);
+                let f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h]);
+                let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+                let r = self.s.op(
+                    c,
+                    "waveActiveOp.f32",
+                    Attr::NoUnwind,
+                    self.s.t.f32,
+                    119,
+                    &[f, sum, signed],
+                );
+                let r = self
+                    .s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let r = self.s.m.bin(c, Bin::And, r, low);
+                // Lane `hi` runs the section on the console even where it is
+                // elsewhere on the host; there it holds the identity.
+                let i32t = self.s.t.i32;
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let b = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                let word = self.s.m.extract(c, b, hi / 32);
+                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+                let bit = self.s.m.bin(c, Bin::And, bit, one);
+                let there = self.s.m.cmp(c, pred::NE, bit, z);
+                let lane = self.s.m.i32(hi);
+                let at = self.read_lane(x, lane);
+                let top = self.s.m.select(c, there, at, id);
+                let high = self.s.m.i32(0xFFFF_0000);
+                let top = self.s.m.bin(c, Bin::And, top, high);
+                return Ok(self.s.m.bin(c, Bin::Or, top, r));
+            }
         };
         // A mesh program's lanes are numbered as the console's, its host
         // waves are not the console's: only a minimum or maximum (the loop
@@ -1433,8 +1489,9 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
+        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
+            let xy = self.mask_number(lo)?;
+            self.ballots.insert(lo, xy);
         }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
@@ -1463,6 +1520,126 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Both dwords of a mask holding lanes that do not reach the block
+    /// writing it (a complement, a copy made where EXEC is not known), so
+    /// no ballot there gives it: with console lanes, the scalar operation
+    /// that writes it applied to its operands' numbers, as the console does.
+    fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        if self.mask_data != MaskData::Console {
+            return Err(ELSEWHERE);
+        }
+        let p = self.x.p;
+        // A register the compiler reuses: a mask on one path, data on another.
+        if let Some(&(b, i)) = self.phi_at.get(&lo)
+            && p.blocks[b].phis[i]
+                .args
+                .iter()
+                .any(|a| !self.x.st.masks.contains_key(a))
+        {
+            return Err("a register joining a lane mask and data, read as data");
+        }
+        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .ok_or(ELSEWHERE)?;
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return Err(ELSEWHERE);
+        };
+        let wave64 = self.x.native.wave64;
+        let width = if wave64 { "_b64" } else { "_b32" };
+        let op = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .ok_or(ELSEWHERE)?;
+        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+            return Err(ELSEWHERE);
+        }
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        // Dword `h` of source `k` (inline constants sign-extend).
+        let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
+            let x = match src.get(k) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                    let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
+                    return l.i32_of(v);
+                }
+                Some(&Operand::Const(c)) => {
+                    let x = crate::resource::inline(c).ok_or(ELSEWHERE)?;
+                    match h {
+                        0 => x,
+                        _ if (x as i32) < 0 => u32::MAX,
+                        _ => 0,
+                    }
+                }
+                Some(&Operand::Literal(x)) if h == 0 => x,
+                Some(Operand::Literal(_)) => 0,
+                _ => return Err(ELSEWHERE),
+            };
+            Ok(l.s.m.i32(x))
+        };
+        let mut out = [self.s.m.i32(0); 2];
+        for h in 0..1 + u8::from(wave64) {
+            let a = word(self, 0, h)?;
+            let ones = self.s.m.i32(u32::MAX);
+            out[usize::from(h)] = match op {
+                "mov" => a,
+                "not" => self.s.m.bin(at, Bin::Xor, a, ones),
+                "cselect" => {
+                    let c = word(self, 1, h)?;
+                    let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                    let cond = match self.get(scc)? {
+                        Val::Bit(x) => x,
+                        Val::I32(x) => {
+                            let z = self.s.m.i32(0);
+                            self.s.m.cmp(at, pred::NE, x, z)
+                        }
+                        Val::Missing(w) => return Err(w),
+                    };
+                    self.s.m.select(at, cond, a, c)
+                }
+                _ => {
+                    let c = word(self, 1, h)?;
+                    // (operation, complement of src1, complement of the result)
+                    let (f, not_c, not_r) = match op {
+                        "and" => (Bin::And, false, false),
+                        "or" => (Bin::Or, false, false),
+                        "xor" => (Bin::Xor, false, false),
+                        "andn2" => (Bin::And, true, false),
+                        "orn2" => (Bin::Or, true, false),
+                        "nand" => (Bin::And, false, true),
+                        "nor" => (Bin::Or, false, true),
+                        "xnor" => (Bin::Xor, false, true),
+                        _ => return Err(ELSEWHERE),
+                    };
+                    let c = if not_c {
+                        self.s.m.bin(at, Bin::Xor, c, ones)
+                    } else {
+                        c
+                    };
+                    let r = self.s.m.bin(at, f, a, c);
+                    if not_r {
+                        self.s.m.bin(at, Bin::Xor, r, ones)
+                    } else {
+                        r
+                    }
+                }
+            };
+        }
+        Ok((out[0], out[1]))
     }
 
     // ---- operands ----
@@ -2965,9 +3142,12 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_mov_b64" => {
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    self.set(lo, Val::I32(a));
-                    self.set(hi, Val::I32(b));
+                    // Dword by dword: one without a value (the high dword of
+                    // a 64-bit wave sum) leaves the other usable.
+                    for (h, v) in [(0, lo), (1, hi)] {
+                        let x = half(self, 0, h).map_or_else(Val::Missing, Val::I32);
+                        self.set(v, x);
+                    }
                     Ok(())
                 }
                 // The code is taken to sit at address 0: what the program
