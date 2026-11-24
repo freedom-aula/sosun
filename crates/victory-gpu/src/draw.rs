@@ -2276,5 +2276,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+        drop(copy);
+        // A slot made from the view holds its copy: after more than a
+        // thousand other views' copies, draws still find (and refresh) the
+        // copy the slot shows; rewritten, the slot lets it go.
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
+        slots.make_at(0, &view(start + 100));
+        let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
+        for k in 1..1200 {
+            if (100 + 4 * k) % 456 != 0 {
+                crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
+            }
+        }
+        let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
+        assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
+        drop(found);
+        slots.make_null(0);
+        assert!(shown.upgrade().is_none(), "released with the slot");
     }
 }

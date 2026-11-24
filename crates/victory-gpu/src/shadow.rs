@@ -569,15 +569,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// its big GPU heap (the meshlet culling's 456-byte constants, the colour
 /// bakes' parameter blocks: refused, their slots read zeros, every meshlet
 /// culled). Such a view gets a copy of its own bytes, starting at its
-/// address.
-pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+/// address (`true` with it), which lives while a heap slot made from the
+/// view or a list holds it.
+pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
-        return Some(shadow);
+        return Some((shadow, false));
     }
     #[cfg(feature = "diagnostics")]
     VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    exact(address, len)
+    exact(address, len).map(|s| (s, true))
 }
 
 /// Asks for, and copies made of, views off their copy's elements, the
@@ -590,10 +591,16 @@ static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::At
 pub(crate) fn log_views(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let [asks, made, bytes, largest] = [0, 1, 2, 3].map(|i| VIEWS[i].swap(0, Relaxed));
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let live = EXACT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .values()
+        .filter(|w| w.strong_count() > 0)
+        .count();
     if asks > 0 {
         tracing::info!(
-            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {kept} kept",
+            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live",
             asks as f64 / frames,
             made as f64 / frames,
             bytes as f64 / frames / 1e3
@@ -601,34 +608,32 @@ pub(crate) fn log_views(frames: f64) {
     }
 }
 
-/// Copies of single views' bytes ([`for_view`]), by (start, length), with
-/// the use that last asked for each.
+/// Copies of single views' bytes ([`for_view`]), by (start, length), held
+/// by the heap slots made from them and the lists that use them: a copy is
+/// found again for as long as a slot shows it, so draws refresh the copy
+/// the GPU reads (a capped cache dropped copies slots still showed, and a
+/// new copy of the same bytes took the refreshes). With the size the map
+/// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
-
-/// Copies [`EXACT`] keeps: ring positions change every frame, so the least
-/// recently asked for go (lists and heap slots using one keep it alive).
-const EXACT_KEPT: usize = 1024;
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
 fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = *tick;
-        return Some(shadow.clone());
+    let (prune_at, map) = &mut *guard;
+    if let Some(shadow) = map.get(&(address, len)).and_then(std::sync::Weak::upgrade) {
+        return Some(shadow);
     }
-    if map.len() >= EXACT_KEPT
-        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
-    {
-        map.remove(&oldest);
+    // Ring positions change every frame: entries die by the hundred.
+    if map.len() >= *prune_at {
+        map.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (2 * map.len()).max(1024);
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), *tick));
+    map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;

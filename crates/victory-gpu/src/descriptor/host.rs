@@ -29,7 +29,8 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// With it the view's own copy of title memory, if it has one.
+    kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -423,7 +424,7 @@ impl HostHeap {
                     .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
             }
         }
-        self.keep(index, buffer.cloned());
+        self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
     }
 
@@ -463,14 +464,14 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    fn keep(&self, index: u32, resource: Kept) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
             #[cfg(feature = "diagnostics")]
-            if let Some(old) = &old
+            if let Some((old, _)) = &old
                 && !self.sampler
-                && slot.as_ref().map(windows::core::Interface::as_raw) != Some(windows::core::Interface::as_raw(old))
+                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
                 // SAFETY: a live resource.
                 && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
             {
@@ -482,7 +483,7 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some(old) = old {
+            if let Some((old, _)) = old {
                 crate::host::retire(old);
             }
         }
@@ -554,8 +555,8 @@ impl HostHeap {
             host.device
                 .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
         }
-        self.keep(index, buffer.cloned());
-        self.keep(index + 1, buffer.cloned());
+        self.keep(index, buffer.map(|b| (b.clone(), None)));
+        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
     }
@@ -793,7 +794,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let shadow = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
 }
 
@@ -815,8 +816,10 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+/// The host resource a slot made by [`make`] views, if any, and the view's
+/// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
+/// it, so that draws reading the view find and refresh that copy.
+type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
 
 fn buffer_srv(
     address: u64,
@@ -833,7 +836,7 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
@@ -846,7 +849,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -886,7 +889,7 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let shadow = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -906,7 +909,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1013,7 +1016,7 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten()
+    make(view, at).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -1063,7 +1066,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Some((texture.clone(), None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -1086,7 +1089,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
             if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
-                return crate::twin::uav(resource, &copy, desc.as_ref(), at).map(Some);
+                return crate::twin::uav(resource, &copy, desc.as_ref(), at)
+                    .map(|twin| Some((twin, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
             if desc.is_none() && !default_view(resource) {
@@ -1104,7 +1108,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some((texture.clone(), None)))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
