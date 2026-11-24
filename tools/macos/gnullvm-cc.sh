@@ -16,6 +16,6 @@ for a in "$@"; do
     esac
     shift
 done
-exec "$LLVM/bin/clang" --target=x86_64-w64-windows-gnu \
+exec "$LLVM/bin/clang" --target=x86_64-w64-windows-gnu -Wno-unused-command-line-argument \
     --sysroot="$M/x86_64-w64-mingw32" -fuse-ld="$LLD/bin/ld.lld" \
     -L"$GCC_LIB" -L"$M/x86_64-w64-mingw32/lib" "$@"

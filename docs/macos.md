@@ -44,8 +44,10 @@ WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRID
 On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored. Every loader, HLE, console memory and shader test passes on the same Wine. The policy test fails only because it runs git inside Wine. Three GPU tests show real D3DMetal differences that still need work.
 
 - `buffer_data_reaches_the_host_texture`: fixed. The upload was queued as a copy into title memory, and that check uses VirtualQuery, which cannot see D3DMetal's mappings under Wine, so the copy was skipped. It is now queued as a fill of the list's upload memory.
-- `argument_clamp_builds`: the clamp shader is compiled at run time with D3DCompile, and Wine's compiler (vkd3d-shader) has no `Load` on `RWByteAddressBuffer`, no structured buffer stores and no `[RootSignature]` attribute. Without the clamp, indirect draws are dropped.
-- `a_rejected_blob_gives_an_empty_library`: D3DMetal accepts a pipeline library blob that Windows rejects.
+- `argument_clamp_builds`: fixed. Wine's HLSL compiler (vkd3d-shader) cannot compile the clamp shader, so the `clamp bytecode` workflow compiles `clamp.hlsl` with FXC and DXC on a Windows runner, and `cargo xtask embed-clamp` embeds the result with a hash of the source.
+- `a_rejected_blob_gives_an_empty_library`: fixed. D3DMetal accepts any pipeline library bytes, so the cache file now carries a mark and a checksum that VIctory checks itself.
+
+After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 265 passed, 0 failed and 4 ignored.
 
 ## Route A: next steps
 
@@ -61,3 +63,15 @@ The steps are as follows.
 ## Route B: a native macOS host
 
 Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
+
+## Running VIctory on a Mac
+
+These steps set up a Mac from nothing. Only the last one needs the game.
+
+1. Install Homebrew, then `brew install rustup llvm lld mingw-w64 bison flex pkgconf`, and install Rosetta 2.
+2. Build an x86_64 prefix with FreeType and GnuTLS (the Minecraft Bedrock macOS setup has one), and run `DEPS=<that prefix> tools/macos/build-crossover-wine.sh`. It takes about half an hour.
+3. Download the Game Porting Toolkit from developer.apple.com with your own Apple account, open "Evaluation environment for Windows games" inside it, and copy its `redist/lib` folder over `~/Library/Caches/victory-macos/target/wine-cx/lib`.
+4. Run `tools/macos/victory.sh config` to check the setup.
+5. Copy `victory.example.toml` to `victory.toml`, set the path to your own copy of the game, and run `tools/macos/victory.sh run --execute <the game's executable>`.
+
+The game itself is as far along as upstream VIctory on Windows: it reaches the menus and loads the world, and the world does not render yet.
