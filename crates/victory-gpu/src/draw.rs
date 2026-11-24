@@ -106,9 +106,17 @@ pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Draws, mesh dispatches and dispatches recorded but not run on the host
+/// (no host pipeline) since the last call.
+pub(crate) fn take_dropped() -> u64 {
+    DROPPED.swap(0, Ordering::Relaxed)
+}
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped() {
+fn dropped(pipeline: usize) {
+    crate::pipeline::note_drop(pipeline as This);
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -325,6 +333,10 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -403,6 +415,7 @@ impl State {
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
@@ -420,11 +433,16 @@ impl State {
             }
             self.host_roots[usize::from(compute)] = root;
         }
-        if self.host_pipeline != self.pipeline {
+        // By host object: a title pipeline released and another made at its
+        // address is another host pipeline (the list keeps the old one).
+        if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = self.pipeline;
+            self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
+            // The title may release the pipeline before it submits the list.
+            list.keep(&p.pso);
+            list.keep(&p.root);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -475,11 +493,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         };
         if !p.compute {
@@ -548,12 +575,11 @@ impl State {
                 }
                 Err(_) => false,
             };
-        #[cfg(feature = "diagnostics")]
         if !ran {
-            dropped();
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
         }
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = ran;
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -599,6 +625,27 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // Tables reaching past a host heap smaller than the title's (the
+        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
+        // title's slots there have no host slot of their own.
+        for u in used.iter().filter(tables) {
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+                continue;
+            };
+            if index >= host.count() {
+                fresh.push(u.slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -781,9 +828,10 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        #[cfg(feature = "diagnostics")]
         if !ran {
-            dropped();
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
         }
     }
 
@@ -867,11 +915,158 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
-        #[cfg(feature = "diagnostics")]
         if !ran {
-            dropped();
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
         }
     }
+}
+
+impl State {
+    /// Indirect execution of a one-argument signature of `kind` (PC
+    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
+    /// records `stride` bytes apart at title address `arguments`, and the
+    /// record count at `count` if the title gives one: the GPU reads them
+    /// from the buffer's host copy, where earlier dispatches may have
+    /// written them. False if it cannot run on the host.
+    pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
+        let len = u64::from(stride) * u64::from(max.max(1));
+        let Some(args) = crate::shadow::find(arguments, len) else {
+            why("arguments outside title buffers");
+            return false;
+        };
+        let counter = match count {
+            Some(at) => match crate::shadow::find(at, 4) {
+                Some(s) => Some((s, at)),
+                None => {
+                    why("count outside title buffers");
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+            .then(|| host_signature(kind, stride))
+            .flatten()
+        else {
+            why("no host signature");
+            return false;
+        };
+        args.refresh(list, arguments, len);
+        if let Some((s, at)) = &counter {
+            s.refresh(list, *at, 4);
+        }
+        // Bounded first: the clamp binds a compute pipeline of its own.
+        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            return false;
+        }
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let ran = match kind {
+            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            MESH => self.prepare_for(list, false, true),
+            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+                Some(p) if p.compute => {
+                    self.bind(list, p, true);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ran {
+            crate::indirect::done(list, &args.buffer);
+            #[cfg(feature = "diagnostics")]
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                None => crate::pipeline::note_drop(self.pipeline as This),
+                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            }
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+        });
+        // SAFETY: an open list with everything set; the buffers are host
+        // copies the list keeps alive (refresh), the signature is cached.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &signature,
+                max,
+                &args.buffer,
+                args.offset(arguments),
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            )
+        };
+        crate::indirect::done(list, &args.buffer);
+        if kind == DISPATCH {
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+/// The host command signature for one argument of `kind` with records
+/// `stride` bytes apart (no root arguments, so no root signature), made
+/// once.
+fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        return Some(s.clone());
+    }
+    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+        ..Default::default()
+    };
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: stride,
+        NumArgumentDescs: 1,
+        pArgumentDescs: &argument,
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of one argument; no root arguments.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(
+            &desc,
+            None::<&ID3D12RootSignature>,
+            &mut signature,
+        )
+    };
+    if let Err(e) = result {
+        once!(error = %e, kind, stride, "host command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

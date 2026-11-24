@@ -53,7 +53,8 @@ pub struct Packet {
 }
 
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
-    let b = data.get(index * PACKET_BYTES..index * PACKET_BYTES + 4)?;
+    let start = index.checked_mul(PACKET_BYTES)?;
+    let b = data.get(start..)?.get(..4)?;
     let h = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     Some(Packet {
         frames: h >> 26,
@@ -136,7 +137,14 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut number = 0;
     while at < start {
         let mut cursor = Cursor { data, pos: at };
-        at += cursor.bits(LENGTH_BITS)? as usize;
+        let bits = cursor.bits(LENGTH_BITS)? as usize;
+        // The same rule as `read_frame`: a length that does not cover its own
+        // field is not a frame. A zero length would never move `at`, so a
+        // damaged packet would loop here for good.
+        if bits <= LENGTH_BITS as usize {
+            return None;
+        }
+        at += bits;
         number += 1;
     }
     let last = number + 1 >= header.frames;
@@ -1015,6 +1023,30 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
+    /// Writes `value` as `n` bits, MSB first, at bit `pos`.
+    fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
+        for i in 0..n as usize {
+            if value >> (n as usize - 1 - i) & 1 == 1 {
+                data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
+            }
+        }
+    }
+
+    /// A damaged packet whose first frame says it is 0 bits long: finding
+    /// the frame after a later one must give up, not walk in place forever
+    /// (found by random-input testing).
+    #[test]
+    fn a_zero_length_frame_before_the_start_ends_the_search() {
+        let mut data = vec![0u8; PACKET_BYTES];
+        // Two frames, the first at payload bit 0; its 15-bit length stays 0.
+        put_bits(&mut data, 0, 32, 2 << 26);
+        let start = HEADER_BITS + 100;
+        put_bits(&mut data, start, LENGTH_BITS, 200);
+        let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
+        assert_eq!(frame.bits, 200);
+        assert_eq!(frame.next, None);
+    }
+
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
     /// the standard formula, negated).
     fn imdct_reference(input: &[f32]) -> Vec<f32> {
@@ -1082,6 +1114,12 @@ mod tests {
     }
 
     #[test]
+    fn packet_rejects_out_of_range_indices_and_partial_headers() {
+        assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
+        assert!(packet(&[0; 3], 0).is_none());
+    }
+
+    #[test]
     fn packet_headers_and_frame_walk() {
         // Two packets: frame A (100 bits) and B (16300 bits, crossing into
         // packet 1 by 48 bits), then C (60 bits) in packet 1; the rest is
@@ -1124,11 +1162,13 @@ mod tests {
     fn walks_saved_streams() {
         let dir = std::env::var("VICTORY_XMA_STREAMS").unwrap();
         let mut bad = 0;
+        let mut streams = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|e| e != "xma") {
                 continue;
             }
+            streams += 1;
             let data = std::fs::read(&path).unwrap();
             let counted: u32 = (0..data.len() / PACKET_BYTES)
                 .map(|i| packet(&data, i).unwrap().frames)
@@ -1154,6 +1194,7 @@ mod tests {
             );
             bad += u32::from(walked != counted || errors > 0);
         }
+        assert!(streams > 0, "VICTORY_XMA_STREAMS contains no .xma files");
         assert_eq!(bad, 0);
     }
 

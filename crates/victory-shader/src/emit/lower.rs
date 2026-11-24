@@ -183,6 +183,10 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// Masks whose ballot is being built: a mask whose lane bit needs its
+    /// own value as a number (an opaque mask keyed by a dword it shares
+    /// with another) would otherwise recurse until the stack overflows.
+    balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -201,13 +205,14 @@ struct Lower<'a> {
     abort: Option<usize>,
 }
 
-/// Iterations after which a loop is left (per entry into it). The console
-/// runs a loop as long as its data says; data the host has not mirrored
-/// yet (a null view reads zeros) can make that four billion iterations,
-/// which hangs the host GPU until the driver resets it. A lane that
-/// reaches the limit leaves the program as killed (a pixel discards).
+/// Iterations after which a loop is left (per entry into it), unless
+/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
+/// its data says; data the host has not mirrored yet (a null view reads
+/// zeros) can make that four billion iterations, which hangs the host GPU
+/// until the driver resets it. A lane that reaches the limit leaves the
+/// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -472,6 +477,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            balloting: HashSet::new(),
             def_block: p
                 .blocks
                 .iter()
@@ -1013,8 +1019,10 @@ impl<'a> Lower<'a> {
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
         self.s.inputs.iter().enumerate().find_map(|(id, e)| {
             let r = e.row?;
+            // `then`, not `then_some`: the channel is only past `col` when
+            // the condition holds.
             (r == u32::from(row) && channel >= e.col && channel < e.col + e.cols)
-                .then_some((id, channel - e.col))
+                .then(|| (id, channel - e.col))
         })
     }
 
@@ -1161,7 +1169,12 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                let bit = self.boolean(m, at)?;
+                if !self.balloting.insert(lo) {
+                    return Err("a lane mask whose lanes depend on its own value");
+                }
+                let bit = self.boolean(m, at);
+                self.balloting.remove(&lo);
+                let bit = bit?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -1356,7 +1369,9 @@ impl<'a> Lower<'a> {
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
-    /// top bit when `signed`; widths from 32 on take every bit.
+    /// top bit when `signed`; widths from 32 on take every bit. A signed
+    /// field that runs past bit 31 extends from bit 31, as the hardware
+    /// does: the shift is arithmetic then.
     fn bfe(&mut self, a: V, off: V, width: V, signed: bool) -> V {
         let c = self.cur;
         let (k31, k32, zero, one, ones) = (
@@ -1367,7 +1382,8 @@ impl<'a> Lower<'a> {
             self.s.m.i32(u32::MAX),
         );
         let off = self.s.m.bin(c, Bin::And, off, k31);
-        let shifted = self.s.m.bin(c, Bin::LShr, a, off);
+        let shift = if signed { Bin::AShr } else { Bin::LShr };
+        let shifted = self.s.m.bin(c, shift, a, off);
         let full = self.s.m.cmp(c, pred::IUGE, width, k32);
         let w = self.s.m.bin(c, Bin::And, width, k31);
         let mask = self.s.m.bin(c, Bin::Shl, one, w);
@@ -1385,6 +1401,63 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// The median of three. With a NaN among them the hardware gives the
+    /// minimum of the three instead (the host's minimum skips NaNs, so that
+    /// is the smallest number among them).
+    fn med3(&mut self, a: V, b: V, third: V) -> V {
+        let c = self.cur;
+        let lo = self.binary(36, a, b);
+        let hi = self.binary(35, a, b);
+        let t = self.binary(36, hi, third);
+        let median = self.binary(35, lo, t);
+        let least = self.binary(36, lo, third);
+        let ab = self.s.m.cmp(c, pred::UNO, a, b);
+        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        self.s.m.select(c, nan, least, median)
+    }
+
+    /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
+    /// would round to it (a tiny negative `a`), the result is `below_one`,
+    /// the largest value under 1.0 in the operation's width. Hosts differ
+    /// here (some give 1.0). Comparing against a `threshold` distinct from
+    /// `below_one` prevents drivers (observed on NVIDIA) from folding
+    /// `r > k ? k : r` into `minNum` (`FMNMX`) and swallowing NaN.
+    fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
+        let c = self.cur;
+        let r = self.unary(22, a);
+        let limit = self.s.m.f32(threshold.to_bits());
+        let k = self.s.m.f32(below_one.to_bits());
+        let over = self.s.m.cmp(c, pred::OGE, r, limit);
+        self.s.m.select(c, over, k, r)
+    }
+
+    /// Sine, or cosine, of an angle in turns, as the hardware takes it. The
+    /// whole turns are taken off first (`x - round_even(x)`, exact, within
+    /// half a turn), so a large angle keeps its fraction; scaling to radians
+    /// first rounds it away. A zero passes unreduced (the sine of -0 is -0).
+    /// The sine of a half turn and the cosine of a quarter turn are exactly
+    /// +0 on the hardware, where the host's function of the rounded angle
+    /// gives about 1e-7. Infinities and NaN give NaN.
+    /// shortcut: below 2^-12 turns the hardware scales by a slightly
+    /// different constant than 2π (a last-place difference).
+    fn trig_turns(&mut self, x: V, cosine: bool) -> V {
+        let c = self.cur;
+        let zero = self.s.m.f32(0);
+        let whole = self.unary(26, x);
+        let part = self.s.m.bin(c, Bin::Sub, x, whole);
+        let is_zero = self.s.m.cmp(c, pred::OEQ, x, zero);
+        let part = self.s.m.select(c, is_zero, x, part);
+        let k = self.s.m.f32(TWO_PI.to_bits());
+        let angle = self.s.m.bin(c, Bin::Mul, part, k);
+        let r = self.unary(if cosine { 12 } else { 13 }, angle);
+        let at = if cosine { 0.25f32 } else { 0.5 };
+        let at = self.s.m.f32(at.to_bits());
+        let size = self.unary(6, part);
+        let exact = self.s.m.cmp(c, pred::OEQ, size, at);
+        self.s.m.select(c, exact, zero, r)
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -2451,15 +2524,8 @@ impl<'a> Lower<'a> {
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let cin = self.scc_in(inst)?;
-                let cin32 = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
-                let op = if name == "s_addc_u32" {
-                    Bin::Add
-                } else {
-                    Bin::Sub
-                };
-                let t = self.s.m.bin(c, op, a, b);
-                let r = self.s.m.bin(c, op, t, cin32);
-                (r, None)
+                let (r, carry) = self.add_sub_carry(c, name == "s_addc_u32", a, b, Some(cin));
+                (r, Some(carry))
             }
             "s_mul_i32" | "s_mulk_i32" => {
                 let a = src32(self, 0)?;
@@ -2608,6 +2674,31 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the
+    /// scalar and vector add-with-carry instructions set it.
+    fn add_sub_carry(&mut self, c: usize, add: bool, a: V, b: V, cin: Option<V>) -> (V, V) {
+        let op = if add { Bin::Add } else { Bin::Sub };
+        let mut r = self.s.m.bin(c, op, a, b);
+        // Without a carry in: a + b wraps below a; a - b borrows when a < b.
+        let mut carry = if add {
+            self.s.m.cmp(c, pred::IULT, r, a)
+        } else {
+            self.s.m.cmp(c, pred::IULT, a, b)
+        };
+        if let Some(cin) = cin {
+            let one = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
+            let t = r;
+            r = self.s.m.bin(c, op, t, one);
+            // The carry in carries on when the partial result is all ones
+            // (add) or zero (sub).
+            let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
+            let at_edge = self.s.m.cmp(c, pred::EQ, t, edge);
+            let more = self.s.m.bin(c, Bin::And, cin, at_edge);
+            carry = self.s.m.bin(c, Bin::Or, carry, more);
+        }
+        (r, carry)
     }
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
@@ -3540,6 +3631,22 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_swap_b32" => {
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swap_b32");
+                };
+                let a = self.i32_of(inst.read(Reg::V(dreg)).ok_or("v_swap_b32")?)?;
+                let b = self.i32_of(inst.read(Reg::V(sreg)).ok_or("v_swap_b32")?)?;
+                self.write_placed(inst, Reg::V(dreg), b, guard);
+                if dreg != sreg {
+                    self.write_placed(inst, Reg::V(sreg), a, guard);
+                }
+                Ok(())
+            }
             "v_ffbh_u32" | "v_ffbh_i32" => {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
@@ -3624,12 +3731,7 @@ impl<'a> Lower<'a> {
                         let t = self.binary(36, a, bb);
                         self.binary(36, t, cc)
                     }
-                    _ => {
-                        let lo = self.binary(36, a, bb);
-                        let hi = self.binary(35, a, bb);
-                        let t = self.binary(36, hi, cc);
-                        self.binary(35, lo, t)
-                    }
+                    _ => self.med3(a, bb, cc),
                 };
                 float(self, r)
             }
@@ -3643,7 +3745,7 @@ impl<'a> Lower<'a> {
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
-                let mut a = f(self, 0)?;
+                let a = f(self, 0)?;
                 let op = match name {
                     "v_rsq_f32" => 25,
                     "v_sqrt_f32" => 24,
@@ -3657,12 +3759,11 @@ impl<'a> Lower<'a> {
                     "v_sin_f32" => 13,
                     _ => 12,
                 };
-                if op == 13 || op == 12 {
-                    // The hardware takes revolutions.
-                    let k = self.s.m.f32(TWO_PI.to_bits());
-                    a = self.s.m.bin(c, Bin::Mul, a, k);
-                }
-                let r = self.unary(op, a);
+                let r = match op {
+                    12 | 13 => self.trig_turns(a, op == 12),
+                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    _ => self.unary(op, a),
+                };
                 float(self, r)
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
@@ -3849,26 +3950,7 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let add = name.starts_with("v_add");
-                let op = if add { Bin::Add } else { Bin::Sub };
-                let mut r = self.s.m.bin(c, op, a, bb);
-                // Without a carry in: a + b wraps below a; a - b borrows when a < b.
-                let mut carry = if add {
-                    self.s.m.cmp(c, pred::IULT, r, a)
-                } else {
-                    self.s.m.cmp(c, pred::IULT, a, bb)
-                };
-                if let Some(cin) = cin {
-                    let one = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
-                    let t = r;
-                    r = self.s.m.bin(c, op, t, one);
-                    // The carry in carries on when the partial result is all
-                    // ones (add) or zero (sub).
-                    let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
-                    let at_edge = self.s.m.cmp(c, pred::EQ, t, edge);
-                    let more = self.s.m.bin(c, Bin::And, cin, at_edge);
-                    carry = self.s.m.bin(c, Bin::Or, carry, more);
-                }
+                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -4221,12 +4303,7 @@ impl<'a> Lower<'a> {
                     let t = self.binary(36, a, b);
                     self.binary(36, t, acc)
                 }
-                _ => {
-                    let lo = self.binary(36, a, b);
-                    let hi = self.binary(35, a, b);
-                    let t = self.binary(36, hi, acc);
-                    self.binary(35, lo, t)
-                }
+                _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
         }
@@ -4250,7 +4327,7 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
                 _ => {
-                    let mut a = self.half_fsrc(inst, 0)?;
+                    let a = self.half_fsrc(inst, 0)?;
                     let op = match name {
                         "v_sqrt_f16" => 24,
                         "v_rsq_f16" => 25,
@@ -4264,11 +4341,12 @@ impl<'a> Lower<'a> {
                         "v_sin_f16" => 13,
                         _ => 12,
                     };
-                    if op == 13 || op == 12 {
-                        let k = self.s.m.f32(TWO_PI.to_bits());
-                        a = self.s.m.bin(c, Bin::Mul, a, k);
+                    match op {
+                        12 | 13 => self.trig_turns(a, op == 12),
+                        // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
+                        22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                        _ => self.unary(op, a),
                     }
-                    self.unary(op, a)
                 }
             };
             return float_result(self, r);
@@ -4500,6 +4578,12 @@ impl<'a> Lower<'a> {
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_xnor_b32" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.s.m.bin(c, Bin::Xor, a, b);
+                let ones = k(self, u32::MAX);
+                self.s.m.bin(c, Bin::Xor, x, ones)
             }
             "v_not_b32" => {
                 let a = s(self, 0)?;
@@ -6379,7 +6463,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(LOOP_LIMIT);
+        let limit = self.s.m.i32(super::loop_limit());
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -6475,7 +6559,76 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, buffer_format};
+    use super::{Numeric, Parts, buffer_format, lower};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::{io, ir, resource, structure};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Lowers a compute program of constants: whether it translates.
+    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_scalar_carry_chain_reaches_the_select() {
+        // The high dword of a 64-bit add or subtract, then a select on the
+        // carry (borrow) the high half leaves in SCC, and a branch on it
+        // (only code with an effect needs its operands).
+        let add = [
+            0xBE80_03C1, // s_mov_b32 s0, -1
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let sub = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8080_8100, // s_sub_u32 s0, s0, 1
+            0x8281_8001, // s_subb_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        for words in [add, sub] {
+            lowers(&words).unwrap();
+        }
+    }
 
     #[test]
     fn buffer_formats_by_number() {
