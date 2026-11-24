@@ -910,14 +910,22 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mips (width, height, levels, texels of
+    /// each level in turn).
+    Mipped(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F square texture SRV (size, levels) whose texels in level
+    /// `n` are all `n`.
+    Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1018,7 +1026,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
+            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1027,10 +1035,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1085,21 +1093,26 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::Cube(..) | View::Mipped(..) => {
+                        let (w0, h0, mut texels, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
+                            View::Cube(n, t) => (n, n, t, 6, 1),
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = levels as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        // Subresources face by face, each level in turn.
+                        for face in 0..(faces * levels) as usize {
+                            let level = face as u32 % levels;
+                            let (w, h) = ((w0 >> level).max(1), (h0 >> level).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1107,7 +1120,6 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
                             for y in 0..h as usize {
                                 let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
@@ -1116,6 +1128,7 @@ impl Host {
                                     row.len() * 16,
                                 );
                             }
+                            texels = &texels[(w * h) as usize..];
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
                             at_face.Anonymous.SubresourceIndex = face as u32;
@@ -1150,6 +1163,53 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::Levels(w, levels) => {
+                        let mut desc = texture(w, w, D3D12_RESOURCE_FLAG_NONE);
+                        desc.MipLevels = levels as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for level in 0..levels {
+                            let n = (w >> level).max(1);
+                            let pitch = (n as usize * 16).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * n as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            let row = vec![[level as f32; 4]; n as usize];
+                            for y in 0..n as usize {
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_ptr().cast::<u8>(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    row.len() * 16,
+                                );
+                            }
+                            upload.Unmap(0, None);
+                            let mut at_level = subresource(&tex);
+                            at_level.Anonymous.SubresourceIndex = level;
+                            list.CopyTextureRegion(
+                                &at_level,
+                                0,
+                                0,
+                                0,
+                                &footprint(&upload, n, n),
+                                None,
+                            );
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
@@ -1206,25 +1266,24 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
+                        let (format, words) = match *v {
+                            View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
+                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;

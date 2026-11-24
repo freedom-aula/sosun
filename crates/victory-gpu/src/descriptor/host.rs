@@ -33,6 +33,11 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// View heaps: the view-stride table translated shaders read
+    /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
+    /// byte stride of the buffer view there, 0 for none. Mapped at the
+    /// address kept beside it.
+    strides: Option<(ID3D12Resource, usize)>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -93,6 +98,12 @@ impl HostHeap {
                     })
             }
         };
+        // Every title slot, also past a capped heap: shaders read the table
+        // as a root view, which has no bounds.
+        let strides = (!sampler)
+            .then(|| host.upload_buffer(u64::from(count) * 4))
+            .flatten()
+            .map(|(buffer, data)| (buffer, data as usize));
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
@@ -146,6 +157,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            strides,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -296,6 +308,24 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+        self.set_stride(index, None);
+    }
+
+    /// Enters the byte stride of `view` (0 for none or not a buffer view)
+    /// for title slot `index` in the view-stride table.
+    fn set_stride(&self, index: u32, view: Option<&View>) {
+        let Some((_, data)) = &self.strides else { return };
+        if index >= self.count {
+            return;
+        }
+        let stride = view.map_or(0, view_stride);
+        // SAFETY: a dword of the mapped table, which has one per title slot.
+        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+    }
+
+    /// The view-stride table, for root SRV `VIEW_STRIDES`.
+    pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
+        self.strides.as_ref().map(|(buffer, _)| buffer)
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -320,6 +350,15 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+    }
+
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -363,6 +402,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            self.set_stride(index, Some(&view));
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -426,6 +466,41 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// The byte stride of a buffer view (its element size), 0 for other views:
+/// what the view-stride table holds for it.
+fn view_stride(view: &View) -> u32 {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            match desc[..10].try_into() {
+                Ok(words) => (*unordered, words),
+                Err(_) => return 0,
+            }
+        }
+        _ => return 0,
+    };
+    // The view dimension: buffer (1) for shader and unordered views alike.
+    if words[1] != 1 {
+        return 0;
+    }
+    let element = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        }
+    } else {
+        element_size(&srv_desc(words))
+    };
+    element as u32
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -619,6 +694,12 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Makes the host descriptor for `view` at `at` (in any host view heap):
+/// the host resource it views, if it can.
+pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    make(view, at).flatten()
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
