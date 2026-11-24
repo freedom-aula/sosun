@@ -41,7 +41,10 @@ x86() { arch -x86_64 /usr/bin/env PATH="$BREW/opt/bison/bin:$BREW/opt/flex/bin:$
 mkdir -p "$WORK" "$OBJ"
 TAR="$WORK/crossover-sources-$VERSION.tar.gz"
 if [[ ! -d $WORK/sources/wine ]]; then
-  [[ -f $TAR ]] || curl -fL -o "$TAR" "https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
+  [[ -f $TAR ]] || curl -fL --retry 3 -o "$TAR" "https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
+  if [[ $VERSION == 26.3.0 ]]; then
+    echo "ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872  $TAR" | shasum -a 256 -c --quiet || { echo "checksum mismatch for ${TAR:t}" >&2; exit 1; }
+  fi
   tar -xzf "$TAR" -C "$WORK"
 fi
 SRC="$WORK/sources/wine"
