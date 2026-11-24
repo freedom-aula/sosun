@@ -1,8 +1,22 @@
 # VIctory for macOS
 
-This is a fork of [VIctory](https://github.com/Marvisak/VIctory) that works on running it on Apple Silicon Macs. The first route runs the Windows build of VIctory under Wine with Apple's D3DMetal, and the later route replaces the Windows host layer with a native macOS one that uses Metal. Upstream is GPL-3.0 and this fork keeps that licence. No game files are in this repository, and none ever will be.
+This project runs Grand Theft Auto VI (Xbox Series X|S build) on Apple Silicon Macs from files that the user supplies. It is a separate macOS project and is not meant to be merged back into any other repository.
 
-The upstream README follows.
+No game files are in this repository, and none ever will be. You need your own copy of the game.
+
+## How it works
+
+The project builds the Windows runtime for `x86_64-pc-windows-gnullvm` on the Mac and runs it under a Wine built from CodeWeavers' CrossOver source, with Apple's D3DMetal turning Direct3D 12 into Metal. Rosetta 2 runs the game's x86-64 code. The current state, the build steps and the test results are in [docs/macos.md](docs/macos.md).
+
+## Acknowledgement
+
+This project is built on [VIctory](https://github.com/Marvisak/VIctory) by Marvisak, which runs the game natively on Windows. The loader, the console runtime, the GPU layer and the shader recompiler come from VIctory, and its history is kept in this repository. VIctory is licensed under GPL-3.0, so this project is licensed under GPL-3.0 as well.
+
+D3DMetal is part of Apple's Game Porting Toolkit and is not included here. Each user downloads it from Apple.
+
+## Notes from VIctory
+
+The text below is VIctory's own README, kept for reference. It describes the Windows version.
 
 # VIctory
 
