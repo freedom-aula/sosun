@@ -67,6 +67,34 @@
 //!   report 64-bit atomics on typed resources (options 9) and on descriptor
 //!   heap resources (options 11), else the pipeline is refused.
 //!
+//! * **Root parameters past the user SGPRs** (added 2026-11-24): a
+//!   compute program whose root signature does not fit its 16 user SGPRs
+//!   loads the rest from memory whose 40-bit address is in user data 0-1;
+//!   the table starts with user-data dword 16. They are user data as any
+//!   other: the host fills dword `index` as above.
+//! * **Root UAVs** (raw buffers) as root descriptors `u<i>` in
+//!   [`ROOT_CBV_SPACE`] ([`HostShader::root_uavs`]); what shaders write there
+//!   is the title's to see.
+//! * **Title memory** (added 2026-11-24, decision 0005's unified-memory
+//!   item): accesses at addresses the program computes (pointers in root
+//!   constants or loaded from memory, BVH nodes) go through a page table,
+//!   the root SRV `t0` in [`MEMORY_SPACE`] ([`HostShader::memory`]), dwords:
+//!   4096 level-1 entries for address bits 28-39 (a level-2 block number,
+//!   0 for none), then blocks of 4096 entries for bits 16-27 (64 KiB pages),
+//!   two dwords each: the resource-heap index of a raw SRV of the host
+//!   memory holding the page, whose raw UAV is the next index, and the low
+//!   dword of the title address that memory starts at (byte offset =
+//!   address low dword - it). Block 0 names null views; addresses at or
+//!   above 2^40 use it. A shader that writes there
+//!   ([`HostShader::memory_writes`]) sets bit `block × 4096 + page` of the
+//!   root UAV `u0` in [`MEMORY_SPACE`] for each page it writes (pages of an
+//!   access's first and last byte): what the host copies back.
+//! * **View addresses** ([`HostShader::view_addresses`]): a buffer
+//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
+//!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
+//!   index, two dwords, the buffer view's title address (high dword bits
+//!   0-15; stride bits 0), zeros for no buffer view.
+//!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
 //! earlier stages already run). The root constants of each stage must
@@ -96,6 +124,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod memory_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
@@ -115,7 +145,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES};
+pub use shader::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -174,6 +204,20 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
+    /// Whether the shader reads title memory at addresses it computes: the
+    /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
+    /// "Title memory").
+    pub memory: bool,
+    /// Whether it also writes there: the host binds the written-pages
+    /// bitmap `u0` in [`MEMORY_SPACE`].
+    pub memory_writes: bool,
+    /// Whether it reads buffer views' title addresses from their
+    /// descriptors: the host binds the view addresses `t1` in
+    /// [`MEMORY_SPACE`] (module notes, "Title memory").
+    pub view_addresses: bool,
 }
 
 impl HostShader {
@@ -327,6 +371,10 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
     })
 }
 
@@ -584,6 +632,10 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -594,6 +646,10 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

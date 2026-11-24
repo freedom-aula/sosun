@@ -111,6 +111,10 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         samplers: lowered.samplers,
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
     })
 }
 
