@@ -46,6 +46,15 @@ if [[ ! -d $WORK/sources/wine ]]; then
 fi
 SRC="$WORK/sources/wine"
 
+# CrossOver's win32u names libvulkan even when Wine is built without
+# Vulkan. A fallback name lets it compile, and loading it then fails
+# cleanly at run time. D3DMetal does not use Vulkan.
+VK="$SRC/dlls/win32u/vulkan.c"
+if ! grep -q 'victory-macos fallback' "$VK"; then
+  printf '%s\n' '/* victory-macos fallback */' '#ifndef SONAME_LIBVULKAN' '#define SONAME_LIBVULKAN "libvulkan.1.dylib"' '#endif' | cat - "$VK" > "$VK.new"
+  mv "$VK.new" "$VK"
+fi
+
 cd "$OBJ"
 if [[ ! -f Makefile ]]; then
   echo "configuring CrossOver Wine"
