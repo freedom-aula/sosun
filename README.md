@@ -8,9 +8,9 @@ It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which 
 </p>
 
 <p align="center">
-<img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-black?logo=apple">
+<img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="Tests 265 passed on an M4" src="https://img.shields.io/badge/tests-265%20passed%20on%20M4-2ea44f">
+<img alt="265 tests passed" src="https://img.shields.io/badge/tests-265%20passed-2ea44f">
 <img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
 </p>
 

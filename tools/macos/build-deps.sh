@@ -16,18 +16,29 @@ if [[ -f $PREFIX/lib/libgnutls.30.dylib && -f $PREFIX/lib/libfreetype.6.dylib ]]
   exit 0
 fi
 
-# Each entry is a URL and the SHA-256 of its tarball.
+# Each entry is a tarball, its SHA-256 and the mirrors that serve it.
 DEPS=(
-  "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
-  "https://ftp.gnu.org/gnu/nettle/nettle-3.10.tar.gz b4c518adb174e484cb4acea54118f02380c7133771e7e9beb98a0787194ee47c"
-  "https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.13.tar.xz ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e"
-  "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz 36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"
+  "gmp-6.3.0.tar.xz a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898 https://ftpmirror.gnu.org/gnu/gmp https://mirrors.kernel.org/gnu/gmp https://ftp.gnu.org/gnu/gmp"
+  "nettle-3.10.tar.gz b4c518adb174e484cb4acea54118f02380c7133771e7e9beb98a0787194ee47c https://ftpmirror.gnu.org/gnu/nettle https://mirrors.kernel.org/gnu/nettle https://ftp.gnu.org/gnu/nettle"
+  "gnutls-3.8.13.tar.xz ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8 https://mirrors.dotsrc.org/gcrypt/gnutls/v3.8 https://ftp.heanet.ie/mirrors/ftp.gnupg.org/gcrypt/gnutls/v3.8"
+  "freetype-2.14.3.tar.xz 36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f https://download.savannah.gnu.org/releases/freetype https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3 https://mirrors.sarata.com/non-gnu/freetype"
 )
 mkdir -p "$SRC" "$WORK"
+# Each tarball is tried from every mirror in turn, and a broken download is
+# resumed. The checksum decides what is kept, so a mirror cannot change it.
 for entry in $DEPS; do
-  url="${entry%% *}"; sum="${entry##* }"; file="$SRC/${url:t}"
-  [[ -f $file ]] || { echo "downloading ${url:t}"; curl -fL --retry 3 -o "$file.part" "$url" && mv "$file.part" "$file"; }
-  echo "$sum  $file" | shasum -a 256 -c --quiet || { echo "checksum mismatch for ${url:t}" >&2; exit 1; }
+  parts=(${=entry}); name="${parts[1]}"; sum="${parts[2]}"; file="$SRC/$name"
+  ok=0
+  for mirror in ${parts[3,-1]}; do
+    if [[ -f $file ]] && echo "$sum  $file" | shasum -a 256 -c --quiet 2> /dev/null; then ok=1; break; fi
+    echo "downloading $name from ${mirror}"
+    curl -fL --retry 5 --retry-all-errors --connect-timeout 20 -C - -o "$file.part" "$mirror/$name" || { rm -f "$file.part"; continue; }
+    mv "$file.part" "$file"
+    if echo "$sum  $file" | shasum -a 256 -c --quiet 2> /dev/null; then ok=1; break; fi
+    echo "checksum mismatch for $name from this mirror, trying the next one"
+    rm -f "$file"
+  done
+  (( ok )) || { echo "could not download $name from any mirror" >&2; exit 1; }
   tar -xf "$file" -C "$WORK"
 done
 
