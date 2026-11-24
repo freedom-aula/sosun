@@ -18,13 +18,13 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+use windows::core::Interface;
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -67,29 +67,17 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
-
-/// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-/// A host copy or resolve writes `resource`.
+/// A host copy or resolve writes `resource`: its host texture's contents
+/// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
-/// The title released a resource.
-pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
-    }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
-    }
+fn is_host_written(resource: This) -> bool {
+    crate::resource::host_copy(resource)
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -100,11 +88,17 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Copies [`alias_copy`] recorded since the last frame-rate line.
+pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
-/// two title textures at one memory, `to` (a placed view's) reading what
-/// the GPU wrote through `from` in another format of the same size
-/// (`resource::alias_source`). Through a buffer, each subresource with its
-/// own format; `to` no longer takes its contents from title memory.
+/// two title textures at one memory that cannot share a host texture
+/// (`resource::alias_source`: block-compressed against plain formats of
+/// the same bytes, or a cast the host refused), `to` (a placed view's)
+/// reading what the GPU wrote through `from`. Through a buffer, each
+/// subresource with its own format, as many as have the same bytes per
+/// row and rows in both; `to` no longer takes its contents from title
+/// memory.
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -115,28 +109,41 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ) else {
         return;
     };
-    // An odd key: textures' own first uses are keyed by the resource.
+    // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
     }
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
-    let n = u32::from(da.MipLevels) * u32::from(da.DepthOrArraySize).max(1);
-    let n = if da.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(da.MipLevels) } else { n };
-    let mut fa = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
-    let mut fb = fa.clone();
-    let mut total = 0;
-    // SAFETY: outputs sized for `n` subresources.
-    unsafe {
-        host.device
-            .GetCopyableFootprints(&da, 0, n, 0, Some(fa.as_mut_ptr()), None, None, Some(&mut total));
-        host.device
-            .GetCopyableFootprints(&db, 0, n, 0, Some(fb.as_mut_ptr()), None, None, None);
-    }
-    let same = fa.iter().zip(&fb).all(|(x, y)| {
-        x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && x.Footprint.Height == y.Footprint.Height
-    });
-    if !same {
+    let count = |d: &D3D12_RESOURCE_DESC| {
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(d.MipLevels)
+        } else {
+            u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize).max(1)
+        }
+    };
+    let footprints = |d: &D3D12_RESOURCE_DESC, n: u32| {
+        let mut f = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
+        let mut rows = vec![0u32; n as usize];
+        let mut total = 0;
+        // SAFETY: outputs sized for `n` subresources.
+        unsafe {
+            host.device
+                .GetCopyableFootprints(d, 0, n, 0, Some(f.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+        }
+        (f, rows, total)
+    };
+    let (fa, ra, total) = footprints(&da, count(&da));
+    let (fb, rb, _) = footprints(&db, count(&db));
+    // Subresources in order while both have the same bytes there (mips of
+    // a block-compressed texture past its last whole block do not).
+    let n = (0..fa.len().min(fb.len()))
+        .take_while(|&i| {
+            let (x, y) = (fa[i], fb[i]);
+            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
+        })
+        .count() as u32;
+    if n == 0 {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
@@ -172,11 +179,12 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
+    ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
         logged.push((from as usize, to as usize));
-        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, "aliased texture copied");
+        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
     }
 }
 
@@ -185,14 +193,11 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    // Once per list for each host texture, however many title textures of
+    // its memory the list samples.
+    if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -211,12 +216,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// never uploaded). True if it recorded; the texture is then in the copy
 /// destination state.
 pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    if host_written {
+    if is_host_written(resource) {
         return false;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -390,11 +390,12 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// The staging state of a title texture, made on first use.
+/// The staging state of a title texture's host texture, made on first use
+/// (one for all title textures of its memory).
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
+    let copy = crate::resource::host_copy(resource)?;
+    let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = held.as_ref() {
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -456,6 +457,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
-    map.insert(resource as usize, s.clone());
+    *held = Some(s.clone());
     Some(s)
 }

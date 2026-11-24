@@ -378,6 +378,15 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        // A depth texture's writable twin (`crate::twin`): what unordered
+        // views wrote, which reaches the depth texture at its next use.
+        for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
+            // SAFETY: a live resource.
+            let pd = unsafe { plane.texture.GetDesc() };
+            let by = format!("{by}-twin{p}");
+            let target = (i, *resource as crate::object::This, by.as_str());
+            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+        }
     }
 }
 
@@ -514,7 +523,10 @@ fn dump_one(
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
+        // decode it as depth, not as floats (all denormals, shown black).
+        let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
+        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0

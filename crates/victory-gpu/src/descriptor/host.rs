@@ -861,12 +861,13 @@ fn buffer_uav(
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
-/// resource's permission, of typed depth, and in another format than a
-/// typed resource's. A view of a typed texture in another format of its
-/// family takes the texture's format.
-/// shortcut: such a view (sRGB of UNORM, say) reads without its
-/// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+/// resource's permission, of typed depth, and in a format neither of the
+/// resource's family nor among the formats it was made castable to
+/// (`castable`, `resource::castable`). A view of a typed texture in another
+/// format of its family takes the texture's format unless it is castable.
+/// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
+/// without castable formats) reads without its conversion.
+fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -899,16 +900,63 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    if family(view) != family(own) {
+    let cast = castable.contains(&view);
+    if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
+        return false;
+    }
+    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+        once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
     if let Some(format) = format
         && !typeless
+        && !cast
     {
         *format = d.Format;
     }
     true
+}
+
+/// Whether a view without a description of `resource` (a title texture)
+/// may take its host texture's defaults: not when the host texture has
+/// another format than the title's (typeless, or shared with a title
+/// texture of another format of the same memory).
+/// shortcut: such views are null; spell the description out (dimension,
+/// mips) if the title makes them.
+fn default_view(resource: crate::object::This) -> bool {
+    let other = crate::resource::view_format(resource);
+    if other.is_some() {
+        once!(format = other, "a view without a description of a texture whose host texture has another format");
+    }
+    other.is_none()
+}
+
+/// Whether the host stores to typed unordered views of `format`.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
 }
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
@@ -947,9 +995,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if desc.is_none() && !default_view(resource) {
+                    return None;
+                }
+                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -971,7 +1023,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -979,8 +1031,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            let texture = &copy.texture;
+            // A depth texture's unordered views write its twin.
+            // SAFETY: a live resource.
+            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+                return crate::twin::uav(resource, &copy, desc.as_ref(), at).map(Some);
+            }
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if desc.is_none() && !default_view(resource) {
+                return None;
+            }
+            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
