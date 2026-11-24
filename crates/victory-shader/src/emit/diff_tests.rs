@@ -354,6 +354,21 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
+    // The same at uniform indices: scalar loads of the last structured
+    // element and the last raw dword (record counts read as data beside
+    // `s_buffer_load`).
+    (
+        "sizes for scalar loads",
+        r#"CS {
+            uint ns, st, nb;
+            structured.GetDimensions(ns, st);
+            raw.GetDimensions(nb);
+            S last = structured[ns - 1];
+            uint tail = raw.Load(nb - 4);
+            outb.Store4(16 * (d.y * 16 + d.x),
+                uint4(ns + asuint(last.a), last.b * 3 + st, tail ^ nb, nb != 0 ? d.x : d.y));
+        }"#,
+    ),
     // Typed loads (`tbuffer_load_format_*`, Grand Theft Auto VI's vertex
     // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
