@@ -15,8 +15,23 @@ DEPS_REAL="${DEPS:?set DEPS to an x86_64 prefix with FreeType and GnuTLS}"
 ALIAS="$HOME/Library/Caches/victory-macos"
 mkdir -p "$ALIAS" "$ROOT/target"
 ln -sfn "$ROOT/target" "$ALIAS/target"
-ln -sfn "$DEPS_REAL" "$ALIAS/deps"
-DEPS="$ALIAS/deps"
+# The deps are copied, and each library's recorded path is pointed at the
+# copy, because a prefix built elsewhere may record a folder that is gone.
+DEPS="$ALIAS/target/deps"
+if [[ ! -f $DEPS/.relinked ]]; then
+  rm -rf "$DEPS"
+  ditto "$DEPS_REAL" "$DEPS"
+  for lib in "$DEPS"/lib/*.dylib(.N); do
+    old_dir="$(otool -D "$lib" | sed -n 2p)"
+    old_dir="${old_dir:h}"
+    install_name_tool -id "$DEPS/lib/${lib:t}" "$lib" 2> /dev/null
+    for ref in $(otool -L "$lib" | awk 'NR > 2 {print $1}' | grep -F "$old_dir/" || true); do
+      install_name_tool -change "$ref" "$DEPS/lib/${ref:t}" "$lib" 2> /dev/null
+    done
+    codesign -f -s - "$lib" 2> /dev/null || true
+  done
+  touch "$DEPS/.relinked"
+fi
 WORK="$ALIAS/target/crossover"
 OBJ="$WORK/build"
 PREFIX="$ALIAS/target/wine-cx"
@@ -50,7 +65,7 @@ if [[ ! -f Makefile ]]; then
     --without-ffmpeg > configure.log 2>&1 || { tail -20 configure.log; exit 1; }
 fi
 echo "building CrossOver Wine"
-x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -m5 -B2 'error' make.log; exit 1; }
+x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
 x86 make install > install.log 2>&1
 cp -f "$DEPS"/lib/lib{gmp.10,nettle.8,hogweed.6,gnutls.30,freetype.6}.dylib "$PREFIX/lib/"
 echo "installed in $PREFIX"
