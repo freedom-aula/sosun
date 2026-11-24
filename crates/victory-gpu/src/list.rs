@@ -522,7 +522,10 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            list.defer_copy(staging, data, bytes as usize);
+            // The destination is the list's upload memory, not title
+            // memory. Under Wine it is mapped by the host GPU driver, which
+            // the title-memory check cannot see, so it is a fill.
+            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
