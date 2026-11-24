@@ -19,7 +19,7 @@ If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTR
 </p>
 
 > [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus and loads the world, but the world does not render yet. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
 
 ## What works today
 
