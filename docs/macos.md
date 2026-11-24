@@ -67,3 +67,7 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 ## Running VIctory on a Mac
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (265 passed, 0 failed).
+
+## Open differences under D3DMetal
+
+- Signed zero in minimums. VIctory's `max_and_min_order_negative_zero_below_positive_zero` test (added upstream on 24 November 2026) finds that a -0 input reaches the shader as +0 under D3DMetal, so `v_min_f32(-0, +0)` gives +0 where the console gives -0. Selecting on the integer bits did not help, which points at Apple's shader converter or Metal's fast math. The minimum cases of that test are skipped under Wine until a fix is found.
