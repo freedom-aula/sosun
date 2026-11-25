@@ -485,6 +485,12 @@ impl Shadow {
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
 
+    /// Its tracker's bit: `crate::watch::clean_bit` of it is
+    /// [`Shadow::clean`] (none for memory that is not tracked: never clean).
+    pub(crate) fn dirty_bit(&self) -> Option<u32> {
+        self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.

@@ -84,6 +84,8 @@ impl Map {
 #[derive(Default)]
 struct Layout {
     copies: Vec<Arc<Shadow>>,
+    /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
+    bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
 }
@@ -313,6 +315,7 @@ impl Shared {
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
+            bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
             blocks,
             owner,
@@ -348,9 +351,15 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         Some(s.layout.clone())
     })
     .flatten();
-    for c in layout.iter().flat_map(|l| &l.copies) {
-        let (start, len) = c.range();
-        add(c, start as usize, len as usize);
+    // Copies the title has not written since they took it are passed by
+    // without touching them (the table names every copy, ~4,700 in the world).
+    for l in layout.iter() {
+        for (c, bit) in l.copies.iter().zip(&l.bits) {
+            if !crate::watch::clean_bit(*bit) {
+                let (start, len) = c.range();
+                add(c, start as usize, len as usize);
+            }
+        }
     }
 }
 
@@ -400,7 +409,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner } = &*layout(key);
+        let Layout { copies, blocks, owner, .. } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };

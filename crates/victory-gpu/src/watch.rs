@@ -35,7 +35,7 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -44,9 +44,56 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, what it saves of
-/// pages it armed, and whether the first holds any (set and cleared under
-/// its lock, read without: [`Tracked::clean`]).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, AtomicBool);
+/// pages it armed, and its bit in [`DIRTY`] (none: always taken as dirty).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>);
+
+/// A bit per tracker, set while it holds changed pages: set and cleared
+/// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
+/// so that a submission asking about every copy its heaps reach (~14,000)
+/// reads a few KB instead of a cache line per copy.
+static DIRTY: [AtomicU64; DIRTY_WORDS] = [const { AtomicU64::new(0) }; DIRTY_WORDS];
+const DIRTY_WORDS: usize = 1 << 14;
+
+/// Bits of [`DIRTY`] given back, and the first never handed out.
+static FREE_BITS: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 0));
+
+fn dirty_bit() -> Option<u32> {
+    let mut free = FREE_BITS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(bit) = free.0.pop() {
+        return Some(bit);
+    }
+    let bit = free.1;
+    (bit < (DIRTY_WORDS * 64) as u32).then(|| {
+        free.1 += 1;
+        bit
+    })
+}
+
+fn set_dirty(bit: Option<u32>, dirty: bool) {
+    if let Some(bit) = bit {
+        let (word, mask) = (&DIRTY[bit as usize / 64], 1u64 << (bit % 64));
+        if dirty {
+            word.fetch_or(mask, Ordering::Release);
+        } else {
+            word.fetch_and(!mask, Ordering::Release);
+        }
+    }
+}
+
+/// Whether the tracker with bit `bit` holds no changed page (see
+/// [`Tracked::clean`]).
+pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
+    bit.is_some_and(|bit| DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0)
+}
+
+impl Drop for Changed {
+    fn drop(&mut self) {
+        if let Some(bit) = self.2 {
+            set_dirty(Some(bit), false);
+            FREE_BITS.lock().unwrap_or_else(|e| e.into_inner()).0.push(bit);
+        }
+    }
+}
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -225,11 +272,6 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         return None;
     }
     install();
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), AtomicBool::new(true)));
-    let mut g = guards();
-    for &page in &pages {
-        g.holders.entry(page).or_default().push(changed.clone());
-    }
     // The rest of the range, as byte runs.
     let mut untracked: Vec<(usize, usize)> = Vec::new();
     let mut at = start;
@@ -240,6 +282,15 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         }
         at = at.max(b);
     }
+    // A tracker with untracked parts is never clean: no bit.
+    let bit = if untracked.is_empty() { dirty_bit() } else { None };
+    set_dirty(bit, true);
+    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit));
+    let mut g = guards();
+    for &page in &pages {
+        g.holders.entry(page).or_default().push(changed.clone());
+    }
+    drop(g);
     Some(Tracked {
         start,
         end,
@@ -374,7 +425,7 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
-        self.changed.2.store(!changed.is_empty(), Ordering::Release);
+        set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -408,14 +459,20 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
-        self.changed.2.store(!changed.is_empty(), Ordering::Release);
+        set_dirty(self.changed.2, !changed.is_empty());
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
     /// finds nothing, and asking costs no lock. A write racing this answer
     /// is found by the next asking, as one racing a take.
     pub(crate) fn clean(&self) -> bool {
-        self.untracked.is_empty() && !self.changed.2.load(Ordering::Acquire)
+        clean_bit(self.changed.2)
+    }
+
+    /// The tracker's bit for [`clean_bit`], for callers that ask about
+    /// many trackers at once without touching each (none: never clean).
+    pub(crate) fn bit(&self) -> Option<u32> {
+        self.changed.2
     }
 
     /// The parts of `[from, to)` that are not tracked (see
@@ -549,7 +606,7 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         for c in holders {
             let first_write = {
                 let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
-                c.2.store(true, Ordering::Release);
+                set_dirty(c.2, true);
                 set.insert(page)
             };
             if first_write && save {
@@ -829,6 +886,22 @@ pub(crate) mod tests {
         drop(t);
         free(foreign);
         free(pool);
+    }
+
+    /// A tracker's dirty bit goes back when it goes, and the next tracker
+    /// starts dirty on it (everything changed at first).
+    #[test]
+    fn a_new_tracker_starts_dirty_on_a_bit_given_back() {
+        let p = pool(1);
+        let a = track(p, PAGE, true).expect("tracked");
+        assert_eq!(a.take(p, p + PAGE).len(), 1);
+        assert!(a.clean() && clean_bit(a.bit()));
+        drop(a);
+        let b = track(p, PAGE, true).expect("tracked");
+        assert!(!b.clean() && !clean_bit(b.bit()));
+        assert!(!clean_bit(None), "no bit: never clean");
+        drop(b);
+        free(p);
     }
 
     /// A page only partly in the range asked is copied in part and stays

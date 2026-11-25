@@ -44,8 +44,9 @@ pub(crate) struct Viewed {
 
 type Range = (usize, u64, u64, bool);
 
-/// A merged range: copy, start, bytes, unordered access.
-type Hull = (Arc<Shadow>, u64, u64, bool);
+/// A merged range: copy, start, bytes, unordered access, the copy's bit in
+/// the change tracker (`crate::watch::clean_bit`).
+type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
@@ -131,21 +132,24 @@ impl Viewed {
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hulls) = &inner.hulls {
-            return hulls.clone();
-        }
-        let hulls: Vec<Hull> = inner
-            .ends
-            .iter()
-            .filter_map(|(&(_, uav), (shadow, starts, ends))| {
-                let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
-                Some((shadow.clone(), from, to - from, uav))
-            })
-            .collect();
-        inner.hulls = Some(hulls.clone());
-        hulls
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls().clone()
+    }
+}
+
+impl Inner {
+    /// [`Viewed::ranges`], made once while no range comes or goes.
+    fn hulls(&mut self) -> &Vec<Hull> {
+        let Inner { hulls, ends, .. } = self;
+        hulls.get_or_insert_with(|| {
+            ends.iter()
+                .filter_map(|(&(_, uav), (shadow, starts, ends))| {
+                    let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
+                    Some((shadow.clone(), from, to - from, uav, shadow.dirty_bit()))
+                })
+                .collect()
+        })
     }
 }
 
@@ -256,9 +260,15 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
+///
+/// Copies the title has not written since they took it are passed by: a
+/// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, _, bit) in inner.hulls() {
+        if !crate::watch::clean_bit(*bit) {
+            add(shadow, *address as usize, *len as usize);
+        }
     }
 }
 
