@@ -751,10 +751,13 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// Textures also live on the host GPU (decision 0007), made on first use
+    /// ([`Resource::host`]); buffers do not yet.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    /// The creation's initial state and clear value, for the host texture.
+    #[cfg(windows)]
+    made_with: (u32, Option<[u32; 5]>),
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -985,7 +988,7 @@ pub(crate) mod life {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1000,7 +1003,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1009,7 +1012,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host().cloned()
 }
 
 /// The host description of a title texture: the same, without the
@@ -1141,6 +1144,17 @@ fn shared_texture(
         }
         return live;
     }
+    // Host textures are made on first use, in any order: the new one takes
+    // the uses of every title texture of the memory, so none replaces it.
+    let mut d = d;
+    if let Some(k) = key {
+        let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
+            if memory_key(address, &r.desc) == Some(k) {
+                d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+            }
+        }
+    }
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
@@ -1176,7 +1190,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(Some(h)), Some(k)) = (r.host.get(), memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1306,6 +1320,21 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 }
 
 impl Resource {
+    /// Its host texture, made the first time it is asked for: a list uses
+    /// the texture, a heap slot views it, a copy or upload reaches it. Most
+    /// of the title's textures are never used (decision 0007, "Host
+    /// textures made on first use").
+    #[cfg(windows)]
+    fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let (state, clear) = self.made_with;
+                let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
+                shared_texture(self.data() as u64, &self.desc, state, clear)
+            })
+            .as_ref()
+    }
+
     fn data(&self) -> *mut u8 {
         match self.backing {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
@@ -1341,25 +1370,25 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
-    #[allow(unused_mut)] // the host texture is set on Windows only
-    let mut resource = Box::new(Resource {
+    let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
         heap,
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: None,
+        host: std::sync::OnceLock::new(),
+        // The clear value names the format too: format, then color or
+        // depth and stencil (5 words), kept for when the texture is made.
+        #[cfg(windows)]
+        // SAFETY: the title passes a whole clear value (or null).
+        made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
     });
-    #[cfg(windows)]
-    {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
-    }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host.is_some() {
+    } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -1404,7 +1433,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+                && matches!((a.host.get(), b.host.get()), (Some(Some(x)), Some(Some(y))) if !std::sync::Arc::ptr_eq(x, y))
         })
 }
 
@@ -1414,7 +1443,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1430,7 +1460,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(h) = &self.host {
+        if let Some(Some(h)) = self.host.get() {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -1669,7 +1699,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1955,6 +1985,36 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// A title texture's host texture is made when first asked for, and a
+    /// texture of the same memory made later with more uses (unordered
+    /// access) shares it: the first one made takes every use the memory's
+    /// title textures have.
+    #[cfg(windows)]
+    #[test]
+    fn host_textures_are_made_on_first_use_with_every_use_of_their_memory() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let read = place(&texture(64, 64, 28, 1));
+        let written = place(&ResourceDesc { flags: UNORDERED, ..texture(64, 64, 28, 1) });
+        assert!(resource(read).host.get().is_none() && resource(written).host.get().is_none(), "made at creation");
+        let first = host_copy(read).expect("a host texture");
+        // SAFETY: a live resource.
+        assert_ne!(unsafe { first.texture.GetDesc() }.Flags.0 as u32 & UNORDERED, 0, "the memory's uses");
+        assert!(std::sync::Arc::ptr_eq(&first, &host_copy(written).unwrap()), "shared");
+        for r in [read, written] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     /// Title textures of one memory share a key in any format of the same
