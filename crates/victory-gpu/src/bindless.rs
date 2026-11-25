@@ -187,13 +187,18 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 }
 
 /// At submission, before anything else of it: the textures the heaps of its
-/// heap-indexing lists view are brought up to date, those whose title
-/// memory changed copied into their host textures by a list of ours, which
-/// the submission runs first (and leaves them readable by shaders).
+/// heap-indexing lists view, and `textures` (staging and host texture of
+/// those its lists read through tables, `crate::texture::upload`), are
+/// brought up to date, those whose title memory changed copied into their
+/// host textures by a list of ours, which the submission runs first (and
+/// leaves them readable by shaders): each at most once.
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
+pub(crate) fn uploads(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -205,6 +210,15 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     let list = guard.0.as_ref()?;
     let mut recorded = false;
+    let mut staged = std::collections::HashSet::new();
+    for (staging, copy) in textures {
+        if staged.insert(Arc::as_ptr(staging)) && staging.refresh() {
+            crate::texture::record_upload(list, copy, staging);
+            recorded = true;
+            #[cfg(feature = "diagnostics")]
+            UPLOADED.fetch_add(1, Relaxed);
+        }
+    }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its

@@ -52,8 +52,7 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked).
+/// What a texture's staging buffer holds: the hash of the memory detiled.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
@@ -195,10 +194,13 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
 }
 
-/// Records, once per list, the copy of `resource`'s staging buffer into
-/// its host copy, and the detiling that refreshes the staging buffer at
-/// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
+/// Has `resource`'s host copy brought up to date at the submission that
+/// runs `list`: its staging buffer detiled again if the memory changed, and
+/// then copied into the host texture by the submission's own upload list,
+/// once for all its lists (`crate::bindless::uploads`).
+///
+/// shortcut: a title copy into texture memory recorded in the same
+/// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
@@ -220,15 +222,34 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
         return;
     };
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    record(list, resource, texture, &staging);
-    // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    // Each list recorded the copy before (run perf7: 149 textures uploaded
+    // 3,195 times in a frame, 17 ms of GPU time), changed or not.
+    list.defer_texture(staging, copy);
 }
+
+/// Records into `list` the copy of `staging` into host texture `copy`,
+/// leaving it readable by shaders.
+pub(crate) fn record_upload(list: &HostList, copy: &Arc<crate::resource::HostTexture>, staging: &Staging) {
+    const COPY_DEST: u32 = 0x400;
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    let move_to = |wanted| {
+        if let Some(b) = list.move_texture(copy, wanted) {
+            // SAFETY: an open list; the barrier names a live texture.
+            unsafe { list.list.ResourceBarrier(&[b]) };
+        }
+    };
+    move_to(COPY_DEST);
+    copies(list, &copy.texture, staging, String::new);
+    move_to(SHADER_RESOURCE);
+    list.keep(&staging.buffer);
+    UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Uploads [`record_upload`] recorded.
+pub(crate) static UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// For textures shaders reach through the heap itself, at submission
 /// (`crate::bindless::uploads`): brings the staging buffer up to date and
@@ -255,6 +276,13 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
 fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    copies(list, texture, staging, || format!("{resource:?}"));
+}
+
+/// Records the copy of every subresource of `staging` into `texture` (in
+/// the copy destination state); `name` names it in diagnostics notes.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn copies(list: &HostList, texture: &ID3D12Resource, staging: &Staging, name: impl Fn() -> String) {
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
@@ -265,7 +293,8 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
             list.note_read(
                 || {
                     format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        name(),
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -332,6 +361,12 @@ impl Staging {
             // double each texture's system memory.
             let mut read = vec![0u8; size];
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            // Its pages also hold other data the title writes (64 KiB pages,
+            // small textures): its own bytes decide.
+            let hash = blake3::hash(&read);
+            if last.hash.replace(hash) == Some(hash) {
+                return (size, false);
+            }
             self.detile(&read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);

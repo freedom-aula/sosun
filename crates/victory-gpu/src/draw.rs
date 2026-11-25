@@ -2351,6 +2351,51 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A texture the title wrote, read through tables by two lists of one
+    /// submission, is uploaded once; the next submission uploads it again
+    /// only after the title writes it (run perf7 uploaded the same textures
+    /// up to 24 times a frame).
+    #[test]
+    fn a_texture_is_uploaded_once_per_submission_and_only_when_written() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // Runtime memory the change journal follows; RGBA8 64x64, linear.
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        slots.make(0, &view);
+        let submit = |byte: Option<u8>| {
+            if let Some(byte) = byte {
+                // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+                unsafe { std::ptr::write_bytes(address as *mut u8, byte, 64 * 64 * 4) };
+            }
+            let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+            for list in &lists {
+                readable(list, &used(ResourceType::Srv), &view, false);
+                run(list, &slots, &read, 0, Some(&out), (8, 8));
+                list.close();
+            }
+            let before = crate::texture::UPLOADS.load(Ordering::Relaxed);
+            host.execute(&[&lists[0], &lists[1]]);
+            // SAFETY: inside the mapped output.
+            let texel = unsafe { (data as *const [f32; 4]).read() };
+            (crate::texture::UPLOADS.load(Ordering::Relaxed) - before, texel[0])
+        };
+        let (n, x) = submit(Some(0x40));
+        assert_eq!(n, 1, "one upload for two lists");
+        assert!((x - 64.0 / 255.0).abs() < 1e-6);
+        assert_eq!(submit(None).0, 0, "not written: not uploaded");
+        let (n, x) = submit(Some(0x80));
+        assert_eq!(n, 1, "written: uploaded again");
+        assert!((x - 128.0 / 255.0).abs() < 1e-6);
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 32-bit float) written through unordered views of its planes,
     /// then read as depth and stencil: the 16-bit depth arrives as the
