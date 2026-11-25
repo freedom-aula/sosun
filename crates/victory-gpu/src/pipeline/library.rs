@@ -171,11 +171,34 @@ fn unseal(file: Vec<u8>) -> Option<Vec<u8>> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // The `windows` binding hands the method the pointer of the slice it
+        // is given, and the pointer of an empty Rust slice is dangling rather
+        // than null. D3DMetal 3.0 reads any non-null pointer as a serialized
+        // blob, even at length zero, and refuses it, so the fallback that
+        // starts an empty library fails too and a run is left with no host
+        // pipeline library at all. The method's blob is optional, so an empty
+        // library is made through the vtable with a null pointer. (Found by
+        // nickorlabs in #28; measured here on an M5 Pro with CrossOver 26.3's
+        // D3DMetal 3.0.)
+        let data = if bytes.is_empty() {
+            core::ptr::null()
+        } else {
+            bytes.as_ptr().cast::<core::ffi::c_void>()
+        };
+        let mut raw = core::ptr::null_mut();
+        // SAFETY: `device` is a live device, and `bytes` outlives the call
+        // because the blob is kept beside the library. A null pointer with
+        // size 0 is what the method documents for "no initial data".
         unsafe {
-            device
-                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
-                .cast()
+            (device.vtable().CreatePipelineLibrary)(
+                device.as_raw(),
+                data,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(raw).cast()
         }
     };
     if !blob.is_empty() {
