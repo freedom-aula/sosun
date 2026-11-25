@@ -11,6 +11,10 @@
 #        queue.sh autotask
 # shellcheck disable=SC2016,SC2001 # literal backticks, jq and GraphQL in single quotes
 set -euo pipefail
+# A step that fails under `set -e` says where, instead of a bare exit 1
+# (25 November: claims were leased but never answered, with no output).
+set -E
+trap 'echo "queue.sh: line $LINENO failed (status $?): $BASH_COMMAND" >&2' ERR
 # shellcheck source=tools/fleet/lib.sh
 . "$(dirname "$0")/lib.sh"
 
