@@ -2438,6 +2438,50 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!((x - 128.0 / 255.0).abs() < 1e-6, "a reused staging buffer carries the new bytes: {x}");
     }
 
+    /// A title write into one mip of a texture uploads that mip alone (the
+    /// pages of the others did not change), and the others keep their
+    /// contents.
+    #[test]
+    fn a_write_into_one_mip_uploads_that_mip_alone() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // RGBA8 512x512 with two mips, linear, in memory the journal follows.
+        let address = crate::watch::tests::pool(32) as u64;
+        let mut words = texture_words(512, 512, 28, 0x100, 0);
+        words[7] = 1 | 2 << 16;
+        let object = texture_at_address(address, &words);
+        let (_, desc) = crate::resource::texture_memory(object).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+        let mip1 = layout.mips[1].offset as usize;
+        // SAFETY: the texture's memory (its layout's size).
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, layout.size as usize) };
+        let mut view = [0u32; 10];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 2]);
+        let view = View::Shader(object as usize, Some(view));
+        slots.make(0, &view);
+        let submit = || {
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            let before = crate::texture::copied(object);
+            host.execute(&[&list]);
+            // SAFETY: inside the mapped output.
+            let texel = unsafe { (data as *const [f32; 4]).read() };
+            (crate::texture::copied(object) - before, texel[0])
+        };
+        assert_eq!(submit().0, 2, "both mips at first");
+        // SAFETY: mip 1's bytes (256x256 texels of 4 bytes).
+        unsafe { std::ptr::write_bytes((address as usize + mip1) as *mut u8, 0x80, 256 * 256 * 4) };
+        let (n, x) = submit();
+        assert_eq!(n, 1, "mip 1 alone");
+        assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+    }
+
     /// A depth texture with stencil (the console's 16-bit depth, the
     /// host's 32-bit float) written through unordered views of its planes,
     /// then read as depth and stencil: the 16-bit depth arrives as the

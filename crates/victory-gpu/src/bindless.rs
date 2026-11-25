@@ -214,9 +214,9 @@ pub(crate) fn uploads(
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
         if staged.insert(Arc::as_ptr(staging))
-            && let Some(buffer) = staging.refresh()
+            && let Some(upload) = staging.refresh()
         {
-            crate::texture::record_upload(list, copy, staging, &buffer);
+            crate::texture::record_upload(list, copy, staging, &upload);
             recorded = true;
             #[cfg(feature = "diagnostics")]
             UPLOADED.fetch_add(1, Relaxed);
