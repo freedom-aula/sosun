@@ -2441,6 +2441,46 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
     }
 
+    /// Textures brought up in one submission share staging space (parts
+    /// of one upload buffer): each reads its own bytes.
+    #[test]
+    fn textures_uploaded_together_each_read_their_own_bytes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let outs: Vec<_> = (0..2).map(|_| host.shared_buffer(64 * 64 * 16).unwrap()).collect();
+        let pool = crate::watch::tests::pool(2);
+        let views: Vec<View> = (0..2usize)
+            .map(|k| {
+                let address = (pool + k * crate::watch::PAGE) as u64;
+                // SAFETY: the texture's memory in our pool, 256-byte rows of 64 texels.
+                unsafe { std::ptr::write_bytes(address as *mut u8, 0x40 * (k as u8 + 1), 64 * 64 * 4) };
+                let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+                let mut desc = [0u32; 10];
+                desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                View::Shader(object as usize, Some(desc))
+            })
+            .collect();
+        let lists: Vec<_> = (0..2usize)
+            .map(|k| {
+                slots.make(k as u32, &views[k]);
+                let list = host.new_list().unwrap();
+                readable(&list, &used(ResourceType::Srv), &views[k], false);
+                run(&list, &slots, &read, k as u32, Some(&outs[k].0), (8, 8));
+                list.close();
+                list
+            })
+            .collect();
+        host.execute(&[&lists[0], &lists[1]]);
+        for (k, (_, data)) in outs.iter().enumerate() {
+            // SAFETY: inside the mapped output.
+            let texel = unsafe { (*data as *const [f32; 4]).read() };
+            assert!((texel[0] - (0x40 * (k + 1)) as f32 / 255.0).abs() < 1e-6, "texture {k}: {}", texel[0]);
+        }
+    }
+
     /// A texture written in a page that holds only its own bytes is uploaded
     /// without hashing them (a movie frame rewritten every frame), so even
     /// the same bytes again are uploaded.

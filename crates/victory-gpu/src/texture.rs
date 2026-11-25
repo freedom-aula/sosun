@@ -118,6 +118,11 @@ const KEPT_BYTES: u64 = 64 << 20;
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
+    {
+        let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        (c.current, c.used) = (0, 0);
+        c.all.truncate(CHUNKS_KEPT);
+    }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
     for e in b.used.drain(..) {
@@ -154,6 +159,52 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = (e.1.clone(), e.2 as *mut u8);
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
     Some(made)
+}
+
+/// Staging space carved from large upload buffers, front to back: most
+/// textures take a part of one instead of a buffer of their own (making
+/// upload buffers was 10 % of the submitting thread in a new shot, run
+/// evict5). Rewound at each submission ([`recycle`]): the last one has run.
+struct Chunks {
+    /// (buffer, mapping), [`CHUNK`] bytes each.
+    all: Vec<(ID3D12Resource, usize)>,
+    /// The chunk being carved and the bytes taken from it.
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: the mappings are persistent mappings of the upload buffers.
+unsafe impl Send for Chunks {}
+
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+
+const CHUNK: u64 = 32 << 20;
+/// Chunks kept between submissions (more are made while one needs them).
+const CHUNKS_KEPT: usize = 16;
+
+/// `size` bytes of staging space: a buffer, the offset of the space in it
+/// (a multiple of 512, as texture copies need) and its mapping there.
+/// Space larger than a chunk is a buffer of its own ([`staging_buffer`]).
+fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    if size > CHUNK {
+        return staging_buffer(size).map(|(b, data)| (b, 0, data));
+    }
+    let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some((buffer, data)) = c.all.get(c.current) {
+            let at = c.used.next_multiple_of(512);
+            if at + size <= CHUNK {
+                let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
+                c.used = at + size;
+                return Some(made);
+            }
+            (c.current, c.used) = (c.current + 1, 0);
+            continue;
+        }
+        let (buffer, data) = host()?.upload_buffer(CHUNK)?;
+        crate::host::name(&buffer, || "texture staging chunk".into());
+        c.all.push((buffer, data as usize));
+    }
 }
 
 // SAFETY: the title memory is only read, under `last`'s lock.
@@ -324,7 +375,7 @@ pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
-    (buffer, subresources): &(ID3D12Resource, Vec<u32>),
+    (buffer, at, subresources): &Upload,
 ) {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -335,7 +386,7 @@ pub(crate) fn record_upload(
         }
     };
     move_to(COPY_DEST);
-    copies(list, &copy.texture, staging, buffer, subresources, String::new);
+    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     move_to(SHADER_RESOURCE);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -367,13 +418,15 @@ fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
-    buffer: &ID3D12Resource,
+    (buffer, at): (&ID3D12Resource, u64),
     subresources: &[u32],
     name: impl Fn() -> String,
 ) {
     for &i in subresources {
         let i = i as usize;
-        let footprint = &staging.footprints[i];
+        let mut footprint = staging.footprints[i];
+        footprint.Offset += at;
+        let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -423,9 +476,9 @@ fn copies(
     }
 }
 
-/// What a refresh gives: a staging buffer and the subresources detiled
-/// into it.
-pub(crate) type Upload = (ID3D12Resource, Vec<u32>);
+/// What a refresh gives: a staging buffer, where its space starts in it,
+/// and the subresources detiled into it.
+pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
@@ -474,7 +527,7 @@ impl Staging {
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).
-    pub(crate) fn refresh(&self) -> Option<(ID3D12Resource, Vec<u32>)> {
+    pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let (read, buffer) = self.refresh_now();
@@ -486,7 +539,7 @@ impl Staging {
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<(ID3D12Resource, Vec<u32>)>) {
+    fn refresh_now(&self) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -558,7 +611,7 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|b| (b, fresh)));
+            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -583,14 +636,14 @@ impl Staging {
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|b| (b, every)))
+        (size, buffer.map(|(b, at)| (b, at, every)))
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<ID3D12Resource> {
-        let (buffer, data) = staging_buffer(self.size)?;
+    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, at, data) = staging_space(self.size)?;
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -619,7 +672,7 @@ impl Staging {
                 return None;
             }
         }
-        Some(buffer)
+        Some((buffer, at))
     }
 }
 
