@@ -10760,6 +10760,35 @@ mod tests {
     }
 
     #[test]
+    fn an_address_half_set_where_only_lanes_that_never_run_skip_is_known() {
+        // As `indirect_light_probes:CS_Alpha_Schedule` after its texture: a
+        // table address whose high half (s25 = 0) is set inside the region
+        // that only a skip no lane takes bypasses; the skip edge would bring
+        // the stale input s25.
+        let words = [
+            0xBE9A_037E, // s_mov_b32 s26, exec_lo
+            0xBEFE_097E, // s_wqm_b32 exec_lo, exec_lo
+            0xBE98_0300, // s_mov_b32 s24, s0
+            0xBE86_3C1A, // s_and_saveexec_b32 s6, s26
+            0xBF88_0001, // s_cbranch_execz -> join
+            0xBE99_0380, // s_mov_b32 s25, 0
+            0xBEFE_0306, // join: s_mov_b32 exec_lo, s6
+            0xF408_0A0C,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[24:25], 0x40
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_1000,
+            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout, used).expect("the high half is 0 wherever a lane runs");
+    }
+
+    #[test]
     fn a_descriptor_skipped_only_by_lanes_that_never_run_needs_no_source() {
         // As `indirect_light_probes:CS_Alpha_Schedule`: the texture is
         // loaded under the lanes that ran before `s_wqm`, skipped when there

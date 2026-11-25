@@ -950,6 +950,25 @@ impl<'a> Tracer<'a> {
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+            || self.joined_on_taken_edges(hi) == Some(want)
+    }
+
+    /// What phi `t` holds in every lane that reads it: the one value its
+    /// args bring along the edges some lane takes (a register set inside a
+    /// region that only a skip no lane takes bypasses, as
+    /// `indirect_light_probes:CS_Alpha_Schedule`'s table address).
+    fn joined_on_taken_edges(&self, t: Term) -> Option<Term> {
+        let Term::Value(v) = t else { return None };
+        let (b, i) = self.phis[v.0 as usize]?;
+        let block = &self.p.blocks[b];
+        let mut taken = block.phis[i]
+            .args
+            .iter()
+            .zip(&block.preds)
+            .filter(|&(_, &q)| self.edge_taken(q, b))
+            .map(|(&a, _)| self.origin(a));
+        let first = taken.next()?;
+        taken.all(|x| x == first).then_some(first)
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
