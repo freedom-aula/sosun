@@ -12,6 +12,7 @@ use victory_platform::mem::{self, Protect};
 
 use super::xmem::{GRAPHICS, HOST_PROTECTION, PAGES_2M, PAGES_64K, PAGES_64K_BIT, address_range};
 
+#[allow(clippy::upper_case_acronyms)]
 pub(super) type BOOL = i32;
 
 // The Win32 values titles pass (`windows-sys` does not exist here).

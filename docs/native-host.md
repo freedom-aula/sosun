@@ -13,8 +13,10 @@ Wine-based work continues on the `test/run-C*` branches. This branch (`native/ho
 | `victory-loader::native`: map, relocate, protect, bind, TLS, TEB, calling-convention bridge, run | Done, x86-64 Rosetta host |
 | `victory-hle::host_posix`: first kernel32 calls on POSIX | 24 functions; `VirtualAlloc` is 64 KiB granular |
 | Probe PE end to end under Rosetta | Done |
-| `xmem` physical pages (`XMemAllocatePhysicalPages`, map, scatter, `map_alias`, DirectStorage writes) on `PagePool`, `modules::xmem_physical` | Done on both hosts: one pool per allocation, one Mach memory entry on macOS; Wine keeps one view per run of consecutive pages. `XMemVirtualAlloc` and the rest of `xmem` are still Windows only |
-| Exceptions (SEH, vectored handlers), files, the rest of `xmem`, DirectStorage, window and audio on macOS | Not started (see below) |
+| `xmem` physical pages (`XMemAllocatePhysicalPages`, map, scatter, `map_alias`, DirectStorage writes) on `PagePool`, `modules::xmem_physical` | Done on both hosts: one pool per allocation, one Mach memory entry on macOS; Wine keeps one view per run of consecutive pages. |
+| The rest of `xmem` (`XMemVirtualAlloc`, `XMemVirtualQuery`, `XMemAlloc` and the hooks, working-set statistics, transfers), `modules::xmem_posix` | Done on macOS, on `mem::reserve_in` / `next_region` / `footprint`; served from the registry. Hooks are found by reading the mapped title's export table |
+| DirectStorage (`modules::dstorage`) | Done on macOS: the scheduler and completion rules are unchanged; file reads are `pread` on its worker threads, destinations go through `write_physical` and `page_window`. Paths are the title's own with `\\` read as `/` until `files.rs` is ported |
+| Exceptions (SEH, vectored handlers), files, window and audio on macOS | Not started (see below) |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
 
 Run the tests with:
@@ -210,10 +212,10 @@ The recompiler produces arm64 code for the title's functions and runs it in an a
 
 ## Next steps, in order
 
-1. The rest of `xmem` on macOS: `XMemVirtualAlloc` (address range and 2 MiB alignment through `mach_vm_map` with a mask; a placeholder is just a reservation here), `XMemVirtualQuery`, `XMemAlloc` and the hooks, working-set statistics; `dstorage` onto `write_physical` and `page_window`, which are already portable. Merging Wine's views for scatter maps.
+1. Merging Wine's views for scatter maps. (`xmem` and `dstorage` are ported to macOS; a 32-bit `XMemAlloc` or `XMemVirtualAlloc` finds no address on macOS until the host executable is linked with a small `-pagezero_size`, since the default 4 GiB `__PAGEZERO` is the whole low range; and a committed page without access reports as reserved to `XMemVirtualQuery`.)
 2. Exceptions on macOS: the signal handler, `CONTEXT` translation, vectored handler chain, `RtlLookupFunctionEntry`/`RtlVirtualUnwind` over the mapped image, SEH dispatch (`__C_specific_handler`). The title's CRT and `crash.rs` depend on it; nothing real runs for long without it.
 3. Thread notices (`DLL_THREAD_ATTACH/DETACH`) from `spawn_title_thread`, `CREATE_SUSPENDED`, `SuspendThread`/`ResumeThread` (Mach), `WaitForMultipleObjects`, critical sections and SRW locks in the shim.
-4. Files: port `files.rs` (path rewriting) to POSIX behind the shim, then `storage.rs` and `dstorage.rs` (worker pool, `pread`).
+4. Files: port `files.rs` (path rewriting) to POSIX behind the shim, then `storage.rs`; `dstorage.rs` already opens through a private helper, which becomes the shim's `CreateFileW` once that has virtual drives.
 5. Move the remaining `cfg(windows)` HLE modules to compile on macOS with their Win32 calls behind `victory-platform`: `lifecycle` (window, `NSWindow`), `net`, `apu`/`audio` (CoreAudio), `media`.
 6. Cheaper crossings: inline the TEB-only host calls (`GetLastError`, `TlsGetValue`, `GetCurrentThreadId`) in the stubs; batch crossings for hot calls.
 7. Add `sig` to `HleExport`, generate bridge stubs from it (float arguments through the System V bridge, a recompiler-facing description).
