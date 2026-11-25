@@ -284,6 +284,11 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
 }
 
 impl Staging {
+    /// The title memory it reads: where it starts, bytes.
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all): whether it did.
     pub(crate) fn refresh(&self) -> bool {

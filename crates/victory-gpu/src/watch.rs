@@ -722,6 +722,16 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Whether a page of `[at, at + len)` is shown elsewhere too, as the
+/// runtime told when it mapped it (tracked or not): a write here changes
+/// the bytes there. Asked at submission, by a batch of refreshes that
+/// keeps what a copy into title memory cannot have changed; it takes the
+/// guard lock for one lookup and allocates nothing under it.
+pub(crate) fn aliased(at: usize, len: usize) -> bool {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    guards().alias_of.range(first..last).next().is_some()
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1070,6 +1080,27 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    /// Pages are reported aliased while the runtime says they are shown
+    /// twice, and not after either mapping changes.
+    #[test]
+    fn aliased_pages_are_found_by_range() {
+        let (a, b) = twin_views(3);
+        assert!(
+            aliased(a, 1) && aliased(b + 2 * PAGE + 5, 10),
+            "either view, any byte"
+        );
+        assert!(aliased(a + PAGE - 1, 2), "a range that reaches a page");
+        assert!(!aliased(a, 0), "no bytes");
+        let plain = pool(1);
+        assert!(!aliased(plain, PAGE));
+        free(plain);
+        // One page shown once only again: its link goes, the others stay.
+        title_memory_remapped(b + PAGE, PAGE);
+        assert!(!aliased(a + PAGE, PAGE) && !aliased(b + PAGE, PAGE));
+        assert!(aliased(a, PAGE) && aliased(b + 2 * PAGE, PAGE));
+        assert!(aliased(a, usize::MAX), "no overflow");
     }
 
     /// A write or mapping that runs past the end of the address space (a
