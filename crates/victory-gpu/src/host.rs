@@ -1992,6 +1992,11 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Nothing to copy: a world submission asks for every copy its heaps'
+        // views and page tables reach (~9,000), a few of them written.
+        if shadow.clean() {
+            return;
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;

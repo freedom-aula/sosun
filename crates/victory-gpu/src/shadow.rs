@@ -479,10 +479,19 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether the title wrote none of the copy's memory since the copy took
+    /// it (tracked memory only): [`Shadow::update`] would copy nothing.
+    pub(crate) fn clean(&self) -> bool {
+        self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.clean() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {

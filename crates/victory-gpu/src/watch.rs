@@ -35,6 +35,7 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -42,9 +43,10 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
-/// The pages a tracker has not taken since they changed, and what it saves
-/// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+/// The pages a tracker has not taken since they changed, what it saves of
+/// pages it armed, and whether the first holds any (set and cleared under
+/// its lock, read without: [`Tracked::clean`]).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, AtomicBool);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -214,7 +216,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default(), AtomicBool::new(true)));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -328,6 +330,7 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        self.changed.2.store(!changed.is_empty(), Ordering::Release);
         drop(changed);
         drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -361,6 +364,14 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        self.changed.2.store(!changed.is_empty(), Ordering::Release);
+    }
+
+    /// Whether no page changed since it was taken: then [`Tracked::take`]
+    /// finds nothing, and asking costs no lock. A write racing this answer
+    /// is found by the next asking, as one racing a take.
+    pub(crate) fn clean(&self) -> bool {
+        !self.changed.2.load(Ordering::Acquire)
     }
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
@@ -482,7 +493,11 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let first_write = {
+                let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+                c.2.store(true, Ordering::Release);
+                set.insert(page)
+            };
             if first_write && save {
                 c.save(page);
             }
@@ -684,16 +699,21 @@ pub(crate) mod tests {
         let p = pool(4);
         let a = track(p, 4 * PAGE, true).expect("pool memory is tracked");
         let b = track(p + PAGE, 2 * PAGE, true).expect("tracked");
+        assert!(!a.clean() && !b.clean(), "changed at first");
         assert_eq!(a.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        assert!(a.clean() && !b.clean());
         assert_eq!(b.take(p, p + 4 * PAGE), [(p + PAGE, p + 3 * PAGE)]);
         assert!(a.take(p, p + 4 * PAGE).is_empty() && b.take(p, p + 4 * PAGE).is_empty());
+        assert!(a.clean() && b.clean());
         // SAFETY: committed pages of ours, now read-only: the handler opens
         // the block; the second write needs no fault.
         unsafe {
             ((p + PAGE + 8) as *mut u8).write_volatile(1);
             ((p + PAGE + 9) as *mut u8).write_volatile(2);
         }
+        assert!(!a.clean() && !b.clean(), "a write is seen by every tracker");
         assert_eq!(a.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        assert!(a.clean());
         // `a` guarded it again; `b` still has it changed.
         assert!(b.changed(p / PAGE + 1));
         assert_eq!(b.take(p, p + 4 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
@@ -717,8 +737,10 @@ pub(crate) mod tests {
         let t = track(p + 100, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take(p + 100, p + PAGE + 10), [(p + 100, p + PAGE + 10)]);
         assert!(!t.changed(p / PAGE) && t.changed(p / PAGE + 1));
+        assert!(!t.clean(), "a page taken in part stays changed");
         assert_eq!(t.take(p, p + 3 * PAGE), [(p + PAGE, p + 2 * PAGE + 100)]);
         assert!(t.take(p, p + 3 * PAGE).is_empty());
+        assert!(t.clean());
         drop(t);
         free(p);
     }
