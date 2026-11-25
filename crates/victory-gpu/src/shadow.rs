@@ -596,7 +596,9 @@ impl Shadow {
     /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
     fn update_busy(&self, from: usize, to: usize) -> usize {
         let runs = match &self.tracked {
-            Some(t) => t.take(from, to),
+            // The parts off the runtime's memory whole, as `update_free`
+            // copies them.
+            Some(t) => t.take(from, to).into_iter().chain(t.untracked(from, to)).collect(),
             None => vec![(from, to)],
         };
         if runs.is_empty() {
@@ -1453,6 +1455,20 @@ pub(crate) mod tests {
         assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
         assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
         assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        // Under a range shaders write, declared before its refresh (as a
+        // submission's steps may come): the change reaches the copy and its
+        // snapshot, so copy-back takes it for nobody's and leaves the
+        // title's later write.
+        copy.writing(pool, len, false);
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0x9abc) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x9abc], "the change under the busy range");
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0xdef0) };
+        assert_eq!(copy.copy_back(pool, len), 0, "nothing the GPU wrote");
+        // SAFETY: as above.
+        assert_eq!(unsafe { word.read_volatile() }, 0xdef0, "the title's later write stays");
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.

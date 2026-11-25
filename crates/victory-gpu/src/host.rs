@@ -2464,11 +2464,11 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len, marked, _) => {
-                    // The shaders start from the title's data, which a
-                    // snapshot must hold (marked ranges keep none).
-                    if !marked {
-                        batch.flush();
-                    }
+                    // No flush first: the range's refreshes still pending
+                    // bring the title's data to the copy and its snapshot
+                    // alike (`Shadow::update_busy`), and the other copies'
+                    // stay batched (a flush per range cost 60-260 ms a
+                    // world frame).
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
@@ -4152,7 +4152,9 @@ mod withholding {
             let (copy, address) = (copies[k].clone(), (pools[k] + at) as u64);
             copy.refresh(&list, address, len);
             copy.gpu_writes(&list, address, len, false);
-            // The shader's write, after the step that keeps the range's bytes.
+            // The shader's write, after the refreshes (which a step that may
+            // write title memory does first, as the lists' run does).
+            list.defer(|| {});
             list.defer_host(move || copy.write_host(address, &[value]));
         }
         list.defer_missed(|| true);
