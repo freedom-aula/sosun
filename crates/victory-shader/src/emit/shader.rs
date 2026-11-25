@@ -40,6 +40,12 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
 /// the last bit.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// Lock words of emulated 64-bit image atomics, past the bitmap in the
+/// same buffer (`emit`, "Atomic locks"); a power of two.
+pub const ATOMIC_LOCKS: u32 = 1 << 16;
+/// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the bitmap, then
+/// the lock words.
+pub const VIEW_WRITES_BYTES: u32 = VIEW_WRITE_BITS / 8 + 4 * ATOMIC_LOCKS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -65,6 +71,7 @@ pub(crate) struct Types {
     pub bind: Ty,
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
+    pub res_ret_i32: Ty,
 }
 
 /// What a mesh shader declares beyond its thread-group size.
@@ -146,6 +153,7 @@ impl Shader {
         let bind = m.named_struct("dx.types.ResBind", vec![i32, i32, i32, i8]);
         let cbuf_ret = m.named_struct("dx.types.CBufRet.i32", vec![i32, i32, i32, i32]);
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
+        let res_ret_i32 = m.named_struct("dx.types.ResRet.i32", vec![i32, i32, i32, i32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
         let main = m.function("main", main_ty, None, true);
@@ -162,6 +170,7 @@ impl Shader {
                 bind,
                 cbuf_ret,
                 res_ret,
+                res_ret_i32,
             },
             pixel,
             inputs: Vec::new(),

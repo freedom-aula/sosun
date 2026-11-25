@@ -140,6 +140,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        atomic_locks: false,
         view_marks: false,
     })?;
 
@@ -1177,6 +1178,16 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
+    lower_cs32_with(words, used, validate, false)
+}
+
+/// [`lower_cs32`], with 64-bit image atomics under locks if `atomic_locks`.
+fn lower_cs32_with(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+    validate: bool,
+    atomic_locks: bool,
+) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1229,6 +1240,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        atomic_locks,
         view_marks: false,
     })
     .expect("lower");
@@ -1469,8 +1481,6 @@ fn image_atomics_of_64_bits() {
     ]);
     words.extend(image_atomic(0x10, 10, 3, 8, 0xF, false));
     words.push(S_ENDPGM);
-    let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 8)], true);
-
     let key = |lo: u32, hi: u32| u64::from(lo) | u64::from(hi) << 32;
     let a = |l: u32| key(31 - l, (l & 3) << 30);
     let b = |l: u32| key(l, 1);
@@ -1482,40 +1492,55 @@ fn image_atomics_of_64_bits() {
         want[96 + l as usize] = b(l);
     }
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        // D3DMetal says it has them but leaves the texels untouched
-        // (docs/macos.md, "Open differences").
-        if !host.heap_atomics64() || super::host::under_wine() {
-            // The runtime refuses such pipelines on this device.
-            eprintln!("no 64-bit typed heap atomics on the {label} device; skipped");
-            continue;
+    // The host's own 64-bit atomics, and ours under locks (`emit`, "Atomic
+    // locks"), which every SM 6.6 device runs.
+    for locks in [false, true] {
+        let shader = lower_cs32_with(&words, &[(4, ResourceType::Uav, 0, 8)], true, locks);
+        assert_eq!(shader.view_marks, locks, "the lock words' buffer");
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            // D3DMetal says it has them but leaves the texels untouched
+            // (docs/macos.md, "Open differences").
+            if !locks && (!host.heap_atomics64() || super::host::under_wine()) {
+                // The runtime refuses such pipelines on this device.
+                eprintln!("no 64-bit typed heap atomics on the {label} device; skipped");
+                continue;
+            }
+            let label = format!("{label}{}", if locks { ", locks" } else { "" });
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+                ud[u.index as usize] = 0;
+            }
+            let mut roots = vec![(0, Root::Constants(ud))];
+            if locks {
+                roots.push((1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0] }));
+                roots.push((2, Root::Uav(super::VIEW_WRITES_BYTES / 4)));
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &[View::Uint2TextureUav(32, 4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
+            assert_eq!(got, want, "{label}");
+            if locks {
+                assert!(out[1].iter().all(|&w| w == 0), "{label}: a lock left taken or a page marked");
+            }
         }
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
-            ud[u.index as usize] = 0;
-        }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::Uint2TextureUav(32, 4)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
-        assert_eq!(got, want, "{label}");
     }
 }
 
