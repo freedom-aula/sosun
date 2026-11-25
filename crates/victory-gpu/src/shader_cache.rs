@@ -91,8 +91,9 @@ fn atomic_locks() -> bool {
     })
 }
 
+/// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
-fn under_wine() -> bool {
+pub(crate) fn under_wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: ntdll is always loaded; both names end with a NUL.
     unsafe {
@@ -105,7 +106,7 @@ fn under_wine() -> bool {
 }
 
 #[cfg(not(windows))]
-fn under_wine() -> bool {
+pub(crate) fn under_wine() -> bool {
     false
 }
 

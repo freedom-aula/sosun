@@ -114,6 +114,18 @@ The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new sha
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
 
+## Host view heaps are filled with other threads' submissions held off
+
+Under Wine on D3DMetal, a list that one thread submits while another thread fills a new host view heap can lose its views: its shaders' writes are dropped and its reads give zeros, whatever heap the list binds (issue #31). Each host view heap has 2,359,296 slots, and `HostHeap::fill_null` makes every one null with 36 copies of 65,536 null views. On an M5 Pro with D3DMetal 4.0 beta 3 that takes 30 to 50 ms, and the victory-gpu tests fill several at once when they start.
+
+A texture that a dispatch wrote in that time read back as zeros. A copy of it by the copy engine was zeros too, and so was the same write and read in fresh lists, with fresh pipelines or with the views made again. It took writes again by itself 31 to 49 ms later, once the fills had ended. Skipping the fill, or holding submissions off while a heap is made and filled, stopped it. Holding them off only while its upload buffers were made did not.
+
+So `Host::quiet` holds the submission lock while a view heap is made and filled (`HostHeap::new`, and the first `Heap::host` of a title view heap, which also writes the views queued before it). The fill waits for the submission running then, and the next submission waits for the fill. That happens once per view heap. Elsewhere than Wine nothing is held. In 100 runs of the victory-gpu library tests on that Mac, the four texture tests this hit (1D and 3D, placed view, depth through unordered views, overlay) failed 62 times before, often several in one run, and not once after.
+
+A standalone D3D12 program did not reproduce it: 16 threads writing and reading textures, while 3 or 4 other threads made heaps of the same size and filled them the same way, bound in submissions or not. Something else VIctory does is needed as well, and it is not known what.
+
+Buffers are another matter, still open. `root_views_reach_their_copy_and_read_zeros_past_it` and the two `heap_views_` tests still fail in a few runs in a hundred, with or without the change. In a failed `root_views` run the source's host copy held the title's values while the output stayed zero, when run again at once, 100 ms later and with its view written again, so it does not come back by itself as the textures do.
+
 ## Masked stores into protected pages hang Rosetta
 
 On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpectedly need to EmulateForward on a synchronous exception` and the process hangs (issue #1). The faulting instruction is `vpmaskmovd [rax], ymm6, ymm4`, an AVX2 masked store in a loop that steps 32 bytes at a time.
