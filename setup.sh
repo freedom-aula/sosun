@@ -41,6 +41,8 @@ export PATH="$BREW/opt/rustup/bin:$PATH"
 say "setting up Rust"
 rustup show active-toolchain > /dev/null 2>&1 || rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
 rustup target add x86_64-pc-windows-gnullvm > /dev/null
+# The native macOS host's Rosetta tests (docs/native-host.md).
+rustup target add x86_64-apple-darwin > /dev/null
 
 # Wine's build breaks on paths with spaces, so the large build folders live
 # under a space-free link in the cache folder.

@@ -79,7 +79,7 @@ The steps are as follows.
 
 ## Route B: a native macOS host
 
-Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break.
+Later work replaces the Windows host underneath the title. That needs a Rosetta x86-64 process that maps the PE image, a macOS version of the host pass-through in `victory-hle`, a Metal backend for `victory-gpu`, and DXIL to Metal conversion with Apple's Metal shader converter. This only makes sense after Route A shows where things break. `docs/native-host.md` has the design, the first working slice (a PE mapped and run under Rosetta with no Wine) and the interfaces for the Metal backend and the recompiler.
 
 ## Running VIctory on a Mac
 
