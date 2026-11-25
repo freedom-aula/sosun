@@ -693,7 +693,8 @@ fn bitmap() -> Option<&'static Bitmap> {
     static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
-            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            // The bitmap, then the lock words of emulated 64-bit atomics.
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITES_BYTES);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
