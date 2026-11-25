@@ -1,6 +1,7 @@
 # Mac test fleet: opens a round of test-matrix tasks when main changes, at
-# most once per auto_round_hours (tools/fleet/fleet.json), and closes open
-# tasks for older commits. See docs/fleet.md.
+# most once per auto_round_hours (tools/fleet/fleet.json), closes open tasks
+# for older commits, and fills coverage gaps (chip x macOS version). Hourly,
+# so that gap tasks follow a round within gap_delay_hours. See docs/fleet.md.
 name: Fleet rounds
 
 on:
@@ -8,7 +9,7 @@ on:
     branches: [main]
     paths-ignore: ["docs/**", "**/*.md"]
   schedule:
-    - cron: "41 3 * * *"
+    - cron: "41 * * * *"
   workflow_dispatch:
 
 permissions:

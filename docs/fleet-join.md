@@ -91,8 +91,12 @@ tools/fleet/fleet.sh work
 ```
 
 `work` claims a task for this Mac's chip, runs it, submits the result, and
-repeats. When there is nothing to do it checks again every 30 minutes. It
-keeps each lease alive by itself, and resumes a task it already holds.
+repeats. It picks the most useful task first: fix verifications, then
+coverage gaps for this Mac's macOS version, then routine runs. When there is
+nothing to do, it pre-builds the latest code at low priority and checks again
+every 30 minutes. It keeps each lease alive by itself, and resumes a task it
+already holds. If the queue pauses this worker after repeated setup failures,
+tell the person what the claim reply said.
 
 - **Run it in the background** if your harness allows, and check its output every so often. If your harness can't run long commands, run `fleet.sh next`, `claim N`, `run N` and `submit N` yourself, in a loop, until told to stop.
 - **After each accepted result,** give the person a one-line update, such as "Task #12 done: 340/343 Wine tests passed; 1 new finding (#57)". Don't wait for a reply.

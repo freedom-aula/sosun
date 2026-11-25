@@ -13,7 +13,11 @@ REPO="${FLEET_REPO:-$(conf .repo)}"
 CACHE="$HOME/Library/Caches/victory-fleet"
 WORK="$CACHE/work"
 LEGAL="$ROOT/docs/fleet-legal.md"
-WINE_BIN="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine"
+# One persistent build folder for every task: setup.sh builds Wine and
+# VIctory inside the checkout's target/, so each worktree's target/ is a
+# symlink to this, and nothing is rebuilt from scratch between tasks.
+TARGET="$CACHE/target"
+WINE_BIN="$TARGET/wine-cx/bin/wine"
 MIN_FREE_GB=25
 
 say() { printf 'fleet: %s\n' "$*"; }
@@ -45,6 +49,47 @@ EOF
 }
 
 me() { gh api user --jq .login; }
+macos_major() { sw_vers -productVersion | cut -d . -f 1; }
+
+# Checks out COMMIT in the fleet worktree, with target/ linked to the shared
+# build folder.
+prepare_worktree() { # COMMIT
+    mkdir -p "$TARGET"
+    git -C "$ROOT" fetch --quiet "https://github.com/$REPO.git" "$1"
+    git -C "$ROOT" worktree remove --force "$WORK" > /dev/null 2>&1 || true
+    git -C "$ROOT" worktree prune
+    git -C "$ROOT" worktree add --quiet --detach "$WORK" "$1"
+    [ "$(git -C "$WORK" rev-parse HEAD)" = "$1" ] || die "checkout did not land on $1"
+    rm -rf "$WORK/target"
+    ln -s "$TARGET" "$WORK/target"
+}
+
+# Open tasks this Mac can take, best first: highest priority, then oldest.
+# Skips tasks that need another macOS version, and commits this person has
+# already run on this chip (the queue refuses both anyway). Prints
+# "NUMBER<TAB>PRIORITY<TAB>TITLE" lines.
+pick_tasks() {
+    local chip major done_commits it author body task meta m
+    chip=$(my_chip)
+    major=$(macos_major)
+    done_commits=$(gh issue list -R "$REPO" --state closed --assignee @me --label "$(label "done")" \
+        --label "$(chip_label "$chip")" --limit 100 --json body --jq '.[].body' |
+        sed -nE 's/^commit: *([0-9a-f]{40}) *$/\1/p' | sort -u)
+    gh issue list -R "$REPO" --state open --label "$(label task)" --label "$(label open)" \
+        --label "$(chip_label "$chip")" --limit 100 --json number,title,body,author --jq '.[] | @json' |
+        while read -r it; do
+            author=$(jq -r '.author.login' <<< "$it")
+            is_trusted_author "$author" || continue
+            body=$(jq -r '.body' <<< "$it")
+            task=$(parse_task "$body") || continue
+            grep -qx "${task% *}" <<< "$done_commits" && continue
+            meta=$(task_meta "$body")
+            m=$(jq -r .macos <<< "$meta")
+            [ -z "$m" ] || [ "$m" = "$major" ] || continue
+            printf '%s\t%s\t%s\n' "$(jq -r '.number' <<< "$it")" "$(jq -r .priority <<< "$meta")" \
+                "$(jq -r '.title' <<< "$it")"
+        done | sort -t "$(printf '\t')" -k2,2nr -k1,1n
+}
 brand() { sysctl -n machdep.cpu.brand_string 2> /dev/null || true; }
 my_chip() { chip_family_of "$(brand)"; }
 legal_hash() { shasum -a 256 "$LEGAL" | cut -d ' ' -f 1; }
@@ -75,6 +120,7 @@ load_issue() {
         T_KIND=task
         T_COMMIT=${task% *}
         T_CHIP=${task#* }
+        T_MACOS=$(task_meta "$body" | jq -r .macos)
     elif is_bot_login "$author" && finding=$(parse_finding "$body"); then
         T_KIND=finding
         read -r F_SIG F_TEST F_TOPIC <<< "$finding"
@@ -87,6 +133,7 @@ load_task() {
     load_issue "$1"
     [ "$T_KIND" = task ] || die "issue #$1 is a finding, not a test task"
     [ "$T_CHIP" = "$(my_chip)" ] || die "task #$1 is for $T_CHIP Macs and this is $(brand)"
+    [ -z "$T_MACOS" ] || [ "$T_MACOS" = "$(macos_major)" ] || die "task #$1 needs macOS $T_MACOS and this Mac runs $(sw_vers -productVersion)"
 }
 
 require_lease() {
@@ -175,12 +222,10 @@ cmd_gptk() {
 }
 
 cmd_next() {
-    local chip list
-    chip=$(my_chip)
-    is_chip "$chip" || die "unknown chip: $(brand)"
-    list=$(gh issue list -R "$REPO" --state open --label "$(label task)" --label "$(label open)" \
-        --label "$(chip_label "$chip")" --limit 10 --json number,title --jq '.[] | "#\(.number)\t\(.title)"')
-    if [ -z "$list" ]; then say "no open tasks for $chip Macs right now"; else printf '%s\n' "$list"; fi
+    local list
+    is_chip "$(my_chip)" || die "unknown chip: $(brand)"
+    list=$(pick_tasks | head -n 10 | awk -F '\t' '{ printf "#%s\tpriority %s\t%s\n", $1, $2, $3 }')
+    if [ -z "$list" ]; then say "no open tasks for this Mac right now"; else printf '%s\n' "$list"; fi
 }
 
 cmd_claim() {
@@ -215,15 +260,11 @@ cmd_run() {
     logs="$CACHE/logs/$n"
     mkdir -p "$logs"
 
-    say "checking out ${T_COMMIT:0:12} in $WORK"
-    git -C "$ROOT" fetch --quiet "https://github.com/$REPO.git" "$T_COMMIT"
-    git -C "$ROOT" worktree remove --force "$WORK" > /dev/null 2>&1 || true
-    git -C "$ROOT" worktree prune
-    git -C "$ROOT" worktree add --quiet --detach "$WORK" "$T_COMMIT"
-    [ "$(git -C "$WORK" rev-parse HEAD)" = "$T_COMMIT" ] || die "checkout did not land on $T_COMMIT"
+    say "checking out ${T_COMMIT:0:12} in $WORK (builds are kept in $TARGET)"
+    prepare_worktree "$T_COMMIT"
 
     # Keep the lease alive while the suites run.
-    (while sleep 3000; do gh issue comment "$n" -R "$REPO" --body "/beat" > /dev/null 2>&1 || true; done) &
+    (while sleep 1800; do gh issue comment "$n" -R "$REPO" --body "/beat" > /dev/null 2>&1 || true; done) &
     local beat_pid=$!
     trap 'kill "$beat_pid" 2> /dev/null || true' EXIT
 
@@ -264,7 +305,7 @@ cmd_run() {
         '{schema: 1, kind: "test-matrix", upstream_commit: $commit, hw_model: $model, chip: $chip,
           macos: $macos, gptk: $gptk, setup: $setup, native: $native, wine: $wine, failures: $failed,
           timings: {setup: $ts, native: $tn, wine: $tw}, binaries: $binaries}')
-    validate_result "$result" "$T_COMMIT" "$T_CHIP" > "$logs/result-errors.txt" ||
+    validate_result "$result" "$T_COMMIT" "$T_CHIP" "$T_MACOS" > "$logs/result-errors.txt" ||
         die "the result does not pass the schema (see $logs/result-errors.txt); please report this"
     printf '%s\n' "$result" > "$logs/result.json"
     jq . <<< "$result"
@@ -278,7 +319,7 @@ cmd_submit() {
     require_lease "$n"
     [ -f "$file" ] || die "no result for task #$n yet; run tools/fleet/fleet.sh run $n"
     result=$(jq -c . "$file")
-    validate_result "$result" "$T_COMMIT" "$T_CHIP" > /dev/null || die "$file does not pass the schema"
+    validate_result "$result" "$T_COMMIT" "$T_CHIP" "$T_MACOS" > /dev/null || die "$file does not pass the schema"
     gh issue comment "$n" -R "$REPO" --body "$(printf '/result\n```json\n%s\n```\n' "$result")" > /dev/null
     say "result posted; waiting for the queue to check it"
     for _ in $(seq 1 24); do
@@ -337,10 +378,11 @@ cmd_work() {
             n=$held
             say "resuming task #$n"
         else
-            n=$(gh issue list -R "$REPO" --state open --label "$(label task)" --label "$(label open)" \
-                --label "$(chip_label "$chip")" --limit 1 --json number --jq '.[0].number // empty' 2> /dev/null || true)
+            n=$(pick_tasks 2> /dev/null | head -n 1 | cut -f 1 || true)
             if [ -z "$n" ]; then
-                say "no tasks for $chip Macs right now ($done_count done so far); checking again in 30 minutes"
+                say "no tasks for this Mac right now ($done_count done so far)"
+                prewarm
+                say "checking again in 30 minutes"
                 nap 1800
                 continue
             fi
@@ -366,6 +408,23 @@ cmd_work() {
     done
     rm -f "$STOP_FILE"
     say "stopped after $done_count tasks"
+}
+
+# Backfill: while idle, pre-build the latest main at the lowest CPU priority,
+# so the next task starts with a warm build. Posts nothing.
+prewarm() {
+    local head
+    [ -x "$WINE_BIN" ] || return 0
+    head=$(git ls-remote "https://github.com/$REPO.git" refs/heads/main 2> /dev/null | cut -f 1)
+    [ -n "$head" ] && [ "$head" != "$(cat "$CACHE/prewarmed" 2> /dev/null)" ] || return 0
+    say "idle: pre-building main (${head:0:12}) at low priority so the next task starts warm"
+    (prepare_worktree "$head") || return 0
+    mkdir -p "$CACHE/logs"
+    (cd "$WORK" && PATH="/opt/homebrew/opt/rustup/bin:$PATH" nice -n 19 cargo build --quiet --workspace --tests &&
+        PATH="/opt/homebrew/opt/rustup/bin:$PATH" nice -n 19 cargo build --quiet --workspace --tests \
+            --target x86_64-pc-windows-gnullvm) \
+        > "$CACHE/logs/prewarm.log" 2>&1 || true
+    echo "$head" > "$CACHE/prewarmed"
 }
 
 cmd_stop() {
@@ -395,10 +454,7 @@ cmd_repro() {
     [ "$filter" = "$rest" ] && filter=""
     log="$CACHE/logs/repro-$1.log"
     mkdir -p "$CACHE/logs"
-    git -C "$ROOT" fetch --quiet "https://github.com/$REPO.git" main
-    git -C "$ROOT" worktree remove --force "$WORK" > /dev/null 2>&1 || true
-    git -C "$ROOT" worktree prune
-    git -C "$ROOT" worktree add --quiet --detach "$WORK" FETCH_HEAD
+    prepare_worktree "$(git ls-remote "https://github.com/$REPO.git" refs/heads/main | cut -f 1)"
     say "rerunning $F_TEST ($F_TOPIC) at $(git -C "$WORK" rev-parse --short=12 HEAD); log: $log"
     if [ "$suite" = native ]; then
         (cd "$WORK" && PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --workspace --no-fail-fast -- ${filter:+"$filter"}) > "$log" 2>&1 || true
@@ -408,7 +464,7 @@ cmd_repro() {
     fi
     local parsed
     parsed=$(parse_cargo "$log")
-    if signature_lines "$parsed" "$suite" | grep -q "^$F_SIG"; then
+    if grep -q "^$F_SIG" <<< "$(signature_lines "$parsed" "$suite")"; then
         say "reproduced: same signature $F_SIG. Local failure text (do not post it):"
         signature_lines "$parsed" "$suite" | grep "^$F_SIG" | cut -f 3
     elif grep -q "^F" <<< "$parsed"; then

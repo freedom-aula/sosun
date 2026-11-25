@@ -207,8 +207,26 @@ eq "small slowdowns ignored" "" "$(slowdowns "$good" "$(jq -c '.binaries[0].seco
 eq "chip family" m3 "$(chip_family_of "Apple M3 Pro")"
 eq "chip family of an Intel Mac" "" "$(chip_family_of "Intel(R) Core(TM) i7")"
 
+# --- scheduling
+fb=$(task_body "$SHA" m3 "$REPO" 26 5 2 57)
+eq "task with fields round-trips" "$SHA m3" "$(parse_task "$fb")"
+eq "task fields" '{"macos":"26","priority":5,"replica":"2","verifies":57}' "$(task_meta "$fb")"
+eq "default task fields" '{"macos":"","priority":1,"replica":"","verifies":null}' "$(task_meta "$body")"
+eq "task with fields passes moderation" "" "$(moderate "$fb")"
+ok "macOS constraint met" validate_result "$good" "$SHA" m3 15
+eq "macOS constraint missed" "this task needs macOS 26" "$(validate_result "$good" "$SHA" m3 26 || true)"
+eq "result seconds" 233 "$(result_seconds "$good")"
+eq "time limit default with few samples" 6 "$(printf '3600\n3600\n' | time_limit_hours 6)"
+eq "time limit from the 90th percentile" 6 "$(printf '3600\n3600\n7200\n' | time_limit_hours 6)"
+eq "time limit at least 2 hours" 2 "$(printf '60\n60\n60\n' | time_limit_hours 6)"
+eq "time limit at most 12 hours" 12 "$(printf '90000\n90000\n90000\n' | time_limit_hours 6)"
+clean=$(jq -c '.failures = []' <<< "$good")
+eq "flaky: one run saw it, the other did not" 0123456789ab "$(flaky_sigs "$good" "$clean")"
+eq "flaky: same failures" "" "$(flaky_sigs "$good" "$good")"
+eq "flaky: a suite did not run" "" "$(flaky_sigs "$good" "$(jq -c '.wine = null' <<< "$clean")")"
+
 # --- report
-r1=$(jq -c '. + {n: 1, closed: "2026-11-20T10:00:00Z"}' <<< "$good")
+r1=$(jq -c '. + {n: 1, closed: "2026-11-20T10:00:00Z", worker: "alice"}' <<< "$good")
 r2=$(jq -c '. + {n: 2, closed: "2026-11-21T10:00:00Z", chip: "Apple M1", hw_model: "MacBookAir10,1", failures: [], wine: {passed: 343, failed: 0, ignored: 0}}' <<< "$good")
 r3=$(jq -c '. + {n: 3, closed: "2026-11-22T10:00:00Z", chip: "Apple M2", setup: "failed", native: null, wine: null, failures: [], binaries: []}' <<< "$good")
 report=$(printf '%s\n%s\n%s\n' "$r1" "$r2" "$r3" | report_markdown)
@@ -216,6 +234,7 @@ ok "report counts results" grep -q '^3 accepted results across 1 commits' <<< "$
 ok "report coverage" grep -q '3 of 5: m1, m2, m3 | 2 of 3' <<< "$report"
 ok "report chip-specific failure" grep -q 'victory_gpu::tests::depth16` (gpu, sig `0123456789ab`): fails on m3; passes on m1' <<< "$report"
 ok "report lists every result" grep -q '^| #3 |' <<< "$report"
+ok "report workers" grep -q '^| @alice | 1 | m3 | 0.1 | 2026-11-20 |' <<< "$report"
 ok "report slowest binaries" grep -q 'm3 (`0123456789ab`): wine/victory_gpu 20.5 s' <<< "$report"
 r4=$(jq -c '. + {n: 4, closed: "2026-11-23T10:00:00Z", upstream_commit: "fedcba9876543210fedcba9876543210fedcba98", binaries: [{suite: "wine", name: "victory_gpu", seconds: 40}]}' <<< "$good")
 ok "report slowdowns" grep -q 'm3: wine/victory_gpu 20.5 s at `0123456789ab` -> 40 s at `fedcba987654`' <<< "$(printf '%s\n%s\n' "$r1" "$r4" | report_markdown)"

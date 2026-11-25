@@ -1,5 +1,6 @@
 # Mac test fleet: leases tasks and findings through issue comments, checks
-# results, files findings and screens text in fleet issues. See
+# results, files findings, opens verification tasks when a finding is
+# closed as fixed, and screens text in fleet issues. See
 # docs/fleet.md. Runs only for issues labelled fleet:task or fleet:finding,
 # or for every issue when the repository variable FLEET_MODERATE_ALL is
 # "true". Comment text is never evaluated. There is no concurrency group,
@@ -8,7 +9,7 @@ name: Fleet queue
 
 on:
   issues:
-    types: [opened, edited]
+    types: [opened, edited, closed]
   issue_comment:
     types: [created, edited]
 

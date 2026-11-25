@@ -25,6 +25,7 @@ cmd_labels() {
     gh label create "$(label review)" -R "$REPO" --force --color b60205 --description "Moderation bot flagged text for review"
     gh label create "$(label finding)" -R "$REPO" --force --color 5319e7 --description "Fleet finding: a failure signature or slowdown to fix"
     gh label create "$(label regressed)" -R "$REPO" --force --color b60205 --description "Fleet finding seen again after it was closed"
+    gh label create "$(label flaky)" -R "$REPO" --force --color fef2c0 --description "Fleet finding: runs of the same commit and chip disagree"
     local topic
     for topic in $FLEET_TOPICS; do
         gh label create "fleet:topic:$topic" -R "$REPO" --force --color ededed --description "Fleet finding topic: $topic"
@@ -68,7 +69,7 @@ cmd_report() {
                 jq -rs --arg w "$who" '[add // [] | .[] | select(.user.login == $w and (.body | startswith("/result")))] | last | .body // empty')
             json=$(result_json "$body") || continue
             validate_result "$json" "${task% *}" "${task#* }" > /dev/null || continue
-            jq -c --argjson n "$n" --arg closed "$closed" '. + {n: $n, closed: $closed}' <<< "$json"
+            jq -c --argjson n "$n" --arg closed "$closed" --arg who "$who" '. + {n: $n, closed: $closed, worker: $who}' <<< "$json"
         done | report_markdown
     printf '\n## Findings\n\n'
     gh issue list -R "$REPO" --state all --label "$(label finding)" --limit 1000 --json number,state,labels,assignees |

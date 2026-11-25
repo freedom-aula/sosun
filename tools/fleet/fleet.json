@@ -3,7 +3,6 @@
   "maintainers": [
     "pragyaangaur"
   ],
-  "lease_hours": 4,
   "chips": [
     "m1",
     "m2",
@@ -26,8 +25,23 @@
     "failing": "fleet:failing",
     "review": "fleet:review",
     "finding": "fleet:finding",
-    "regressed": "fleet:regressed"
+    "regressed": "fleet:regressed",
+    "flaky": "fleet:flaky"
   },
-  "lease_hours_finding": 72,
-  "auto_round_hours": 24
+  "auto_round_hours": 24,
+  "heartbeat_hours": 2,
+  "heartbeat_hours_finding": 72,
+  "time_limit_default_hours": 6,
+  "replicas": 2,
+  "macos_targets": [
+    "15",
+    "26",
+    "27"
+  ],
+  "gap_delay_hours": 6,
+  "priorities": {
+    "verify": 9,
+    "gap": 5,
+    "round": 1
+  }
 }

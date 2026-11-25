@@ -65,12 +65,15 @@ comment.
 | Comment | Effect |
 | --- | --- |
 | `/claim` | Leases an open task or finding to you: assigns it and labels it `fleet:leased`. You can hold one task lease and one finding lease at a time. If two people claim at once, the earlier comment wins. |
-| `/beat` | Keeps your lease alive. `fleet.sh run` posts one every 50 minutes. |
+| `/beat` | Keeps your lease alive. `fleet.sh run` posts one every 30 minutes. |
 | `/release REASON` | Hands it back. REASON is `setup_failed`, `wrong_hardware`, `no_time` or `other`. |
 | `/result` and one json block | Submits a task's result. Only the lease holder can submit it. |
 
-The hourly `fleet-leases` workflow releases any lease that goes without a
-`/claim` or `/beat` for too long: 4 hours for a task, 72 hours for a finding.
+A lease has two limits, as a Slurm job does. The hourly `fleet-leases`
+workflow releases a lease that breaks either one:
+
+- **Heartbeat timeout:** no `/claim` or `/beat` for 2 hours on a task, or 72 hours on a finding.
+- **Time limit**, for tasks only: three times the 90th percentile of recent run times on that chip family, between 2 and 12 hours (6 until there's enough history). It catches a worker that keeps beating but never finishes. The claim reply states the limit.
 
 **Results.** A result must match this schema exactly. The queue deletes
 anything that does not match and says why.
@@ -102,6 +105,25 @@ anything that does not match and says why.
 
 An accepted result closes the task with `fleet:done`, plus `fleet:passing` or
 `fleet:failing`, and the queue posts a summary table.
+
+## Scheduling
+
+The queue borrows from Slurm and from volunteer-computing systems such as BOINC.
+
+| Idea | What the fleet does |
+| --- | --- |
+| **Priorities** | Workers take the highest-priority task first, then the oldest. Fix verifications are priority 9, coverage gaps 5 and routine rounds 1. |
+| **Constraints** | A task can require a macOS major version (`macos: 26`). Workers on other versions skip it, and the queue rejects a result from the wrong version. |
+| **Replicas** | Each round has `replicas` (2) independent runs per chip family. Nobody may run the same commit on the same chip twice, so the two runs come from different Macs. |
+| **Flaky tests** | When two runs of one commit on one chip disagree about a failure signature, its finding is labelled `fleet:flaky`. |
+| **Coverage gaps** | `gap_delay_hours` (6) after a round, the queue opens a task for each chip family and macOS version in `macos_targets` that has no result yet. It only does this for chips whose round tasks have been taken. |
+| **Dependencies** | Closing a finding as completed, usually by merging its fix, opens priority-9 verification tasks at the latest main for the chips that saw it. A clean result posts "Verified" on the finding. If the failure is seen again, the finding reopens as regressed. |
+| **Draining** | A worker whose last three results all failed setup, or whose leases expired three times in a week, can't claim tasks for 24 hours after the latest one. Its own `work` loop also stops after three failures in a row. |
+| **Backfill** | When it's idle, the `work` loop pre-builds the latest main at the lowest CPU priority, so the next task starts warm. |
+| **Data locality** | Every task's worktree shares one build folder (`~/Library/Caches/victory-fleet/target`). Wine is built once per Mac, and VIctory builds incrementally. |
+| **Accounting** | The report lists each worker's results, chips and compute hours. |
+
+All of these settings are in `tools/fleet/fleet.json`.
 
 ## Findings
 
@@ -162,6 +184,16 @@ The fleet answers two questions: does each commit pass on every kind of Mac, and
 | Fleet health | Few expired leases and few rejected results. Many of either means the join instructions or the worker need work. |
 
 The fleet pays off when findings turn into fixes. Each fix's pull request references its finding, so that the connection is visible.
+
+## Scaling past GitHub
+
+The GitHub-issues queue suits a few dozen active workers. Past that, API rate
+limits (the Actions token gets about 1,000 requests an hour) and issue noise
+become the bottleneck. The protocol (claim, beat, result, release, findings)
+doesn't depend on GitHub. It could move to a small serverless service, such
+as API Gateway with Lambda, and DynamoDB with time-to-live leases. The
+worker would barely change, since only the transport differs. Results could
+then be mirrored into issues for findings only.
 
 ## Development
 

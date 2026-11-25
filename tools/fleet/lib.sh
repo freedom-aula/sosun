@@ -36,22 +36,42 @@ chip_family_of() {
     sed -nE 's/^Apple (M[0-9]{1,2})( Pro| Max| Ultra)?$/\1/p' <<< "$1" | tr 'M' 'm'
 }
 
-# The body of a task issue. The HTML comment is what machines read.
-task_body() { # COMMIT CHIP REPO
-    local chip_upper
+# The body of a task issue. The HTML comment is what machines read. The
+# optional fields: MACOS (a macOS major version the Mac must run), PRIORITY
+# (0-9, higher first), REPLICA (which independent run of this commit and
+# chip this is) and VERIFIES (a finding whose fix this run checks).
+task_body() { # COMMIT CHIP REPO [MACOS] [PRIORITY] [REPLICA] [VERIFIES]
+    local chip_upper why="" fields=""
     chip_upper=$(tr 'm' 'M' <<< "$2")
+    [ -n "${4:-}" ] && why="$why This run needs macOS $4, to fill a gap in coverage." && fields="${fields}macos: $4"$'\n'
+    [ -n "${5:-}" ] && fields="${fields}priority: $5"$'\n'
+    [ -n "${6:-}" ] && why="$why It is run $6 of several independent runs, which lets the fleet spot flaky tests: take it only if you haven't already run this commit on this chip." && fields="${fields}replica: $6"$'\n'
+    [ -n "${7:-}" ] && why="$why It checks whether the fix for #$7 holds." && fields="${fields}verifies: $7"$'\n'
     cat << EOF
 <!-- fleet-task
 kind: test-matrix
 commit: $1
 chip: $2
--->
-**Test matrix: commit \`${1:0:12}\` on an Apple $chip_upper Mac** (any $chip_upper, $chip_upper Pro, $chip_upper Max or $chip_upper Ultra).
+${fields}-->
+**Test matrix: commit \`${1:0:12}\` on an Apple $chip_upper Mac** (any $chip_upper, $chip_upper Pro, $chip_upper Max or $chip_upper Ultra).$why
 
 Run the native and the Wine test suites at this commit and report the counts. Only a short, strictly checked result is posted. Logs stay on your Mac.
 
 To take this task, point your AI coding agent at [docs/fleet-join.md](https://github.com/$3/blob/main/docs/fleet-join.md), or read [docs/fleet.md](https://github.com/$3/blob/main/docs/fleet.md). Follow [docs/fleet-legal.md](https://github.com/$3/blob/main/docs/fleet-legal.md): nothing from any game is ever posted here.
 EOF
+}
+
+
+# The optional fields of a task, as JSON: {macos, priority, replica, verifies}.
+task_meta() { # BODY
+    local block
+    block=$(tr -d '\r' <<< "$1" | awk '/^<!-- fleet-task[ \t]*$/ { f = 1; next } f && /^-->/ { exit } f')
+    jq -cn --arg m "$(sed -nE 's/^macos: *([0-9]{2}) *$/\1/p' <<< "$block" | head -n 1)" \
+        --arg p "$(sed -nE 's/^priority: *([0-9]) *$/\1/p' <<< "$block" | head -n 1)" \
+        --arg r "$(sed -nE 's/^replica: *([1-9]) *$/\1/p' <<< "$block" | head -n 1)" \
+        --arg v "$(sed -nE 's/^verifies: *([0-9]{1,7}) *$/\1/p' <<< "$block" | head -n 1)" \
+        '{macos: $m, priority: (if $p == "" then 1 else ($p | tonumber) end), replica: $r,
+          verifies: (if $v == "" then null else ($v | tonumber) end)}'
 }
 
 # Reads a task issue body. Prints "COMMIT CHIP" or fails.
@@ -124,7 +144,9 @@ else
   (if (.chip | str("^Apple M[0-9]{1,2}( Pro| Max| Ultra)?$")) | not then "chip is not an Apple M-series name"
    elif (.chip | ascii_downcase | capture("(?<f>m[0-9]+)").f) != $chip then "chip is not the task chip family"
    else empty end),
-  (if (.macos | str("^[0-9]{2}(\\.[0-9]{1,2}){0,2}$")) then empty else "macos is not a version number" end),
+  (if (.macos | str("^[0-9]{2}(\\.[0-9]{1,2}){0,2}$")) | not then "macos is not a version number"
+   elif $want_macos != "" and (.macos | split(".")[0]) != $want_macos then "this task needs macOS \($want_macos)"
+   else empty end),
   (if (.gptk | str("^([0-9]{1,2}(\\.[0-9]{1,2}){0,2}(-beta[0-9]?)?|unknown)$")) then empty
    else "gptk is not a version number or unknown" end),
   (if .setup == "ok" or .setup == "failed" then empty else "setup must be ok or failed" end),
@@ -146,7 +168,7 @@ else
 end'
 
 # Prints one error per line and fails if the result is not valid for the task.
-validate_result() { # JSON COMMIT CHIP
+validate_result() { # JSON COMMIT CHIP [MACOS_MAJOR]
     local errors
     if [ "${#1}" -gt 8000 ]; then
         echo "result is larger than 8000 bytes"
@@ -156,7 +178,7 @@ validate_result() { # JSON COMMIT CHIP
         echo "result is not valid JSON"
         return 1
     fi
-    errors=$(jq -r --arg commit "$2" --arg chip "$3" --arg topics "$FLEET_TOPICS" "$FLEET_VALIDATE_JQ" <<< "$1")
+    errors=$(jq -r --arg commit "$2" --arg chip "$3" --arg want_macos "${4:-}" --arg topics "$FLEET_TOPICS" "$FLEET_VALIDATE_JQ" <<< "$1")
     if [ -n "$errors" ]; then
         printf '%s\n' "$errors"
         return 1
@@ -327,6 +349,28 @@ parse_finding() { # BODY -> "SIG TEST TOPIC"
     printf '%s %s %s\n' "$sig" "$test" "$topic"
 }
 
+# Seconds a result took end to end (setup and both suites).
+result_seconds() { jq -r '[.timings[] // 0] | add | floor' <<< "$1"; }
+
+# Time limit for a task lease, in hours: three times the 90th percentile of
+# recent end-to-end durations, clamped to 2-12 hours, or DEFAULT with fewer
+# than three samples. Reads one duration in seconds per line.
+time_limit_hours() { # DEFAULT
+    jq -rs --argjson d "$1" '
+        sort as $s | ($s | length) as $n
+        | if $n < 3 then $d
+          else ($s[[($n * 0.9 | floor), $n - 1] | min] * 3 / 3600 | ceil)
+               | if . < 2 then 2 elif . > 12 then 12 else . end end'
+}
+
+# Signatures that one of two results of the same commit and chip has and the
+# other lacks, when both ran both suites: the likely flaky tests.
+flaky_sigs() { # RESULT_A RESULT_B
+    jq -rn --argjson a "$1" --argjson b "$2" '
+        if [$a, $b] | any(.native == null or .wine == null) then empty
+        else (([$a.failures[].sig] - [$b.failures[].sig]) + ([$b.failures[].sig] - [$a.failures[].sig])) | unique[] end'
+}
+
 # PREVIOUS CURRENT (results) -> lines "suite/binary<TAB>old<TAB>new" for
 # test binaries that got at least 50% and 5 seconds slower.
 slowdowns() {
@@ -372,6 +416,10 @@ report_markdown() {
             | $b.binaries[] | "\(.suite)/\(.name)" as $k | select($old[$k] != null)
             | select(.seconds >= $old[$k] * 1.5 and .seconds - $old[$k] >= 5)
             | "- \($b | fam): \($k) \($old[$k]) s at `\($a.upstream_commit[0:12])` -> \(.seconds) s at `\($b.upstream_commit[0:12])`"])
+        + "\n\n## Workers\n\n| Worker | Results | Chips | Compute hours | Last result |\n|---|---|---|---|---|\n"
+        + ($rs | map(select(.worker != null)) | group_by(.worker) | sort_by(-length)
+           | map("| @\(.[0].worker) | \(length) | \(map(fam) | unique | join(", ")) | \(map([.timings[] // 0] | add) | add / 3600 * 10 | round / 10) | \(map(.closed) | max | .[0:10]) |")
+           | if length == 0 then "None recorded." else join("\n") end)
         + "\n\n## All results\n\n| Task | Closed | Commit | Chip | Model | macOS | Toolkit | Native passed / failed | Wine passed / failed | Wall time native / wine |\n|---|---|---|---|---|---|---|---|---|---|\n"
         + ($rs | map("| #\(.n) | \(.closed[0:10]) | `\(.upstream_commit[0:12])` | \(.chip) | \(.hw_model) | \(.macos) | \(.gptk) | \(pf(.native)) | \(pf(.wine)) | \(.timings.native // "-") s / \(.timings.wine // "-") s |") | join("\n"))'
 }
