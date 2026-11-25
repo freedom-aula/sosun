@@ -4162,7 +4162,7 @@ mod withholding {
             copy.gpu_writes(&list, address, len, false);
             // The shader's write, after the refreshes (which a step that may
             // write title memory does first, as the lists' run does).
-            list.defer(|| {});
+            list.defer(address as usize, len as usize, || {});
             list.defer_host(move || copy.write_host(address, &[value]));
         }
         list.defer_missed(|| true);
