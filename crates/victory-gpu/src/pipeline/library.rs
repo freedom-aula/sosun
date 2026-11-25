@@ -365,7 +365,7 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
+    let written = crate::make_dir(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &seal(&blob)))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
