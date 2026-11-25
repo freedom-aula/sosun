@@ -64,6 +64,8 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
