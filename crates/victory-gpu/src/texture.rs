@@ -50,6 +50,8 @@ pub(crate) struct Staging {
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
+    /// Uploads [`record_upload`] recorded.
+    uploads: std::sync::atomic::AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled.
@@ -245,11 +247,17 @@ pub(crate) fn record_upload(list: &HostList, copy: &Arc<crate::resource::HostTex
     copies(list, &copy.texture, staging, String::new);
     move_to(SHADER_RESOURCE);
     list.keep(&staging.buffer);
-    UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Uploads [`record_upload`] recorded.
-pub(crate) static UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The uploads [`record_upload`] recorded into `resource`'s host texture
+/// (tests: counts of their own texture, whatever other tests upload
+/// meanwhile).
+#[cfg(test)]
+pub(crate) fn uploads(resource: This) -> u64 {
+    let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    staging.map_or(0, |s| s.uploads.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// For textures shaders reach through the heap itself, at submission
 /// (`crate::bindless::uploads`): brings the staging buffer up to date and
@@ -546,6 +554,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
+        uploads: Default::default(),
     });
     *held = Some(s.clone());
     Some(s)

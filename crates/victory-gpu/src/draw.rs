@@ -2384,11 +2384,11 @@ void main(uint3 id : SV_DispatchThreadID) {
                 run(list, &slots, &read, 0, Some(&out), (8, 8));
                 list.close();
             }
-            let before = crate::texture::UPLOADS.load(Ordering::Relaxed);
+            let before = crate::texture::uploads(object);
             host.execute(&[&lists[0], &lists[1]]);
             // SAFETY: inside the mapped output.
             let texel = unsafe { (data as *const [f32; 4]).read() };
-            (crate::texture::UPLOADS.load(Ordering::Relaxed) - before, texel[0])
+            (crate::texture::uploads(object) - before, texel[0])
         };
         let (n, x) = submit(Some(0x40));
         assert_eq!(n, 1, "one upload for two lists");
@@ -2425,9 +2425,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 0, Some(&out), (8, 8));
             list.close();
-            let before = crate::texture::UPLOADS.load(Ordering::Relaxed);
+            let before = crate::texture::uploads(object);
             host.execute(&[&list]);
-            crate::texture::UPLOADS.load(Ordering::Relaxed) - before
+            crate::texture::uploads(object) - before
         };
         assert_eq!(submit(), 1);
         assert_eq!(submit(), 1, "its own page written: uploaded");
