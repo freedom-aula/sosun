@@ -58,6 +58,8 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -581,6 +583,15 @@ impl Shader {
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
+        // UAVs outside pixel and compute programs (the write and read marks
+        // of vertex, geometry and mesh programs), as DXC counts them: UAV
+        // ranges declared below, not UAVs indexed from the heap.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.gs.is_none();
+        let declared_uavs =
+            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+        if declared_uavs && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -693,7 +704,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some() {
+            if declared_uavs {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -916,6 +927,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -1021,5 +1035,57 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    /// A program that sets a bit through the write marks' UAV, or (`heap`)
+    /// through a UAV indexed from the heap: a vertex (`pixel` false, no
+    /// thread-group size), pixel or compute program.
+    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        let b = s.entry;
+        let h = if heap {
+            let index = s.m.i32(0);
+            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+        } else {
+            s.view_writes_handle()
+        };
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// A vertex program writing a declared UAV declares UAVs at every stage
+    /// (the validator refuses it otherwise: "Flags must match usage", the
+    /// 5,046 programs of the title's list); pixel and compute programs need
+    /// not, nor a vertex program whose UAVs all come from the heap (the
+    /// validator counts declared ranges only: 26 mesh and vertex programs).
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for (name, pixel, threads, heap) in [
+            ("vertex", false, None, false),
+            ("pixel", true, None, false),
+            ("compute", false, Some([1, 1, 1]), false),
+            ("vertex, heap", false, None, true),
+        ] {
+            let mut dxil = marked(pixel, threads, heap);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
     }
 }
