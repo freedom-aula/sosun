@@ -709,6 +709,10 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
+            if later {
+                // Made once a shader reads it (`crate::shadow::take_reads`).
+                crate::shadow::forget_read(index);
+            }
             made[index as usize] = key;
             let (kept, mark) = if later {
                 (None, None)

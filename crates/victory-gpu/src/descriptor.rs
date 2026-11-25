@@ -196,6 +196,41 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Makes the views of slots `slots` that were left null (textures the title
+/// placed itself) in every shader-visible view heap, now that shaders read
+/// them (`crate::shadow::take_reads`), while placed textures take under
+/// [`PLACED_CAP`] bytes.
+/// shortcut: past the cap, views read later stay null; nothing is released
+/// for them (placed textures are kept until the end); add eviction by the
+/// read marks if the cap is reached.
+#[cfg(windows)]
+pub(crate) fn make_read(slots: &[u32]) {
+    if crate::resource::PLACED_BYTES.load(std::sync::atomic::Ordering::Relaxed) >= PLACED_CAP {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("placed textures reached their cap: views shaders read now stay null"));
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+        }
+    }
+}
+
+/// Console bytes of placed textures past which views shaders read stay
+/// null: the 12 GB card held 6.5 GB without them (run textures2).
+#[cfg(windows)]
+const PLACED_CAP: u64 = 3 << 30;
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

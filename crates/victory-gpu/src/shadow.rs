@@ -743,9 +743,11 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
     static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
-            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            // Written pages, then one read mark per heap index.
+            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
+            let bytes = u64::from(bits / 8);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
-            crate::host::name(&buffer, || "views' written pages".into());
+            crate::host::name(&buffer, || "views' written pages and read slots".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             // SAFETY: a live buffer.
@@ -764,6 +766,51 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
 /// title memory, see [`bitmap`]).
 pub(crate) fn view_writes(memory: bool) -> Option<u64> {
     bitmap(memory).map(|b| b.gpu)
+}
+
+/// Heap slots whose texture views shaders read: the marks seen so far (a
+/// slot's stays set in the bitmap until [`forget_read`]), and the slots to
+/// clear at the next [`take_reads`].
+static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`]. Clears the slots forgotten since first.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let Some(b) = bitmap() else {
+        return Vec::new();
+    };
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+    // (one submission runs at a time).
+    let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, forgotten) = &mut *reads;
+    seen.resize(words, 0);
+    for slot in forgotten.drain(..) {
+        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+        if w < words {
+            bits[w] &= !bit;
+            seen[w] &= !bit;
+        }
+    }
+    let mut new = Vec::new();
+    for (w, (x, s)) in bits.iter().zip(seen.iter_mut()).enumerate() {
+        let mut fresh = *x & !*s;
+        *s |= fresh;
+        while fresh != 0 {
+            new.push(w as u32 * 32 + fresh.trailing_zeros());
+            fresh &= fresh - 1;
+        }
+    }
+    new
+}
+
+/// Heap slot `slot` now holds a texture view left null: its next read is
+/// marked again.
+pub(crate) fn forget_read(slot: u32) {
+    READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
 /// After a submission: every page its shaders marked as written through

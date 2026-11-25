@@ -4913,8 +4913,18 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A handle for the descriptor `src` read at `site`.
-    fn handle(
+    /// A handle for the descriptor `src` read at `site`; a texture shader
+    /// view's heap index is noted for the instruction's read mark (handles
+    /// are made once per block, often before the instruction).
+    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
+        let h = self.handle_made(site, src, sampler, props)?;
+        if let Some(&index) = self.s.texture_index.get(&h) {
+            self.s.texture_reads.push(index);
+        }
+        Ok(h)
+    }
+
+    fn handle_made(
         &mut self,
         site: Site,
         src: &Source,
@@ -7771,7 +7781,48 @@ impl<'a> Lower<'a> {
             .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
     }
 
+    /// An image instruction, its reads of texture views marked (module
+    /// notes, "Read marks") after it.
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        self.s.texture_reads.clear();
+        let lowered = self.image_op(inst, b, i);
+        for index in std::mem::take(&mut self.s.texture_reads) {
+            if lowered.is_ok() {
+                self.mark_view_read(index);
+            }
+        }
+        lowered
+    }
+
+    /// Sets the read mark of resource-heap index `index` (module notes,
+    /// "Read marks") where it is still clear. Nothing without
+    /// [`Parts::view_marks`].
+    fn mark_view_read(&mut self, index: V) {
+        if !self.x.view_marks {
+            return;
+        }
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let bitmap = self.s.view_writes_handle();
+        let c = self.cur;
+        let (base, k5, k2, k31, one, zero) =
+            (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+        let n = self.s.m.bin(c, Bin::Add, index, base);
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let bit = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        // Most reads find their slot marked: a load, not an atomic.
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let at = self.begin_guarded(Some(clear));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR.
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(at, &[]);
+    }
+
+    fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
