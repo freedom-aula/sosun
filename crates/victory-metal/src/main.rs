@@ -9,6 +9,8 @@
 #[cfg(target_os = "macos")]
 mod convert;
 #[cfg(target_os = "macos")]
+mod corpus;
+#[cfg(target_os = "macos")]
 mod demo;
 #[cfg(target_os = "macos")]
 mod dxc;
@@ -23,7 +25,9 @@ fn main() {
     #[cfg(target_os = "macos")]
     {
         let files: Vec<String> = std::env::args().skip(1).collect();
-        if files.first().map(String::as_str) == Some("--demo") {
+        if files.first().map(String::as_str) == Some("--corpus") {
+            corpus::run(&files[1..]);
+        } else if files.first().map(String::as_str) == Some("--demo") {
             demo::run();
         } else if files.is_empty() {
             probe::run();

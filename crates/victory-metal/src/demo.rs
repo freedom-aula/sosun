@@ -19,12 +19,11 @@ void main(uint3 id : SV_DispatchThreadID) { dst.Store(id.x * 4, src.Load(id.x * 
 "#;
 
 pub fn run() {
-    let msc_path = std::env::var("VICTORY_MSC_DYLIB").expect("set VICTORY_MSC_DYLIB");
     let dxc_path =
         std::env::var("VICTORY_DXC_DYLIB").expect("set VICTORY_DXC_DYLIB to libdxcompiler.dylib");
     let dxil = crate::dxc::hlsl_to_dxil(&dxc_path, HLSL, "cs_6_0").expect("dxc");
     println!("HLSL -> DXIL container: {} B", dxil.len());
-    let msc = crate::msc::Msc::open(&msc_path).expect("msc");
+    let msc = crate::msc::Msc::open_default();
     let (stage, lib) = msc.convert(&dxil, None).expect("convert");
     println!("DXIL -> metallib: stage {stage}, {} B", lib.len());
 

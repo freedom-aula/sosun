@@ -5,9 +5,7 @@ use objc2_metal::*;
 use std::time::Instant;
 
 pub fn run(files: &[String]) {
-    let path = std::env::var("VICTORY_MSC_DYLIB")
-        .expect("set VICTORY_MSC_DYLIB to libmetalirconverter.dylib");
-    let msc = crate::msc::Msc::open(&path).unwrap_or_else(|e| panic!("dlopen {path}: {e}"));
+    let msc = crate::msc::Msc::open_default();
     let dev = MTLCreateSystemDefaultDevice().expect("no Metal device");
     for f in files {
         let dxil = std::fs::read(f).expect("read dxil");

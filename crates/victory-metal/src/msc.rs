@@ -16,9 +16,28 @@ type LibSize = unsafe extern "C" fn(*const c_void) -> usize;
 type LibBytes = unsafe extern "C" fn(*const c_void, *mut u8) -> usize;
 type ErrCode = unsafe extern "C" fn(*mut c_void) -> u32;
 type SetEntry = unsafe extern "C" fn(*mut c_void, *const c_char);
+type Payload = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 
 pub struct Msc {
     h: *mut c_void,
+}
+
+// SAFETY: the handle is a dlopen handle; every conversion makes and destroys its own IR objects.
+unsafe impl Send for Msc {}
+// SAFETY: as above, no state is shared between calls.
+unsafe impl Sync for Msc {}
+
+/// A converter failure: the `IRError` code and the converter's own message.
+#[derive(Debug)]
+pub struct ConvError {
+    pub code: u32,
+    pub msg: String,
+}
+
+impl std::fmt::Display for ConvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IRError code {}: {}", self.code, self.msg)
+    }
 }
 
 fn sym<T: Copy>(h: *mut c_void, name: &str) -> T {
@@ -30,7 +49,16 @@ fn sym<T: Copy>(h: *mut c_void, name: &str) -> T {
     unsafe { std::mem::transmute_copy(&p) }
 }
 
+/// Where Apple's installer puts the converter (universal binary); `VICTORY_MSC_DYLIB` overrides.
+pub const DEFAULT_DYLIB: &str = "/usr/local/lib/libmetalirconverter.dylib";
+
 impl Msc {
+    /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default.
+    pub fn open_default() -> Msc {
+        let path = std::env::var("VICTORY_MSC_DYLIB").unwrap_or_else(|_| DEFAULT_DYLIB.into());
+        Msc::open(&path).unwrap_or_else(|e| panic!("dlopen {path}: {e}"))
+    }
+
     pub fn open(path: &str) -> Result<Msc, String> {
         let c = CString::new(path).unwrap();
         // SAFETY: dlopen of a user-named library.
@@ -50,7 +78,7 @@ impl Msc {
     }
 
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
-    pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), String> {
+    pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
@@ -69,14 +97,19 @@ impl Msc {
                 &mut err,
             );
             let res = if out.is_null() {
-                let code = if err.is_null() {
-                    0
+                let (code, msg) = if err.is_null() {
+                    (0, String::new())
                 } else {
-                    sym::<ErrCode>(h, "IRErrorGetCode")(err)
+                    // The payload is the message text (the library formats "<Name> : <detail>").
+                    let p = sym::<Payload>(h, "IRErrorGetPayload")(err);
+                    let msg = if p.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(p).to_string_lossy().into_owned()
+                    };
+                    (sym::<ErrCode>(h, "IRErrorGetCode")(err), msg)
                 };
-                Err(format!(
-                    "IRCompilerAllocCompileAndLink failed, IRError code {code}"
-                ))
+                Err(ConvError { code, msg })
             } else {
                 let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
                 let lib = sym::<Create>(h, "IRMetalLibBinaryCreate")();
@@ -86,7 +119,10 @@ impl Msc {
                     sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
                     Ok((stage, v))
                 } else {
-                    Err("no metallib for stage".to_string())
+                    Err(ConvError {
+                        code: u32::MAX,
+                        msg: "no metallib for stage".into(),
+                    })
                 };
                 sym::<Destroy>(h, "IRMetalLibBinaryDestroy")(lib);
                 sym::<Destroy>(h, "IRObjectDestroy")(out);
