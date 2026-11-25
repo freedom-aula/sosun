@@ -359,15 +359,14 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let (mut ran, mut hardware) = (0, false);
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        hardware |= !warp;
         // The program declares the console's wave of 32, which WARP refuses.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp, "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of 32; skipped");
             continue;
         };
@@ -385,10 +384,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
-        ran += 1;
     }
-    // WARP refuses the wave of 32, so without a GPU nothing runs it.
-    assert!(ran > 0 || !hardware, "no device ran the permute");
 }
 
 #[test]
