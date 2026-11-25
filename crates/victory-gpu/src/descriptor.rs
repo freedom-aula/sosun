@@ -220,9 +220,11 @@ pub(crate) fn make_read(slots: &[u32]) {
     };
     #[cfg(test)]
     tests::while_making(slots);
-    for view in &placed {
-        let _ = host::placed_texture(view);
-    }
+    // Several at a time (each a committed texture; hundreds in a new shot,
+    // 7 % of the submitting thread when made one by one, run evict5).
+    crate::texture::in_parallel(placed.len(), |i| {
+        let _ = host::placed_texture(&placed[i]);
+    });
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).

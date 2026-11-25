@@ -2008,6 +2008,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     map.insert((address, *desc), out as usize);
+    // Its host texture is made without the map's lock: the textures of the
+    // slots a submission's shaders read are made several at a time.
+    drop(map);
     resource(out).host().is_some().then_some(out)
 }
 
@@ -2373,6 +2376,29 @@ mod tests {
         assert!(t.upgrade().is_none(), "freed with its title texture");
         assert_eq!(slot::<Release>(read, 0x10)(read), 0);
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Placed textures asked for from several threads at once: one resource
+    /// and one host texture for each memory, made side by side.
+    #[cfg(windows)]
+    #[test]
+    fn placed_textures_made_side_by_side_are_one_each() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let memory = vec![0u8; 4 << 16];
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let base = memory.as_ptr() as u64;
+        let made: Vec<Vec<usize>> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| s.spawn(move || (0..4u64).map(|k| texture_at(base + (k << 16), &words).unwrap() as usize).collect::<Vec<_>>()))
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        for k in 0..4 {
+            assert!(made.iter().all(|m| m[k] == made[0][k]), "one resource for memory {k}");
+            assert!(made_copy(made[0][k] as This).is_some(), "with a host texture");
+        }
     }
 
     /// Textures idle for the idle time and frames are given up; past the

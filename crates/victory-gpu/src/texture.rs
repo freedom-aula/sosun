@@ -480,37 +480,44 @@ fn copies(
 /// and the subresources detiled into it.
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
-/// [`Staging::refresh`] of each of `work`, those whose memory may have
-/// changed on several threads at once (reading title memory and detiling
-/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
+/// at most: the title's own threads need the rest), here when that is
+/// fewer than two.
+pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
-    // Most find nothing changed (their trackers' clean bits say so): those
-    // are not handed to threads.
-    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
-    // A quarter of the CPUs at most, four at most: the title's own threads
-    // need the rest.
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(changed.len());
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
     if threads < 2 {
-        for &i in &changed {
-            out[i] = work[i].0.refresh();
-        }
-        return out;
+        (0..n).for_each(f);
+        return;
     }
     let next = AtomicUsize::new(0);
-    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
                 loop {
-                    let k = next.fetch_add(1, Relaxed);
-                    let Some(&i) = changed.get(k) else { break };
-                    *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[i].0.refresh();
+                    let i = next.fetch_add(1, Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    f(i);
                 }
             });
         }
     });
+}
+
+/// [`Staging::refresh`] of each of `work`, those whose memory may have
+/// changed on several threads at once (reading title memory and detiling
+/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
+pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+    // Most find nothing changed (their trackers' clean bits say so): those
+    // are not handed to threads.
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
+    in_parallel(changed.len(), |k| {
+        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
+    });
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
     for (k, r) in results.into_iter().enumerate() {
         out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
     }
