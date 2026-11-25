@@ -75,7 +75,13 @@ task_time_limit() { # CHIP
     local it json
     while read -r it; do
         [ -n "$it" ] || continue
-        json=$(accepted_result "$it") && result_seconds "$json"
+        # A result an older schema wrote no longer passes: skip it. Not
+        # `a && b` as the loop's last command, whose status then fails the
+        # whole pipeline under pipefail (25 November: every claim on a chip
+        # whose last result was an old one went unanswered).
+        if json=$(accepted_result "$it"); then
+            result_seconds "$json"
+        fi
     done < <(done_tasks "$1" | head -n 10) | time_limit_hours "$(conf .time_limit_default_hours)"
 }
 
