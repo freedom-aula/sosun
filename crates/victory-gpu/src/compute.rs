@@ -35,9 +35,6 @@ pub(crate) struct Range {
     count: u32,
 }
 
-/// A range's count with no end: the table runs to the end of the heap.
-pub(crate) const UNBOUNDED: u32 = u32::MAX;
-
 /// `count` shader resource views from `t{register}`.
 pub(crate) const fn srv(register: u32, count: u32) -> Range {
     Range {
@@ -113,7 +110,7 @@ pub(crate) fn pipeline(
     Ok((root, pso))
 }
 
-fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootSignature> {
+pub(crate) fn root_signature(device: &ID3D12Device, params: &[Param]) -> Result<ID3D12RootSignature> {
     let ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = params
         .iter()
         .map(|p| match p {
