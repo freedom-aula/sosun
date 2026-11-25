@@ -370,6 +370,15 @@ fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::
         && found == unsafe { GetModuleHandleA(name) }
 }
 
+/// The base of the title image `address` lies in, if any.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn title_image_base(address: usize) -> Option<usize> {
+    images().iter().find_map(|m| {
+        let base = m.image.base();
+        (base..base + m.image.info().size_of_image as usize).contains(&address).then_some(base)
+    })
+}
+
 /// Whether `address` lies in an image the title loaded (its executable or
 /// one of its DLLs), as opposed to the host's own code.
 pub fn in_title_image(address: usize) -> bool {

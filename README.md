@@ -132,6 +132,17 @@ Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/flee
 
 Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run the fleet by hand with `tools/fleet/fleet.sh`.
 
+## Debugging switches
+
+These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ...`) and are for chasing problems, not for playing.
+
+| Variable | What it does |
+| --- | --- |
+| `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |
+| `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
+| `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
+| `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
+
 ## Where things are
 
 | Path | What it holds |
