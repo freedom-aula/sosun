@@ -60,7 +60,14 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    /// The container's length, as logged once its bytes are gone.
+    size: usize,
+    /// The container, until `translated` has made its translation (or its
+    /// refusal) and let it go: a run holds one per distinct shader its title
+    /// passes, and nothing reads it after. Off Windows nothing translates,
+    /// so only tests keep it.
+    #[cfg(any(windows, test))]
+    container: Mutex<Vec<u8>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -90,7 +97,9 @@ impl Shader {
         Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
+            size: bytes.len(),
+            #[cfg(any(windows, test))]
+            container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -112,7 +121,14 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let (done, cached) = {
+                    let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                    let done = translate(&container);
+                    // After the translation, not before: if it panics, the
+                    // bytes are still there for the next try.
+                    *container = Vec::new();
+                    done
+                };
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -232,7 +248,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
 }
 
@@ -704,7 +720,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container.lock().unwrap().clone()))
             .collect()
     }
 
@@ -748,6 +764,16 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn translation_lets_the_container_go() {
+        // Not a container: it does not translate, and goes all the same.
+        let s = Shader::new("compute", &[1, 2, 3]);
+        assert!(s.translated().is_none());
+        assert!(s.container.lock().unwrap().is_empty());
+        assert_eq!(s.size, 3);
     }
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
