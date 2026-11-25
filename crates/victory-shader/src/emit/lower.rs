@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_STRIDES, flags};
 use crate::ShaderError;
@@ -77,6 +77,9 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// 64-bit image atomics run under per-texel locks (`emit`, "Atomic
+    /// locks").
+    pub atomic_locks: bool,
 }
 
 enum Stop {
@@ -4267,6 +4270,172 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
+    /// A 64-bit image atomic `op` of `value` (cmpswap: replacing
+    /// `compare`) on the texel at `cs` of the globally coherent R32G32_UINT
+    /// view `h`, under a lock word (`emit`, "Atomic locks"). The wave's
+    /// lanes take turns in a loop over lane indices that every lane runs
+    /// alike: in its turn a lane takes its texel's lock, reads, writes and
+    /// frees it. Lanes of one wave never wait for each other's locks (that
+    /// never finishes on Apple GPUs), and the loop needs no wave operation
+    /// in divergent code (D3DMetal's return other lanes' values there).
+    /// Returns the old value's low and high dwords.
+    fn locked_atomic64(
+        &mut self,
+        h: V,
+        cs: &[V],
+        coords: usize,
+        op: &str,
+        value: V,
+        compare: Option<V>,
+    ) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let i64t = self.s.m.int(64);
+        let void = self.s.t.void;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        self.s.flags |= flags::WAVE_OPS | flags::TYPED_UAV_LOADS | flags::INT64;
+        let c = self.cur;
+        // The lock: a hash of the coordinates.
+        let mut hash = k(self, 0);
+        for (&x, m) in cs
+            .iter()
+            .take(coords)
+            .zip([0x9E37_79B1u32, 0x85EB_CA77, 0xC2B2_AE3D])
+        {
+            let m = k(self, m);
+            let x = self.s.m.bin(c, Bin::Mul, x, m);
+            hash = self.s.m.bin(c, Bin::Xor, hash, x);
+            let k15 = k(self, 15);
+            let r = self.s.m.bin(c, Bin::LShr, hash, k15);
+            hash = self.s.m.bin(c, Bin::Xor, hash, r);
+        }
+        let mask = k(self, super::ATOMIC_LOCKS - 1);
+        let slot = self.s.m.bin(c, Bin::And, hash, mask);
+        let k2 = k(self, 2);
+        let slot = self.s.m.bin(c, Bin::Shl, slot, k2);
+        let base = k(self, super::VIEW_WRITE_BITS / 8);
+        let lock = self.s.m.bin(c, Bin::Add, slot, base);
+        let locks = self.s.view_writes_handle();
+        let me = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
+        let lanes = self
+            .s
+            .op(c, "waveGetLaneCount", Attr::ReadNone, i32t, 112, &[]);
+        let mut blocks = [0; 5];
+        for b in &mut blocks {
+            *b = self.s.m.new_block();
+        }
+        let [head, spin, held, latch, done] = blocks;
+        self.s.m.terminate(c, Term::Br(head));
+        let iu = self.s.m.undef(i32t);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let fence = k(self, 2 | 8);
+
+        // Head: lane `i`'s turn.
+        let i = self.s.m.phi(head, i32t);
+        let plo = self.s.m.phi(head, i32t);
+        let phi_ = self.s.m.phi(head, i32t);
+        let turn = self.s.m.cmp(head, pred::EQ, me, i);
+        self.s.m.terminate(head, Term::CondBr(turn, spin, latch));
+
+        // Spin, bounded (past it, on without the lock).
+        let got = self.s.op(
+            spin,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &[locks, lock, iu, iu, zero, one],
+        );
+        let won = self.s.m.cmp(spin, pred::EQ, got, zero);
+        let tries = self.s.m.phi(spin, i32t);
+        let more = self.s.m.bin(spin, Bin::Add, tries, one);
+        self.s.m.set_phi(tries, vec![(zero, head), (more, spin)]);
+        let limit = k(self, 1 << 16);
+        let out = self.s.m.cmp(spin, pred::IUGE, more, limit);
+        let leave = self.s.m.bin(spin, Bin::Or, won, out);
+        self.s.m.terminate(spin, Term::CondBr(leave, held, spin));
+
+        // Held: fence, read, write, fence, free.
+        self.s
+            .op(held, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let mut args = vec![h, iu];
+        args.extend(cs);
+        args.extend([iu, iu, iu]);
+        let r = self.s.op(
+            held,
+            "textureLoad.i32",
+            Attr::ReadOnly,
+            self.s.t.res_ret_i32,
+            66,
+            &args,
+        );
+        let lo = self.s.m.extract(held, r, 0);
+        let hi = self.s.m.extract(held, r, 1);
+        let l64 = self.s.m.cast(held, Cast::ZExt, lo, i64t);
+        let h64 = self.s.m.cast(held, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let h64 = self.s.m.bin(held, Bin::Shl, h64, k32);
+        let old = self.s.m.bin(held, Bin::Or, l64, h64);
+        let m = &mut self.s.m;
+        let pick = |m: &mut Module, p: u8| {
+            let keep = m.cmp(held, p, old, value);
+            m.select(held, keep, old, value)
+        };
+        let new = match op {
+            "add" | "sub" => m.bin(held, Bin::Add, old, value),
+            "and" => m.bin(held, Bin::And, old, value),
+            "or" => m.bin(held, Bin::Or, old, value),
+            "xor" => m.bin(held, Bin::Xor, old, value),
+            "smin" => pick(m, pred::SLT),
+            "smax" => pick(m, pred::SGT),
+            "umin" => pick(m, pred::IULT),
+            "umax" => pick(m, pred::IUGT),
+            "swap" => value,
+            _ => {
+                let same = m.cmp(held, pred::EQ, old, compare.expect("a compare value"));
+                m.select(held, same, value, old)
+            }
+        };
+        let nlo = self.s.m.cast(held, Cast::Trunc, new, i32t);
+        let nhi = self.s.m.bin(held, Bin::LShr, new, k32);
+        let nhi = self.s.m.cast(held, Cast::Trunc, nhi, i32t);
+        let mut args = vec![h];
+        args.extend(cs);
+        // DXIL stores all four channels; an R32G32 view keeps two.
+        args.extend([nlo, nhi, nlo, nhi, self.s.m.i8(0xF)]);
+        self.s
+            .op(held, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+        self.s
+            .op(held, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        // Frees it only if taken: an `and` with all ones changes nothing.
+        let (and, all) = (k(self, 1), k(self, u32::MAX));
+        let keep = self.s.m.select(held, won, zero, all);
+        self.s.op(
+            held,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[locks, and, lock, iu, iu, keep],
+        );
+        self.s.m.terminate(held, Term::Br(latch));
+
+        // Latch: the next lane.
+        let olo = self.s.m.phi(latch, i32t);
+        self.s.m.set_phi(olo, vec![(lo, held), (plo, head)]);
+        let ohi = self.s.m.phi(latch, i32t);
+        self.s.m.set_phi(ohi, vec![(hi, held), (phi_, head)]);
+        let next = self.s.m.bin(latch, Bin::Add, i, one);
+        let more = self.s.m.cmp(latch, pred::IULT, next, lanes);
+        self.s.m.set_phi(i, vec![(zero, c), (next, latch)]);
+        self.s.m.set_phi(plo, vec![(iu, c), (olo, latch)]);
+        self.s.m.set_phi(phi_, vec![(iu, c), (ohi, latch)]);
+        self.s.m.terminate(latch, Term::CondBr(more, head, done));
+        self.cur = done;
+        (olo, ohi)
+    }
+
     /// The dword at byte `at` of raw buffer `h`.
     fn raw_dword(&mut self, h: V, at: V) -> V {
         let c = self.cur;
@@ -7801,6 +7970,19 @@ impl<'a> Lower<'a> {
                     _ => self.s.m.i32(0),
                 });
             }
+            if wide && self.x.atomic_locks {
+                let compare = (code == u32::MAX).then(|| value_at(self, 1));
+                let h = self.handle(site, src, false, (kind | 0x1000 | 0x4000, 0x205))?;
+                let at = self.begin_guarded(guard);
+                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare);
+                let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
+                if cache.glc {
+                    for (k, x) in (0..).zip(r) {
+                        self.write(inst, Reg::V(reg + k), x, None);
+                    }
+                }
+                return Ok(());
+            }
             if wide {
                 // SM 6.6's 64-bit atomics on typed resources in the heap: the
                 // host device must support both (D3D12 options 9 and 11).
@@ -9950,6 +10132,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            atomic_locks: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -10001,6 +10184,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            atomic_locks: false,
             view_marks: false,
         })
     }
@@ -10191,6 +10375,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            atomic_locks: false,
             view_marks: false,
         })
         .unwrap();
