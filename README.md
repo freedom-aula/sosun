@@ -51,7 +51,7 @@ Several people who own the game have run it on their Macs and reported back in t
 | M2 Max | Account selection, the first setup screens with keyboard input, and the loading artwork all worked, and then the window went black. | #28 |
 | M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. | #50 |
 
-<p align="center"><img src="https://github.com/user-attachments/assets/482a101c-e375-4e35-b5a3-dfc3bd8faf30" width="720" alt="The game's title card on an M3 Max under VIctory"><br><sub>The title card on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
+<p align="center"><img src="https://github.com/user-attachments/assets/a05ca6bd-2427-4035-8d35-942e797f3307" width="720" alt="The game's title screen on an M3 Max under VIctory"><br><sub>The title screen on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
 
 The black screen was tracked in #15. On Series S the game presents two images, a 1920x1080 overlay and the 3840x2160 picture, and VIctory used to show only the first. It now shows the larger one, and `VICTORY_PRESENT_COMPOSITE=1` also draws the overlay on top. The main open problems now are crashes in Apple's shader compiler while the game builds its world shaders, and the window going black after loading.
 
