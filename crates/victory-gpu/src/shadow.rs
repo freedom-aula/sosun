@@ -269,6 +269,9 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if self.null() {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -530,7 +533,18 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
-        self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+        self.null() || self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+    }
+
+    /// The copy of the lowest window of the address space ([`loose`]): the
+    /// null page and the host's own memory (Wine's TEB, PEB and mapped
+    /// files), never the title's. Shaders following a null pointer read it,
+    /// so it exists, but it stays zeros: never brought up to date (it is
+    /// not tracked, so it was copied whole at each submission using title
+    /// memory, through the copy fallback: 60-200 ms a frame), and what
+    /// shaders write there never goes back.
+    fn null(&self) -> bool {
+        self.start == 0
     }
 
     /// Its tracker's bit: `crate::watch::clean_bit` of it is
@@ -1306,6 +1320,17 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The lowest window's copy (a null pointer's target) stays zeros: it is
+    /// clean, so no refresh copies the host's bytes into it.
+    #[test]
+    fn the_lowest_window_reads_zeros() {
+        let copy = find(0x11000, 256).expect("a copy of the lowest window");
+        assert_eq!(copy.range(), (0, WINDOW));
+        assert!(copy.clean(), "never brought up to date");
+        assert_eq!(copy.update(0, WINDOW as usize), 0, "nothing copied");
+        assert!(copy.read_host(0x11000, 64).iter().all(|&w| w == 0), "zeros, not the host's memory");
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
