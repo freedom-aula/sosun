@@ -377,8 +377,9 @@ impl Shader {
     }
 
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
-    /// buffer: per resource-heap index, a buffer view's title address as a
-    /// buffer descriptor's dwords 0 and 1), made in the entry block.
+    /// buffer: per resource-heap index, a descriptor's dwords 0-3 as far as
+    /// the host knows them, `emit` "View addresses"), made in the entry
+    /// block.
     pub fn view_addresses_handle(&mut self) -> V {
         if let Some(h) = self.view_addresses {
             return h;

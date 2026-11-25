@@ -50,10 +50,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
+    /// Per title slot, the console descriptor's dwords 0-3 as far as the
+    /// host knows them (shaders reading a descriptor as data, `crate::memory`;
+    /// [`write_address`]): the buffer, its mapping and host address, made on
+    /// first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -542,7 +542,7 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -891,14 +891,83 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
+/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+/// high), a texture view's size fields ([`texture_words`]), zeros for
+/// anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let words = match view.and_then(texture_words) {
+        Some(words) => words,
+        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
+    };
+    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// A texture view's console image descriptor dwords 0-3 as far as its size
+/// goes: width - 1 and height - 1 of the resource's level 0 (dword 1 bits
+/// 30-31, dword 2 bits 0-13 and 14-29), dword 3 an identity swizzle, the
+/// view's first and last level (bits 12-15, 16-19) and the image type (bits
+/// 28-31). `None` for buffers and samplers.
+// shortcut: the address, format and tiling fields read 0 (no translated
+// shader reads them: the shader refuses such reads where it can tell),
+// and the swizzle is the identity whatever the view's component mapping.
+fn texture_words(view: &View) -> Option<[u32; 4]> {
+    let (resource, desc, unordered) = match view {
+        View::Shader(r, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, false),
+        View::Unordered(r, _, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, true),
+        View::Placed(unordered, resource, desc) if resource[0] != 1 => {
+            (*resource, desc[..10].try_into().ok(), *unordered)
+        }
+        _ => return None,
+    };
+    Some(image_words(&resource, desc.as_ref(), unordered))
+}
+
+/// [`texture_words`] of a texture of resource description `resource` (as
+/// words) through a view of description `desc` (none: the resource's own).
+fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) -> [u32; 4] {
+    let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+    let height = resource[6];
+    let (depth, mips) = (resource[7] & 0xFFFF, resource[7] >> 16);
+    let (samples, dimension) = (resource[9], resource[0]);
+    // Mip count 0: the whole chain.
+    let deepest = if dimension == 4 { depth } else { 1 };
+    let chain = 64 - (width.max(u64::from(height)).max(u64::from(deepest)) | 1).leading_zeros();
+    let mips = if mips == 0 { chain } else { mips };
+    // Image types: 8 1D, 9 2D, 10 3D, 11 cube, 12 1D array, 13 2D array,
+    // 14 2D MSAA, 15 2D MSAA array.
+    let (ty, first, count) = match desc {
+        // Shader and unordered view dimensions number alike up to 3D (8).
+        Some(d) => {
+            let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
+            match (unordered, d[1]) {
+                (_, 6 | 7) => (ty, 0, 1),
+                (true, _) => (ty, d[4], 1),
+                (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
+            }
+        }
+        None => {
+            let array = depth > 1;
+            let ty = match dimension {
+                2 if array => 12,
+                2 => 8,
+                3 if samples > 1 => 14 + u32::from(array),
+                3 => 9 + 4 * u32::from(array),
+                _ => 10,
+            };
+            (ty, 0, if unordered { 1 } else { mips })
+        }
+    };
+    let (w, h) = (width.saturating_sub(1) as u32, height.saturating_sub(1));
+    let last = first + count.max(1) - 1;
+    [
+        0,
+        (w & 3) << 30,
+        (w >> 2 & 0x3FFF) | (h & 0xFFFF) << 14,
+        0xFAC | (first & 0xF) << 12 | (last & 0xF) << 16 | ty << 28,
+    ]
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1741,5 +1810,31 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A texture view's size words are the console image descriptor's
+    /// fields: level 0's size of the resource, the view's levels, its type.
+    #[test]
+    fn a_texture_view_gives_its_image_descriptor_size_fields() {
+        // A 1000x600 2D texture of 10 levels, then an array of 6 with the
+        // whole chain (mip count 0, 1024 wide: 11 levels).
+        let mut texture = [0u32; 14];
+        (texture[0], texture[4], texture[6], texture[7], texture[9]) = (3, 1000, 600, 1 | 10 << 16, 1);
+        let mut array = texture;
+        (array[4], array[7]) = (1024, 6);
+        let mut view = [0u32; 10];
+        // Levels 2-4 of the texture: width - 1 = 999 (0b11_1110_0111).
+        (view[1], view[4], view[5]) = (4, 2, 3);
+        let words = image_words(&texture, Some(&view), false);
+        assert_eq!(words, [0, 3 << 30, 249 | 599 << 14, 0xFAC | 2 << 12 | 4 << 16 | 9 << 28]);
+        // Its whole chain from level 1.
+        (view[4], view[5]) = (1, u32::MAX);
+        assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
+        // An unordered view of level 3: that level alone.
+        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // The array's own view: a 2D array, levels 0-10.
+        let words = image_words(&array, None, false);
+        assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
     }
 }

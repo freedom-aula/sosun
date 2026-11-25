@@ -1331,6 +1331,16 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
 }
 
+/// A texture's description as words (the layout of placed views'
+/// resource descriptions); `None` for buffers.
+pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
+    let (_, desc) = texture_memory(this)?;
+    let mut words = [0u32; 14];
+    // SAFETY: 56 bytes in the description's layout.
+    unsafe { words.as_mut_ptr().cast::<ResourceDesc>().write_unaligned(desc) };
+    Some(words)
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)

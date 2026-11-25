@@ -5,7 +5,8 @@
 //! global and a scalar load, follows a pointer it loaded with another
 //! scalar load, stores through a pointer it computes (64-bit multiply-add)
 //! and does float min/max atomics, reads through the address it takes
-//! from a buffer view's descriptor (the host's view addresses), reads
+//! from a buffer view's descriptor and an image descriptor's size fields
+//! (the host's view addresses), reads
 //! pointers into memory no copy holds (zeros, marked missed) and stores and
 //! loads through a root UAV (title memory in such a program).
 
@@ -104,6 +105,14 @@ fn program() -> HostShader {
     w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
     w.push(S_WAITCNT_ALL);
     w.extend(buffer_store_dword(9, 8, 20));
+    // The image descriptor at heap index 2 loaded whole and read only for
+    // its size fields (dwords 1-3).
+    w.extend(s_load(3, 28, 4, 0x40)); // s[28:35]
+    w.push(S_WAITCNT_ALL);
+    for (k, at) in [(29, 24), (30, 28), (31, 32)] {
+        w.push(v_mov_b32(5, k));
+        w.extend(buffer_store_dword(5, 8, at));
+    }
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -241,9 +250,12 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[0x80 / 4] = 1.0f32.to_bits();
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
-    // Heap index 1 (the memory's view) has the title address.
-    let mut view_addresses = vec![0u32; 2 * 5];
-    view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    // Heap index 1 (the memory's view) has the title address, index 2 a
+    // texture's size fields.
+    let mut view_addresses = vec![0u32; 4 * 5];
+    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
+    view_addresses[9..12].copy_from_slice(&image);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -275,7 +287,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(6),
+                            View::RawUav(9),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -288,7 +300,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2]],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
