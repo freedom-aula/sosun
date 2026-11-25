@@ -653,7 +653,7 @@ struct ScratchChunk {
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
+    /// buffer and memory copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),

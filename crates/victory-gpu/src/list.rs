@@ -857,22 +857,29 @@ extern "system" fn clear_dsv(
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// are title memory, copied at submission like buffer copies (`copy_mapped`:
+/// an unmapped source page reads as zeros). Ranges that overlap are moved
+/// with `memmove`, which the kernel's copy does not promise to do, once
+/// both are known to be committed, as work that may write anywhere.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        if src.abs_diff(dst) >= len {
+            list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
+        } else {
+            let len = len as usize;
+            list.defer(move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    // SAFETY: both ranges are committed title memory.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
