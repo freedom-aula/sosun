@@ -36,6 +36,34 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+thread_local! {
+    /// The thread holds the submission lock ([`Host::execute`] or
+    /// [`Host::quiet`]).
+    static HOLDS_SUBMISSIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The thread holds the submission lock while this lives.
+struct Holding(bool);
+
+impl Holding {
+    fn enter() -> Self {
+        Holding(HOLDS_SUBMISSIONS.with(|h| h.replace(true)))
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        HOLDS_SUBMISSIONS.with(|h| h.set(self.0));
+    }
+}
+
+/// Submissions held off ([`Host::quiet`]).
+pub(crate) struct Quiet<'a> {
+    // Dropped in this order: the mark, then the lock.
+    _holding: Holding,
+    _held: std::sync::MutexGuard<'a, u64>,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -833,11 +861,27 @@ impl Host {
         }
     }
 
+    /// Holds other threads' submissions off until dropped, around the making
+    /// of a shader-visible host view heap and its fill with null views
+    /// (millions of descriptor copies). Under Wine on D3DMetal, lists other
+    /// threads submitted during such a fill lost their views: their
+    /// shaders' writes were dropped and their reads gave zeros, whatever
+    /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
+    /// that holds the submission lock already, nor off Wine.
+    pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
+        if !crate::shader_cache::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Quiet { _holding: Holding::enter(), _held: held })
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
