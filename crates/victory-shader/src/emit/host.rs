@@ -1433,6 +1433,32 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
+            // Zeros a UAV made as a copy destination (`size`: a texture's,
+            // `n` its words per texel, else a buffer's dwords) and returns
+            // the upload buffer to keep. A new committed resource is not
+            // always zeroed: WARP hands out memory a freed buffer of ours held.
+            let zero = |r: &ID3D12Resource, size: Option<(u32, u32)>, n: u32| {
+                let zeros = match size {
+                    Some((w, h)) => {
+                        let pitch = (w * 4 * n).next_multiple_of(256);
+                        let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        let from = footprint_as(&zeros, w, h, n);
+                        list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
+                        zeros
+                    }
+                    None => {
+                        let zeros = upload(&vec![0; n as usize])?;
+                        list.CopyBufferRegion(r, 0, &zeros, 0, u64::from(n) * 4);
+                        zeros
+                    }
+                };
+                list.ResourceBarrier(&[transition(
+                    r,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                Ok::<_, String>(zeros)
+            };
             let slots = match d.views.last() {
                 Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
                 _ => d.views.len(),
@@ -1595,7 +1621,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
@@ -1609,6 +1635,7 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1620,9 +1647,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), 4)?);
                         let pitch = (w * 16).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1639,9 +1667,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), words)?);
                         let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1839,9 +1868,10 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1854,7 +1884,6 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
-                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
