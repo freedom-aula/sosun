@@ -2430,6 +2430,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The overlay blend pass, once tried (#15).
+    compositor: Option<std::result::Result<crate::composite::Compositor, ()>>,
+    /// The texture the blend pass writes.
+    blended: Option<ID3D12Resource>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -2569,14 +2573,33 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `overlay` (a
+    /// texture and its host state, which it keeps) blended over it when
+    /// `VICTORY_PRESENT_COMPOSITE=1`. `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        let Some(picture_format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
+        };
+        // The overlay with its view format, when it is to be blended in.
+        let overlay = overlay.filter(|_| crate::composite::wanted()).and_then(|(o, s)| {
+            // SAFETY: a live resource.
+            let f = swap_format(unsafe { o.GetDesc() }.Format)?;
+            Some((o, s, f))
+        });
+        let format = if overlay.is_some() {
+            crate::composite::result_format(picture_format)
+        } else {
+            picture_format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -2593,6 +2616,29 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // The blend pass and the texture it writes, made on first use.
+        let mut blended = None;
+        if let Some(overlay) = overlay {
+            if p.compositor.is_none() {
+                p.compositor = Some(crate::composite::Compositor::new(&self.device).map_err(|e| {
+                    tracing::warn!(error = %e, "no overlay blending: the pass did not compile");
+                }));
+            }
+            if let Some(Ok(compositor)) = &p.compositor {
+                let current = p.blended.as_ref().is_some_and(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    (d.Width, d.Height, d.Format) == (desc.Width, desc.Height, format)
+                });
+                if !current {
+                    p.blended =
+                        crate::composite::result_texture(&self.device, desc.Width, desc.Height, format).ok();
+                }
+                if let Some(result) = &p.blended {
+                    blended = Some((compositor, result.clone(), overlay));
+                }
+            }
+        }
         // What is presented, whenever it changes: the title's texture in its
         // host format, and the swap chain format it is copied into.
         static SHOWN: Mutex<Option<(u64, u32, i32)>> = Mutex::new(None);
@@ -2641,14 +2687,32 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // What is copied to the back buffer: the blend or the picture,
+            // and the state it returns to afterwards.
+            let (source, state) = match &blended {
+                Some((compositor, result, (o, ostate, oformat))) => {
+                    let ostate = D3D12_RESOURCE_STATES(*ostate as i32);
+                    list.ResourceBarrier(&[transition(texture, state, READ), transition(o, ostate, READ)]);
+                    compositor.record(&self.device, list, (texture, picture_format), (o, *oformat), result, format);
+                    list.ResourceBarrier(&[
+                        transition(texture, READ, state),
+                        transition(o, READ, ostate),
+                        transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    ]);
+                    (result.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                }
+                None => {
+                    list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    (texture.clone(), state)
+                }
+            };
+            let texture = &source;
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -2723,6 +2787,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
+                blended: None,
             })
         }
     }

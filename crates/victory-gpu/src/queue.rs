@@ -420,7 +420,21 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The other plane's first resource, blended over the picture when
+        // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
+        let other = (found.len() == 2)
+            .then(|| found[1 - shown].first().copied())
+            .flatten()
+            .filter(|&o| o != resource && crate::composite::wanted())
+            .and_then(|o| Some((o, crate::resource::host_resource(o)?)));
+        let overlay_state = other.map(|(o, _)| {
+            crate::resource::host_transition(o, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
+        });
+        let overlay = other.zip(overlay_state).map(|((_, t), s)| (t, s));
+        let shown = host.present(texture, state, overlay, frame);
+        if let Some(((o, _), s)) = other.zip(overlay_state) {
+            crate::resource::host_transition(o, s);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
