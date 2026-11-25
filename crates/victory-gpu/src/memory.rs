@@ -192,10 +192,35 @@ fn withheld_in(frame: u64, missed: u64) -> bool {
     missed != MISS_NEVER && frame <= missed.saturating_add(1)
 }
 
+/// Title memory whose host copies hold what shaders wrote this frame and
+/// the frame withheld ([`withholding`]; ranges).
+static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Shaders wrote `[address, address + len)` of title memory in host copies
+/// and the frame withheld it: at the frame's end the copies take title
+/// memory's bytes again ([`retake_dropped`]).
+pub(crate) fn drop_at_frame_end(address: usize, len: usize) {
+    DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
+}
+
+/// At a frame's end: what the frame withheld leaves the host copies, so
+/// that results computed from memory with no copy (garbage record arrays
+/// and node pointers of the BVH builder) do not feed later frames whose
+/// writes go back (a box16 node's f16 bounds over a title object, run
+/// textures9). Each copy holding such memory takes it from title memory at
+/// its next refresh, through its tracker.
+fn retake_dropped() {
+    let dropped = std::mem::take(&mut *DROPPED.lock().unwrap_or_else(|e| e.into_inner()));
+    for (address, len) in dropped {
+        crate::watch::retake(address, len);
+    }
+}
+
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    retake_dropped();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -473,6 +498,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        if withheld > 0 {
+            for &(_, at) in &writes {
+                drop_at_frame_end(at as usize, 1 << 16);
+            }
+        }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);

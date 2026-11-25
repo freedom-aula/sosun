@@ -722,6 +722,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// What shaders wrote into host copies of `[at, at + len)` is dropped:
+/// every copy holding the memory takes it from title memory again at its
+/// next refresh (the pages count as changed in each, aliases too).
+pub(crate) fn retake(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    changed(&mut guards(), first, last, false);
+}
+
 /// The runtime mapped the page at `at` where `others` show it already: the
 /// pages are linked both ways, and if we guard it there, it is guarded here
 /// too (a write through the new mapping must not go unseen by the trackers

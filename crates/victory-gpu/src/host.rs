@@ -1117,6 +1117,7 @@ impl Host {
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
+                crate::memory::drop_at_frame_end(address, len);
             }
         }
         for list in runs {

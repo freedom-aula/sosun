@@ -776,7 +776,7 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 // another both wrote through views goes back unless the withheld list
 // declared it.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
-    let mut marked = Vec::new();
+    let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
             continue;
@@ -790,8 +790,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let used = (marks().end as usize).div_ceil(32).min(words);
         for (w, word) in bits[..used].iter_mut().enumerate() {
             let mut x = std::mem::take(word);
-            while x != 0 && !(memory && memory_withheld) {
-                marked.push((w * 32) as u32 + x.trailing_zeros());
+            let into = if memory && memory_withheld { &mut held } else { &mut marked };
+            while x != 0 {
+                into.push((w * 32) as u32 + x.trailing_zeros());
                 x &= x - 1;
             }
         }
@@ -800,23 +801,28 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
+    let page_of = |m: &Marks, n: u32| {
+        let (&base, copy) = m.owners.range(..=n).next_back()?;
+        let copy = copy.upgrade()?;
+        let k = n - base;
+        (k < pages(copy.start, copy.len)).then(|| {
+            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+            (copy, page)
+        })
+    };
+    // Held back: dropped from the copies at the frame's end.
+    if !held.is_empty() {
+        let m = marks();
+        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memory::drop_at_frame_end(page, PAGE);
+        }
+    }
     if marked.is_empty() {
         return;
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked
-            .iter()
-            .filter_map(|&n| {
-                let (&base, copy) = m.owners.range(..=n).next_back()?;
-                let copy = copy.upgrade()?;
-                let k = n - base;
-                (k < pages(copy.start, copy.len)).then(|| {
-                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-                    (copy, page)
-                })
-            })
-            .collect()
+        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
     for (copy, page) in pages {
         if withheld
@@ -1416,6 +1422,49 @@ mod tests {
         assert_eq!((read(10), read(PAGE + 10)), (0xaa, 0), "page 1 held back");
         // SAFETY: a dword of the mapped bitmap.
         assert_eq!(unsafe { *(memory.data as *const u32).add((base + 1) / 32) } & 1 << ((base + 1) % 32), 0, "cleared");
+        unregister(p, p as u64);
+    }
+
+    /// What a frame withheld leaves every host copy of its memory at the
+    /// frame's end (run textures9's shape): in frame N a program using title
+    /// memory writes a record into the copies and the frame misses, so it
+    /// stays out of title memory but in the copies for the GPU; in frame
+    /// N+1, which misses nothing, a program reading the record must see
+    /// title memory's bytes, not frame N's, in a title buffer's copy and in
+    /// an inner buffer's copy of the same pages alike.
+    #[test]
+    fn what_a_frame_withholds_leaves_the_copies_at_its_end() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, len as u64);
+        register(p + 1, p as u64, PAGE as u64);
+        let (Some(outer), Some(inner)) = (find(p as u64, len as u64), find(p as u64 + 16, 16)) else {
+            unregister(p + 1, p as u64);
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let byte = |c: &Shadow| c.read_host(p as u64 + 16, 1)[0] & 0xff;
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+            c.writing(start as usize, n as usize, false);
+            c.write_host(p as u64 + 16, &[0x22]);
+            c.keep_writes(start as usize, n as usize);
+        }
+        crate::memory::drop_at_frame_end(p + 16, 4);
+        assert_eq!((byte(&outer), byte(&inner)), (0x22, 0x22), "frame N: the GPU's copies keep it");
+        crate::memory::log_frame();
+        for c in [&outer, &inner] {
+            let (start, n) = c.range();
+            c.update(start as usize, n as usize);
+        }
+        assert_eq!((byte(&outer), byte(&inner)), (0x11, 0x11), "frame N+1: title memory's bytes");
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0x11, "title memory untouched");
+        unregister(p + 1, p as u64);
         unregister(p, p as u64);
     }
 
