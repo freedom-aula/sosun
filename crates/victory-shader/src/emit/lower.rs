@@ -5320,7 +5320,12 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        let mut guard = self.guard(b, i)?;
+        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
+        // whatever EXEC holds.
+        let mut guard = match v.dst {
+            Some(Operand::Scalar { .. }) => None,
+            _ => self.guard(b, i)?,
+        };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -10969,6 +10974,27 @@ mod tests {
         words[6] = 0xBF80_0000; // s_nop 0
         words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
         lowers(&words, 1 << 7).expect("a uniform loop's mask join");
+    }
+
+    #[test]
+    fn a_scalar_result_needs_no_exec() {
+        // s6 is 0 where every lane skips and the saved EXEC where some run:
+        // no lane mask at the per-lane join. EXEC taken from it guards only
+        // a `v_readlane` (written whatever EXEC holds) before it is restored
+        // (`CS_IrradianceCache_Shade`).
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_0304, // s_mov_b32 s6, s4
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD760_0002, // v_readlane_b32 s2, v0, 3
+            0x0001_0700,
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
     }
 
     #[test]
