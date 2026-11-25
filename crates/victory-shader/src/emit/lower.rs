@@ -341,9 +341,11 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// program as killed (a pixel discards). The limit is also what such a loop
+/// costs: a dispatch lasts as long as its slowest lane, and one lane's 2^20
+/// passes took 60 to 195 ms on an Apple M5 GPU, where 2^14 take 1 to 3 ms.
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
