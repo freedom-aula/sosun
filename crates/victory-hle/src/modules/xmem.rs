@@ -131,8 +131,10 @@ pub extern "system" fn XMemVirtualAlloc(
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        // watched (their physical-page views are copied whole). Nor is
+        // anything under Rosetta, where Wine's watch faults on first writes
+        // Rosetta cannot resume (`victory_gpu::fault_tracking`).
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && victory_gpu::fault_tracking() {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -1086,7 +1088,8 @@ mod tests {
                 &mut granularity,
             )
         };
-        assert_eq!(watched, 0);
+        // Not under Rosetta (`victory_gpu::fault_tracking`).
+        assert_eq!(watched == 0, victory_gpu::fault_tracking());
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);

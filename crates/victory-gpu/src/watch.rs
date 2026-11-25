@@ -33,9 +33,65 @@
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen.
+//!
+//! Under Rosetta (Wine on macOS) nothing is tracked: see
+//! [`fault_tracking`].
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// Whether title writes may fault into a tracker: the guards here and the
+/// write watch of the runtime's pools (`victory_hle`'s `XMemVirtualAlloc`,
+/// which Wine emulates with page protection). Not under Rosetta: it
+/// cannot resume an AVX2 masked store (`vpmaskmovd`) that faults after
+/// writing its first lanes, which happens when the store starts in
+/// writable memory and ends in a protected page; it prints `unexpectedly
+/// need to EmulateForward on a synchronous exception` and the process
+/// hangs (VIctory-macOS issue #1). Without tracking, copies take their
+/// memory whole every time, as they do for memory that is not the
+/// runtime's. `VICTORY_FAULT_TRACKING=1` turns tracking on anyway, `0`
+/// turns it off. Tests keep it on: their stores do not cross pages.
+pub fn fault_tracking() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        decide(
+            std::env::var("VICTORY_FAULT_TRACKING").ok().as_deref(),
+            cfg!(test) || !rosetta(),
+        )
+    });
+    *ON
+}
+
+/// `fault_tracking` from the variable's value and the default.
+fn decide(var: Option<&str>, default: bool) -> bool {
+    match var {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
+}
+
+/// Whether x86-64 code here runs under Rosetta: Wine on macOS, whose
+/// x86-64 Wine only runs that way on the Apple silicon Macs D3DMetal needs.
+fn rosetta() -> bool {
+    use std::ffi::{CStr, c_char};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    type HostVersion = unsafe extern "C" fn(*mut *const c_char, *mut *const c_char);
+    // SAFETY: ntdll is always loaded and both names end with a NUL. Wine's
+    // `wine_get_host_version` (cdecl, two out pointers) sets them to static
+    // strings: the host's `uname` system name and release.
+    unsafe {
+        let Some(f) = GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+            c"wine_get_host_version".as_ptr().cast(),
+        ) else {
+            return false;
+        };
+        let f: HostVersion = std::mem::transmute(f);
+        let (mut sysname, mut release) = (std::ptr::null(), std::ptr::null());
+        f(&mut sysname, &mut release);
+        !sysname.is_null() && CStr::from_ptr(sysname) == c"Darwin"
+    }
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
@@ -175,7 +231,7 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    if len == 0 || !runtime_memory(start, views) {
+    if len == 0 || !fault_tracking() || !runtime_memory(start, views) {
         return None;
     }
     install();
@@ -586,6 +642,17 @@ pub(crate) mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn fault_tracking_follows_the_variable() {
+        assert!(decide(Some("1"), false));
+        assert!(!decide(Some("0"), true));
+        assert!(decide(None, true));
+        assert!(!decide(None, false));
+        assert!(!decide(Some("yes"), false));
+        // Tests keep tracking on, under Rosetta too.
+        assert!(fault_tracking() || std::env::var("VICTORY_FAULT_TRACKING").as_deref() == Ok("0"));
+    }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
