@@ -59,6 +59,8 @@ Several people who own the game have run it on their Macs and reported back in t
 
 <p align="center"><img src="https://github.com/user-attachments/assets/f68a0cf3-bebc-4b12-a830-057983deb2cc" width="720" alt="The game world on an M3 Max under VIctory, after the speed changes"><br><sub>The game world on jjlange's M3 Max on current main, after the freeze and speed fixes, 25 November 2026 (#50).</sub></p>
 
+<p align="center"><video src="https://github.com/user-attachments/assets/ea9413fa-f523-4a2e-af94-b00da1f004de" width="720" controls></video><br><sub>Seven minutes from launch on jgrizon's M5 Pro (24 GB), current main, 25 November 2026 (#65).</sub></p>
+
 <p align="center"><img src="https://github.com/user-attachments/assets/3d324ff6-05e0-42f4-9793-297da0475bc0" width="720" alt="The game's loading artwork on an M5 Pro under VIctory"><br><sub>Loading artwork on LakshanSivakumar's M5 Pro, 25 November 2026 (#50).</sub></p>
 
 <p align="center"><img src="https://github.com/user-attachments/assets/5ce34eca-cc47-4934-ad67-b999324ee791" width="720" alt="The game world, a city skyline at night, on an M5 Pro under VIctory"><br><sub>The game world on LakshanSivakumar's M5 Pro at 0.1 fps, 25 November 2026 (#50).</sub></p>
@@ -88,7 +90,7 @@ git clone https://github.com/pragyaangaur/VIctory-macOS.git
 cd VIctory-macOS
 ```
 
-**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it. Use version 4.0 beta 3 or newer. The D3DMetal 3.0 that CrossOver bundles runs the tests, but with it the game stops at one of its own start-up checks about seven seconds in, while the same game files get to the game world with 4.0 beta 3 (#24, #50).
+**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it. Use version 4.0 beta 3 or newer: every tester who has reached the game world used it, and the D3DMetal 3.0 that CrossOver bundles cannot keep compiled pipelines (#30). One tester with 4.0 beta 3 still stops at an early start-up check of the game, so the version is not the whole story there (#24).
 
 **3. Run the setup.**
 
