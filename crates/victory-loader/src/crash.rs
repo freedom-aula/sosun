@@ -51,6 +51,23 @@ static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new()
 /// Read before installing the exception handler.
 static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
+/// Diagnostics: title `int3` asserts to step over and resume, the way a
+/// debugger continues past one, to see how far init gets. Their RVAs in
+/// the title image, from `VICTORY_SKIP_TITLE_INT3=1dac734,...` (#24).
+/// Every other assert still stops the run.
+#[cfg(feature = "diagnostics")]
+static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// The RVAs in a `VICTORY_SKIP_TITLE_INT3` list (hex, `0x` optional,
+/// comma-separated); entries that do not parse are left out.
+#[cfg(any(feature = "diagnostics", test))]
+fn skip_list(value: &str) -> Vec<u32> {
+    value
+        .split(',')
+        .filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -187,6 +204,10 @@ pub fn report_crashes() {
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
+    #[cfg(feature = "diagnostics")]
+    SKIP_TITLE_INT3.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_TITLE_INT3").map(|v| skip_list(&v)).unwrap_or_default()
+    });
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -553,6 +574,25 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT
+        && let Some(list) = SKIP_TITLE_INT3.get()
+        && !list.is_empty()
+    {
+        // SAFETY: the context record is valid.
+        let rip = unsafe { (*(*info).ContextRecord).Rip } as usize;
+        if let Some(base) = crate::threads::title_image_base(rip)
+            && let Ok(rva) = u32::try_from(rip - base)
+            && list.contains(&rva)
+        {
+            // Logged every time, so a log never hides a patched run.
+            tracing::warn!(rva = format_args!("{rva:#x}"), "stepped over a title int3 (VICTORY_SKIP_TITLE_INT3)");
+            // Step over the one-byte `int3` and resume, the way a debugger
+            // continues past an assert. SAFETY: the context record is valid.
+            unsafe { (*(*info).ContextRecord).Rip += 1 };
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
@@ -844,6 +884,12 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_lists_take_hex_rvas() {
+        assert_eq!(skip_list("1dac734, 0x2d5f3e2,zz,"), vec![0x1dac734, 0x2d5f3e2]);
+        assert!(skip_list("").is_empty());
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
