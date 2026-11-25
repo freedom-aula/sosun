@@ -11,6 +11,10 @@
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
+//! With a count buffer ExecuteIndirect runs only the first min(max, count)
+//! records, so the clamp reads the count word and stops there: the maximum
+//! can be far above the count, and the records between never run.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
@@ -21,15 +25,19 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+// The title's record count: read only if `counted`.
+RWByteAddressBuffer countWord : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -73,16 +81,25 @@ void main(uint lane : SV_GroupIndex) {
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
     }
+    // ExecuteIndirect runs min(max, count) records: no others are clamped or
+    // charged. The loop still counts tiles up to `records`, a constant, as
+    // the compiler cannot prove that a value read from memory is the same
+    // in every lane, and barriers need that; tiles past `walked` only wait
+    // at them.
+    uint walked = records;
+    if (counted != 0) {
+        walked = min(records, countWord.Load(0));
+    }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
         uint at = record * stride;
         uint cost = 0;
-        if (record < records) {
+        if (record < walked) {
             cost = clamped(at);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
-        if (lane == 0) {
+        if (lane == 0 && tile * 64 < walked) {
             for (uint i = 0; i < 64; i++) {
                 if (costs[i] > left) {
                     // The first record that does not fit takes what is
@@ -110,7 +127,8 @@ struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     /// Built from [`WORDS_SOURCE`], which also reads the two buffers as
-    /// words through root views 3 and 4.
+    /// words through root views 3 and 4, and the count through 5 (the
+    /// count is view 3 otherwise).
     words: bool,
 }
 
@@ -145,11 +163,12 @@ fn make() -> windows::core::Result<Clamp> {
 /// of the same buffers, and one thread charging the records in order
 /// instead of a group of 64. The results are the same.
 const WORDS_SOURCE: &str = r#"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 RWStructuredBuffer<uint> argWords : register(u2);
 RWStructuredBuffer<uint> budgetWords : register(u3);
+RWStructuredBuffer<uint> countWords : register(u4);
 static const uint BUDGET = 1u << 27;
 static const uint GROUPS = 1u << 20;
 uint3 load3(uint at) { return uint3(argWords[at / 4], argWords[at / 4 + 1], argWords[at / 4 + 2]); }
@@ -178,7 +197,11 @@ uint clamped(uint at) {
 [numthreads(1, 1, 1)]
 void main() {
     uint left = BUDGET - min(budgetWords[0], BUDGET);
-    for (uint record = 0; record < records; record++) {
+    uint walked = records;
+    if (counted != 0) {
+        walked = min(records, countWords[0]);
+    }
+    for (uint record = 0; record < walked; record++) {
         uint at = record * stride;
         uint cost = clamped(at);
         if (cost > left) {
@@ -202,6 +225,7 @@ fn make_words() -> windows::core::Result<Clamp> {
         Param::Uav { register: 1 },
         Param::Uav { register: 2 },
         Param::Uav { register: 3 },
+        Param::Uav { register: 4 },
     ];
     let (root, pso) = crate::compute::pipeline(WORDS_SOURCE, s!("clamp"), 0, &params)?;
     Ok(Clamp { root, pso, words: true })
@@ -259,11 +283,18 @@ fn make_fxc() -> windows::core::Result<Clamp> {
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
+///
+/// `count` is the host address of the title's record count: the clamp then
+/// stops at the lesser of it and `records`, which is where ExecuteIndirect
+/// stops. A count that is not 4-byte aligned, or that lies among the
+/// records (the clamp writes them, so ExecuteIndirect would read it
+/// changed), is not read: every record is clamped.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    count: Option<u64>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -271,8 +302,14 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return false;
     }
+    let end = gpu.saturating_add(u64::from(stride) * u64::from(records));
+    let count = count.filter(|at| at.is_multiple_of(4) && (*at >= end || at + 4 <= gpu));
+    RECORDS[0].fetch_add(u64::from(records), Ordering::Relaxed);
+    if count.is_some() {
+        RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
+    }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(count.is_some())];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -283,11 +320,16 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        // Set even when not read: a root view has to be set.
+        let count = count.unwrap_or(gpu);
         if c.words {
             l.SetComputeRootUnorderedAccessView(3, gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
+            l.SetComputeRootUnorderedAccessView(5, count);
+        } else {
+            l.SetComputeRootUnorderedAccessView(3, count);
         }
-        // One group walks every record.
+        // One group walks every record (up to the count).
         l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -300,6 +342,14 @@ pub(crate) fn bound(
     }
     true
 }
+
+/// Records the clamps were asked to walk (the maximum of each execution)
+/// since the last call, and the part of them under a count buffer, where
+/// the walk stops at the count.
+pub(crate) fn take_records() -> [u64; 2] {
+    RECORDS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static RECORDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
@@ -340,6 +390,18 @@ mod tests {
     /// it runs empty). One record more follows them and must stay as
     /// written. `None` without a host GPU.
     fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        clamped_under(kind, words, records, calls, None)
+    }
+
+    /// As [`clamped`], with the title's record count `count` (a word in a
+    /// buffer of its own) if there is one.
+    fn clamped_under(
+        kind: u32,
+        words: &[u32],
+        records: u32,
+        calls: u32,
+        count: Option<u32>,
+    ) -> Option<Vec<u32>> {
         let host = super::host()?;
         // Words in a record of `kind`.
         let per = match kind {
@@ -359,8 +421,11 @@ mod tests {
                 data.add(at).write_volatile(words[at % words.len()]);
             }
             let gpu = buffer.GetGPUVirtualAddress();
+            let (counter, word) = host.shared_buffer(4).unwrap();
+            word.cast::<u32>().write_volatile(count.unwrap_or(0));
+            let counted = count.map(|_| counter.GetGPUVirtualAddress());
             for _ in 0..calls {
-                assert!(super::bound(&list, &buffer, gpu, spec));
+                assert!(super::bound(&list, &buffer, gpu, spec, counted));
                 super::done(&list, &buffer);
             }
             list.close();
@@ -422,5 +487,37 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// The walk stops at the count: of 128 garbage draws under a count of 3
+    /// the first two run and the third runs empty, as they do without one,
+    /// and the others are never read (they stay as written). A count above
+    /// the records changes nothing; a count of zero walks none.
+    #[test]
+    fn the_walk_stops_at_the_count() {
+        let Some(under) = clamped_under(0, &[u32::MAX], 128, 1, Some(3)) else {
+            return; // no host GPU here
+        };
+        assert_eq!(under[..4], [1 << 24, 1 << 24, 0, u32::MAX]);
+        assert!(under[3..].iter().all(|&count| count == u32::MAX));
+        let all = clamped(0, &[u32::MAX], 128, 1).unwrap();
+        assert_eq!(under[..3], all[..3]);
+        let above = clamped_under(0, &[u32::MAX], 128, 1, Some(1 << 20)).unwrap();
+        assert_eq!(above, all);
+        let none = clamped_under(0, &[u32::MAX], 128, 1, Some(0)).unwrap();
+        assert!(none.iter().all(|&count| count == u32::MAX));
+    }
+
+    /// Only the records that run are charged to the budget: after a call
+    /// under a count of 1 a second finds room for that record again, where
+    /// the same draws with no count spent it all on records that never ran.
+    #[test]
+    fn records_past_the_count_are_not_charged() {
+        let Some(twice) = clamped_under(0, &[u32::MAX], 128, 2, Some(1)) else {
+            return; // no host GPU here
+        };
+        assert_eq!(twice[0], 1 << 24);
+        let spent = clamped(0, &[u32::MAX], 128, 2).unwrap();
+        assert!(spent.iter().all(|&count| count == 0));
     }
 }

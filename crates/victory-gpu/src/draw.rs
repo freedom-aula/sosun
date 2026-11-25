@@ -1594,8 +1594,16 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own. It
+        // reads the count, so that it stops where the execution does.
+        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            counted,
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
