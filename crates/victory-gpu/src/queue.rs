@@ -613,10 +613,10 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
-    /// Two planes 64 bytes apart (as a longer plane description would
-    /// place them), each listing one of our textures, are both found; a
-    /// list naming something else is not taken for a plane.
-    #[cfg(windows)]
+    /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
+    /// it names one, else the plane whose first resource has the most
+    /// pixels. It only weighs the areas it is handed, so it runs on every
+    /// host.
     #[test]
     fn the_largest_plane_is_shown_unless_one_is_named() {
         // Series S: a 1080p overlay, then the 4K picture.
@@ -632,6 +632,11 @@ mod tests {
         assert_eq!(pick_plane(None, &[]), 0);
     }
 
+    /// Two planes 64 bytes apart (as a longer plane description would
+    /// place them), each listing one of our textures, are both found; a
+    /// list naming something else is not taken for a plane. This reads
+    /// title memory through the host, so it runs where a host exists.
+    #[cfg(windows)]
     #[test]
     fn planes_after_the_first_are_found_by_their_stride() {
         let texture = || {
