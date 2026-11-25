@@ -18,7 +18,7 @@ use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
-use crate::structure::{Atom, Bool, LaneExit, Structured};
+use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 
@@ -175,37 +175,44 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
-    lane_fail: HashMap<Value, Why>,
-    vals: HashMap<Value, Val>,
-    floats: HashMap<Value, V>,
+    lane_fail: Map<Value, Why>,
+    vals: Map<Value, Val>,
+    floats: Map<Value, V>,
     /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
     /// result written over a value with no DXIL form keeps its high half.
-    low16: HashMap<Value, V>,
+    low16: Map<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
-    bools: HashMap<(usize, Bool), V>,
-    lane_bits: HashMap<Value, V>,
+    bools: Map<(usize, Bool), V>,
+    lane_bits: Map<Value, V>,
     /// IR phi location by value.
-    phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
+    phi_at: Map<Value, (usize, usize)>,
+    mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
+    /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
-    params: HashMap<Value, (usize, u32)>,
+    params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
-    root_views: HashMap<u32, V>,
+    root_views: Map<u32, V>,
     samplers: Vec<[u32; 4]>,
-    descriptors: HashMap<(Site, bool), &'a Source>,
-    scalar: HashMap<Site, Address>,
-    exports: HashMap<Site, &'a Export>,
-    interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    descriptors: Map<(Site, bool), &'a Source>,
+    scalar: Map<Site, Address>,
+    exports: Map<Site, &'a Export>,
+    interps: Map<Site, &'a Interp>,
+    /// The lists of `x.res.waterfall` as sets: they are tested for every
+    /// VALU instruction, and a bindless shader has hundreds of compares.
+    waterfall_compares: Set<Site>,
+    waterfall_reads: Set<Value>,
+    waterfall_loads: Set<Site>,
+    handles: Map<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    edges: Map<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -231,7 +238,7 @@ struct Lower<'a> {
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
-    no_barrier: HashSet<usize>,
+    no_barrier: Set<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -240,19 +247,19 @@ struct Lower<'a> {
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
-    ballots: HashMap<Value, (V, V)>,
+    ballots: Map<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
-    balloting: HashSet<Value>,
+    balloting: Set<Value>,
     /// Block writing each value.
-    def_block: HashMap<Value, usize>,
+    def_block: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
-    section_out: HashSet<Value>,
+    section_out: Set<Value>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -473,7 +480,7 @@ fn smem_dwords(name: &str) -> Option<u32> {
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -534,7 +541,7 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = Set::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -583,23 +590,23 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
-            low16: HashMap::new(),
+            lane_fail: Map::default(),
+            vals: Map::default(),
+            floats: Map::default(),
+            low16: Map::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: Map::default(),
+            lane_bits: Map::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: Map::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
-            root_views: HashMap::new(),
+            root_views: Map::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -610,8 +617,11 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            handles: HashMap::new(),
-            edges: HashMap::new(),
+            waterfall_compares: x.res.waterfall.compares.iter().copied().collect(),
+            waterfall_reads: x.res.waterfall.reads.iter().copied().collect(),
+            waterfall_loads: x.res.waterfall.loads.iter().copied().collect(),
+            handles: Map::default(),
+            edges: Map::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -631,8 +641,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
-            balloting: HashSet::new(),
+            ballots: Map::default(),
+            balloting: Set::default(),
             def_block: p
                 .blocks
                 .iter()
@@ -647,7 +657,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             sections: HashMap::new(),
-            section_out: HashSet::new(),
+            section_out: Set::default(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1552,14 +1562,17 @@ impl<'a> Lower<'a> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
-        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
-        match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
-                return self.mask_dword(v).map(Val::I32);
-            }
-            Some(&Val::Missing(w)) => return Err(w),
-            Some(&val) => return Ok(val),
-            None => {}
+        let found = self.vals.get(&v).copied();
+        // Most values have a DXIL form, which is the answer whatever they
+        // are; only one without needs to know whether it is a lane mask.
+        if let Some(val @ (Val::I32(_) | Val::Bit(_))) = found {
+            return Ok(val);
+        }
+        if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
+            return self.mask_dword(v).map(Val::I32);
+        }
+        if let Some(Val::Missing(w)) = found {
+            return Err(w);
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -5061,7 +5074,7 @@ impl<'a> Lower<'a> {
                 let index = self.buffer_guard(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
-                let per_lane = self.x.res.waterfall.loads.contains(load);
+                let per_lane = self.waterfall_loads.contains(load);
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -5406,7 +5419,7 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if self.x.res.waterfall.compares.contains(&(b, i)) {
+        if self.waterfall_compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).
             self.lane(inst, Some(true));
@@ -6275,7 +6288,7 @@ impl<'a> Lower<'a> {
                 if inst
                     .writes
                     .first()
-                    .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
+                    .is_some_and(|w| self.waterfall_reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
@@ -9991,13 +10004,13 @@ impl<'a> Lower<'a> {
     /// that ran it) leaves the edge dead. A back edge forgets the branches
     /// (the loop redefines their conditions). Fewer conditions are weaker,
     /// so keeping only the last few stays sound.
-    fn live_edges(&self) -> HashSet<(Value, usize)> {
+    fn live_edges(&self) -> Set<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
         let (p, st) = (self.x.p, &self.x.st);
         let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
-        let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Vec<(Bool, bool)>>>::new();
+        let mut live = Set::default();
+        let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
