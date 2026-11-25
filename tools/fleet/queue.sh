@@ -541,18 +541,22 @@ auto_round() {
             return 0
         fi
     fi
-    fill_gaps "$tasks"
+    fill_gaps "$tasks" "$head"
 }
 
 # Once the newest round is gap_delay_hours old, opens one task for each chip
 # family and target macOS version that has no accepted result and no task
 # yet, so that coverage spreads across macOS versions. Only for chips whose
 # round tasks have all been taken.
-fill_gaps() { # TASKS_JSON
-    local tasks=$1 commit created have chip m it json
+fill_gaps() { # TASKS_JSON HEAD
+    local tasks=$1 head=${2:-} commit created have chip m it json
     commit=$(jq -r 'map(select((.body // "") | contains("\nverifies: ") | not)) | max_by(.created_at) | .body // ""' <<< "$tasks" |
         sed -nE 's/^commit: *([0-9a-f]{40}) *$/\1/p')
     [ -n "$commit" ] || return 0
+    # Only for the commit main points to: gaps of an older round would test
+    # code that main has moved past (25 November: twelve gap tasks for a
+    # round 50 merges behind main).
+    [ -z "$head" ] || [ "$commit" = "$head" ] || return 0
     created=$(jq -r --arg c "$commit" 'map(select((.body // "") | contains("\ncommit: \($c)\n"))) | map(.created_at) | min' <<< "$tasks")
     [ $(($(date -u +%s) - $(date -u -d "$created" +%s))) -ge $(($(conf .gap_delay_hours) * 3600)) ] || return 0
     have=""
