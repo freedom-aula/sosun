@@ -150,7 +150,7 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
         crate::pipeline::note_drop(pipeline as This);
     } else {
-        crate::pipeline::note_why(format!("{kind}: {why}"));
+        crate::pipeline::note_why(format!("{kind}: {why} {}", crate::pipeline::shaders_of(pipeline as This)));
     }
     list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
