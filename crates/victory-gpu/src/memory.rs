@@ -392,12 +392,25 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
-        marks.iter().enumerate().any(|(w, &mark)| {
-            (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
-                let entry = w * 32 + b;
-                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
+        // Most words are 0: skip them, and walk the set bits of the rest.
+        marks
+            .iter()
+            .enumerate()
+            .filter(|&(_, &mark)| mark != 0)
+            .any(|(w, &mark)| {
+                let mut bits = mark;
+                while bits != 0 {
+                    let entry = w * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if entry / BLOCK == 0
+                        || l.blocks.get(entry / BLOCK).is_none()
+                        || l.owner.get(entry).is_none_or(|o| o.is_none())
+                    {
+                        return true;
+                    }
+                }
+                false
             })
-        })
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner } = &*layout(key);
@@ -407,6 +420,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
+            // Most words are 0: write back only the ones that are not.
+            if *mark == 0 {
+                continue;
+            }
             let mut bits = std::mem::take(mark);
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
