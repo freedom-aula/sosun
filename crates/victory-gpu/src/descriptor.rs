@@ -186,9 +186,7 @@ pub(crate) fn sync_heaps() {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
-                }
+                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }
     }
@@ -453,6 +451,18 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// For each record (tag, index, generation): whether it names a view that
+/// is current, as [`view_at`] would find it (one lock for them all).
+fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        })
+        .collect()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

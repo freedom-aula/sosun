@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -624,6 +624,34 @@ impl HostHeap {
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
+        }
+    }
+
+    /// A heap sync of slots `first..last`, whose records are at `start` +
+    /// index × `step`: [`HostHeap::mirror`] of each slot whose record
+    /// differs from what the slot holds, the rest passed by as `mirror`
+    /// would, with one lock of each kind for them all instead of two per slot
+    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        let at = |i: u32| start + u64::from(i) * step;
+        // SAFETY: records in title heap memory the caller found mapped.
+        let records: Vec<[u32; 3]> =
+            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
+        let current = views_current(&records);
+        let stale: Vec<u32> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            (first..last)
+                .zip(records.iter().zip(current))
+                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
+                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                    Some(&m) => m != 0,
+                    None => true,
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for i in stale {
+            self.mirror(i, at(i), false);
         }
     }
 
@@ -1474,6 +1502,37 @@ mod tests {
         }
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made for the draw");
+    }
+
+    /// A heap sync makes the slots whose records the title changed as bytes
+    /// (a copy of another slot's record, a record cleared) and passes the
+    /// others by.
+    #[test]
+    fn heap_syncs_make_the_slots_whose_records_changed() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        // A view of no memory: a view of the test's own heap memory would get
+        // a host copy whose 4 MiB window the guards may cover (the process
+        // heap guarded read-only hung the suite).
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start);
+        let host = title_heap.host().expect("a host view heap");
+        // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
+        unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
+        assert!(!host.made(1), "copied as bytes: not seen yet");
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && host.made(1) && !host.made(2));
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
