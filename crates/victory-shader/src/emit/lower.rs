@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -4378,11 +4378,35 @@ impl<'a> Lower<'a> {
     /// The byte stride of the buffer view at heap index `index`, from the
     /// view-stride table (`t`[`VIEW_STRIDES`]).
     fn stride_at(&mut self, index: V) -> V {
+        let word = self.view_word(index);
+        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
+        self.s.m.bin(self.cur, Bin::And, word, bits)
+    }
+
+    /// Dword `index` of the view-stride table: the stride and the format
+    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
+    fn view_word(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         self.raw_dword(table, at)
+    }
+
+    /// Whether the typed buffer view a handle names has an integer format,
+    /// and whether a signed one, from the view-stride table; `None` if the
+    /// handle's heap index is not known.
+    fn integer_view(&mut self, h: V) -> Option<(V, V)> {
+        let index = *self.s.view_index.get(&h)?;
+        let word = self.view_word(index);
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let [int, signed] = [VIEW_INTEGER, VIEW_SIGNED].map(|bit| {
+            let bit = self.s.m.i32(bit);
+            let x = self.s.m.bin(c, Bin::And, word, bit);
+            self.s.m.cmp(c, pred::NE, x, zero)
+        });
+        Some((int, signed))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -4834,7 +4858,9 @@ impl<'a> Lower<'a> {
             &[table, at, iu, mask, four],
         );
         let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        let word = self.as_int(x);
+        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
+        Ok(self.s.m.bin(c, Bin::And, word, bits))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -8961,9 +8987,19 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            let typed_h = if typed {
+                Some(self.handle(site, src, false, (10 | u, 0x409))?)
+            } else {
+                None
+            };
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is f16 for float and normalized formats, widened
+                // for the 32-bit float store; for integer formats (the view's
+                // kind, from the view-stride table) the 16-bit integer, zero-
+                // or sign-extended (stored through the float-typed handle as
+                // loads read: see there).
+                let integer = typed_h.and_then(|h| self.integer_view(h));
+                let c = self.cur;
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -8975,7 +9011,16 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let mut w = self.as_int(f);
+                    if let Some((int, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
+                        w = self.s.m.select(c, int, n, w);
+                    }
+                    wide.push(w);
                 }
                 vals = wide;
             }
@@ -8989,7 +9034,7 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
                 args.push(h);
                 args.extend([element, iu]);
@@ -9094,6 +9139,7 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
+        let mut typed_h = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -9102,6 +9148,7 @@ impl<'a> Lower<'a> {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            typed_h = Some(h);
             let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
                 c,
@@ -9150,16 +9197,31 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
+            // float and normalized formats; for integer formats (the view's
+            // kind, from the view-stride table) the integer's low 16 bits.
+            // shortcut: an integer view is read and written through the
+            // float-typed handle, so its channels' bits travel as the driver
+            // passes a mismatched component type (unchanged on the RX 6700
+            // XT and WARP, `stride_tests`); an integer-typed second handle
+            // for the slot would not rely on it.
+            let integer = typed_h.and_then(|h| self.integer_view(h));
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
+                    let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    if let Some((int, _)) = integer {
+                        let bits = self.as_int(f);
+                        let low = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, bits, low);
+                        h = self.s.m.select(c, int, low, h);
+                    }
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);

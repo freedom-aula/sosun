@@ -468,9 +468,10 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
+    /// for slot `index` in the view-stride table, with the integer-format
+    /// bits of a typed buffer view ([`view_kind`]).
     fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
+        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -828,6 +829,51 @@ fn view_stride(view: &View) -> u32 {
     // Nonzero: shaders taking views at computed indices read the null buffer
     // view where the table holds 0 (`victory_shader::emit`).
     element.max(1) as u32
+}
+
+/// The view-stride table's format-kind bits of a buffer view: a typed view
+/// (no structure stride, not raw) of an integer format gets
+/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
+/// Translated shaders pass 16-bit typed data of such views as bits, not as
+/// halves (`victory_shader::emit`, "d16").
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    // Buffer views only (dimension 1); a structured or raw one is no typed view.
+    let (format, typed) = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
+    };
+    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
+        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
+        Some(false) => VIEW_INTEGER,
+        None => 0,
+    }
+}
+
+/// Whether a DXGI format is an integer one, and if so whether signed:
+/// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
+fn integer_format(format: u32) -> Option<bool> {
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),
+        _ => None,
+    }
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -1471,6 +1517,27 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed buffer views of integer formats carry their kind in the
+    /// view-stride table; float, normalized, raw and structured ones none.
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(57, 0, 0)), VIEW_INTEGER, "R16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        // Format, dimension, mapping, first element, count, stride, flags.
+        let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
+        assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
+        assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
 
     /// A placed texture's view the title writes into a heap is left null
     /// and noted once: heap syncs (every submission) pass it by, a draw

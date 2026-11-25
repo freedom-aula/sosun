@@ -14,8 +14,16 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
+/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
+/// The bits of a view-stride table dword holding the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a view-stride table dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -533,8 +541,10 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12).
-        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+        // Unordered typed, raw and structured buffers (kinds 10-12), and
+        // typed buffers read (their format kind, `Lower::view_word`).
+        let kind = props.0 & 0xFF;
+        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
             self.view_index.insert(h, index);
         }
         h
