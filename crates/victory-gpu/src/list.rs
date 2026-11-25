@@ -522,8 +522,10 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if !texture_to_buffer(list, &dst, (x, y, z), &src, source_box) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("a texture to buffer copy was dropped"));
+            }
             return;
         };
         let mut from = src;
@@ -605,6 +607,78 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+#[cfg(test)]
+impl CopyLocation {
+    /// A placed footprint in `resource` (tests).
+    pub(crate) fn placed(resource: This, footprint: crate::resource::PlacedFootprint) -> Self {
+        Self { resource, kind: 1, footprint }
+    }
+    /// Subresource 0 of `resource` (tests).
+    pub(crate) fn whole(resource: This) -> Self {
+        Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
+    }
+}
+
+/// Texture to buffer (a read back): the copy goes on the GPU into the
+/// buffer's host copy, and the copy-back after the submission puts it in
+/// title memory, as for shader writes. The title then reads it, often
+/// waiting on it first (#50: the main thread slept for good right after
+/// these copies were dropped). False if it cannot be done this way.
+#[cfg(windows)]
+pub(crate) fn texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    (x, y, z): (u32, u32, u32),
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) -> bool {
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    // Placed footprints start on 512-byte boundaries in a host buffer.
+    const PLACEMENT: u64 = 512;
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        return false;
+    }
+    let (Some(bytes), Some(texture)) = (dst.footprint.bytes(), crate::resource::host_resource(src.resource)) else {
+        return false;
+    };
+    let Some(data) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
+        return false;
+    };
+    let address = data as u64;
+    let Some(shadow) = crate::shadow::find(address, bytes) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    let offset = shadow.gpu(address) - base;
+    if offset % PLACEMENT != 0 || shadow.left(address) < bytes {
+        return false;
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    // What the copy does not write keeps the title's bytes; what it writes
+    // goes back after the submission.
+    shadow.refresh(list, address, bytes);
+    shadow.gpu_writes(list, address, bytes, false);
+    let mut to = *dst;
+    to.resource = shadow.buffer.as_raw().cast_const().cast();
+    to.footprint.offset = offset;
+    let mut from = *src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("copy texture {:?} to buffer {:?} at {address:#x}, {bytes} bytes", src.resource, dst.resource));
+    // SAFETY: an open list; both locations in the host's layout, naming
+    // live resources; the box is the title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion((&raw const to).cast(), x, y, z, (&raw const from).cast(), host_box)
+    };
+    true
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
