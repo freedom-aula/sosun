@@ -1084,6 +1084,8 @@ impl Upload {
             return None;
         }
         crate::shadow::register(at, at as u64, len as u64);
+        UPLOADS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        UPLOADS[1].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         Some(Upload { at, len })
     }
 
@@ -1107,6 +1109,8 @@ impl Drop for Upload {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         crate::shadow::unregister(self.at, self.at as u64);
+        UPLOADS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        UPLOADS[1].fetch_sub(self.len as u64, std::sync::atomic::Ordering::Relaxed);
         // Not guarded any more: memory allocated here next is new.
         crate::watch::title_memory_remapped(self.at, self.len);
         // SAFETY: our allocation; lists that still use its copy hold that.
@@ -1117,6 +1121,11 @@ impl Drop for Upload {
 // SAFETY: plain memory, handed out once.
 #[cfg(windows)]
 unsafe impl Send for Upload {}
+
+/// Live list upload blocks and their bytes (the statistics).
+#[cfg(windows)]
+pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any

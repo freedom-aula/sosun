@@ -345,6 +345,33 @@ pub struct CountingAlloc;
 /// Bytes [`CountingAlloc`] has handed out and not taken back.
 pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Allocations of at least this many bytes name their caller, once per
+/// power-of-two size class (who holds the big blocks of our heap).
+const LARGE: usize = 32 << 20;
+
+/// Logs the stack of a large allocation of `size` bytes, the first of its
+/// size class.
+fn note_large(size: usize) {
+    static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    std::thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    let class = 1u64 << size.ilog2().min(63);
+    if INSIDE.with(|i| i.replace(true)) {
+        return;
+    }
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *seen & class == 0;
+        *seen |= class;
+        first
+    };
+    if first {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
+        tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
+    }
+    INSIDE.with(|i| i.set(false));
+}
+
 // SAFETY: every call goes to the system allocator unchanged; only counted.
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
@@ -352,6 +379,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
         }
         p
     }
@@ -361,6 +391,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !p.is_null() {
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
         }
         p
     }
@@ -377,6 +410,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         if !q.is_null() {
             HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
             HEAP_BYTES.fetch_add(size as u64, Relaxed);
+            if size >= LARGE {
+                note_large(size);
+            }
         }
         q
     }
