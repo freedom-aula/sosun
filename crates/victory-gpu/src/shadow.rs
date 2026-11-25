@@ -428,56 +428,90 @@ impl Shadow {
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, pages: &[usize]) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (page.max(start), (page + PAGE).min(end));
-        if from >= to {
-            return 0;
-        }
-        // Our own write below must not save the page for this copy again.
-        t.unarm(page / PAGE);
-        let saved = t.saved(page / PAGE);
-        if saved.is_none() && t.changed(page / PAGE) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
-        }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+        // What goes back (address, bytes), and the pages equal to title
+        // memory once it has: written, then guarded, all at once (each
+        // opening and guarding is a Wine call and a guard-lock round trip,
+        // ~1,000 pages a frame in #50's world).
+        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut taken = Vec::new();
+        for &page in pages {
+            let (from, to) = (page.max(start), (page + PAGE).min(end));
+            if from >= to {
+                continue;
             }
-        };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            // Our own write below must not save the page for this copy again.
+            t.unarm(page / PAGE);
+            let saved = t.saved(page / PAGE);
+            if saved.is_none() && t.changed(page / PAGE) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+                continue;
+            }
+            let n = to - from;
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+            let mut title = vec![0u8; n];
+            if !crate::host::read_into(from as *const u8, &mut title) {
+                continue;
+            }
+            let differs = match &saved {
+                // The title's bytes are the copy's from before: what differs
+                // is the shaders'.
+                None => {
+                    let differs = *host != title[..];
+                    if differs {
+                        title.copy_from_slice(host);
+                    }
+                    differs
+                }
+                Some(before) => {
+                    let before = &before[from - page..to - page];
+                    let mut changed = false;
+                    for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
+                        if *h != *b && *t != *h {
+                            *t = *h;
+                            changed = true;
+                        }
+                        *h = *t;
+                    }
+                    changed
+                }
+            };
+            if differs {
+                writes.push((from, title));
+            }
+            // Equal to title memory now: taken, unless it holds the page in part.
+            if from == page && to == page + PAGE {
+                taken.push(page / PAGE);
+            }
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+        let mut written = 0;
+        {
+            // Consecutive writes share one opening.
+            let mut i = 0;
+            while i < writes.len() {
+                let mut j = i + 1;
+                while j < writes.len() && writes[j].0 == writes[j - 1].0 + writes[j - 1].1.len() {
+                    j += 1;
+                }
+                let (from, to) = (writes[i].0, writes[j - 1].0 + writes[j - 1].1.len());
+                let _writing = crate::watch::writing(from, to - from);
+                for (at, bytes) in &writes[i..j] {
+                    crate::host::write_mapped(*at as *mut u8, bytes.as_ptr(), bytes.len());
+                    written += bytes.len();
+                }
+                i = j;
+            }
         }
-        written.map_or(0, |_| n)
+        if !taken.is_empty() {
+            t.taken(&taken);
+        }
+        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -763,6 +797,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             })
             .collect()
     };
+    // Per copy, in page order, so its pages go back together.
+    let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -770,10 +806,18 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        match by_copy.iter_mut().find(|(c, _)| Arc::ptr_eq(c, &copy)) {
+            Some((_, list)) => list.push(page),
+            None => by_copy.push((copy, vec![page])),
+        }
+    }
+    for (copy, mut list) in by_copy {
+        list.sort_unstable();
+        list.dedup();
+        let written = copy.copy_back_marked(&list);
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+            crate::copystat::add(crate::copystat::C::MarkedPages, list.len() as u64);
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }
         #[cfg(not(feature = "diagnostics"))]

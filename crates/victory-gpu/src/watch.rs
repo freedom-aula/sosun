@@ -384,6 +384,28 @@ fn open(g: &mut Guards, page: usize) -> bool {
     true
 }
 
+/// [`open`] of the guarded pages `[first, last)`, all in `protected`.
+fn open_run(g: &mut Guards, first: usize, last: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if last - first == 1 {
+        open(g, first);
+        return;
+    }
+    let mut old = 0;
+    // SAFETY: blocks we made read-only.
+    if unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } == 0 {
+        for page in first..last {
+            open(g, page);
+        }
+        return;
+    }
+    for page in first..last {
+        g.protected.remove(&page);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
+}
+
 impl Tracked {
     /// Takes the changed pages of `[from, to)`: guards them (writes from
     /// now on mark them again) and returns the byte ranges to copy, cut to
@@ -631,8 +653,16 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 /// lands: trackers armed for a page they had taken keep its bytes.
 fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
+    // In runs: one protection change for consecutive pages (a run across
+    // two views fails, and goes page by page).
+    let mut i = 0;
+    while i < guarded.len() {
+        let mut j = i + 1;
+        while j < guarded.len() && guarded[j] == guarded[j - 1] + 1 {
+            j += 1;
+        }
+        open_run(g, guarded[i], guarded[j - 1] + 1);
+        i = j;
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
