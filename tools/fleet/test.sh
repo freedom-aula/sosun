@@ -46,6 +46,20 @@ no "task with short commit" parse_task "$(task_body 0123abc m3 "$REPO")"
 no "task without a block" parse_task "commit: $SHA"
 no "task with another kind" parse_task "$(sed 's/^kind: test-matrix/kind: shader/' <<< "$body")"
 
+# --- toolkit filenames
+eq "toolkit 4 beta 3 filename" "4.0-beta3" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_3.dmg')"
+eq "toolkit 2 beta 3 filename" "2.0-beta3" "$(gptk_version_of 'Game_Porting_Toolkit_2.0_beta_3.dmg')"
+eq "toolkit stable filename" "3.0" "$(gptk_version_of 'Game_Porting_Toolkit_3.0.dmg')"
+eq "toolkit legacy beta filename" "3.0-beta4" "$(gptk_version_of 'Game_Porting_Toolkit_3.0-beta4.dmg')"
+eq "toolkit beta without number" "4.0-beta" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta.dmg')"
+eq "toolkit version prefix" "3.0" "$(gptk_version_of 'Game_Porting_Toolkit_v3.0.dmg')"
+eq "toolkit path with spaces" "4.0-beta3" "$(gptk_version_of '/tmp/path with spaces/Game_Porting_Toolkit_4.0 beta 3.dmg')"
+eq "missing toolkit filename" "unknown" "$(gptk_version_of '')"
+eq "unrecognized toolkit filename" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_latest.dmg')"
+eq "unrelated disk image" "unknown" "$(gptk_version_of '4.0.dmg')"
+eq "unfinished toolkit download" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_3.dmg.part')"
+eq "unsupported toolkit beta number" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_10.dmg')"
+
 # --- commands
 eq "claim" claim "$(parse_command "/claim")"
 eq "claim with spaces" claim "$(parse_command "  /claim  ")"
@@ -90,6 +104,7 @@ no "not JSON" validate_result 'nope' "$SHA" m3
 no "too large" validate_result "$(printf '%9000s' x)" "$SHA" m3
 ok "null suites when setup failed" bad '.setup = "failed" | .native = null | .wine = null | .failed_tests = []'
 ok "unknown toolkit version" bad '.gptk = "unknown"'
+ok "normalized toolkit beta version passes schema" bad '.gptk = "4.0-beta3"'
 ok "MacBook model id" bad '.hw_model = "MacBookAir10,1"'
 ok "failing result" result_failing "$good"
 no "passing result" result_failing "$(jq -c '.wine.failed = 0' <<< "$good")"

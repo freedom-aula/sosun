@@ -49,9 +49,7 @@ GPTK_URL="https://developer.apple.com/download/all/?q=game%20porting%20toolkit"
 gptk_dmg() { find "$HOME/Downloads" -maxdepth 1 -name 'Game_Porting_Toolkit*.dmg' 2> /dev/null | sort | tail -n 1; }
 
 gptk_version() {
-    local v
-    v=$(basename "$(gptk_dmg)" .dmg | sed -nE 's/^Game_Porting_Toolkit[_ -]?v?([0-9]{1,2}(\.[0-9]{1,2}){0,2}(-beta[0-9]?)?)$/\1/p')
-    echo "${v:-unknown}"
+    gptk_version_of "$(gptk_dmg)"
 }
 
 need_number() { [[ ${1:-} =~ ^[0-9]{1,7}$ ]] || die "give a task number"; }

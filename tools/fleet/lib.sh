@@ -30,6 +30,16 @@ chip_family_of() {
     sed -nE 's/^Apple (M[0-9]{1,2})( Pro| Max| Ultra)?$/\1/p' <<< "$1" | tr 'M' 'm'
 }
 
+# Normalize Apple's DMG filename to the version format accepted by results.
+# For example, Game_Porting_Toolkit_4.0_beta_3.dmg becomes 4.0-beta3.
+gptk_version_of() { # DMG PATH -> VERSION or unknown
+    local v
+    v=$(sed -nE 's/^Game_Porting_Toolkit[_ -]?v?(.+)\.dmg$/\1/p' <<< "${1##*/}" |
+        sed -E 's/[_ -]beta[_ -]?/-beta/' |
+        sed -nE '/^[0-9]{1,2}(\.[0-9]{1,2}){0,2}(-beta[0-9]?)?$/p')
+    printf '%s\n' "${v:-unknown}"
+}
+
 # The body of a task issue. The HTML comment is what machines read.
 task_body() { # COMMIT CHIP REPO
     local chip_upper
