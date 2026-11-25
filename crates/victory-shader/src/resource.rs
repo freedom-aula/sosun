@@ -1161,20 +1161,51 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect();
-                self.classify(&edge, joins, known)
-            })
-            .collect::<Result<_, _>>();
+        let preds = &self.p.blocks[block].preds;
+        // An edge no lane takes (a skip only helper lanes would take, say)
+        // brings nothing a lane reads: it takes a taken edge's source, and
+        // lowering joins no value there (`never_taken`).
+        let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+        let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
+            let edge: Vec<Term> = words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect();
+            self.classify(&edge, joins, known)
+        };
+        let args = match taken.iter().position(|&t| t) {
+            Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
+                (0..preds.len())
+                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                    .collect::<Result<_, _>>()
+            }),
+            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+        };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    /// Whether some lane goes from block `q` to `b` (true without the
+    /// lanes' paths): `Lower::never_taken`'s test.
+    fn edge_taken(&self, q: usize, b: usize) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let mut edge = vec![(lanes.reach[q], true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        // The very test lowering makes, so both drop the same edges.
+        lanes.bools.meet(&edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

@@ -5065,6 +5065,12 @@ impl<'a> Lower<'a> {
                     }
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    // No lane comes this way (`resource` gave it another
+                    // edge's source): any index will do.
+                    if self.never_taken(q, *block) {
+                        incoming.push((self.s.m.i32(0), at));
+                        continue;
+                    }
                     let here = std::mem::replace(&mut self.cur, at);
                     let index = self.uniform_heap_index(arg, sampler);
                     self.cur = here;
@@ -10450,6 +10456,54 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    #[test]
+    fn a_descriptor_skipped_only_by_lanes_that_never_run_needs_no_source() {
+        // As `indirect_light_probes:CS_Alpha_Schedule`: the texture is
+        // loaded under the lanes that ran before `s_wqm`, skipped when there
+        // are none, and sampled with the helper lanes after the join. With
+        // every lane running from the start nothing takes the skip, so the
+        // registers it would bring (no descriptor) are never read.
+        let words = [
+            0xBE9A_037E, // s_mov_b32 s26, exec_lo
+            0xBEFE_097E, // s_wqm_b32 exec_lo, exec_lo
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBE86_3C1A, // s_and_saveexec_b32 s6, s26
+            0xBF88_0002, // s_cbranch_execz -> join
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBEFE_0306, // join: s_mov_b32 exec_lo, s6
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E04_02F0, // v_mov_b32 v2, 0.5
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let l = lower_with(&words, layout, used).unwrap();
+        assert_eq!(l.nonuniform_handles, 0);
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
         }
     }
 
