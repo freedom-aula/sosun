@@ -265,10 +265,16 @@ pub fn query(addr: usize) -> Option<Region> {
 /// Mach memory entry stands behind it, so writes through any mapping are
 /// seen through all, and `mach_vm_protect` over a range spanning many
 /// mappings is one call.
+///
+/// Every pool also has one mapping of the whole of it, read-write, at
+/// [`base`](PagePool::base): never moved, protected or unmapped while the
+/// pool lives, so a GPU backend can wrap it once (`newBufferWithBytesNoCopy`).
+/// Other mappings come and go at the caller's addresses.
 #[derive(Debug)]
 pub struct PagePool {
     entry: MachPort,
     len: usize,
+    base: usize,
 }
 
 // SAFETY: a Mach port name is a process-wide integer.
@@ -276,11 +282,15 @@ unsafe impl Send for PagePool {}
 // SAFETY: as above; the API takes `&self` only.
 unsafe impl Sync for PagePool {}
 
+/// The kernel's page size (16 KiB, also in an x86-64 process under Rosetta,
+/// where [`page_size`] says 4 KiB): pools and their bases are a multiple of it.
+const KERNEL_PAGE: usize = 0x4000;
+
 impl PagePool {
-    /// A pool of `len` bytes (a multiple of the page size), zero filled,
-    /// committed as it is first touched.
+    /// A pool of `len` bytes (rounded up to 16 KiB), zero filled, committed
+    /// as it is first touched.
     pub fn new(len: usize) -> io::Result<PagePool> {
-        let mut size = len as u64;
+        let mut size = len.next_multiple_of(KERNEL_PAGE) as u64;
         let mut entry = 0;
         // SAFETY: creates a new anonymous memory object; out-pointers are locals.
         check("mach_make_memory_entry_64", unsafe {
@@ -293,10 +303,21 @@ impl PagePool {
                 0,
             )
         })?;
-        Ok(PagePool {
+        let mut pool = PagePool {
             entry,
             len: size as usize,
-        })
+            base: 0,
+        };
+        // SAFETY: anywhere, so nothing of the caller's is replaced. On
+        // failure `pool` drops and gives the port back.
+        pool.base = unsafe { pool.map(0, pool.len, None, Protect::READ_WRITE) }? as usize;
+        Ok(pool)
+    }
+
+    /// As [`new`](PagePool::new). Memory is committed on first touch here
+    /// whichever way; Windows must be told.
+    pub fn new_lazy(len: usize) -> io::Result<PagePool> {
+        PagePool::new(len)
     }
 
     pub fn len(&self) -> usize {
@@ -305,6 +326,29 @@ impl PagePool {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The pool's permanent read-write mapping of all of it (always `Some`
+    /// here; a Windows host may fail to map a large pool).
+    pub fn base(&self) -> Option<*mut u8> {
+        Some(self.base as *mut u8)
+    }
+
+    /// The Mach memory entry (a send right the pool keeps): a `mach_vm_map`
+    /// of the caller's own maps the same pages.
+    pub fn memory_entry(&self) -> u32 {
+        self.entry
+    }
+
+    /// Bytes `[offset, offset + len)` through [`base`](PagePool::base): no
+    /// mapping of its own here.
+    pub fn window(&self, offset: usize, len: usize) -> io::Result<Window> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(io::Error::other("range outside the page pool"));
+        }
+        Ok(Window {
+            at: self.base + offset,
+        })
     }
 
     /// Maps `[offset, offset + len)` of the pool, at `at` if given (over
@@ -336,7 +380,8 @@ impl PagePool {
                 task(),
                 &mut addr,
                 len as u64,
-                0,
+                // 16 KiB aligned anywhere, also under Rosetta (4 KiB there).
+                KERNEL_PAGE as u64 - 1,
                 flags,
                 self.entry,
                 offset as u64,
@@ -348,14 +393,57 @@ impl PagePool {
         })?;
         Ok(addr as *mut u8)
     }
+
+    /// Maps `[offset, offset + len)` at `at`, in place of what is there (a
+    /// part of a reservation of the caller's). On Windows the range must lie
+    /// in a placeholder, which it splits as needed.
+    ///
+    /// # Safety
+    /// As [`map`](PagePool::map).
+    pub unsafe fn map_over(
+        &self,
+        offset: usize,
+        len: usize,
+        at: usize,
+        prot: Protect,
+    ) -> io::Result<()> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.map(offset, len, Some(at), prot) }.map(|_| ())
+    }
 }
 
 impl Drop for PagePool {
     fn drop(&mut self) {
-        // Mappings keep the memory alive; this only drops our name for it.
-        // SAFETY: our own port right.
-        unsafe { mach_port_deallocate(task(), self.entry) };
+        // SAFETY: our own base mapping and port right; other mappings keep
+        // the memory alive until they go.
+        unsafe {
+            mach_vm_deallocate(task(), self.base as u64, self.len as u64);
+            mach_port_deallocate(task(), self.entry);
+        }
     }
+}
+
+/// Bytes of a pool, writable in place (see [`PagePool::window`]).
+#[derive(Debug)]
+pub struct Window {
+    at: usize,
+}
+
+impl Window {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.at as *mut u8
+    }
+}
+
+/// Returns a mapping made by [`PagePool::map_over`] to what a reservation
+/// is: no access, nothing behind it. On Windows the whole view that starts
+/// at `addr` goes, whatever `len`, and becomes a placeholder.
+///
+/// # Safety
+/// The range must be the caller's, and not used afterwards.
+pub unsafe fn unmap_over(addr: *mut u8, len: usize) -> io::Result<()> {
+    // SAFETY: forwarded from the caller.
+    unsafe { decommit(addr, len) }
 }
 
 /// Unmaps a view made by [`PagePool::map`].

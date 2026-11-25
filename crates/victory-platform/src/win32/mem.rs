@@ -3,15 +3,17 @@
 
 use std::ffi::c_void;
 use std::io;
+use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-    MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
-    MapViewOfFile3, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect,
-    VirtualQuery,
+    CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_DECOMMIT, MEM_PRESERVE_PLACEHOLDER,
+    MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER,
+    MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
+    VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -172,6 +174,12 @@ pub fn query(addr: usize) -> Option<Region> {
 pub struct PagePool {
     section: HANDLE,
     len: usize,
+    /// Our own view of the whole section, mapped the first time it is asked
+    /// for and kept while the pool lives (0: it could not be mapped). A view
+    /// per request cost a map and an unmap, and under Wine each holds the
+    /// process's one virtual-memory lock across a wineserver request: every
+    /// page fault and protection change on other threads waits for it.
+    whole: OnceLock<usize>,
 }
 
 // SAFETY: a section handle is process-wide.
@@ -180,14 +188,25 @@ unsafe impl Send for PagePool {}
 unsafe impl Sync for PagePool {}
 
 impl PagePool {
-    /// A pool of `len` bytes (a multiple of [`granularity`]), zero filled.
+    /// A pool of `len` bytes (a multiple of [`granularity`]), zero filled,
+    /// committed now (a sparse file under Wine, free until touched).
     pub fn new(len: usize) -> io::Result<PagePool> {
+        PagePool::create(len, 0)
+    }
+
+    /// A pool whose pages are reserved only: commit what is mapped with
+    /// [`commit`] (a request for 6 GiB at once often cannot be committed).
+    pub fn new_lazy(len: usize) -> io::Result<PagePool> {
+        PagePool::create(len, SEC_RESERVE)
+    }
+
+    fn create(len: usize, kind: u32) -> io::Result<PagePool> {
         // SAFETY: plain section creation.
         let section = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
-                PAGE_READWRITE,
+                PAGE_READWRITE | kind,
                 (len as u64 >> 32) as u32,
                 len as u32,
                 std::ptr::null(),
@@ -196,7 +215,11 @@ impl PagePool {
         if section.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(PagePool { section, len })
+        Ok(PagePool {
+            section,
+            len,
+            whole: OnceLock::new(),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -205,6 +228,47 @@ impl PagePool {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The pool's mapping of all of it, read-write, made the first time and
+    /// kept while the pool lives; `None` if the host would not map it.
+    pub fn base(&self) -> Option<*mut u8> {
+        let at = *self.whole.get_or_init(|| {
+            // SAFETY: our section; the view is ours until the pool drops.
+            unsafe { MapViewOfFile(self.section, FILE_MAP_WRITE, 0, 0, self.len) }.Value as usize
+        });
+        (at != 0).then_some(at as *mut u8)
+    }
+
+    /// Bytes `[offset, offset + len)`, through [`base`](PagePool::base), or
+    /// through a view of their own if the host would not map the whole pool.
+    pub fn window(&self, offset: usize, len: usize) -> io::Result<Window> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(io::Error::other("range outside the page pool"));
+        }
+        if let Some(base) = self.base() {
+            return Ok(Window {
+                at: base as usize + offset,
+                own: false,
+            });
+        }
+        // SAFETY: bytes of a section we own; the view is ours until dropped.
+        let own = unsafe {
+            MapViewOfFile(
+                self.section,
+                FILE_MAP_WRITE,
+                (offset as u64 >> 32) as u32,
+                offset as u32,
+                len,
+            )
+        };
+        if own.Value.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Window {
+            at: own.Value as usize,
+            own: true,
+        })
     }
 
     /// Maps `[offset, offset + len)` of the pool, at `at` if given (the range
@@ -268,13 +332,111 @@ impl PagePool {
         }
         Ok(view.Value.cast())
     }
+
+    /// Maps `[offset, offset + len)` at `at`, in place of what is there. The
+    /// range must lie in a placeholder (a reservation of the caller's made
+    /// as one), which is split around it as needed.
+    ///
+    /// # Safety
+    /// As [`map`](PagePool::map), except that the range is a placeholder.
+    pub unsafe fn map_over(
+        &self,
+        offset: usize,
+        len: usize,
+        at: usize,
+        prot: Protect,
+    ) -> io::Result<()> {
+        // SAFETY: splits the placeholder around the range (failing
+        // harmlessly when the range is the whole placeholder), then maps the
+        // section there; both act only on placeholders.
+        let view = unsafe {
+            VirtualFree(
+                at as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+            MapViewOfFile3(
+                self.section,
+                GetCurrentProcess(),
+                at as *const c_void,
+                offset as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                prot.0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != at {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PagePool {
     fn drop(&mut self) {
+        if let Some(&at) = self.whole.get()
+            && at != 0
+        {
+            // SAFETY: our own view; windows over it hold the pool.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                })
+            };
+        }
         // SAFETY: our own handle; views keep the section alive.
         unsafe { CloseHandle(self.section) };
     }
+}
+
+/// Bytes of a pool, writable in place (see [`PagePool::window`]); a view of
+/// their own is unmapped on drop.
+#[derive(Debug)]
+pub struct Window {
+    at: usize,
+    own: bool,
+}
+
+impl Window {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.at as *mut u8
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        if self.own {
+            // SAFETY: the view `window` mapped.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.at as *mut c_void,
+                })
+            };
+        }
+    }
+}
+
+/// Returns a mapping made by [`PagePool::map_over`] to a placeholder: the
+/// whole view that starts at `addr` goes, whatever `len` (on macOS it is the
+/// length returned to no access).
+///
+/// # Safety
+/// The range must be the caller's, and not used afterwards.
+pub unsafe fn unmap_over(addr: *mut u8, _len: usize) -> io::Result<()> {
+    // SAFETY: forwarded from the caller.
+    let ok = unsafe {
+        UnmapViewOfFile2(
+            GetCurrentProcess(),
+            MEMORY_MAPPED_VIEW_ADDRESS { Value: addr.cast() },
+            MEM_PRESERVE_PLACEHOLDER,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Unmaps a view made by [`PagePool::map`].

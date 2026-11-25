@@ -1270,7 +1270,10 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+        assert_eq!(
+            (v.dir.file_name(), v.display.as_str()),
+            (Some("v1".as_ref()), "Chapter 1")
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1492,7 +1495,10 @@ mod tests {
     fn a_noncanonical_folder_does_not_remove_a_committed_save() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
         let slot = container_dir(root, "Slot");
         for stray in ["v01", "v001", "v+1", "v0", "v02"] {
             std::fs::create_dir(slot.join(stray)).unwrap();
@@ -1521,18 +1527,28 @@ mod tests {
         for (what, make) in strays {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+            assert_eq!(
+                update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                S_OK
+            );
             let slot = container_dir(root, "Slot");
             make(&slot.join("v2"));
 
             assert_eq!(state(root), old_state(), "{what}: read");
             assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
 
-            assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
+            assert_eq!(
+                update(root, "two", &[("a", Some("new a"))]),
+                S_OK,
+                "{what}: update"
+            );
             let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
             let after = Some(("two".into(), blobs));
             assert_eq!(state(root), after, "{what}: after the update");
-            assert!(slot.join("v3").is_dir(), "{what}: the update did not go above v2");
+            assert!(
+                slot.join("v3").is_dir(),
+                "{what}: the update did not go above v2"
+            );
             // Read again: the new version stays the container.
             assert_eq!(state(root), after, "{what}: second read");
         }

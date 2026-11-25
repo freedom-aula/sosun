@@ -551,7 +551,11 @@ pub extern "system" fn ReadFile(
     // good (#50). With tracking on, the read is waited for before the
     // destination is guarded again; the title still sees the pending
     // result, and its event or completion port is signalled as before.
-    if done == 0 && error == ERROR_IO_PENDING && !overlapped.is_null() && victory_gpu::fault_tracking() {
+    if done == 0
+        && error == ERROR_IO_PENDING
+        && !overlapped.is_null()
+        && victory_gpu::fault_tracking()
+    {
         let mut n = 0u32;
         host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
             file, overlapped, &mut n, 1,
@@ -805,13 +809,25 @@ mod tests {
         let mut out = vec![0u8; data.len()];
         // An OVERLAPPED (32 bytes), zeroed: a read at offset 0, no event.
         let mut ov = [0u64; 4];
-        let ok = ReadFile(handle, out.as_mut_ptr(), out.len() as u32, std::ptr::null_mut(), (&raw mut ov).cast());
+        let ok = ReadFile(
+            handle,
+            out.as_mut_ptr(),
+            out.len() as u32,
+            std::ptr::null_mut(),
+            (&raw mut ov).cast(),
+        );
         // SAFETY: a plain query of the thread's last error.
         let error = unsafe { GetLastError() };
-        assert!(ok != 0 || error == ERROR_IO_PENDING, "ReadFile gave {ok}, last error {error}");
+        assert!(
+            ok != 0 || error == ERROR_IO_PENDING,
+            "ReadFile gave {ok}, last error {error}"
+        );
         let mut n = 0;
         let waited = host!("kernel32.dll", "GetOverlappedResult": extern "system" fn(*mut c_void, *mut c_void, *mut u32, i32) -> i32)(
-            handle, (&raw mut ov).cast(), &mut n, 1,
+            handle,
+            (&raw mut ov).cast(),
+            &mut n,
+            1,
         );
         assert_ne!(waited, 0);
         assert_eq!(n as usize, data.len());

@@ -556,7 +556,11 @@ mod host {
     fn start_address(thread: *mut c_void) -> usize {
         let mut start = 0usize;
         host!("ntdll.dll", "NtQueryInformationThread": extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32)(
-            thread, 9, (&raw mut start).cast(), size_of::<usize>() as u32, std::ptr::null_mut(),
+            thread,
+            9,
+            (&raw mut start).cast(),
+            size_of::<usize>() as u32,
+            std::ptr::null_mut(),
         );
         start
     }
@@ -567,7 +571,11 @@ mod host {
             static SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
-                tracing::warn!(n, start = format_args!("{start:#x}"), "the title asked to suspend a thread it did not make; left running");
+                tracing::warn!(
+                    n,
+                    start = format_args!("{start:#x}"),
+                    "the title asked to suspend a thread it did not make; left running"
+                );
             }
             return 0;
         }

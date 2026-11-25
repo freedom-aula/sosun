@@ -144,7 +144,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, path: name },
+    );
     put(out, file)
 }
 
@@ -498,7 +501,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
@@ -587,7 +591,11 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        let mut commands = if explicit {
+            std::mem::take(&mut lane.held)
+        } else {
+            Vec::new()
+        };
         commands.append(&mut lane.unsubmitted);
         for command in commands {
             let hold = !explicit
@@ -800,7 +808,9 @@ fn queue(this: QueueRef, command: Command) {
         if !lane.held.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+                tracing::warn!(
+                    "dstorage: a full queue's reads into physical pages start before the title's Submit"
+                );
             }
             lanes.submit(id);
             scheduler.work.notify_all();
@@ -838,7 +848,10 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes
+        .lanes
+        .get(&id)
+        .map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1101,7 +1114,9 @@ fn source_name(request: &Request) -> &str {
         return "memory";
     }
     // SAFETY: a file object we created; the title keeps it open.
-    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
+    &unsafe { &*request.source.cast::<Instance<File>>() }
+        .state
+        .path
 }
 
 /// Queues that submitted themselves, half full (diagnostics).
@@ -1694,7 +1709,11 @@ mod tests {
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
         add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
@@ -1727,7 +1746,10 @@ mod tests {
             0x04,
         );
         assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
+            mapped
+        );
         // The title's page table: still the page's previous owner when the
         // request is enqueued, the right page by its Submit.
         let mut list = [pages[0]];
@@ -1754,7 +1776,17 @@ mod tests {
         );
         enqueue(queue, &r);
         let mut out = [0u8; 16];
-        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                out.as_mut_ptr().cast(),
+                16,
+                plain.as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
         // Half of four: the queue submitted itself. Time for a read started
         // then to land in the old page.
         std::thread::sleep(std::time::Duration::from_millis(50));

@@ -276,10 +276,17 @@ mod tests {
     fn a_relaunch_replaces_a_relative_startup_executable() {
         // `runtime::set_image_path` makes this absolute before the launch.
         let current = std::path::absolute("game.exe").unwrap();
-        let ours: Vec<std::ffi::OsString> =
-            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
-                .map(Into::into)
-                .into();
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            "game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
         let again = relaunch_args(
             ours,
             current.as_os_str(),

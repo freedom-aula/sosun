@@ -135,6 +135,117 @@ fn one_protect_call_covers_many_mappings_of_a_pool() {
     }
 }
 
+/// The pool's own mapping of all of it, which stays where it is whatever
+/// else is mapped and unmapped, and the windows cut from it.
+#[test]
+fn a_page_pool_has_one_permanent_base() {
+    let g = mem::granularity();
+    let pool = PagePool::new(4 * g).unwrap();
+    let base = pool.base().expect("the host maps the pool");
+    assert_eq!(base as usize % 0x4000, 0);
+    // SAFETY: the test owns every view it maps.
+    unsafe {
+        write(base, 2 * g + 1, 0x5a);
+        let a = pool.map(0, 4 * g, None, Protect::READ_WRITE).unwrap();
+        assert_eq!(read(a, 2 * g + 1), 0x5a, "a view shows what base wrote");
+        write(a, 3 * g, 0x77);
+        mem::unmap(a, 4 * g).unwrap();
+        assert_eq!(pool.base(), Some(base), "the base does not move");
+        assert_eq!(read(base, 3 * g), 0x77, "and what a view wrote stays");
+    }
+    // A window is the same bytes at their place in the base.
+    let w = pool.window(g, 2 * g).unwrap();
+    assert_eq!(w.as_mut_ptr(), base.wrapping_add(g));
+    assert_eq!(read(w.as_mut_ptr(), g + 1), 0x5a);
+    assert!(pool.window(3 * g, 2 * g).is_err(), "past the end");
+}
+
+/// A mapping goes over part of a reservation and comes off it again, at
+/// title addresses: one VM call each, the pool's base undisturbed. macOS
+/// only: a Windows mapping goes over a placeholder (see the `xmem` tests).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pool_maps_over_a_reservation_and_unmaps_again() {
+    let g = mem::granularity();
+    let pool = PagePool::new(8 * g).unwrap();
+    assert!(pool.memory_entry() != 0);
+    // SAFETY: the test owns the reservation and its views.
+    unsafe {
+        let base = pool.base().unwrap();
+        let at = mem::reserve(None, 8 * g).unwrap();
+        // Remap the pool in halves, swapped: one call per run.
+        pool.map_over(4 * g, 4 * g, at as usize, Protect::READ_WRITE)
+            .unwrap();
+        pool.map_over(0, 4 * g, at as usize + 4 * g, Protect::READ_WRITE)
+            .unwrap();
+        write(base, 0, 1);
+        assert_eq!(read(at, 4 * g), 1);
+        write(at, 0, 2);
+        assert_eq!(read(base, 4 * g), 2);
+        // The Mach memory entry maps the same pages once more.
+        let mut other: u64 = 0;
+        let kr = mach_vm_map(
+            mach_task_self_,
+            &mut other,
+            (8 * g) as u64,
+            0,
+            1, // anywhere
+            pool.memory_entry(),
+            0,
+            0,
+            3,
+            3,
+            2,
+        );
+        assert_eq!(kr, 0);
+        assert_eq!(read(other as *mut u8, 4 * g), 2);
+        mem::unmap(other as *mut u8, 8 * g).unwrap();
+        // Unmapping a part cuts the mapping there and leaves no access.
+        mem::unmap_over(at.wrapping_add(g), g).unwrap();
+        assert_eq!(
+            mem::query(at as usize).unwrap().protect,
+            Protect::READ_WRITE
+        );
+        assert_eq!(
+            mem::query(at as usize + g).unwrap().protect,
+            Protect::NO_ACCESS
+        );
+        assert_eq!(
+            read(at, 2 * g),
+            0,
+            "the pages after the cut are still there"
+        );
+        // The pool kept everything.
+        assert_eq!(read(base, 4 * g), 2);
+        assert_eq!(pool.base(), Some(base));
+        // Mapped again over the cut, the same pages show.
+        pool.map_over(5 * g, g, at as usize + g, Protect::READ_WRITE)
+            .unwrap();
+        write(base, 5 * g + 7, 9);
+        assert_eq!(read(at, g + 7), 9);
+        mem::release(at, 8 * g).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    #[allow(clippy::too_many_arguments)]
+    fn mach_vm_map(
+        task: u32,
+        addr: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        object: u32,
+        offset: u64,
+        copy: u32,
+        cur: i32,
+        max: i32,
+        inherit: u32,
+    ) -> i32;
+}
+
 #[test]
 fn a_thread_returns_its_exit_code_and_has_its_own_id() {
     let main_id = thread::current_id();

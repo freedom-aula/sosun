@@ -39,6 +39,8 @@ pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
 pub mod xmem;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod xmem_physical;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
@@ -72,6 +74,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(rpcrt4::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    #[cfg(target_os = "macos")]
+    all.push(xmem_physical::module());
     #[cfg(windows)]
     all.push(xsystem::module());
     #[cfg(windows)]
