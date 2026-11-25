@@ -94,8 +94,11 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// Title copies into memory shown at two addresses, which make every
+    /// range of the submission due again.
+    AliasedCopies,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = 58;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -214,7 +217,8 @@ pub(crate) fn log(frames: f64) {
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
-        "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
+        "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB ({:.0} into memory \
+         shown twice); {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
@@ -229,6 +233,7 @@ pub(crate) fn log(frames: f64) {
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
+        c[C::AliasedCopies as usize],
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
         c[C::Skipped as usize],

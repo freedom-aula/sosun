@@ -658,8 +658,8 @@ enum Step {
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a `Copy` into it or a
+    /// `Run` intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
@@ -669,7 +669,8 @@ enum Step {
     /// whether they mark the pages they write (no snapshot then).
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a `Copy` into its memory or a `Run`
+    /// intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
@@ -1934,7 +1935,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_copied(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1978,7 +1979,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due(staging, staging.memory()) {
                         staging.refresh();
                     }
                     continue;
@@ -1998,63 +1999,111 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, as the ranges of each buffer copy
+/// asked for (ranges less than [`JOIN`] apart are done as one): done before
+/// a step that writes title memory or gives a range to shaders, and before
+/// the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
-/// once, it is checked again only after a step that writes title memory.
+/// once, it is checked again only after a step that writes the memory it
+/// reads.
 ///
-/// A copy's range brought up to date is not copied again in the submission
-/// until a step writes title memory: every list of a world submission using
-/// title memory asks for every copy whole. What the title's threads write
-/// meanwhile is for later submissions (on the console it would race the
-/// GPU).
+/// A copy's ranges brought up to date are not copied again in the
+/// submission until a step writes them: every list of a world submission
+/// using title memory asks for every copy whole, and the title copies into
+/// buffers ~80 times in between. A step that may write anywhere
+/// ([`Batch::title_written`]) makes all of them due again, a title copy
+/// ([`Batch::title_copied`]) only what it writes. What the title's threads
+/// write meanwhile is for later submissions (on the console it would race
+/// the GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy's refresh is in `refreshes`, by copy.
+    /// The ranges still to bring up to date, by copy.
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    /// Where each copy's refreshes are in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// The ranges of each copy brought up to date since the last write that
+    /// can have changed them, by copy (held, so that its address names no
+    /// other).
+    current: std::collections::HashMap<
+        usize,
+        (std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges),
+    >,
+    /// Staging buffers (by address) refreshed since the last write to the
+    /// title memory they read (where it starts, bytes).
+    textures: std::collections::HashMap<usize, (usize, usize)>,
 }
+
+/// How far apart a copy's pending ranges may be and still be done as one,
+/// the bytes between copied too: a call that copies a range costs about
+/// what copying this much does at the 6-7 GB/s testers saw (a guess, not
+/// measured).
+const JOIN: usize = crate::watch::PAGE;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        // Only what is not current: most lists ask for a copy whole, after
+        // a title copy took a few bytes of it.
+        let todo = match self.current.get(&key) {
+            Some((_, have)) => have.missing(address, end),
+            None if len > 0 => vec![(address, end)],
+            None => return,
+        };
+        if todo.is_empty() {
             return;
         }
-        match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
-            None => {
-                self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
-            }
+        let i = *self.pending.entry(key).or_insert_with(|| {
+            self.refreshes.push((shadow.clone(), Default::default()));
+            self.refreshes.len() - 1
+        });
+        for (from, to) in todo {
+            self.refreshes[i].1.insert(from, to, JOIN);
         }
     }
 
-    /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
-    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
+    /// Whether `staging` (which reads the title memory `memory`: where it
+    /// starts, bytes) is still to be refreshed in this submission (and notes
+    /// it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>, memory: (usize, usize)) -> bool {
         self.textures
-            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+            .insert(
+                std::sync::Arc::as_ptr(staging) as *const () as usize,
+                memory,
+            )
+            .is_none()
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that may write any title memory: pending refreshes are
+    /// done first, and textures and copies are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
         self.current.clear();
+    }
+
+    /// As [`Batch::title_written`], before a copy into the title memory
+    /// `[at, at + len)`, which `copy_mapped` writes and nothing more: only
+    /// what the copy can have changed is checked again after it.
+    // shortcut: memory shown at two addresses is what the runtime said it
+    // maps twice (`crate::watch::aliased`, as the trackers know it); where
+    // it says so, the copy makes everything due again, as it may change
+    // bytes any copy holds.
+    fn title_copied(&mut self, at: usize, len: usize) {
+        if crate::watch::aliased(at, len) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
+            return self.title_written();
+        }
+        self.flush();
+        let (from, to) = touched(at, at.saturating_add(len));
+        for (_, have) in self.current.values_mut() {
+            have.remove(from, to);
+        }
+        self.textures
+            .retain(|_, &mut (start, bytes)| start + bytes <= from || to <= start);
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -2063,26 +2112,62 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+        for (shadow, ranges) in self.refreshes.drain(..) {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            let (start, len) = shadow.range();
+            for (from, to) in ranges.iter() {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+                let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
+                self.current
+                    .entry(key)
+                    .or_insert_with(|| (shadow.clone(), Default::default()))
+                    .1
+                    .insert(from, to, 0);
             }
         }
         total
+    }
+}
+
+/// What a write to title memory `[from, to)` changes in the trackers: the
+/// 64 KiB pages it touches, whole (`crate::watch::writing`); just the bytes
+/// where nothing is tracked.
+fn touched(from: usize, to: usize) -> (usize, usize) {
+    let page = crate::watch::PAGE;
+    if crate::watch::fault_tracking() {
+        (from / page * page, to.div_ceil(page).saturating_mul(page))
+    } else {
+        (from, to)
+    }
+}
+
+/// What a refresh of `[from, to)` of the copy of title memory `memory`
+/// (where it starts and ends) leaves current: all of it, but with tracking
+/// only the pages it took, those it holds whole (the ends of the copy's
+/// memory count whole, as `Tracked::take` counts them). A page it holds in
+/// part stays changed, and the next request that holds it whole must take
+/// it, or copy-back reads it as written by the title and keeps the
+/// shaders' writes there out of title memory.
+fn taken(from: usize, to: usize, memory: (usize, usize)) -> (usize, usize) {
+    let page = crate::watch::PAGE;
+    if crate::watch::fault_tracking() {
+        (
+            if from <= memory.0 {
+                from
+            } else {
+                from.next_multiple_of(page)
+            },
+            if to >= memory.1 { to } else { to / page * page },
+        )
+    } else {
+        (from, to)
     }
 }
 
@@ -3201,6 +3286,8 @@ fn pump() {
 mod batch {
     // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
+    use crate::shadow::Shadow;
+    use crate::watch::PAGE;
     use std::sync::Arc;
 
     #[test]
@@ -3208,28 +3295,28 @@ mod batch {
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
         // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
+        assert!(batch.texture_due(&a, (0, 16)));
+        assert!(batch.texture_due(&b, (16, 16)));
         // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
+        assert!(!batch.texture_due(&a, (0, 16)));
+        assert!(!batch.texture_due(&a.clone(), (0, 16)));
+        assert!(!batch.texture_due(&b, (16, 16)));
     }
 
     #[test]
     fn title_writes_make_textures_due_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, (0, 4)));
+        assert!(!batch.texture_due(&a, (0, 4)));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
         batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, (0, 4)));
+        assert!(!batch.texture_due(&a, (0, 4)));
         // A fresh submission starts over.
         let mut next = Batch::default();
-        assert!(next.texture_due(&a));
+        assert!(next.texture_due(&a, (0, 4)));
     }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
@@ -3237,7 +3324,6 @@ mod batch {
     /// only after a step that writes title memory.
     #[test]
     fn a_copy_is_refreshed_once_per_submission_by_the_pages_written() {
-        use crate::watch::PAGE;
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
         crate::shadow::register(p, p as u64, len as u64);
@@ -3268,6 +3354,253 @@ mod batch {
         crate::watch::tests::free(p);
     }
 
+    /// A copy of `pages` pages of plain private memory, which is not the
+    /// runtime's: untracked, copied whole whatever was asked for. None
+    /// without a host GPU.
+    fn plain(pages: usize) -> Option<(usize, Arc<Shadow>)> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: a fresh allocation, freed by `done`.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert!(p != 0);
+        crate::shadow::register(p, p as u64, (pages * PAGE) as u64);
+        let copy = crate::shadow::find(p as u64, (pages * PAGE) as u64);
+        if copy.is_none() {
+            done(p, None);
+        }
+        copy.map(|c| (p, c))
+    }
+
+    fn done(p: usize, copy: Option<Arc<Shadow>>) {
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Fills `len` bytes of title memory at `at`.
+    fn fill(at: usize, len: usize, byte: u8) {
+        // SAFETY: memory of the test's own allocations.
+        unsafe { std::ptr::write_bytes(at as *mut u8, byte, len) };
+    }
+
+    /// A title copy of `len` bytes from `src` to `dst`, as a list's step
+    /// runs it.
+    fn title_copy(batch: &mut Batch, dst: usize, src: usize, len: usize) {
+        batch.title_copied(dst, len);
+        super::copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    }
+
+    /// Two copies of title memory, every list of a submission asking for
+    /// both whole between title copies: a title copy makes due again only
+    /// the bytes it wrote, and copies far apart in one copy are two
+    /// ranges, not what is between them.
+    #[test]
+    fn a_title_copy_makes_due_again_only_the_bytes_it_wrote() {
+        let (Some((pa, a)), Some((pb, b))) = (plain(64), plain(4)) else {
+            return; // no host GPU here
+        };
+        let (la, lb) = (64 * PAGE, 4 * PAGE);
+        fill(pb, lb, 0x5a);
+        let mut batch = Batch::default();
+        batch.add(&a, pa, la);
+        batch.add(&b, pb, lb);
+        assert_eq!(batch.flush(), la + lb, "all of both at first");
+        // Two copies into the big one, a list asking for both after them.
+        title_copy(&mut batch, pa + 5 * PAGE, pb, PAGE);
+        title_copy(&mut batch, pa + 50 * PAGE, pb, 2 * PAGE);
+        batch.add(&a, pa, la);
+        batch.add(&b, pb, lb);
+        assert_eq!(
+            batch.flush(),
+            3 * PAGE,
+            "the bytes written, not the 45 pages between"
+        );
+        assert_eq!(a.read_host((pa + 5 * PAGE) as u64, 1)[0], 0x5a5a_5a5a);
+        assert_eq!(a.read_host((pa + 52 * PAGE - 4) as u64, 1)[0], 0x5a5a_5a5a);
+        assert_eq!(a.read_host((pa + 52 * PAGE) as u64, 1)[0], 0, "not past it");
+        assert_eq!(
+            a.read_host((pa + 5 * PAGE - 4) as u64, 1)[0],
+            0,
+            "nor before it"
+        );
+        // And nothing more until the next write.
+        batch.add(&a, pa, la);
+        batch.add(&b, pb, lb);
+        assert_eq!(batch.flush(), 0);
+        // A step that may write anywhere makes everything due again.
+        batch.title_written();
+        batch.add(&a, pa, la);
+        batch.add(&b, pb, lb);
+        assert_eq!(batch.flush(), la + lb);
+        done(pa, Some(a));
+        done(pb, Some(b));
+    }
+
+    /// What a title copy wrote is checked again where it is, and only
+    /// there, down to the bytes where nothing is tracked.
+    #[test]
+    fn a_title_copy_within_a_page_is_refreshed_exactly_where_nothing_is_tracked() {
+        let Some((p, copy)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(p + PAGE, 8, 0x77);
+        let mut batch = Batch::default();
+        batch.add(&copy, p, 2 * PAGE);
+        batch.flush();
+        title_copy(&mut batch, p + 100, p + PAGE, 8);
+        batch.add(&copy, p, 2 * PAGE);
+        let tracking = crate::watch::fault_tracking();
+        // With tracking the pages the write marks changed, whole.
+        assert_eq!(batch.flush(), if tracking { PAGE } else { 8 });
+        assert_eq!(copy.read_host(p as u64 + 100, 1)[0], 0x7777_7777);
+        done(p, Some(copy));
+    }
+
+    /// A range asked for in part first is current only where it covers
+    /// whole pages with tracking (a page taken in part stays changed, and
+    /// copy-back reads that as the title's write): the request for all of
+    /// the copy takes the ends whole.
+    #[test]
+    fn a_partial_request_leaves_the_ends_to_the_next() {
+        let p = crate::watch::tests::pool(10);
+        let len = 10 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            done(p, None);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p + 100, 6 * PAGE);
+        assert_eq!(batch.flush(), 6 * PAGE, "just the bytes asked for");
+        batch.add(&copy, p, len);
+        let tracking = crate::watch::fault_tracking();
+        let rest = if tracking { 5 * PAGE } else { 4 * PAGE };
+        assert_eq!(
+            batch.flush(),
+            rest,
+            "the pages the first took in part, and the rest"
+        );
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), 0);
+        // A fresh submission finds nothing changed.
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), if tracking { 0 } else { len });
+        done(p, Some(copy));
+    }
+
+    /// With tracking, a title copy inside one page leaves the page taken
+    /// whole by the request after it, not changed for the next submission.
+    #[test]
+    fn a_title_copy_inside_a_page_takes_the_page_whole_with_tracking() {
+        if !crate::watch::fault_tracking() {
+            return;
+        }
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            done(p, None);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), len);
+        let from = [0x33u8; 50];
+        title_copy(&mut batch, p + PAGE + 100, from.as_ptr() as usize, 50);
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), PAGE, "the page the copy touched, once");
+        assert_eq!(copy.read_host((p + PAGE + 100) as u64, 1)[0], 0x3333_3333);
+        let mut next = Batch::default();
+        next.add(&copy, p, len);
+        assert_eq!(next.flush(), 0, "not left changed for the next submission");
+        done(p, Some(copy));
+    }
+
+    /// Pages the runtime maps at two addresses: a title copy at one
+    /// changes what a copy of the other holds, so it makes everything due
+    /// again, as any step that may write anywhere does.
+    #[test]
+    fn a_title_copy_into_pages_shown_elsewhere_makes_everything_due_again() {
+        let (a, b) = crate::watch::tests::twin_views(2);
+        let len = 2 * PAGE;
+        crate::shadow::register(a, a as u64, len as u64);
+        crate::shadow::register(b, b as u64, len as u64);
+        let (Some(ca), Some(cb)) = (
+            crate::shadow::find(a as u64, len as u64),
+            crate::shadow::find(b as u64, len as u64),
+        ) else {
+            crate::shadow::unregister(a, a as u64);
+            crate::shadow::unregister(b, b as u64);
+            return; // no host GPU here
+        };
+        let src = crate::watch::tests::pool(1);
+        fill(src, PAGE, 0x42);
+        let mut batch = Batch::default();
+        batch.add(&ca, a, len);
+        batch.add(&cb, b, len);
+        batch.flush();
+        let (t1, t2) = (Arc::new(0u8), Arc::new(0u8));
+        assert!(batch.texture_due(&t1, (b + PAGE, 16)) && batch.texture_due(&t2, (src, 16)));
+        // Through the first view; the second shows it too.
+        title_copy(&mut batch, a, src, PAGE);
+        assert!(
+            batch.texture_due(&t1, (b + PAGE, 16)),
+            "textures are checked again"
+        );
+        assert!(batch.texture_due(&t2, (src, 16)));
+        batch.add(&ca, a, len);
+        batch.add(&cb, b, len);
+        batch.flush();
+        assert_eq!(
+            cb.read_host(b as u64, 1)[0],
+            0x4242_4242,
+            "the other view's copy has it"
+        );
+        assert_eq!(ca.read_host(a as u64, 1)[0], 0x4242_4242);
+        crate::shadow::unregister(a, a as u64);
+        crate::shadow::unregister(b, b as u64);
+        done(src, None);
+    }
+
+    /// A texture is checked again after a copy that wrote its memory, not
+    /// after one that wrote other memory.
+    #[test]
+    fn a_title_copy_makes_textures_due_again_only_where_it_wrote() {
+        let (near, far) = (Arc::new(0u8), Arc::new(0u8));
+        let base = 0x4000_0000_0000;
+        let mut batch = Batch::default();
+        assert!(batch.texture_due(&near, (base + 3 * PAGE, 2 * PAGE)));
+        assert!(batch.texture_due(&far, (base + 40 * PAGE, 4 * PAGE)));
+        batch.title_copied(base + 4 * PAGE + 8, 16);
+        assert!(
+            batch.texture_due(&near, (base + 3 * PAGE, 2 * PAGE)),
+            "written in it"
+        );
+        assert!(
+            !batch.texture_due(&far, (base + 40 * PAGE, 4 * PAGE)),
+            "elsewhere"
+        );
+        batch.title_copied(base + 39 * PAGE, PAGE);
+        assert!(
+            !batch.texture_due(&far, (base + 40 * PAGE, 4 * PAGE)),
+            "touching, not in it"
+        );
+        batch.title_copied(base + 40 * PAGE - 1, 2);
+        assert!(
+            batch.texture_due(&far, (base + 40 * PAGE, 4 * PAGE)),
+            "its first byte"
+        );
+    }
+
     /// The hashing a submission does for textures in physical-page memory,
     /// with every list checking the textures it samples (before) and with
     /// each checked once (after). Run with
@@ -3287,7 +3620,7 @@ mod batch {
             let started = std::time::Instant::now();
             for _ in 0..LISTS {
                 for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
+                    if !dedupe || batch.texture_due(t, (0, SIZE)) {
                         std::hint::black_box(blake3::hash(t));
                         hashed += 1;
                     }
