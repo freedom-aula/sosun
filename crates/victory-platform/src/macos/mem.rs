@@ -381,7 +381,11 @@ impl PagePool {
                 &mut addr,
                 len as u64,
                 // 16 KiB aligned anywhere, also under Rosetta (4 KiB there).
-                KERNEL_PAGE as u64 - 1,
+                if at.is_some() {
+                    0
+                } else {
+                    KERNEL_PAGE as u64 - 1
+                },
                 flags,
                 self.entry,
                 offset as u64,

@@ -84,6 +84,9 @@ fn a_page_pool_maps_at_several_addresses() {
 
         // At a chosen address.
         let free = mem::reserve(None, 4 * g).unwrap();
+        // Windows maps over free space only; macOS over the reservation
+        // (letting go first would race the other tests for the address).
+        #[cfg(windows)]
         mem::release(free, 4 * g).unwrap();
         let d = pool
             .map(0, 4 * g, Some(free as usize), Protect::READ_WRITE)

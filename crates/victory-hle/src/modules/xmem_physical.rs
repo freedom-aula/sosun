@@ -471,7 +471,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     // A title reserves 64 KiB pages on 64 KiB boundaries (Windows insists).
-    if base % PAGE != 0 {
+    if !base.is_multiple_of(PAGE) {
         return std::ptr::null_mut();
     }
     let mut physical = physical();
