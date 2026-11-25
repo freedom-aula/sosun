@@ -83,6 +83,13 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // Masked stores redone as plain stores Rosetta can resume, so fault
+    // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
+    if let Ok(which) = std::env::var("VICTORY_PATCH_MASKED") {
+        let wanted = victory_loader::masked::wanted_from(Some(&which));
+        let n = victory_loader::masked::patch(image.base() as u64, &prepared.info, &original, wanted);
+        println!("masked stores  {n} patched to plain stores");
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {
