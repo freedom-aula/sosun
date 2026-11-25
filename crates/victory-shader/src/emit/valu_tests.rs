@@ -1404,11 +1404,6 @@ fn image_addresses_of_16_bits_and_clamps() {
             continue;
         };
         for (shader, k, want) in cases {
-            // D3DMetal ignores a sample's bias in compute programs
-            // (docs/macos.md, "Open differences").
-            if std::ptr::eq(shader, &biased) && super::host::under_wine() {
-                continue;
-            }
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));

@@ -2326,7 +2326,21 @@ impl<'a> Lower<'a> {
         // part is NaN. Metal's sin and cos give 0 there, so that NaN is
         // passed through here instead of relying on the host.
         let nan = self.s.m.cmp(c, pred::UNO, part, part);
-        self.s.m.select(c, nan, part, r)
+        let r = self.s.m.select(c, nan, part, r);
+        if cosine {
+            r
+        } else {
+            // Preserve a zero's sign as integer bits. A host sin or float
+            // select may canonicalize -0 under Metal's fast-math lowering.
+            let bits = self.as_int(x);
+            let mask = self.s.m.i32(0x7fff_ffff);
+            let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+            let zero = self.s.m.i32(0);
+            let is_zero = self.s.m.cmp(c, pred::EQ, magnitude, zero);
+            let result = self.as_int(r);
+            let result = self.s.m.select(c, is_zero, bits, result);
+            self.as_float(result)
+        }
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -8285,16 +8299,41 @@ impl<'a> Lower<'a> {
                 61 => {
                     let bias = addr_val(self, 0)?;
                     let bias = to_float(self, bias);
-                    args.extend(&os);
-                    args.extend([bias, fu]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    if self.x.native.stage == HwStage::Cs {
+                        // D3DMetal ignores SampleBias in compute shaders.
+                        // Scale explicit quad gradients by 2^bias instead:
+                        // log2(rho * 2^bias) = log2(rho) + bias.
+                        let scale = self.unary(21, bias);
+                        let mut gradients = vec![fu; 6];
+                        for k in 0..spatial {
+                            let dx = self.unary(83, cs[k]);
+                            let dy = self.unary(84, cs[k]);
+                            gradients[k] = self.s.m.bin(c, Bin::Mul, dx, scale);
+                            gradients[3 + k] = self.s.m.bin(c, Bin::Mul, dy, scale);
+                        }
+                        args.extend(&os);
+                        args.extend(gradients);
+                        args.push(fu);
+                        self.s.op(
+                            c,
+                            "sampleGrad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            63,
+                            &args,
+                        )
+                    } else {
+                        args.extend(&os);
+                        args.extend([bias, fu]);
+                        self.s.op(
+                            c,
+                            "sampleBias.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            61,
+                            &args,
+                        )
+                    }
                 }
                 63 if kind == 5 => {
                     // A cube's gradients are the face's: ds, dt per step in x,

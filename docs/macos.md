@@ -64,6 +64,14 @@ It also refuses any list that names the packed formats `R8G8_B8G8_UNORM` and `G8
 
 D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
 
+## Additional M2 compatibility checks
+
+With CrossOver 26.3 and its bundled D3DMetal 3.0, creating a new pipeline library requires a null blob pointer. A non-null pointer with length zero (as supplied by Rust's empty slice wrapper) returns `0x887e0002`, while null with length zero succeeds. The library creation path now passes null explicitly for an empty blob.
+
+The sine lowering also preserves zero's sign with an integer selection after the host trigonometric operation. This keeps `sin(-0.0)` negative without disabling its exact-bit assertion under Wine.
+
+These checks used the public synthetic tests built with Rust's Windows MSVC target and run in a separate CrossOver bottle, not a game build. The depth/twin copy test still fails on this D3DMetal 3.0 setup; successful sampling, atomics, and pipeline tests do not establish full graphics compatibility.
+
 ## Route A: next steps
 
 The first playable route is the upstream Windows build running under Wine, with D3D12 going to Metal through Apple's D3DMetal. DXMT cannot be used because it covers D3D11 only. Rosetta 2 runs the title's x86-64 code and has supported AVX2 since macOS 15.
@@ -96,7 +104,7 @@ This was the "signed zero in minimums" difference listed here before. Each `v_mi
 The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new shader tests, and three of them find real differences in D3DMetal 4.0 beta 3 on an M4. The tests skip only those checks under Wine, so the rest of each test still runs.
 
 - 64-bit image atomics. D3DMetal reports `AtomicInt64OnTypedResourceSupported` and `AtomicInt64OnDescriptorHeapResourceSupported`, but its 64-bit atomics in `image_atomics_of_64_bits` leave every texel at zero. The game's alpha prepasses use them. Under Wine the translator now emulates them (`Options::atomic_locks`, the module notes' "Atomic locks", `VICTORY_ATOMIC_LOCKS=0` or `1` to override): the lanes of a wave take turns in a loop over lane indices, and in its turn a lane takes a 32-bit lock word, reads the texel, writes the result and frees the lock. Two simpler forms failed under D3DMetal and are worth knowing about. Lanes of one wave spinning on each other's locks never finish, and `WaveIsFirstLane` and `WaveReadLaneFirst` inside a divergent loop return other lanes' values. The spin is bounded at 65536 tries so a fault can never hang the GPU.
-- Sample bias in compute programs. In `image_addresses_of_16_bits_and_clamps`, a sample with a bias of 1 reads level 1 where the console reads level 2, so the bias is ignored. The gather and clamp cases of that test pass.
+- Sample bias in compute programs. D3DMetal's native biased sample ignores the bias: a bias of 1 reads level 1 where the console reads level 2. The translator now lowers compute-stage biased samples to explicit gradients scaled by `2^bias`, preserving the requested LOD shift. The bias cases in `image_addresses_of_16_bits_and_clamps` run under Wine again; all cases pass on an M2 Max with CrossOver 26.3 and D3DMetal 3.0, and in a Windows WARP check. Pixel-stage samples retain their existing lowering.
 - 24-bit depth. Apple GPUs have no 24-bit depth format, so D3DMetal keeps it as 32-bit float and rounds down when it stores 24 bits. The depth test clears to 0.75, where both roundings agree (PR #6).
 - Root signature blobs. D3DMetal accepts a truncated root signature blob and crashes on garbage, where Windows returns `E_INVALIDARG`, so `malformed_blobs_are_rejected_by_the_host` skips under Wine.
 - Hard links. `a_kept_blob_past_the_link_limit_is_copied` needs NTFS's limit of 1024 links to a file, and APFS has no such limit, so the test skips where the 1025th link succeeds.
