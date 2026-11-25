@@ -98,12 +98,23 @@ cargo test --workspace
 WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
 ```
 
+## Help test on your Mac
+
+The project needs test results from as many Macs as possible. The [Mac test fleet](docs/fleet.md) runs both test suites on your Mac and reports the counts to this repository. It uses only the project's own tests, never a game. Paste this into an AI coding agent on your Mac, such as Claude Code, Codex or Cursor:
+
+```text
+Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/fleet-join.md and follow it to help test VIctory on my Mac. Ask me before installing or posting anything.
+```
+
+Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run the fleet by hand with `tools/fleet/fleet.sh`.
+
 ## Where things are
 
 | Path | What it holds |
 | --- | --- |
 | `setup.sh` | The one-step setup |
 | `tools/macos/` | The Wine build, the library build, the launcher and the test runner |
+| `tools/fleet/` | The Mac test fleet: the worker, the issue queue and its tests ([docs/fleet.md](docs/fleet.md)) |
 | `docs/macos.md` | The full story of the port, the problems found and how each was fixed |
 | `crates/` | VIctory's runtime: loader, console runtime, GPU layer, shader recompiler and formats |
 | `docs/architecture.md` | How VIctory itself is put together |
