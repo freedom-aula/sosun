@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod crash;
+pub mod masked;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
