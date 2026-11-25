@@ -89,6 +89,10 @@ Run `./setup.sh` from the top of the repository. It checks the Mac, installs the
 
 On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30), so host pipelines are never kept there. Use 4.0 beta 3 or newer for the game.
 
+## Stacks during a freeze
+
+In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well (in a build with `VICTORY_DIAGNOSTICS=1`), the dumps go to that file instead. The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
+
 ## Presented planes
 
 On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
