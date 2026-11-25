@@ -53,9 +53,11 @@ struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
-    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
-    /// range is added or dropped: every list running heap shaders asks.
-    hulls: Option<Vec<Hull>>,
+    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
+    /// as ranges come and go (each list running heap shaders asks for all
+    /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
+    /// run perf4).
+    hulls: HashMap<(usize, bool), Hull>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
@@ -91,15 +93,24 @@ impl Inner {
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
-                    self.hulls = None;
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
                         .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
                     tally(&mut ends.1, key.1, now > 0);
                     tally(&mut ends.2, key.2, now > 0);
-                    if ends.1.is_empty() {
-                        self.ends.remove(&(key.0, key.3));
+                    let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
+                        (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
+                        _ => None,
+                    };
+                    match hull {
+                        Some(hull) => {
+                            self.hulls.insert((key.0, key.3), hull);
+                        }
+                        None => {
+                            self.ends.remove(&(key.0, key.3));
+                            self.hulls.remove(&(key.0, key.3));
+                        }
                     }
                 }
             }
@@ -134,22 +145,7 @@ impl Viewed {
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls().clone()
-    }
-}
-
-impl Inner {
-    /// [`Viewed::ranges`], made once while no range comes or goes.
-    fn hulls(&mut self) -> &Vec<Hull> {
-        let Inner { hulls, ends, .. } = self;
-        hulls.get_or_insert_with(|| {
-            ends.iter()
-                .filter_map(|(&(_, uav), (shadow, starts, ends))| {
-                    let (&from, &to) = (starts.keys().next()?, ends.keys().next_back()?);
-                    Some((shadow.clone(), from, to - from, uav, shadow.dirty_bit()))
-                })
-                .collect()
-        })
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
     }
 }
 
@@ -264,8 +260,8 @@ impl Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, _, bit) in inner.hulls() {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, _, bit) in inner.hulls.values() {
         if !crate::watch::clean_bit(*bit) {
             add(shadow, *address as usize, *len as usize);
         }
