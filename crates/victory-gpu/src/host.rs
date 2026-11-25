@@ -311,12 +311,14 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
     let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
     *wall_ms += wall.as_secs_f64() * 1e3;
     for (ms, note) in commands {
+        // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
         let head = note.split(" | ").next().unwrap_or_default();
-        let key: Vec<&str> = head
-            .split(' ')
-            .filter(|w| !w.starts_with(|c: char| c.is_ascii_digit()) && !w.starts_with("0x"))
-            .collect();
-        let e = by.entry(key.join(" ")).or_default();
+        let kind = head.split(' ').next().unwrap_or_default();
+        let key = match head.find('[') {
+            Some(at) => format!("{kind} {}", &head[at..]),
+            None => kind.to_owned(),
+        };
+        let e = by.entry(key).or_default();
         (e.0, e.1) = (e.0 + ms, e.1 + 1);
         *sum += ms;
     }
@@ -2126,6 +2128,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
