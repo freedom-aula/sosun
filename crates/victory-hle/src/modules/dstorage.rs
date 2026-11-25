@@ -979,22 +979,24 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let count = (offset + len).div_ceil(PAGE);
+    // The title's page list, copied: the title may still be filling it
+    // (below), so each attempt is judged by the list it wrote through, not
+    // by a later read of it.
+    let list = || {
+        // SAFETY: the title passes a page number per 64 KiB of destination,
+        // which holds at least `len` bytes from `offset`.
+        unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), count) }.to_vec()
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&list(), offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    let mut pages = list();
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
         return Ok(());
     }
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
@@ -1003,29 +1005,31 @@ fn into_destination(
     // its own, so a read can start first. Read the list again for a few
     // milliseconds before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
-    if pages.contains(&0) {
-        for _ in 0..LATE_LIST_TRIES {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
-                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
-                if late.is_power_of_two() {
-                    tracing::info!(
-                        late,
-                        "dstorage: a page list filled after its request started: written late"
-                    );
-                }
-                return Ok(());
+    let mut rereads = 0;
+    while pages.contains(&0) && rereads < LATE_LIST_TRIES {
+        rereads += 1;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        pages = list();
+        if !pages.contains(&0) && super::xmem::write_physical(&pages, offset, &data[..n]) {
+            let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if late.is_power_of_two() {
+                tracing::info!(
+                    late,
+                    rereads,
+                    "dstorage: a page list filled after its request started: written late"
+                );
             }
+            return Ok(());
         }
     }
+    // `still_empty`: the list still named page 0 after the last read;
+    // else the pages it names could not be written.
     tracing::warn!(
         offset,
         len,
         pages = pages.len(),
+        still_empty = pages.contains(&0),
+        rereads,
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
@@ -1590,6 +1594,25 @@ mod tests {
         // SAFETY: the page is mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
+    }
+
+    #[test]
+    fn a_page_list_never_filled_fails_its_request() {
+        let list = [0usize; 1];
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_ptr().cast_mut().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_INVALIDARG);
     }
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
