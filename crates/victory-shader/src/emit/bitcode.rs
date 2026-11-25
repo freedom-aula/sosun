@@ -579,6 +579,17 @@ impl Module {
         }
     }
 
+    /// Calls of functions named `name` that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_calls(&self, name: &str) -> usize {
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
+            .count()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
