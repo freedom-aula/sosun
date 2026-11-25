@@ -2326,7 +2326,21 @@ impl<'a> Lower<'a> {
         // part is NaN. Metal's sin and cos give 0 there, so that NaN is
         // passed through here instead of relying on the host.
         let nan = self.s.m.cmp(c, pred::UNO, part, part);
-        self.s.m.select(c, nan, part, r)
+        let r = self.s.m.select(c, nan, part, r);
+        if cosine {
+            return r;
+        }
+        // sin(±0) is ±0. Some Metal GPUs (M2) drop the sign through the
+        // host's sin or a float select, so a zero input is passed through
+        // as integer bits (from nickorlabs's #30).
+        let bits = self.as_int(x);
+        let mask = self.s.m.i32(0x7fff_ffff);
+        let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+        let zero = self.s.m.i32(0);
+        let is_zero = self.s.m.cmp(c, pred::EQ, magnitude, zero);
+        let result = self.as_int(r);
+        let result = self.s.m.select(c, is_zero, bits, result);
+        self.as_float(result)
     }
 
     /// The high dword of a 32 × 32-bit product.
