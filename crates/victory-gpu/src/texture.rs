@@ -212,11 +212,17 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-/// A host copy or resolve writes `resource`: its host texture's contents
-/// are the host's, not title memory's, which stays as it was.
-pub(crate) fn host_written(resource: This) {
+/// A host copy or resolve that `list` records writes `resource`: from the
+/// submission that runs `list` on, its host texture's contents are the
+/// host's, not title memory's, which stays as it was. Marked when that
+/// submission is made, not when `list` is recorded: a list recorded before
+/// it but run after it must not upload title memory over the host's texels
+/// (submissions run in the order they are made, which need not be the
+/// order their lists were recorded in), and one run before it must still
+/// get its upload.
+pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -294,7 +300,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_written(to);
+    crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {

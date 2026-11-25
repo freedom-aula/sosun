@@ -222,6 +222,11 @@ pub(crate) fn uploads(
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
+        // A host copy wrote it in a submission made before this one (it
+        // was not when the list was recorded).
+        if copy.host_written.load(Relaxed) {
+            continue;
+        }
         if staged.insert(Arc::as_ptr(staging)) {
             work.push((staging.clone(), copy.clone()));
         }
