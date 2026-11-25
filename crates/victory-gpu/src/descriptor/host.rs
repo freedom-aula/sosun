@@ -139,6 +139,9 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
+        // Other threads' submissions held off from here until the heap is
+        // filled (`Host::quiet`; a title heap's `host` holds them already).
+        let _quiet = (!sampler).then(|| host.quiet()).flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or

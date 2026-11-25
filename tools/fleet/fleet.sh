@@ -49,9 +49,7 @@ GPTK_URL="https://developer.apple.com/download/all/?q=game%20porting%20toolkit"
 gptk_dmg() { find "$HOME/Downloads" -maxdepth 1 -name 'Game_Porting_Toolkit*.dmg' 2> /dev/null | sort | tail -n 1; }
 
 gptk_version() {
-    local v
-    v=$(basename "$(gptk_dmg)" .dmg | sed -nE 's/^Game_Porting_Toolkit[_ -]?v?([0-9]{1,2}(\.[0-9]{1,2}){0,2}(-beta[0-9]?)?)$/\1/p')
-    echo "${v:-unknown}"
+    gptk_version_of "$(gptk_dmg)"
 }
 
 need_number() { [[ ${1:-} =~ ^[0-9]{1,7}$ ]] || die "give a task number"; }
@@ -181,14 +179,16 @@ cmd_claim() {
             say "task #$1 is yours. Next: tools/fleet/fleet.sh run $1"
             return
         fi
-        [ -n "$T_ASSIGNEE" ] && die "task #$1 went to someone else; run tools/fleet/fleet.sh next"
+        # Assignment can appear before the queue finishes updating the labels.
+        [ -n "$T_ASSIGNEE" ] && [ "$T_ASSIGNEE" != "$who" ] &&
+            die "task #$1 went to someone else; run tools/fleet/fleet.sh next"
     done
     die "no lease after 3 minutes; read the replies on https://github.com/$REPO/issues/$1"
 }
 
 cmd_run() {
     need_number "${1:-}"
-    local n=$1 logs setup native wine failed result
+    local n=$1 logs setup native wine failed result native_status=0 wine_status=0
     accepted || die "the fleet terms are not accepted yet; run tools/fleet/fleet.sh doctor"
     load_task "$n"
     require_lease "$n"
@@ -205,7 +205,9 @@ cmd_run() {
     # Keep the lease alive while the suites run.
     (while sleep 3000; do gh issue comment "$n" -R "$REPO" --body "/beat" > /dev/null 2>&1 || true; done) &
     local beat_pid=$!
-    trap 'kill "$beat_pid" 2> /dev/null || true' EXIT
+    # Capture the PID now; cmd_run's locals are gone when EXIT runs.
+    # shellcheck disable=SC2064
+    trap "kill $beat_pid 2> /dev/null || true" EXIT
 
     say "running setup.sh (the first run builds Wine and takes about an hour); log: $logs/setup.log"
     (cd "$WORK" && ./setup.sh) > "$logs/setup.log" 2>&1 && setup=ok || setup=failed
@@ -214,15 +216,15 @@ cmd_run() {
     if [ "$setup" = ok ]; then
         say "running the native tests; log: $logs/native.log"
         (cd "$WORK" && PATH="/opt/homebrew/opt/rustup/bin:$PATH" cargo test --workspace --no-fail-fast) \
-            > "$logs/native.log" 2>&1 || true
+            > "$logs/native.log" 2>&1 || native_status=$?
         say "running the Wine + D3DMetal tests; log: $logs/wine.log"
         (cd "$WORK" && WINE="$WINE_BIN" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" \
-            tools/macos/test-wine.sh --workspace --no-fail-fast) > "$logs/wine.log" 2>&1 || true
+            tools/macos/test-wine.sh --workspace --no-fail-fast) > "$logs/wine.log" 2>&1 || wine_status=$?
     else
         say "setup failed; the result will say so. The log stays on this Mac: $logs/setup.log"
     fi
-    native=$(counts_json "$logs/native.log")
-    wine=$(counts_json "$logs/wine.log")
+    native=$(counts_json "$logs/native.log" "$native_status")
+    wine=$(counts_json "$logs/wine.log" "$wine_status")
     failed=$({
         failed_names "$logs/native.log" native
         failed_names "$logs/wine.log" wine

@@ -172,36 +172,77 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
-#[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+thread_local! {
+    /// Whether this thread holds the guard lock. A guarded block it faults
+    /// on then is one the lock's own work touched (#50: an allocation made
+    /// under the lock landed in a guarded block of the host heap, which
+    /// title XMem blocks share), and taking the lock again would hang it.
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The guard lock, timed while held by the line that took it
-/// (diagnostics: [`held_times`]).
-#[cfg(feature = "diagnostics")]
-#[track_caller]
-fn guards() -> Held {
-    let line = std::panic::Location::caller().line();
-    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    Held(Some(guard), std::time::Instant::now(), line)
-}
+/// Blocks opened by faults taken under the guard lock, for its next holder
+/// to mark changed (0: free slot). Fixed: the handler must not allocate.
+static OPENED_UNDER_LOCK: [std::sync::atomic::AtomicUsize; 64] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
 
-#[cfg(feature = "diagnostics")]
-struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32);
-
-#[cfg(feature = "diagnostics")]
-impl std::ops::Deref for Held {
-    type Target = Guards;
-    fn deref(&self) -> &Guards {
-        self.0.as_ref().expect("held until dropped")
+/// A fault on the block `page` by the thread holding the guard lock: write
+/// access back now, marked changed by the lock's next holder.
+// shortcut: assumes a read-only block this thread writes while
+// holding the lock is one of ours; with all 64 slots taken the block stays
+// open without being marked (counted); a bigger table if that shows up.
+fn open_under_lock(page: usize) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block of this process; fails harmlessly if it is gone.
+    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    if !OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
+        static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        LOST.fetch_add(1, Relaxed);
     }
 }
 
-#[cfg(feature = "diagnostics")]
+/// The guard lock, held while this lives. With diagnostics, timed for the
+/// line that took it ([`held_times`]).
+struct Held {
+    guard: Option<std::sync::MutexGuard<'static, Guards>>,
+    #[cfg(feature = "diagnostics")]
+    since: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    line: u32,
+}
+
+#[track_caller]
+fn guards() -> Held {
+    use std::sync::atomic::Ordering::AcqRel;
+    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    HOLDING.with(|h| h.set(true));
+    let mut held = Held {
+        guard: Some(guard),
+        #[cfg(feature = "diagnostics")]
+        since: std::time::Instant::now(),
+        #[cfg(feature = "diagnostics")]
+        line: std::panic::Location::caller().line(),
+    };
+    for slot in &OPENED_UNDER_LOCK {
+        let page = slot.swap(0, AcqRel);
+        if page != 0 {
+            changed(&mut held, page, page + 1, false);
+        }
+    }
+    held
+}
+
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.guard.as_ref().expect("held until dropped")
+    }
+}
+
 impl std::ops::DerefMut for Held {
     fn deref_mut(&mut self) -> &mut Guards {
-        self.0.as_mut().expect("held until dropped")
+        self.guard.as_mut().expect("held until dropped")
     }
 }
 
@@ -211,19 +252,22 @@ impl std::ops::DerefMut for Held {
 static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 16];
 
-#[cfg(feature = "diagnostics")]
 impl Drop for Held {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let us = self.1.elapsed().as_micros() as u64;
-        drop(self.0.take());
-        let line = u64::from(self.2);
-        if let Some(slot) = HELD
-            .iter()
-            .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
+        drop(self.guard.take());
+        HOLDING.with(|h| h.set(false));
+        #[cfg(feature = "diagnostics")]
         {
-            slot[1].fetch_add(us, Relaxed);
-            slot[2].fetch_max(us, Relaxed);
+            use std::sync::atomic::Ordering::Relaxed;
+            let us = self.since.elapsed().as_micros() as u64;
+            let line = u64::from(self.line);
+            if let Some(slot) = HELD
+                .iter()
+                .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
+            {
+                slot[1].fetch_add(us, Relaxed);
+                slot[2].fetch_max(us, Relaxed);
+            }
         }
     }
 }
@@ -478,6 +522,13 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
     let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    // Only the runtime's GPU memory is guarded. A tracked range can start
+    // in free or reserved memory and run on into the host's own pages: in
+    // #50 that guarded the process heap's header, and a thread holding the
+    // heap lock then faulted while another held `Guards` and allocated,
+    // a deadlock. Pages left out stay changed, so they are copied whole.
+    let mut allowed = RuntimeRegions::default();
+    let pages: Vec<usize> = pages.into_iter().filter(|&p| allowed.contains(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -509,6 +560,40 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         }
     }
     taken
+}
+
+/// Which pages are the runtime's GPU memory ([`runtime_memory`]), asked
+/// once per memory region: a region shares its state, type and write watch.
+#[derive(Default)]
+struct RuntimeRegions {
+    /// The last region asked about: its pages and whether it is runtime
+    /// memory.
+    last: Option<(usize, usize, bool)>,
+}
+
+impl RuntimeRegions {
+    fn contains(&mut self, page: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        if let Some((a, b, yes)) = self.last
+            && (a..b).contains(&page)
+        {
+            return yes;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        let yes = runtime_memory(page * PAGE, true);
+        let (base, size) = (info.BaseAddress as usize, info.RegionSize);
+        // In our pages, rounded inward so the region never claims a page it
+        // only shares.
+        let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
+        self.last = Some((a, b, yes));
+        yes
+    }
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -661,6 +746,13 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        if HOLDING.with(|h| h.get()) {
+            if read_only(at) {
+                open_under_lock(at / PAGE);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         let mut g = guards();
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
@@ -678,6 +770,19 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Whether `at` is committed memory that is read-only, as our guards make
+/// it.
+fn read_only(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -707,6 +812,31 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_fault_under_the_guard_lock_does_not_hang() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        install();
+        // SAFETY: a fresh block of our own.
+        let block = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!block.is_null());
+        let mut old = 0;
+        // SAFETY: as above.
+        assert_ne!(unsafe { VirtualProtect(block.cast(), PAGE, PAGE_READONLY, &mut old) }, 0);
+        {
+            let _g = guards();
+            // SAFETY: inside the block; the handler gives write access back.
+            unsafe { block.add(100).write_volatile(7) };
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { block.add(100).read_volatile() }, 7);
+        assert!(writable(block as usize));
+        drop(guards());
+        assert!(OPENED_UNDER_LOCK.iter().all(|s| s.load(std::sync::atomic::Ordering::Relaxed) != block as usize / PAGE));
+        // SAFETY: allocated above.
+        assert_ne!(unsafe { VirtualFree(block.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -746,6 +876,36 @@ pub(crate) mod tests {
 
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
+    /// A tracked range that starts in reserved memory and runs into plain
+    /// committed memory (the host's, as the process heap was in #50) never
+    /// makes that memory read-only; it stays changed instead.
+    #[test]
+    fn plain_committed_memory_is_never_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        // SAFETY: plain reservation and commit of our own memory.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        // The last two blocks committed as plain private memory.
+        // SAFETY: inside our reservation.
+        assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        let _ = t.take(base, base + 4 * PAGE);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery((base + 2 * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(info.Protect, PAGE_READWRITE, "still writable");
+        assert!(t.changed(base / PAGE + 2) && t.changed(base / PAGE + 3), "stays changed");
+        // SAFETY: writable, so no fault.
+        unsafe { ((base + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
+        drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn writes_mark_every_tracker_of_their_page() {
         let p = pool(4);

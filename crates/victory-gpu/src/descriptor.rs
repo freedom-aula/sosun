@@ -88,6 +88,12 @@ impl Heap {
         {
             return None;
         }
+        // Submissions held off while a view heap is made and filled
+        // (`Host::quiet`), from before `pending` is taken: `mirror` waits
+        // for that with `SHADER_HEAPS` held, which a submission waits for.
+        let _quiet = (self.desc.kind == VIEWS_KIND)
+            .then(|| crate::host::host()?.quiet())
+            .flatten();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // A recorder can take the fast path as soon as the OnceLock is
         // initialized. Publish only after replaying the queued writes.

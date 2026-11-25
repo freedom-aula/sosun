@@ -69,6 +69,9 @@ pub fn run(
         }
         None => println!("build          unknown ({hash})"),
     }
+    // Rosetta cannot resume these when they fault partway (#14, #50).
+    let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
+    println!("masked stores  {}", victory_loader::masked::summary(&masked));
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -80,6 +83,13 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    // Masked stores redone as plain stores Rosetta can resume, so fault
+    // tracking (`VICTORY_FAULT_TRACKING=1`) can run under Rosetta (#50).
+    if let Ok(which) = std::env::var("VICTORY_PATCH_MASKED") {
+        let wanted = victory_loader::masked::wanted_from(Some(&which));
+        let n = victory_loader::masked::patch(image.base() as u64, &prepared.info, &original, wanted);
+        println!("masked stores  {n} patched to plain stores");
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

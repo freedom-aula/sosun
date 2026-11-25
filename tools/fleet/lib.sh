@@ -30,6 +30,16 @@ chip_family_of() {
     sed -nE 's/^Apple (M[0-9]{1,2})( Pro| Max| Ultra)?$/\1/p' <<< "$1" | tr 'M' 'm'
 }
 
+# Normalize Apple's DMG filename to the version format accepted by results.
+# For example, Game_Porting_Toolkit_4.0_beta_3.dmg becomes 4.0-beta3.
+gptk_version_of() { # DMG PATH -> VERSION or unknown
+    local v
+    v=$(sed -nE 's/^Game_Porting_Toolkit[_ -]?v?(.+)\.dmg$/\1/p' <<< "${1##*/}" |
+        sed -E 's/[_ -]beta[_ -]?/-beta/' |
+        sed -nE '/^[0-9]{1,2}(\.[0-9]{1,2}){0,2}(-beta[0-9]?)?$/p')
+    printf '%s\n' "${v:-unknown}"
+}
+
 # The body of a task issue. The HTML comment is what machines read.
 task_body() { # COMMIT CHIP REPO
     local chip_upper
@@ -180,8 +190,8 @@ parse_counts() { # LOG
         END { if (n) print p + 0, f + 0, g + 0 }' "$1"
 }
 
-counts_json() { # LOG -> {"passed":..,"failed":..,"ignored":..} or null
-    local c
+counts_json() { # LOG [EXIT STATUS] -> {passed, failed, ignored} or null
+    local c status=${2:-0}
     c=$(parse_counts "$1")
     if [ -z "$c" ]; then
         echo null
@@ -189,6 +199,12 @@ counts_json() { # LOG -> {"passed":..,"failed":..,"ignored":..} or null
     fi
     # shellcheck disable=SC2086 # three numbers
     set -- $c
+    # Passing binaries do not prove the suite finished: a later build or runner
+    # can fail. Keep counted test failures, but mark other unsuccessful runs null.
+    if [ "$status" -ne 0 ] && [ "$2" -eq 0 ]; then
+        echo null
+        return
+    fi
     jq -cn --argjson p "$1" --argjson f "$2" --argjson i "$3" '{passed: $p, failed: $f, ignored: $i}'
 }
 

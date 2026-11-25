@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -35,6 +35,34 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+
+thread_local! {
+    /// The thread holds the submission lock ([`Host::execute`] or
+    /// [`Host::quiet`]).
+    static HOLDS_SUBMISSIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The thread holds the submission lock while this lives.
+struct Holding(bool);
+
+impl Holding {
+    fn enter() -> Self {
+        Holding(HOLDS_SUBMISSIONS.with(|h| h.replace(true)))
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        HOLDS_SUBMISSIONS.with(|h| h.set(self.0));
+    }
+}
+
+/// Submissions held off ([`Host::quiet`]).
+pub(crate) struct Quiet<'a> {
+    // Dropped in this order: the mark, then the lock.
+    _holding: Holding,
+    _held: std::sync::MutexGuard<'a, u64>,
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -799,11 +827,61 @@ impl Host {
         }
     }
 
+    /// Waits until the host fence reaches `value`. The event is only a
+    /// wake-up: the fence's completed value decides. Under D3DMetal a
+    /// submission's work can finish without its event ever being set
+    /// (#50: the title's main thread slept for good in this wait while the
+    /// queue was idle), so the wait wakes every second to check the fence
+    /// itself. A late event left set by an earlier wait cannot end a later
+    /// wait early, as the fence is checked after every wake-up too.
+    fn wait_for(&self, value: u64) {
+        use std::sync::atomic::AtomicU64;
+        static MISSED: AtomicU64 = AtomicU64::new(0);
+        let mut seconds = 0u32;
+        loop {
+            // SAFETY: our event and fence.
+            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            // SAFETY: as above.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= value {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
+                    }
+                }
+                return;
+            }
+            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                seconds += 1;
+                if seconds.is_power_of_two() {
+                    tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+                }
+            }
+        }
+    }
+
+    /// Holds other threads' submissions off until dropped, around the making
+    /// of a shader-visible host view heap and its fill with null views
+    /// (millions of descriptor copies). Under Wine on D3DMetal, lists other
+    /// threads submitted during such a fill lost their views: their
+    /// shaders' writes were dropped and their reads gave zeros, whatever
+    /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
+    /// that holds the submission lock already, nor off Wine.
+    pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
+        if !crate::shader_cache::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Quiet { _holding: Holding::enter(), _held: held })
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -905,9 +983,7 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
+                    Ok(()) => self.wait_for(*submitted),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
@@ -2430,6 +2506,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The overlay blend pass, once tried (#15).
+    compositor: Option<std::result::Result<crate::composite::Compositor, ()>>,
+    /// The texture the blend pass writes.
+    blended: Option<ID3D12Resource>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -2569,14 +2649,33 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `overlay` (a
+    /// texture and its host state, which it keeps) blended over it when
+    /// `VICTORY_PRESENT_COMPOSITE=1`. `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        let Some(picture_format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
+        };
+        // The overlay with its view format, when it is to be blended in.
+        let overlay = overlay.filter(|_| crate::composite::wanted()).and_then(|(o, s)| {
+            // SAFETY: a live resource.
+            let f = swap_format(unsafe { o.GetDesc() }.Format)?;
+            Some((o, s, f))
+        });
+        let format = if overlay.is_some() {
+            crate::composite::result_format(picture_format)
+        } else {
+            picture_format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -2593,6 +2692,29 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // The blend pass and the texture it writes, made on first use.
+        let mut blended = None;
+        if let Some(overlay) = overlay {
+            if p.compositor.is_none() {
+                p.compositor = Some(crate::composite::Compositor::new(&self.device).map_err(|e| {
+                    tracing::warn!(error = %e, "no overlay blending: the pass did not compile");
+                }));
+            }
+            if let Some(Ok(compositor)) = &p.compositor {
+                let current = p.blended.as_ref().is_some_and(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    (d.Width, d.Height, d.Format) == (desc.Width, desc.Height, format)
+                });
+                if !current {
+                    p.blended =
+                        crate::composite::result_texture(&self.device, desc.Width, desc.Height, format).ok();
+                }
+                if let Some(result) = &p.blended {
+                    blended = Some((compositor, result.clone(), overlay));
+                }
+            }
+        }
         // What is presented, whenever it changes: the title's texture in its
         // host format, and the swap chain format it is copied into.
         static SHOWN: Mutex<Option<(u64, u32, i32)>> = Mutex::new(None);
@@ -2641,14 +2763,32 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // What is copied to the back buffer: the blend or the picture,
+            // and the state it returns to afterwards.
+            let (source, state) = match &blended {
+                Some((compositor, result, (o, ostate, oformat))) => {
+                    let ostate = D3D12_RESOURCE_STATES(*ostate as i32);
+                    list.ResourceBarrier(&[transition(texture, state, READ), transition(o, ostate, READ)]);
+                    compositor.record(&self.device, list, (texture, picture_format), (o, *oformat), result, format);
+                    list.ResourceBarrier(&[
+                        transition(texture, READ, state),
+                        transition(o, READ, ostate),
+                        transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    ]);
+                    (result.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                }
+                None => {
+                    list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    (texture.clone(), state)
+                }
+            };
+            let texture = &source;
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -2723,6 +2863,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
+                blended: None,
             })
         }
     }

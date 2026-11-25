@@ -592,6 +592,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        atomic_locks: false,
         view_marks: false,
     })
     .expect("lower");

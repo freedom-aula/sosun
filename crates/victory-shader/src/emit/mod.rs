@@ -161,6 +161,16 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **Atomic locks** ([`Options::atomic_locks`]; added 2026-11-25): a
+//!   64-bit image atomic (an R32G32_UINT view) takes a lock word, reads
+//!   the texel, writes the result and frees the lock, in a loop each lane
+//!   leaves once it has had the lock. The [`ATOMIC_LOCKS`] lock words are
+//!   dwords of the root UAV `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] past
+//!   its [`VIEW_WRITE_BITS`] bits, chosen by a hash of the coordinates
+//!   (texels that share one only wait for each other), so such a shader
+//!   sets [`HostShader::view_marks`] and the host makes that buffer
+//!   [`VIEW_WRITES_BYTES`] long, zeroed. Locks are free again when the
+//!   shader ends.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -220,7 +230,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    ATOMIC_LOCKS, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -357,6 +368,10 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// 64-bit image atomics run as 32-bit locks around plain loads and
+    /// stores (module notes, "Atomic locks"), for hosts that claim the
+    /// 64-bit atomics and leave the texels untouched (D3DMetal).
+    pub atomic_locks: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -481,6 +496,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        atomic_locks: options.atomic_locks,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
