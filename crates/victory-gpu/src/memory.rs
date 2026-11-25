@@ -523,12 +523,10 @@ mod tests {
     /// table and the heap's views, as translated shaders do, into `dst`
     /// from byte `at`.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=3, b0)"
 ByteAddressBuffer views[] : register(t0);
 ByteAddressBuffer table : register(t0, space2);
 RWByteAddressBuffer dst : register(u0);
 cbuffer c : register(b0) { uint lo; uint hi; uint at; }
-[RootSignature(RS)]
 [numthreads(4, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint a = lo + id.x * 4;
@@ -541,29 +539,31 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline() -> (
+    /// The pipeline, or none where the HLSL compiler cannot build its
+    /// array of views: Wine's (vkd3d-shader) has no shader model 5.1
+    /// resource arrays and answers `E_NOTIMPL`.
+    fn pipeline() -> Option<(
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
-    ) {
+    )> {
+        use crate::compute::{Param, UNBOUNDED, srv};
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
-        use windows::Win32::Graphics::Direct3D12::*;
-        let bytes = crate::fxc::compile(SOURCE, "memory", "cs_5_1", D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES).unwrap();
-        let bytes = &bytes[..];
-        let host = crate::host::host().unwrap();
-        // SAFETY: the blob's own bytes; a compiled shader with its root
-        // signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
+        use windows::Win32::Foundation::E_NOTIMPL;
+        use windows::core::s;
+        let params = &[
+            Param::Table(&[srv(0, UNBOUNDED)]),
+            Param::Srv { register: 0, space: 2 },
+            Param::Uav { register: 0 },
+            Param::Constants { register: 0, count: 3 },
+        ];
+        let flags = D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
+        match crate::compute::pipeline(SOURCE, s!("memory"), flags, params) {
+            Ok(made) => Some(made),
+            Err(e) if e.code() == E_NOTIMPL => {
+                eprintln!("skipped: the HLSL compiler lacks what the shader needs (Wine's has no shader model 5.1 resource arrays)");
+                None
+            }
+            Err(e) => panic!("{e}"),
         }
     }
 
@@ -588,7 +588,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let (root, pso) = pipeline();
+        let Some((root, pso)) = pipeline() else {
+            return; // no compiler for the shader here
+        };
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };

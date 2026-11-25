@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 use crate::object::This;
@@ -413,6 +414,7 @@ impl Twin {
                 l.SetComputeRootSignature(&c.root);
                 l.SetPipelineState(&c.pso);
                 l.SetComputeRootUnorderedAccessView(1, self.scratch.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(2, self.scratch.GetGPUVirtualAddress());
                 for r in &self.routes {
                     let Some(d) = r.depth else { continue };
                     let (t, d) = (r.twin.Footprint, d);
@@ -453,11 +455,14 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
 /// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
 /// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
+/// is nearest. The scratch buffer is bound twice, read through `words` and
+/// written through `buf`, because Wine's HLSL compiler (vkd3d-shader) loads
+/// only from structured buffers and stores only to raw ones. The reads and
+/// the writes are in different parts of it.
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
+RWStructuredBuffer<uint> words : register(u0);
+RWByteAddressBuffer buf : register(u1);
 uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
 uint u16(uint d) {
     d &= 0xffffff;
@@ -468,7 +473,6 @@ uint u16(uint d) {
     if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
     return best;
 }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
@@ -478,12 +482,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint b = at32 + y * pitch32 + x * 4;
     bool two = x + 1 < width;
     if (toDepth != 0) {
-        uint pair = buf.Load(a);
+        uint pair = words[a / 4];
         buf.Store(b, d24(pair & 0xffff));
         if (two) buf.Store(b + 4, d24(pair >> 16));
     } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
+        uint lo = u16(words[b / 4]);
+        uint hi = two ? u16(words[b / 4 + 1]) : 0;
         buf.Store(a, lo | hi << 16);
     }
 }
@@ -512,36 +516,19 @@ fn converter() -> Option<&'static Converter> {
 }
 
 fn compile() -> windows::core::Result<Converter> {
-    // Compiled before the device is asked for, so that the test-shaders
-    // workflow saves it on a runner without a GPU.
-    let bytes = crate::fxc::compile(SOURCE, "depth", "cs_5_1", 0).map_err(|e| {
-        tracing::warn!("depth conversion: {e}");
-        windows::core::Error::empty()
-    })?;
-    let bytes = &bytes[..];
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    // SAFETY: the shader's own bytes; the root signature is inside it.
-    unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
-            ..Default::default()
-        })?;
-        Ok(Converter { root, pso })
-    }
+    use crate::compute::Param;
+    let params = [
+        Param::Constants { register: 0, count: 8 },
+        Param::Uav { register: 0 },
+        Param::Uav { register: 1 },
+    ];
+    let (root, pso) = crate::compute::pipeline(SOURCE, s!("depth"), 0, &params)?;
+    Ok(Converter { root, pso })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The conversion shader compiles (and, with
-    /// `VICTORY_DUMP_TEST_SHADERS`, is saved for Wine) without a GPU.
-    #[test]
-    fn the_conversion_shader_compiles() {
-        crate::fxc::compile(SOURCE, "depth", "cs_5_1", 0).expect("the depth conversion compiles");
-    }
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written

@@ -22,6 +22,8 @@ mod bindless;
 mod capture;
 #[cfg(windows)]
 mod clamp_bytecode;
+#[cfg(windows)]
+mod compute;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

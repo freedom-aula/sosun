@@ -348,16 +348,15 @@ mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
     /// start, the same slots a shader indexing the heap reads.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0), UAV(u0), SRV(t1))"
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 Texture2D<float4> tex : register(t1);
-[RootSignature(RS)]
 [numthreads(16, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint texel = (uint)round(tex.Load(int3(id.x % 4, 0, 0)).x * 255.0);
@@ -366,23 +365,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let bytes = crate::fxc::compile(SOURCE, "heap", "cs_5_1", 0).unwrap();
-        let bytes = &bytes[..];
-        let host = crate::host::host().unwrap();
-        // SAFETY: a compiled shader with its root signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+        use crate::compute::{Param, srv, uav};
+        let params = &[Param::Table(&[srv(0, 1), uav(0, 1), srv(1, 1)])];
+        crate::compute::pipeline(SOURCE, s!("heap"), 0, params).unwrap()
     }
 
     /// A title resource from a description in the console's layout (56

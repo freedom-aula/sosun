@@ -1077,15 +1077,18 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// format of the same element (bytes and block texels), as the host's
 /// format list casting allows (uncompressed among uncompressed, block
 /// formats among block formats of the same block size), but depth ones
-/// (refused in lists on the RX 6700 XT and WARP alike) and typeless ones
-/// (no view takes them).
+/// (refused in lists on the RX 6700 XT and WARP alike), typeless ones (no
+/// view takes them) and R10G10B10_XR_BIAS_A2_UNORM (D3DMetal has no Metal
+/// format for it and refuses every list that names it).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    const XR_BIAS: u32 = 89;
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
         .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| f != XR_BIAS)
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -1891,15 +1894,16 @@ mod tests {
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
     }
 
-    /// Castable formats: every format of the same element but typeless and
-    /// depth ones; block formats among block formats of their block size.
+    /// Castable formats: every format of the same element but typeless,
+    /// depth and XR-bias ones; block formats among block formats of their
+    /// block size.
     #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);
         for f in [67, 28, 29, 41, 24, 26, 87, 35] {
             assert!(c.contains(&f), "{f}");
         }
-        for f in [42, 39, 40, 45, 27, 10, 56] {
+        for f in [42, 39, 40, 45, 27, 10, 56, 89] {
             assert!(!c.contains(&f), "{f}");
         }
         let bc1 = castable(71);

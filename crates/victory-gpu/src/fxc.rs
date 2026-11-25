@@ -1,5 +1,4 @@
-//! HLSL shaders compiled with FXC at run time: the depth conversion
-//! (`twin`) and the tests' shaders.
+//! HLSL compute shaders compiled with FXC at run time (`compute`).
 //!
 //! Wine's HLSL compiler cannot build some of them (unbounded descriptor
 //! tables, root signatures that D3DMetal refuses), so under Wine the bytes
@@ -39,14 +38,16 @@ pub(crate) fn wine() -> bool {
     .is_some()
 }
 
-/// The bytecode of `source`'s `main` for `profile`, or the compiler's
-/// errors.
+/// The bytecode of `source`'s `main` for `profile`. Under Wine, the bytes
+/// FXC made on the Windows runner where they exist, since Wine's compiler
+/// lacks shader model 5.1 resource arrays; the compiler's messages for a
+/// failed compile are logged.
 pub(crate) fn compile(
     source: &str,
     name: &str,
     profile: &str,
     flags: u32,
-) -> Result<Vec<u8>, String> {
+) -> windows::core::Result<Vec<u8>> {
     let key = key(source, profile, flags);
     if wine()
         && let Some((_, bytes)) = crate::fxc_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
@@ -80,11 +81,16 @@ pub(crate) fn compile(
             Some(&mut errors),
         )
     };
-    if made.is_err() {
+    if let Err(e) = made {
         let text = errors.as_ref().map(blob).unwrap_or_default();
-        return Err(format!("{made:?}: {}", String::from_utf8_lossy(&text)));
+        tracing::warn!(
+            "{}: {}",
+            name.to_string_lossy(),
+            String::from_utf8_lossy(&text)
+        );
+        return Err(e);
     }
-    let bytes = blob(code.as_ref().ok_or("no bytecode")?);
+    let bytes = blob(code.as_ref().ok_or_else(windows::core::Error::empty)?);
     if let Some(dir) = std::env::var_os("VICTORY_DUMP_TEST_SHADERS") {
         let dir = std::path::PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&dir);

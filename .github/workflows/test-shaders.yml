@@ -8,7 +8,8 @@ on:
   push:
     paths:
       - crates/victory-gpu/src/fxc.rs
-      - crates/victory-gpu/src/twin.rs
+      - crates/victory-gpu/src/compute.rs
+      - crates/victory-gpu/src/memory.rs
       - .github/workflows/test-shaders.yml
 
 jobs:

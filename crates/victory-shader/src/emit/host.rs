@@ -109,6 +109,18 @@ impl Host {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
+            // Without a GPU (CI runners) the default adapter is Microsoft's
+            // software one, which behaves as WARP (vendor 0x1414): the WARP
+            // pass covers it, and its results are not the hardware's.
+            if !warp {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let adapter: IDXGIAdapter1 =
+                    factory.EnumAdapterByLuid(device.GetAdapterLuid()).map_err(err)?;
+                if adapter.GetDesc1().map_err(err)?.VendorId == 0x1414 {
+                    return Err("only the software adapter".into());
+                }
+            }
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
