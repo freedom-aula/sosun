@@ -790,6 +790,10 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
+        } else if !frame_register_inside(context, image, entry, low, high) {
+            // The unwind would read through it and fault (#50: the stack
+            // dump killed the process in `RtlVirtualUnwind2` reading 0x8).
+            break;
         } else {
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
@@ -811,6 +815,30 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether the frame register the function at `entry` unwinds through, if
+/// it has one, points into the stack `low..high`. Another thread caught in
+/// a prologue, or with a register cleared, can have it anywhere.
+fn frame_register_inside(
+    context: &CONTEXT,
+    image: u64,
+    entry: *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    low: usize,
+    high: usize,
+) -> bool {
+    // SAFETY: `entry` is the loaded image's own table entry, and its unwind
+    // info (version and flags, prologue size, code count, frame register and
+    // offset) lies in that image.
+    let register = unsafe {
+        let info = (image as usize + (*entry).Anonymous.UnwindInfoAddress as usize) as *const u8;
+        info.add(3).read() & 0xf
+    };
+    let c = context;
+    let value = [
+        c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15,
+    ][usize::from(register)] as usize;
+    register == 0 || (low..high).contains(&value)
 }
 
 /// `module+rva`, or the bare address.
@@ -916,6 +944,25 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    #[test]
+    fn an_off_stack_frame_register_ends_the_walk() {
+        use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY;
+        // Unwind info at offset 0 of a fake image: version 1, no prologue or
+        // codes, frame register 5 (rbp).
+        let image = [1u8, 0, 0, 5];
+        let entry = IMAGE_RUNTIME_FUNCTION_ENTRY::default();
+        // SAFETY: zeroed is a valid CONTEXT.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        let stack = [0u64; 16];
+        let (low, high) = (stack.as_ptr() as usize, stack.as_ptr() as usize + size_of_val(&stack));
+        assert!(!frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high), "rbp 0");
+        context.Rbp = (low + 64) as u64;
+        assert!(frame_register_inside(&context, image.as_ptr() as u64, &entry, low, high));
+        let none = [1u8, 0, 0, 0];
+        context.Rbp = 0;
+        assert!(frame_register_inside(&context, none.as_ptr() as u64, &entry, low, high), "no frame register");
     }
 
     #[test]
