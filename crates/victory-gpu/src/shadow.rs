@@ -887,11 +887,11 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies at the frame's end.
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
         let m = marks();
         for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_at_frame_end(page, PAGE);
+            crate::memory::drop_withheld(page, PAGE);
         }
     }
     if marked.is_empty() {
@@ -1541,7 +1541,7 @@ pub(crate) mod tests {
             c.write_host(p as u64 + 16, &[0x22]);
             c.keep_writes(start as usize, n as usize);
         }
-        crate::memory::drop_at_frame_end(p + 16, 4);
+        crate::memory::drop_withheld(p + 16, 4);
         assert_eq!((byte(&outer), byte(&inner)), (0x22, 0x22), "frame N: the GPU's copies keep it");
         crate::memory::log_frame();
         for c in [&outer, &inner] {

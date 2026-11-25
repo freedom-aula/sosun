@@ -1273,9 +1273,7 @@ impl Host {
             .iter()
             .map(|list| list.deferred().missed.iter().any(|check| check()))
             .collect();
-        if missed.contains(&true) {
-            crate::memory::note_missed();
-        }
+        crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
@@ -1314,7 +1312,7 @@ impl Host {
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
-                crate::memory::drop_at_frame_end(address, len);
+                crate::memory::drop_withheld(address, len);
             }
         }
         for list in runs {

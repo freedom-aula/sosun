@@ -169,10 +169,18 @@ static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 static MISSED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MISS_NEVER);
 const MISS_NEVER: u64 = u64::MAX;
 
-/// A list using title memory read or wrote memory with no copy.
-pub(crate) fn note_missed() {
+/// Whether a list using title memory in the submission being completed
+/// read or wrote memory with no copy (completions run one at a time).
+static SUBMISSION_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A submission's lists ran: whether one using title memory read or wrote
+/// memory with no copy.
+pub(crate) fn note_submission(missed: bool) {
     use std::sync::atomic::Ordering::Relaxed;
-    MISSED_IN.store(FRAMES.load(Relaxed), Relaxed);
+    SUBMISSION_MISSED.store(missed, Relaxed);
+    if missed {
+        MISSED_IN.store(FRAMES.load(Relaxed), Relaxed);
+    }
 }
 
 /// Whether what lists using title memory wrote stays out of title memory
@@ -197,10 +205,17 @@ fn withheld_in(frame: u64, missed: u64) -> bool {
 static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Shaders wrote `[address, address + len)` of title memory in host copies
-/// and the frame withheld it: at the frame's end the copies take title
-/// memory's bytes again ([`retake_dropped`]).
-pub(crate) fn drop_at_frame_end(address: usize, len: usize) {
-    DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
+/// and the submission withheld it: the copies take title memory's bytes
+/// again at their next refresh, from right after the submission if a list
+/// of it missed (its results would feed the frame's later submissions:
+/// garbage BVH nodes over meshlet buffers, run shards20), else from the
+/// frame's end ([`retake_dropped`]).
+pub(crate) fn drop_withheld(address: usize, len: usize) {
+    if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::watch::retake(address, len);
+    } else {
+        DROPPED.lock().unwrap_or_else(|e| e.into_inner()).push((address, len));
+    }
 }
 
 /// At a frame's end: what the frame withheld leaves the host copies, so
@@ -500,7 +515,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
             for &(_, at) in &writes {
-                drop_at_frame_end(at as usize, 1 << 16);
+                drop_withheld(at as usize, 1 << 16);
             }
         }
         let mut written = 0;
@@ -620,7 +635,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline() -> (
+    fn pipeline(source: &str) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
@@ -633,8 +648,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the source and names outlive the call; the errors are text.
         unsafe {
             let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("memory"),
                 None,
                 None,
@@ -688,7 +703,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let (root, pso) = pipeline();
+        let (root, pso) = pipeline(SOURCE);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
@@ -766,5 +781,119 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);
         }
+    }
+
+    /// Writes `value` at (`lo`, `hi`) through the page table, marking its
+    /// page as translated shaders do, and with `missing_hi` non-zero reads
+    /// (`missing_lo`, `missing_hi`), marking it if no copy holds it.
+    const WRITE: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), RootConstants(num32BitConstants=5, b0)"
+RWByteAddressBuffer views[] : register(u0);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer dirty : register(u0, space2);
+cbuffer c : register(b0) { uint lo; uint hi; uint value; uint missing_lo; uint missing_hi; }
+void access(uint a, uint h, bool write) {
+    bool inside = h < 256;
+    uint l1 = inside ? (h << 4 | a >> 28) : 0;
+    uint block = inside ? table.Load(l1 * 4) : 0;
+    uint entry = block << 12 | (a >> 16 & 0xFFF);
+    uint2 e = table.Load2((4096 + 2 * entry) * 4);
+    bool miss = e.x == table.Load(4096 * 4);
+    uint n = miss && block == 0 ? l1 : entry;
+    if (write || miss) {
+        dirty.InterlockedOr(n >> 5 << 2, 1u << (n & 31));
+    }
+    if (write && !miss) {
+        views[NonUniformResourceIndex(e.x + 1)].Store(a - e.y, value);
+    }
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    access(lo, hi, true);
+    if (missing_hi != 0) {
+        access(missing_lo, missing_hi, false);
+    }
+}
+"#;
+
+    /// What a submission that missed memory wrote through the page table
+    /// leaves the host copies right after it, so the next submission reads
+    /// title memory's bytes (run shards20: garbage BVH nodes over meshlet
+    /// buffers until the frame's end); one that missed nothing leaves its
+    /// writes in the copies.
+    #[test]
+    fn a_submission_that_missed_leaves_the_copies_at_once() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let ((write_root, writer), (read_root, reader)) = (pipeline(WRITE), pipeline(SOURCE));
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        // A page of title memory below 2^40, write-watched as the pools.
+        let p = (0..256u64)
+            .map(|k| 0x50_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        let at = p + 16;
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (at as *mut u32).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // One submission of one dispatch; the list is open again after it.
+        let submit = |root: &windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+                      pso: &windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+                      uav: Option<u64>,
+                      constants: &[u32]| {
+            let map = bind(&list, OURS).expect("a page table");
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, uav.unwrap_or(map.dirty));
+                list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        };
+        let write = |value: u32, miss: bool| {
+            // Memory no copy holds, in a 256 MiB region with no block.
+            let missing: u64 = if miss { 0xff_f000_0000 } else { 0 };
+            let constants = [at as u32, (at >> 32) as u32, value, missing as u32, (missing >> 32) as u32];
+            submit(&write_root, &writer, None, &constants);
+        };
+        let read = || -> u32 {
+            submit(&read_root, &reader, Some(out_gpu), &[at as u32, (at >> 32) as u32, 0]);
+            // SAFETY: the mapped output, the GPU done with it.
+            unsafe { out_cpu.cast::<u32>().read_volatile() }
+        };
+        // SAFETY: our pool.
+        let title = || unsafe { (at as *const u32).read_volatile() };
+        write(0x33, true);
+        // Another test's submission may have refreshed the copy already.
+        let held = copy.read_host(at as u64, 1)[0];
+        assert!(!copy.clean() || held == 0x11, "the written page counts as changed at once");
+        assert_eq!(title(), 0x11, "nothing went back");
+        assert_eq!(read(), 0x11, "the next submission reads title memory's bytes");
+        // Unless another test ends a frame meanwhile (its retake is right).
+        let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        write(0x44, false);
+        let kept = read();
+        if FRAMES.load(std::sync::atomic::Ordering::Relaxed) == frame {
+            assert_eq!(kept, 0x44, "a submission that missed nothing keeps its writes");
+        }
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
     }
 }
