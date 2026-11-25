@@ -39,6 +39,19 @@ This is the real result of a clean run of `./setup.sh` followed by the test suit
 
 Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
 
+## What testers see in the game
+
+Several people who own the game have run it on their Macs and reported back in the issues. The game starts, plays its audio and runs its menus, but the window stays black in most runs. Here is what they have seen so far.
+
+| Mac | What happened | Issue |
+| --- | --- | --- |
+| M5 MacBook Air | Got past the early Rosetta hang. The intro animation and the menu appeared with a local workaround that showed the game's 3840x2160 image directly, and the first scene's audio played. Without the workaround the window stays black. | #1, #15 |
+| M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
+| M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
+| M2 Max | Account selection, the first setup screens with keyboard input, and the loading artwork all worked, and then the window went black. | #28 |
+
+The black screen is the main open problem, and it is tracked in #15. The game draws its picture into a 3840x2160 image, but VIctory shows a different, empty image in the window. The likeliest cause is that the game hands over more than one image when it presents a frame, and VIctory shows only the first. A log line that lists every image the game presents is now in VIctory, and testers are collecting it.
+
 ## How it works
 
 <p align="center"><img src="docs/images/stack.svg" width="720" alt="The layers between the game and the Mac: the game's code, VIctory, CrossOver Wine and D3DMetal, Rosetta 2 and Metal, and the Apple Silicon Mac at the bottom"></p>
