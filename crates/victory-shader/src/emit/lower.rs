@@ -69,6 +69,9 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
+    /// The `WaveSize` the program declares.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -603,16 +606,24 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let lanes = cs.threads.iter().product::<u32>();
             let one_wave = lanes <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
-            }
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
+            let mut synced = false;
             if x.narrow_waves && one_wave && lanes > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                split_barriers = split_wave_barriers(p).unwrap_or_default();
+                if let Some(b) = split_wave_barriers(p) {
+                    split_barriers = b;
+                    synced = true;
+                }
+            }
+            // A host whose waves are narrower than WaveSize(64) does not run
+            // the dispatch (D3DMetal: nothing written): ask for the console's
+            // width only where wave operations need it, or LDS is not synced.
+            let fits = x.narrow_waves && (synced || lanes <= 32);
+            if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
+                s.wave_size = Some(wave);
             }
         }
         let mut no_barrier = Set::default();
@@ -1431,6 +1442,8 @@ impl<'a> Lower<'a> {
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11985,6 +11998,11 @@ mod tests {
     /// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
     /// LDS: the barriers it got for narrow host waves.
     fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
+        lowered(words, lanes, narrow_waves).split_barriers
+    }
+
+    /// The same program, lowered.
+    fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -12018,7 +12036,6 @@ mod tests {
             view_marks: false,
         })
         .expect("lower")
-        .split_barriers
     }
 
     #[test]
@@ -12033,6 +12050,11 @@ mod tests {
         // Option off, or a group one host wave holds: as before.
         assert_eq!(split_barriers(&w, 64, false), 0);
         assert_eq!(split_barriers(&w, 32, true), 0);
+        // Synced, it no longer asks for 64-lane waves a 32-lane host lacks
+        // (D3DMetal runs nothing then); without the option it still does.
+        assert_eq!(lowered(&w, 64, true).wave_size, None);
+        assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
+        assert_eq!(lowered(&w, 32, true).wave_size, None);
     }
 
     #[test]
