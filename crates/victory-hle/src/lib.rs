@@ -12,6 +12,8 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod host_posix;
 pub mod modules;
 mod registry;
 pub mod runtime;

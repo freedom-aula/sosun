@@ -1,0 +1,3 @@
+LIBRARY xgameruntime.dll
+EXPORTS
+XGameRuntimeInitialize

@@ -20,10 +20,15 @@
 //! 5. initialise the title's DLLs, then run TLS callbacks and the entry
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
+//!
+//! On macOS there is no Windows loader: [`native`] maps, relocates and binds
+//! the image itself and runs it under Rosetta, with no Wine.
 
 #[cfg(windows)]
 mod crash;
 pub mod masked;
+#[cfg(target_os = "macos")]
+pub mod native;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
@@ -45,17 +50,17 @@ pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
 pub use prepare::{PrepareError, PreparedImage, prepare};
-pub use resolve::{ImportResolver, Provenance, Resolution};
+pub use resolve::{
+    BindReport, ImportResolver, MissingImport, Provenance, Resolution, UnimplementedPolicy,
+};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::{disable_thread_calls, in_title_image};
 #[cfg(windows)]
-pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
+pub use thunks::unimplemented_call_count;
 #[cfg(windows)]
-pub use windows::{
-    BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
-};
+pub use windows::{LoadedImage, WithTitleDlls, load, load_title_dll, load_title_dlls};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;

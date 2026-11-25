@@ -232,9 +232,15 @@ mod imp {
     }
 }
 
+/// No Windows underneath: on macOS (x86-64 hosts) the shared APIs are
+/// `host_posix`'s, elsewhere there is no pass-through.
 #[cfg(not(windows))]
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if let victory_pe::ImportSymbol::Name { name, .. } = _symbol {
+            return crate::host_posix::lookup(_dll, name);
+        }
         None
     }
 }

@@ -15,8 +15,8 @@ use victory_platform::mem::{self, Protect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
-    DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
-    prepare,
+    BindReport, DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, MissingImport,
+    PreparedImage, Provenance, Resolution, prepare,
 };
 
 /// A title image mapped into this process. A clone names the same mapping
@@ -33,21 +33,6 @@ pub struct LoadedImage {
 unsafe impl Send for LoadedImage {}
 // SAFETY: as above; `LoadedImage` has no interior mutability.
 unsafe impl Sync for LoadedImage {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingImport {
-    pub dll: String,
-    pub symbol: String,
-}
-
-/// Outcome of [`LoadedImage::bind_imports`].
-#[derive(Debug, Default, Clone)]
-pub struct BindReport {
-    pub hle: usize,
-    pub host: usize,
-    pub title: usize,
-    pub missing: Vec<MissingImport>,
-}
 
 /// Writes the prepared copy into `dir` and maps it with the Windows loader.
 ///

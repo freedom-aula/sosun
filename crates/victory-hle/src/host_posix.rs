@@ -1,0 +1,482 @@
+//! The host's shared Windows APIs, reimplemented on macOS for the native
+//! host (no Wine, no Windows).
+//!
+//! On Windows `HostPolicy` passes `kernel32` and friends through to the real
+//! DLLs. Here they are our own functions, written in terms of
+//! `victory-platform` and the TEB. They are ordinary `extern "system"` Rust
+//! functions (the System V ABI here), reached from title code through the
+//! loader's bridge. Only the calls the first native slice needs exist; every
+//! other import of an allowed DLL lands in the loader's unimplemented-import
+//! stub, which names it.
+#![allow(non_snake_case)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use victory_loader::native::{self, teb};
+use victory_platform::mem::{self, Protect};
+use victory_platform::sync::{Event, Semaphore};
+use victory_platform::thread;
+
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x102;
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+const INFINITE: u32 = 0xFFFF_FFFF;
+const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const ERROR_NO_MORE_ITEMS: u32 = 259;
+const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
+const DEFAULT_STACK: usize = 1 << 20;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_error(code: u32) {
+    // SAFETY: the calling thread's own TEB.
+    unsafe { teb::last_error_slot().write(code) };
+}
+
+pub extern "system" fn GetLastError() -> u32 {
+    // SAFETY: the calling thread's own TEB.
+    unsafe { teb::last_error_slot().read() }
+}
+
+pub extern "system" fn SetLastError(code: u32) {
+    set_error(code);
+}
+
+pub extern "system" fn GetCurrentThreadId() -> u32 {
+    thread::current_id()
+}
+
+pub extern "system" fn GetCurrentProcessId() -> u32 {
+    std::process::id()
+}
+
+fn epoch() -> Instant {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    *START
+}
+
+pub extern "system" fn QueryPerformanceFrequency(out: *mut i64) -> i32 {
+    // SAFETY: the title passes a valid pointer.
+    unsafe { out.write(1_000_000_000) };
+    1
+}
+
+pub extern "system" fn QueryPerformanceCounter(out: *mut i64) -> i32 {
+    // One tick is a nanosecond; the epoch's first read is not zero.
+    let ticks = epoch().elapsed().as_nanos() as i64 + 1;
+    // SAFETY: the title passes a valid pointer.
+    unsafe { out.write(ticks) };
+    1
+}
+
+pub extern "system" fn GetTickCount64() -> u64 {
+    epoch().elapsed().as_millis() as u64
+}
+
+pub extern "system" fn GetTickCount() -> u32 {
+    GetTickCount64() as u32
+}
+
+pub extern "system" fn Sleep(ms: u32) {
+    thread::sleep(Duration::from_millis(u64::from(ms)));
+}
+
+// Memory.
+
+/// What `VirtualAlloc` made, by base address: `VirtualFree(MEM_RELEASE)` takes
+/// the whole region.
+static REGIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Win32 `PAGE_*` to a protection.
+fn protection(flags: u32) -> Option<Protect> {
+    Some(match flags & 0xFF {
+        0x01 => Protect::NO_ACCESS,
+        0x02 => Protect::READ,
+        0x04 | 0x08 => Protect::READ_WRITE,
+        0x10 | 0x20 => Protect::READ_EXECUTE,
+        0x40 | 0x80 => Protect::READ_WRITE_EXECUTE,
+        _ => return None,
+    })
+}
+
+/// A protection as `PAGE_*`.
+fn page_flags(p: Protect) -> u32 {
+    match p {
+        Protect::NO_ACCESS => 0x01,
+        Protect::READ => 0x02,
+        Protect::READ_WRITE => 0x04,
+        Protect::READ_EXECUTE => 0x20,
+        _ => 0x40,
+    }
+}
+
+pub extern "system" fn VirtualAlloc(
+    address: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    let (Some(prot), true) = (protection(protect), size > 0) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    let page = mem::page_size();
+    let len = size.next_multiple_of(page);
+    let at = address as usize;
+    let result = if kind & MEM_RESERVE != 0 {
+        let at = (at != 0).then_some(at & !(page - 1));
+        let prot = if kind & MEM_COMMIT != 0 {
+            prot
+        } else {
+            Protect::NO_ACCESS
+        };
+        // SAFETY: fresh address space; a fixed address fails if taken.
+        unsafe { mem::alloc(at, len, prot) }.inspect(|p| {
+            lock(&REGIONS).insert(*p as usize, len);
+        })
+    } else if kind & MEM_COMMIT != 0 && at != 0 {
+        let start = at & !(page - 1);
+        // SAFETY: the title commits inside a reservation of its own.
+        unsafe { mem::commit(start as *mut u8, (at + len) - start, prot) }
+            .map(|()| start as *mut u8)
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    };
+    match result {
+        Ok(p) => p.cast(),
+        Err(_) => {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    let ok = if kind & MEM_RELEASE != 0 {
+        let Some(len) = lock(&REGIONS).remove(&(address as usize)) else {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        };
+        // SAFETY: a region this shim made.
+        unsafe { mem::release(address.cast(), len) }.is_ok()
+    } else if kind & MEM_DECOMMIT != 0 {
+        // SAFETY: the title decommits inside its own reservation.
+        unsafe { mem::decommit(address.cast(), size.next_multiple_of(mem::page_size())) }.is_ok()
+    } else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    i32::from(ok)
+}
+
+pub extern "system" fn VirtualProtect(
+    address: *mut c_void,
+    size: usize,
+    protect: u32,
+    old: *mut u32,
+) -> i32 {
+    let Some(prot) = protection(protect) else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let page = mem::page_size();
+    let start = address as usize & !(page - 1);
+    let len = (address as usize + size).next_multiple_of(page) - start;
+    // SAFETY: the title protects its own memory.
+    match unsafe { mem::protect(start as *mut u8, len, prot) } {
+        Ok(previous) => {
+            if !old.is_null() {
+                // SAFETY: the title passes a valid pointer or null.
+                unsafe { old.write(page_flags(previous)) };
+            }
+            1
+        }
+        Err(_) => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+// Thread-local storage slots (`TlsAlloc`), in the TEB.
+
+static TLS_USED: AtomicU64 = AtomicU64::new(0);
+
+pub extern "system" fn TlsAlloc() -> u32 {
+    let mut used = TLS_USED.load(Ordering::Relaxed);
+    loop {
+        let free = (!used).trailing_zeros();
+        if free as usize >= teb::TLS_SLOT_COUNT {
+            set_error(ERROR_NO_MORE_ITEMS);
+            return TLS_OUT_OF_INDEXES;
+        }
+        match TLS_USED.compare_exchange(used, used | 1 << free, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => return free,
+            Err(now) => used = now,
+        }
+    }
+}
+
+pub extern "system" fn TlsFree(index: u32) -> i32 {
+    if index as usize >= teb::TLS_SLOT_COUNT || TLS_USED.load(Ordering::Relaxed) >> index & 1 == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    TLS_USED.fetch_and(!(1 << index), Ordering::AcqRel);
+    1
+}
+
+pub extern "system" fn TlsGetValue(index: u32) -> *mut c_void {
+    if index as usize >= teb::TLS_SLOT_COUNT {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    set_error(0);
+    // SAFETY: inside the calling thread's TEB.
+    unsafe { teb::tls_slots().add(index as usize).read() as *mut c_void }
+}
+
+pub extern "system" fn TlsSetValue(index: u32, value: *mut c_void) -> i32 {
+    if index as usize >= teb::TLS_SLOT_COUNT {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: inside the calling thread's TEB.
+    unsafe { teb::tls_slots().add(index as usize).write(value as usize) };
+    1
+}
+
+// Kernel objects: a handle table over `victory-platform`.
+
+enum Object {
+    Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+    /// A title thread: signalled when it ends.
+    Thread(Arc<Event>),
+}
+
+static HANDLES: LazyLock<Mutex<HashMap<usize, Object>>> = LazyLock::new(Default::default);
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+fn new_handle(object: Object) -> *mut c_void {
+    let handle = (NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize) << 2;
+    lock(&HANDLES).insert(handle, object);
+    handle as *mut c_void
+}
+
+pub extern "system" fn CreateEventW(
+    _attributes: *const c_void,
+    manual_reset: i32,
+    initial: i32,
+    _name: *const u16,
+) -> *mut c_void {
+    match Event::new(manual_reset != 0, initial != 0) {
+        Ok(e) => new_handle(Object::Event(Arc::new(e))),
+        Err(_) => {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn event_of(handle: *mut c_void) -> Option<Arc<Event>> {
+    match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Event(e)) => Some(e.clone()),
+        _ => None,
+    }
+}
+
+pub extern "system" fn SetEvent(handle: *mut c_void) -> i32 {
+    let Some(e) = event_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    e.set();
+    1
+}
+
+pub extern "system" fn ResetEvent(handle: *mut c_void) -> i32 {
+    let Some(e) = event_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    e.reset();
+    1
+}
+
+pub extern "system" fn CreateSemaphoreW(
+    _attributes: *const c_void,
+    initial: i32,
+    max: i32,
+    _name: *const u16,
+) -> *mut c_void {
+    match Semaphore::new(initial as u32, max as u32) {
+        Ok(s) => new_handle(Object::Semaphore(Arc::new(s))),
+        Err(_) => {
+            set_error(ERROR_INVALID_PARAMETER);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+pub extern "system" fn ReleaseSemaphore(
+    handle: *mut c_void,
+    count: i32,
+    previous: *mut i32,
+) -> i32 {
+    let semaphore = match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Semaphore(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let Some(s) = semaphore else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    match s.release(count as u32) {
+        Some(before) => {
+            if !previous.is_null() {
+                // SAFETY: the title passes a valid pointer or null.
+                unsafe { previous.write(before as i32) };
+            }
+            1
+        }
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 {
+    let timeout = (ms != INFINITE).then(|| Duration::from_millis(u64::from(ms)));
+    // Cloned out, so the table is not locked during a long wait.
+    let object = match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Event(e) | Object::Thread(e)) => Some(Object::Event(e.clone())),
+        Some(Object::Semaphore(s)) => Some(Object::Semaphore(s.clone())),
+        None => None,
+    };
+    let signalled = match object {
+        Some(Object::Event(e) | Object::Thread(e)) => e.wait(timeout),
+        Some(Object::Semaphore(s)) => s.wait(timeout),
+        None => {
+            set_error(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        }
+    };
+    if signalled {
+        WAIT_OBJECT_0
+    } else {
+        WAIT_TIMEOUT
+    }
+}
+
+pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
+    if lock(&HANDLES).remove(&(handle as usize)).is_none() {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    1
+}
+
+/// `CreateThread`: the start routine runs in title code, on a thread with
+/// its own TEB and static TLS. Flags (`CREATE_SUSPENDED`) are not honoured yet.
+pub extern "system" fn CreateThread(
+    _attributes: *const c_void,
+    stack_size: usize,
+    start: usize,
+    param: *mut c_void,
+    _flags: u32,
+    thread_id: *mut u32,
+) -> *mut c_void {
+    let done = Arc::new(Event::new(true, false).expect("event"));
+    let signal = done.clone();
+    // SAFETY: `start` is the title's own thread routine.
+    let started = unsafe {
+        native::spawn_title_thread(
+            "title-thread",
+            if stack_size == 0 {
+                DEFAULT_STACK
+            } else {
+                stack_size
+            },
+            start,
+            param as usize,
+            move |_| signal.set(),
+        )
+    };
+    match started {
+        Ok(t) => {
+            if !thread_id.is_null() {
+                // SAFETY: the title passes a valid pointer or null.
+                unsafe { thread_id.write(t.id()) };
+            }
+            // The thread detaches: its end is seen through `done`.
+            new_handle(Object::Thread(done))
+        }
+        Err(_) => {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The function table `HostPolicy` consults on macOS.
+pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
+    let dll = dll.to_ascii_lowercase();
+    // The API sets and kernelbase forward to kernel32's functions.
+    let kernel =
+        dll == "kernel32.dll" || dll == "kernelbase.dll" || dll.starts_with("api-ms-win-core-");
+    if !kernel {
+        return None;
+    }
+    macro_rules! table {
+        ($($f:ident),* $(,)?) => {
+            match name {
+                $(stringify!($f) => Some($f as *const () as usize),)*
+                _ => None,
+            }
+        };
+    }
+    table!(
+        GetLastError,
+        SetLastError,
+        GetCurrentThreadId,
+        GetCurrentProcessId,
+        QueryPerformanceFrequency,
+        QueryPerformanceCounter,
+        GetTickCount,
+        GetTickCount64,
+        Sleep,
+        VirtualAlloc,
+        VirtualFree,
+        VirtualProtect,
+        TlsAlloc,
+        TlsFree,
+        TlsGetValue,
+        TlsSetValue,
+        CreateEventW,
+        SetEvent,
+        ResetEvent,
+        CreateSemaphoreW,
+        ReleaseSemaphore,
+        WaitForSingleObject,
+        CloseHandle,
+        CreateThread,
+    )
+}

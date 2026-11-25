@@ -18,16 +18,7 @@ use anyhow::{Result, bail};
 use victory_platform::mem::{self, Protect};
 use windows_sys::Win32::System::Diagnostics::Debug::{DebugBreak, IsDebuggerPresent};
 
-/// What an unimplemented import does when called.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum UnimplementedPolicy {
-    /// Log, break into an attached debugger, then abort. The default:
-    /// silently continuing usually crashes later and further from the cause.
-    #[default]
-    Trap,
-    /// Log once per import and return 0. Useful to push through bring-up.
-    ReturnZero,
-}
+pub use crate::resolve::UnimplementedPolicy;
 
 /// Identifies one unresolved import. Leaked: lives as long as the process.
 #[derive(Debug)]
