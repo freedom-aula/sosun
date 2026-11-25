@@ -46,6 +46,11 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
+    /// the run of the shared buffer it holds ([`Arena`]), given back when it
+    /// goes.
+    base: u64,
+    slice: Option<Slice>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -138,7 +143,7 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        address - self.start + self.base
     }
 
     /// Where the title memory it copies starts, and its length.
@@ -200,6 +205,12 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
+        Shadow::new_at(buffer, data, gpu, start, len, None)
+    }
+
+    /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
+    /// `gpu` are the run's).
+    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -212,6 +223,8 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            base: slice.map_or(0, |s| s.offset),
+            slice,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -629,6 +642,9 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some(slice) = self.slice {
+            arena().give_back(slice);
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -940,7 +956,7 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
     }
     #[cfg(feature = "diagnostics")]
     VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    exact(address, len).map(|s| (s, true))
+    exact(address, len, element).map(|s| (s, true))
 }
 
 /// Asks for, and copies made of, views off their copy's elements, the
@@ -960,12 +976,20 @@ pub(crate) fn log_views(frames: f64) {
         .values()
         .filter(|w| w.strong_count() > 0)
         .count();
+    let (chunks, held) = {
+        let a = arena();
+        // SAFETY: live buffers.
+        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
+        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        (a.chunks.len(), held)
+    };
     if asks > 0 {
         tracing::info!(
-            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live",
+            "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live in {chunks} shared buffers ({:.1} MB held)",
             asks as f64 / frames,
             made as f64 / frames,
-            bytes as f64 / frames / 1e3
+            bytes as f64 / frames / 1e3,
+            held as f64 / 1e6
         );
     }
 }
@@ -977,12 +1001,12 @@ pub(crate) fn log_views(frames: f64) {
 /// new copy of the same bytes took the refreshes). With the size the map
 /// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
 
-fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let (prune_at, map) = &mut *guard;
-    if let Some(shadow) = map.get(&(address, len)).and_then(std::sync::Weak::upgrade) {
+    if let Some(shadow) = map.get(&(address, len, element)).and_then(std::sync::Weak::upgrade) {
         return Some(shadow);
     }
     // Ring positions change every frame: entries die by the hundred.
@@ -990,12 +1014,10 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         map.retain(|_, w| w.strong_count() > 0);
         *prune_at = (2 * map.len()).max(1024);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Shadow::new(buffer, data, gpu, address, len);
-    map.insert((address, len), Arc::downgrade(&shadow));
+    // A run of a shared buffer, its start a whole number of elements in.
+    let (buffer, data, gpu, slice) = arena().take(len, element)?;
+    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
+    map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1004,6 +1026,98 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         VIEWS[3].fetch_max(len, Relaxed);
     }
     Some(shadow)
+}
+
+/// A run of an [`Arena`] buffer: the buffer, where the run starts, its
+/// bytes.
+#[derive(Clone, Copy)]
+struct Slice {
+    chunk: usize,
+    offset: u64,
+    len: u64,
+}
+
+/// Shared buffers for the copies of single views ([`exact`]): they are
+/// small (~2 KB on average) and come and go by the hundred a frame, and a
+/// buffer of their own each cost a kernel call to make and one to free on
+/// the title's threads and the submitting one (300-820 a frame), and 64 KiB
+/// of memory each (~5,000 live).
+#[derive(Default)]
+struct Arena {
+    /// Each buffer, its mapping and host address, and its free runs
+    /// (offset → bytes).
+    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+}
+
+/// Bytes of each arena buffer (a larger copy gets one of its size).
+const CHUNK: u64 = 16 << 20;
+
+static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
+
+fn arena() -> std::sync::MutexGuard<'static, Arena> {
+    ARENA.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Arena {
+    /// A run of `len` bytes starting at a multiple of `element` (and of 256)
+    /// in a shared buffer: the buffer, the run's mapping and host address.
+    fn take(&mut self, len: u64, element: u64) -> Option<(ID3D12Resource, *mut u8, u64, Slice)> {
+        let gcd = |mut a: u64, mut b: u64| {
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        };
+        let align = 256 / gcd(256, element.max(1)) * element.max(1);
+        let len = len.max(1).next_multiple_of(4);
+        let fits = |free: &BTreeMap<u64, u64>| {
+            free.iter().find_map(|(&at, &n)| {
+                let start = at.next_multiple_of(align);
+                (start + len <= at + n).then_some((at, n, start))
+            })
+        };
+        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
+        let (chunk, (at, n, start)) = match found {
+            Some(found) => found,
+            None => {
+                let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                crate::host::name(&buffer, || format!("title views {size:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let free = BTreeMap::from([(0, size)]);
+                self.chunks.push((buffer, data as usize, gpu, free));
+                let c = self.chunks.len() - 1;
+                (c, fits(&self.chunks[c].3)?)
+            }
+        };
+        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
+        free.remove(&at);
+        if start > at {
+            free.insert(at, start - at);
+        }
+        if at + n > start + len {
+            free.insert(start + len, at + n - start - len);
+        }
+        let slice = Slice { chunk, offset: start, len };
+        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+    }
+
+    /// A run goes back, joined to its free neighbours.
+    fn give_back(&mut self, slice: Slice) {
+        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let (mut at, mut n) = (slice.offset, slice.len);
+        if let Some((&before, &m)) = free.range(..at).next_back()
+            && before + m == at
+        {
+            free.remove(&before);
+            (at, n) = (before, n + m);
+        }
+        if let Some(m) = free.remove(&(at + n)) {
+            n += m;
+        }
+        free.insert(at, n);
+    }
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -1146,6 +1260,31 @@ mod tests {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// Runs of the shared buffers start a whole number of elements (and of
+    /// 256 bytes) in, do not overlap, and join again when given back.
+    #[test]
+    fn arena_runs_are_aligned_to_their_elements_and_join_again() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let mut arena = Arena::default();
+        let (_, _, _, a) = arena.take(100, 456).unwrap();
+        let (_, _, _, b) = arena.take(5000, 16).unwrap();
+        let (_, _, _, c) = arena.take(4, 4).unwrap();
+        assert!(a.offset % 456 == 0 && a.offset % 256 == 0 && b.offset % 256 == 0);
+        let mut runs = [a, b, c].map(|s| (s.offset, s.offset + s.len));
+        runs.sort_unstable();
+        assert!(runs.windows(2).all(|w| w[0].1 <= w[1].0), "{runs:?}");
+        for s in [b, a, c] {
+            arena.give_back(s);
+        }
+        assert_eq!(arena.chunks.len(), 1);
+        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        // Larger than a buffer: one of its own.
+        let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
+        assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between

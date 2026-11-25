@@ -2616,7 +2616,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             unsafe { made.GetDesc() }.Width
         };
         assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
-        assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
+        assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
         drop(copy);
