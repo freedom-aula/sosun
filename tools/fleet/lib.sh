@@ -138,7 +138,10 @@ FLEET_VALIDATE_JQ='
 def fields: ["binaries","chip","failures","gptk","hw_model","kind","macos","native","schema","setup","timings","upstream_commit","wine"];
 def str($re): type == "string" and test($re);
 def count: type == "number" and . == floor and . >= 0 and . <= 100000;
-def secs: type == "number" and . >= 0 and . <= 100000 and (. * 100 | floor) == (. * 100);
+# At most two decimals. Not "(. * 100 | floor) == . * 100": in binary
+# floating point 0.28 * 100 is 28.000000000000004, which that rejected.
+# Rounding back gives the same double as the literal for two decimals.
+def secs: type == "number" and . >= 0 and . <= 100000 and (. * 100 | round) / 100 == .;
 def counts: . == null or (type == "object" and (keys == ["failed","ignored","passed"])
     and (.passed | count) and (.failed | count) and (.ignored | count));
 def topics: $topics | split(" ");
