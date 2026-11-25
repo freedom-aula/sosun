@@ -71,7 +71,11 @@ fn a_page_pool_maps_at_several_addresses() {
         assert_ne!(a, b);
         write(a, 5, 0xAB);
         write(a, 3 * g, 0xCD);
-        assert_eq!(read(b, 5), 0xAB, "a write through one view shows in the other");
+        assert_eq!(
+            read(b, 5),
+            0xAB,
+            "a write through one view shows in the other"
+        );
         assert_eq!(read(b, 3 * g), 0xCD);
 
         // A sub-range is the same pages at another offset.
@@ -81,7 +85,9 @@ fn a_page_pool_maps_at_several_addresses() {
         // At a chosen address.
         let free = mem::reserve(None, 4 * g).unwrap();
         mem::release(free, 4 * g).unwrap();
-        let d = pool.map(0, 4 * g, Some(free as usize), Protect::READ_WRITE).unwrap();
+        let d = pool
+            .map(0, 4 * g, Some(free as usize), Protect::READ_WRITE)
+            .unwrap();
         assert_eq!(d, free);
         assert_eq!(read(d, 5), 0xAB);
 
@@ -111,11 +117,16 @@ fn one_protect_call_covers_many_mappings_of_a_pool() {
         // The pool's pages in reverse order, one mapping each.
         for i in 0..n {
             let at = base as usize + i * g;
-            pool.map((n - 1 - i) * g, g, Some(at), Protect::READ_WRITE).unwrap();
+            pool.map((n - 1 - i) * g, g, Some(at), Protect::READ_WRITE)
+                .unwrap();
         }
         write(base, 0, 1);
         let alias = pool.map(0, n * g, None, Protect::READ).unwrap();
-        assert_eq!(read(alias, (n - 1) * g), 1, "first page of the base is the pool's last");
+        assert_eq!(
+            read(alias, (n - 1) * g),
+            1,
+            "first page of the base is the pool's last"
+        );
         // One call over all 64 mappings.
         mem::protect(base, n * g, Protect::READ).unwrap();
         assert_eq!(mem::query(base as usize).unwrap().protect, Protect::READ);
@@ -145,15 +156,20 @@ fn events_follow_win32_rules() {
     assert!(!auto.wait(Some(Duration::from_millis(10))));
     auto.set();
     assert!(auto.wait(Some(Duration::ZERO)));
-    assert!(!auto.wait(Some(Duration::from_millis(10))), "auto-reset consumed it");
+    assert!(
+        !auto.wait(Some(Duration::from_millis(10))),
+        "auto-reset consumed it"
+    );
 
     let manual = Arc::new(Event::new(true, true).unwrap());
     assert!(manual.wait(None));
     assert!(manual.wait(None), "manual-reset stays set");
     manual.reset();
     let m = manual.clone();
-    let t = thread::spawn("waiter", 1 << 20, move || u32::from(m.wait(Some(Duration::from_secs(10)))))
-        .unwrap();
+    let t = thread::spawn("waiter", 1 << 20, move || {
+        u32::from(m.wait(Some(Duration::from_secs(10))))
+    })
+    .unwrap();
     thread::sleep(Duration::from_millis(20));
     manual.set();
     assert_eq!(t.join(), 1);

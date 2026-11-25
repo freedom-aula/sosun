@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Threading::{
-    CreateThread, GetCurrentThreadId, GetExitCodeThread, INFINITE, STACK_SIZE_PARAM_IS_A_RESERVATION,
-    Sleep, WaitForSingleObject,
+    CreateThread, GetCurrentThreadId, GetExitCodeThread, INFINITE,
+    STACK_SIZE_PARAM_IS_A_RESERVATION, Sleep, WaitForSingleObject,
 };
 
 /// A thread started by [`spawn`].

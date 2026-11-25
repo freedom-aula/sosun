@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::io;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
     MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
@@ -12,7 +13,6 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect,
     VirtualQuery,
 };
-use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 

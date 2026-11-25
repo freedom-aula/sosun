@@ -170,7 +170,7 @@ pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration
             return true;
         }
         match io::Error::last_os_error().raw_os_error() {
-            Some(libc_eintr) if libc_eintr == 4 => {}
+            Some(4) => {}             // EINTR
             Some(60) => return false, // ETIMEDOUT
             _ => return true,         // EFAULT and the like: let the caller look
         }

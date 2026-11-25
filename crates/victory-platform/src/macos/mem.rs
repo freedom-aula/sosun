@@ -200,7 +200,12 @@ pub unsafe fn decommit(addr: *mut u8, len: usize) -> io::Result<()> {
     let mut at = addr as u64;
     // SAFETY: replaces the caller's own pages with fresh no-access ones.
     check("mach_vm_allocate", unsafe {
-        mach_vm_allocate(task(), &mut at, len as u64, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE)
+        mach_vm_allocate(
+            task(),
+            &mut at,
+            len as u64,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+        )
     })?;
     // SAFETY: just allocated.
     check("mach_vm_protect", unsafe {

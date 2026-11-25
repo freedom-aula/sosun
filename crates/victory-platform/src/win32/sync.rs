@@ -88,8 +88,14 @@ impl Semaphore {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         // SAFETY: plain object creation.
-        let handle =
-            unsafe { CreateSemaphoreW(std::ptr::null(), initial as i32, max as i32, std::ptr::null()) };
+        let handle = unsafe {
+            CreateSemaphoreW(
+                std::ptr::null(),
+                initial as i32,
+                max as i32,
+                std::ptr::null(),
+            )
+        };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }

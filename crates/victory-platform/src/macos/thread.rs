@@ -29,7 +29,7 @@ pub fn spawn(
         .spawn(f)?;
     let mut id = 0;
     // SAFETY: a live thread's pthread_t and a local out-pointer.
-    unsafe { pthread_threadid_np(handle.as_pthread_t() as usize, &mut id) };
+    unsafe { pthread_threadid_np(handle.as_pthread_t(), &mut id) };
     Ok(Thread {
         handle,
         id: id as u32,
