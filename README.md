@@ -49,9 +49,11 @@ Several people who own the game have run it on their Macs and reported back in t
 | M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
 | M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
 | M2 Max | Account selection, the first setup screens with keyboard input, and the loading artwork all worked, and then the window went black. | #28 |
-| M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. | #50 |
+| M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds while shaders compiled. | #50 |
 
 <p align="center"><img src="https://github.com/user-attachments/assets/a05ca6bd-2427-4035-8d35-942e797f3307" width="720" alt="The game's title screen on an M3 Max under VIctory"><br><sub>The title screen on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
+
+<p align="center"><img src="https://github.com/user-attachments/assets/7b1d3b68-3a27-46ca-ac46-10dde3156aee" width="720" alt="The game world on screen on an M3 Max under VIctory"><br><sub>The game world on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
 
 The black screen was tracked in #15. On Series S the game presents two images, a 1920x1080 overlay and the 3840x2160 picture, and VIctory used to show only the first. It now shows the larger one, and `VICTORY_PRESENT_COMPOSITE=1` also draws the overlay on top. The main open problems now are crashes in Apple's shader compiler while the game builds its world shaders, and the window going black after loading.
 
