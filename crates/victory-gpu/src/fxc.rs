@@ -38,10 +38,9 @@ pub(crate) fn wine() -> bool {
     .is_some()
 }
 
-/// The bytecode of `source`'s `main` for `profile`. Under Wine, the bytes
-/// FXC made on the Windows runner where they exist, since Wine's compiler
-/// lacks shader model 5.1 resource arrays; the compiler's messages for a
-/// failed compile are logged.
+/// The bytecode of `source`'s `main` for `profile`. Under Wine, where its
+/// compiler fails, the bytes FXC made on the Windows runner if they exist;
+/// the compiler's messages for a failed compile are logged.
 pub(crate) fn compile(
     source: &str,
     name: &str,
@@ -49,11 +48,6 @@ pub(crate) fn compile(
     flags: u32,
 ) -> windows::core::Result<Vec<u8>> {
     let key = key(source, profile, flags);
-    if wine()
-        && let Some((_, bytes)) = crate::fxc_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
-    {
-        return Ok(bytes.to_vec());
-    }
     let (name, entry, target) = (
         CString::new(name).unwrap(),
         c"main",
@@ -82,6 +76,13 @@ pub(crate) fn compile(
         )
     };
     if let Err(e) = made {
+        // Wine's compiler lacks some features (shader model 5.1 resource
+        // arrays): the bytes FXC made on the Windows runner, if any.
+        if wine()
+            && let Some((_, bytes)) = crate::fxc_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
+        {
+            return Ok(bytes.to_vec());
+        }
         let text = errors.as_ref().map(blob).unwrap_or_default();
         tracing::warn!(
             "{}: {}",
