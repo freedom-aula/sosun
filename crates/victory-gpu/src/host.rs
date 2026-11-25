@@ -1356,8 +1356,22 @@ impl Host {
                     commands,
                     "slow host list"
                 );
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                match runs[i].slowest(frequency, 6) {
+                    Some(slowest) => {
+                        for (ms, op) in slowest {
+                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        }
+                    }
+                    None => {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            tracing::warn!(
+                                frequency,
+                                "GPU timestamps do not advance on this adapter: \
+                                 slow lists are timed whole, their commands are not"
+                            )
+                        });
+                    }
                 }
             }
             // SAFETY: a plain query.
@@ -1786,12 +1800,14 @@ impl HostList {
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// (milliseconds, text) (diagnostics, timing on, after the list ran);
+    /// `None` when its timestamps did not advance (D3DMetal reads them all
+    /// as 0, at a frequency of 60).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn slowest(&self, frequency: u64, n: usize) -> Option<Vec<(f64, String)>> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
         let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let mut data = std::ptr::null_mut();
         let range = D3D12_RANGE {
@@ -1801,12 +1817,15 @@ impl HostList {
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
+                return Some(Vec::new());
             }
             let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
             back.Unmap(0, None);
             s
         };
+        if count > 0 && stamps.windows(2).all(|w| w[0] == w[1]) {
+            return None;
+        }
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
@@ -1818,7 +1837,7 @@ impl HostList {
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        times
+        Some(times)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
