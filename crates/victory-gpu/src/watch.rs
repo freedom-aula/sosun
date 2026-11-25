@@ -373,6 +373,12 @@ impl Tracked {
         }
     }
 
+    /// Page `page` (a page number) needs no saving any more: its copy-back
+    /// is under way.
+    pub(crate) fn unarm(&self, page: usize) {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+    }
+
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
