@@ -1318,6 +1318,16 @@ impl Resource {
     }
 }
 
+/// Whether `p` points at one of our resource objects: its first word, read
+/// without faulting, is the resource method table.
+#[cfg(windows)]
+pub(crate) fn is_resource(p: This) -> bool {
+    let mut word = [0u8; 8];
+    !p.is_null()
+        && crate::host::read_into(p.cast(), &mut word)
+        && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 fn resource<'a>(this: This) -> &'a Resource {
     // SAFETY: called from resource methods only.
     unsafe { &*this.cast::<Resource>() }
