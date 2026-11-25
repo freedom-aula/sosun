@@ -724,10 +724,28 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
 /// every copy holding the memory takes it from title memory again at its
-/// next refresh (the pages count as changed in each, aliases too).
+/// next refresh (the pages count as changed in each, aliases too). Title
+/// memory itself did not change, so its guards stay (opened page by page,
+/// they cost ~15 % of the submitting thread at each frame end, run perf15).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    changed(&mut guards(), first, last, false);
+    let g = guards();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark(&g, first, last);
+    for page in others {
+        mark(&g, page, page + 1);
+    }
+}
+
+/// Pages `[first, last)` count as changed in every tracker holding them.
+fn mark(g: &Guards, first: usize, last: usize) {
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders {
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            set_dirty(c.2, true);
+            set.insert(page);
+        }
+    }
 }
 
 /// The runtime mapped the page at `at` where `others` show it already: the
@@ -1118,6 +1136,47 @@ pub(crate) mod tests {
         // SAFETY: the second view, guarded for `t`'s page too.
         unsafe { ((b + 4) as *mut u32).write_volatile(7) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+    }
+
+    /// A retake has every copy of the memory, and of its other mappings,
+    /// take it again, and leaves it guarded: a later write still counts.
+    #[test]
+    fn a_retake_marks_the_copies_and_keeps_the_guard() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        let u = track(b, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        assert_eq!(u.take(b, b + 2 * PAGE), [(b, b + 2 * PAGE)]);
+        assert!(t.clean() && u.clean());
+        retake(a + PAGE + 16, 32);
+        // Marked in both copies, the second mapping's too, still guarded.
+        assert!(!t.clean() && !u.clean());
+        assert!(t.changed((a + PAGE) / PAGE) && u.changed((b + PAGE) / PAGE));
+        assert!(!t.changed(a / PAGE));
+        assert_eq!(protection(a + PAGE), PAGE_READONLY);
+        assert_eq!(protection(b + PAGE), PAGE_READONLY);
+        // Taken again (the copies re-copy that page), then guarded and clean.
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert_eq!(u.take(b, b + 2 * PAGE), [(b + PAGE, b + 2 * PAGE)]);
+        assert!(t.clean() && u.clean());
+        assert_eq!(protection(a + PAGE), PAGE_READONLY);
+        // SAFETY: the second view, guarded all along.
+        unsafe { ((b + PAGE + 8) as *mut u32).write_volatile(3) };
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        assert_eq!(u.take(b, b + 2 * PAGE), [(b + PAGE, b + 2 * PAGE)]);
+        // A retake while marked and guarded, then a drop: nothing breaks.
+        retake(a, 2 * PAGE);
+        drop(u);
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        assert!(t.clean());
     }
 
     /// A write or mapping that runs past the end of the address space (a
