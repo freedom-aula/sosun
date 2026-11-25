@@ -565,4 +565,56 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
     }
+
+    /// A list that writes a depth texture through its twin and then reads
+    /// its depth side: its prelude owes a copy into the twin first. Every
+    /// barrier the prelude and the list issue starts from the state the
+    /// texture is in, as the debug layer checks (run light21: the prelude's
+    /// copy started from the states the list leaves).
+    #[test]
+    fn prelude_copies_start_from_the_real_states() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut texture) }.unwrap();
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), DEPTH_WRITE, Vec::new()));
+        let twin = depth.twin.get_or_init(|| make(53, &depth.texture)).as_ref().unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
+        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[b]) };
+        }
+        list.close();
+        let recorded = issued();
+        host.execute(&[&list]);
+        // The GPU runs the prelude, then the list.
+        let mut run = issued();
+        run.extend(recorded);
+        let key = |t: &HostTexture| t.texture.as_raw() as usize;
+        let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
+        replay(&run, &mut states).unwrap();
+        // What the list left is what the next prelude starts from.
+        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+    }
 }

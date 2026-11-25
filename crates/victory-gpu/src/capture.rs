@@ -423,9 +423,9 @@ fn peek(when: &str) {
     }
 }
 
-/// In a listed frame: copies an indirect execution's records (`args`:
-/// buffer, offset; in the indirect-argument state) and its count (in the
-/// unordered-access state unless in the same buffer) to readback memory,
+/// In a listed frame: copies an indirect execution's records (`args`: the
+/// list's argument buffer and offset, in the indirect-argument state) and
+/// its count (a title buffer's copy) to readback memory,
 /// logged once the list has run: how many records ask for work, and the
 /// first ones.
 pub(crate) fn read_indirect(
@@ -457,7 +457,6 @@ pub(crate) fn read_indirect(
     let mut buffer: Option<ID3D12Resource> = None;
     let l = &list.list;
     use crate::host::transition;
-    use windows::core::Interface;
     let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
     // SAFETY: plain creation; an open list and live buffers in the states
     // named, put back after the copies.
@@ -473,15 +472,8 @@ pub(crate) fn read_indirect(
         l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
         l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
         if let Some((c, at)) = count {
-            let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
-            if !same {
-                l.ResourceBarrier(&[transition(c, state, copy)]);
-            }
+            // A title buffer's copy: never transitioned, the read promotes it.
             l.CopyBufferRegion(&buffer, len, c, at, 4);
-            if !same {
-                l.ResourceBarrier(&[transition(c, copy, state)]);
-            }
         }
         l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
         list.keep(&buffer);

@@ -369,7 +369,34 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    thread_local! {
+        /// Every transition barrier built on this thread (resource, before,
+        /// after), in order.
+        pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The barriers built on this thread since the last call.
+    pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
+        ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    /// Replays transitions in the order the GPU runs them from the states
+    /// in `states` (resources not in it are not checked), by the debug
+    /// layer's rule: each barrier's before-state is the resource's current
+    /// one. The first that is not, else the states after.
+    pub(crate) fn replay(issued: &[(usize, u32, u32)], states: &mut std::collections::HashMap<usize, u32>) -> Result<(), String> {
+        for (k, &(resource, before, after)) in issued.iter().enumerate() {
+            if let Some(state) = states.get_mut(&resource) {
+                if *state != before {
+                    return Err(format!("barrier {k} on {resource:#x}: before {before:#x}, but the resource is in {state:#x}"));
+                }
+                *state = after;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
@@ -772,6 +799,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Clamped indirect arguments (`crate::indirect`), reused by each
+    /// execution in turn; replaced by a bigger one when too small.
+    arguments: Mutex<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1082,6 +1112,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                arguments: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1866,20 +1897,26 @@ impl HostList {
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
+        // The copies start from the real states, then the list's moves from
+        // them; only after both do they become the states the list leaves.
+        let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
+            states
+                .values()
+                .filter_map(|(first, _, copy)| {
+                    let real = copy.state.load(Ordering::Relaxed);
+                    (real != *first).then(|| {
+                        transition(&copy.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(*first as i32))
+                    })
                 })
-            })
-            .collect();
-        if barriers.is_empty() && copies.is_empty() {
+                .collect()
+        };
+        let left = || {
+            for (_, last, copy) in states.values() {
+                copy.state.store(*last, Ordering::Relaxed);
+            }
+        };
+        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+            left();
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1896,24 +1933,27 @@ impl HostList {
                         let real = t.state.load(Ordering::Relaxed);
                         let wanted = legal_state(&t.texture, wanted);
                         (real != wanted).then(|| {
+                            let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
                             back.push(transition(
                                 &t.texture,
                                 D3D12_RESOURCE_STATES(wanted as i32),
                                 D3D12_RESOURCE_STATES(real as i32),
                             ));
-                            transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32))
+                            there
                         })
                     });
                     if !back.is_empty() {
                         list.ResourceBarrier(&back);
                     }
                 }
+                let barriers = moves();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
                 list.Close()
             })
         };
+        left();
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -2170,6 +2210,23 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's argument buffer, at least `bytes` long, common between
+    /// its uses (`crate::indirect`).
+    pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain query on a live buffer.
+        if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
+            return Some(b.clone());
+        }
+        let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
+        name(&made, || "indirect arguments".into());
+        // Commands recorded earlier may still name the smaller one.
+        if let Some(old) = arguments.replace(made.clone()) {
+            self.keep(&old);
+        }
+        Some(made)
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -3333,6 +3390,8 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    #[cfg(test)]
+    tests::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
