@@ -2550,6 +2550,7 @@ impl Meter {
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::frame::log();
                 log_gpu_times(copy_frames);
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
