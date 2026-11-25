@@ -1084,7 +1084,7 @@ mod tests {
         let title = |at: usize| (p + at) as *mut u8;
         let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
         copy.update(p, len);
-        copy.writing(p, len);
+        copy.writing(p, len, false);
         // SAFETY: (all title reads and writes below) bytes of our allocation.
         unsafe { title(PAGE + 20).write_volatile(0x55) };
         assert_eq!(copy.update(p + PAGE + 16, 16), 16, "the busy range is copied");
