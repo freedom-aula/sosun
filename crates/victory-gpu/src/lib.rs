@@ -22,6 +22,8 @@ mod bindless;
 mod capture;
 #[cfg(windows)]
 #[cfg(windows)]
+mod composite;
+#[cfg(windows)]
 mod compute;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
