@@ -91,6 +91,18 @@ fn atomic_locks() -> bool {
     })
 }
 
+/// Whether compute shaders' biased samples run as scaled gradient samples:
+/// under Wine, whose D3DMetal ignores the bias there (#30).
+/// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
+fn bias_as_gradients() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_BIAS_AS_GRADIENTS").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -110,13 +122,19 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with atomic locks: their own cache entries.
-fn locked_build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+/// [`build`] for translations with host workarounds (atomic locks, bias
+/// as gradients): their own cache entries, one per combination.
+fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
+    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
-        h.update(b"atomic locks");
+        if locks {
+            h.update(b"atomic locks");
+        }
+        if bias {
+            h.update(b"bias as gradients");
+        }
         *h.finalize().as_bytes()
     })
 }
@@ -131,11 +149,12 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
+        bias_as_gradients: bias_as_gradients(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks {
-        locked_build()
+    let build = if options.atomic_locks || options.bias_as_gradients {
+        options_build(options.atomic_locks, options.bias_as_gradients)
     } else {
         build()
     };

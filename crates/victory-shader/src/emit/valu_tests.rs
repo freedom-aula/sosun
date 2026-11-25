@@ -141,6 +141,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: false,
     })?;
 
@@ -1241,6 +1242,7 @@ fn lower_cs32_with(
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks,
+        bias_as_gradients: super::host::under_wine(),
         view_marks: false,
     })
     .expect("lower");
@@ -1404,11 +1406,6 @@ fn image_addresses_of_16_bits_and_clamps() {
             continue;
         };
         for (shader, k, want) in cases {
-            // D3DMetal ignores a sample's bias in compute programs
-            // (docs/macos.md, "Open differences").
-            if std::ptr::eq(shader, &biased) && super::host::under_wine() {
-                continue;
-            }
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));

@@ -194,6 +194,7 @@ fn build(
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: false,
     })
     .expect("lower");

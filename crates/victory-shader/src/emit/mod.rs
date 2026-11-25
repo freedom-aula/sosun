@@ -372,6 +372,10 @@ pub struct Options {
     /// stores (module notes, "Atomic locks"), for hosts that claim the
     /// 64-bit atomics and leave the texels untouched (D3DMetal).
     pub atomic_locks: bool,
+    /// Compute-stage biased samples run as gradient samples with the quad
+    /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
+    /// compute shader's sample (D3DMetal, #30).
+    pub bias_as_gradients: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -497,6 +501,7 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
+        bias_as_gradients: options.bias_as_gradients,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
