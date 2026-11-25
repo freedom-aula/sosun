@@ -85,9 +85,9 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
-## The game needs D3DMetal 4.0 beta 3
+## Use D3DMetal 4.0 beta 3
 
-On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30), so host pipelines are never kept there. Use 4.0 beta 3 or newer for the game.
+On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30), so host pipelines are never kept there. Use 4.0 beta 3 or newer for the game. It is not the only cause of that assert, though: later the same day us3r40456 hit `+0x1dac734` with D3DMetal 4.0 beta 3 too, on both the Series X and Series S profiles, so something else in their setup also decides it (#24).
 
 ## Stacks during a freeze
 
