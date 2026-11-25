@@ -2,12 +2,12 @@
 //! The shader reads and writes through D3D12 root descriptors, which the converter turns into GPU
 //! addresses in a top-level argument buffer bound at slot 2 (`kIRArgumentBufferBindPoint`).
 
-use crate::mem::{Region, page_size};
 use crate::probe::wrap;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 use std::ptr::NonNull;
+use victory_metal::mem::{Region, page_size};
 
 const HLSL: &str = r#"
 cbuffer C : register(b0) { uint2 k; };
@@ -23,7 +23,11 @@ pub fn run() {
         std::env::var("VICTORY_DXC_DYLIB").expect("set VICTORY_DXC_DYLIB to libdxcompiler.dylib");
     let dxil = crate::dxc::hlsl_to_dxil(&dxc_path, HLSL, "cs_6_0").expect("dxc");
     println!("HLSL -> DXIL container: {} B", dxil.len());
-    let msc = crate::msc::Msc::open_default();
+    // Regenerates `tests/affine.dxil`, the fixture of `metal.rs`'s tests.
+    if let Ok(p) = std::env::var("VICTORY_WRITE_DXIL") {
+        std::fs::write(p, &dxil).expect("write fixture");
+    }
+    let msc = victory_metal::msc::Msc::open_default();
     let (stage, lib) = msc.convert(&dxil, None).expect("convert");
     println!("DXIL -> metallib: stage {stage}, {} B", lib.len());
 

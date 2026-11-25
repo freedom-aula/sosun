@@ -5,7 +5,7 @@ use objc2_metal::*;
 use std::time::Instant;
 
 pub fn run(files: &[String]) {
-    let msc = crate::msc::Msc::open_default();
+    let msc = victory_metal::msc::Msc::open_default();
     let dev = MTLCreateSystemDefaultDevice().expect("no Metal device");
     for f in files {
         let dxil = std::fs::read(f).expect("read dxil");

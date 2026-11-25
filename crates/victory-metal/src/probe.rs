@@ -1,10 +1,10 @@
-use crate::mem::{Alias, Region, page_size};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
 use std::ptr::NonNull;
 use std::time::Instant;
+use victory_metal::mem::{Alias, Region, page_size};
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;

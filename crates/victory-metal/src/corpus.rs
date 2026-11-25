@@ -6,7 +6,6 @@
 //! The cache layout is `<build>/<xx>/<hash>`, each file `VSH1 stage:u32 len:u32 dxil...` or `VSHE reason`
 //! (see `victory-gpu/src/shader_cache.rs`). Duplicates across builds are counted once.
 
-use crate::msc::Msc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
@@ -16,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+use victory_metal::msc::Msc;
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 const STAGES: [&str; 8] = ["Ls", "Hs", "Es", "Gs", "Vs", "Ps", "Ms", "Cs"];
@@ -120,11 +120,17 @@ fn dummy_vertex(dev: &Dev, names: &[(String, usize)]) -> Retained<ProtocolObject
     let fields: String = (names.iter().enumerate())
         .map(|(i, (n, t))| {
             let ty = TYPES[*t % TYPES.len()];
-            let flat = if ty.starts_with(['u', 'i']) { ", flat" } else { "" };
+            let flat = if ty.starts_with(['u', 'i']) {
+                ", flat"
+            } else {
+                ""
+            };
             format!("{ty} a{i} [[user({n}){flat}]];")
         })
         .collect();
-    let writes: String = (0..names.len()).map(|i| format!("o.a{i} = {{}};")).collect();
+    let writes: String = (0..names.len())
+        .map(|i| format!("o.a{i} = {{}};"))
+        .collect();
     let src = format!(
         "#include <metal_stdlib>\nusing namespace metal;\nstruct O {{ float4 p [[position]]; {fields} }};\n\
          vertex O dummy_vs(uint v [[vertex_id]]) {{ O o; o.p = float4(0); {writes} return o; }}"
@@ -132,13 +138,14 @@ fn dummy_vertex(dev: &Dev, names: &[(String, usize)]) -> Retained<ProtocolObject
     let lib = dev
         .newLibraryWithSource_options_error(&NSString::from_str(&src), None)
         .expect("dummy vertex source");
-    lib.newFunctionWithName(&NSString::from_str("dummy_vs")).unwrap()
+    lib.newFunctionWithName(&NSString::from_str("dummy_vs"))
+        .unwrap()
 }
 
 /// Types tried for a varying whose type is not known (the error names only the mismatches).
 const TYPES: [&str; 12] = [
-    "float4", "float2", "float3", "float", "half4", "half2", "half", "uint4", "uint", "int4", "uint2",
-    "uint3",
+    "float4", "float2", "float3", "float", "half4", "half2", "half", "uint4", "uint", "int4",
+    "uint2", "uint3",
 ];
 
 /// The varying names in a "Fragment input(s) `user(a),user(b)` mismatching ..." error.
@@ -246,7 +253,11 @@ fn worker(ctx: &Ctx, id: usize) {
                     Ok(()) => row.pso_ok = 1,
                     Err((load, why)) => {
                         fail = Some(format!("{} {why}", if load { "load" } else { "pso" }));
-                        let m = if load { &mut row.load_failed } else { &mut row.pso_failed };
+                        let m = if load {
+                            &mut row.load_failed
+                        } else {
+                            &mut row.pso_failed
+                        };
                         m.insert(normalise(&why), 1);
                     }
                 }
@@ -300,7 +311,10 @@ fn pipeline(
         .ok_or((true, "library has no function".to_string()))?;
     let pso = |e: Retained<objc2_foundation::NSError>| (false, first_line(&e));
     match stage {
-        "Cs" => dev.newComputePipelineStateWithFunction_error(&f).map(drop).map_err(pso),
+        "Cs" => dev
+            .newComputePipelineStateWithFunction_error(&f)
+            .map(drop)
+            .map_err(pso),
         "Vs" => {
             // Depth-only: no fragment function, and the vertex descriptor the stage-in needs.
             let d = MTLRenderPipelineDescriptor::new();
@@ -318,10 +332,13 @@ fn pipeline(
                 }
                 // SAFETY: as above.
                 let l = unsafe { vd.layouts().objectAtIndexedSubscript(8) };
+                // SAFETY: the layout index is 8, below the 31 buffer limit.
                 unsafe { l.setStride(attrs.len().max(1) * 16) };
             }
             d.setVertexDescriptor(Some(&vd));
-            dev.newRenderPipelineStateWithDescriptor_error(&d).map(drop).map_err(pso)
+            dev.newRenderPipelineStateWithDescriptor_error(&d)
+                .map(drop)
+                .map_err(pso)
         }
         "Ps" => {
             let mut names: Vec<(String, usize)> = vec![];
@@ -341,7 +358,8 @@ fn pipeline(
                     d.setFragmentFunction(Some(&f));
                     for (i, fmt) in formats.iter().enumerate() {
                         // SAFETY: i < 8, the attachment limit.
-                        unsafe { d.colorAttachments().objectAtIndexedSubscript(i) }.setPixelFormat(*fmt);
+                        unsafe { d.colorAttachments().objectAtIndexedSubscript(i) }
+                            .setPixelFormat(*fmt);
                     }
                     d.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
                     dev.newRenderPipelineStateWithDescriptor_error(&d)
@@ -410,7 +428,11 @@ fn pipeline(
 }
 
 pub fn run(args: &[String]) {
-    let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1));
+    let arg = |k: &str| {
+        args.iter()
+            .position(|a| a == k)
+            .and_then(|i| args.get(i + 1))
+    };
     let root = args.first().expect("--corpus <cache dir>");
     let limit: usize = arg("--limit").map_or(usize::MAX, |v| v.parse().unwrap());
     let threads: usize = arg("--threads").map_or(8, |v| v.parse().unwrap());
@@ -446,7 +468,9 @@ pub fn run(args: &[String]) {
         t.duplicates,
         t.unreadable
     );
-    println!("\nstage  unique  dxil MB  converted  metallib MB  conv ms avg  pipeline ok  pso ms avg");
+    println!(
+        "\nstage  unique  dxil MB  converted  metallib MB  conv ms avg  pipeline ok  pso ms avg"
+    );
     for (name, r) in &t.rows {
         println!(
             "{name:5} {:7} {:8.1} {:10} {:12.1} {:12.1} {:12} {:11.1}",

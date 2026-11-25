@@ -15,10 +15,6 @@ mod demo;
 #[cfg(target_os = "macos")]
 mod dxc;
 #[cfg(target_os = "macos")]
-mod mem;
-#[cfg(target_os = "macos")]
-mod msc;
-#[cfg(target_os = "macos")]
 mod probe;
 
 fn main() {
