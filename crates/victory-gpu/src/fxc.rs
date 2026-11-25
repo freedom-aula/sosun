@@ -1,9 +1,10 @@
-//! HLSL test shaders compiled with FXC, for the tests that need one.
+//! HLSL shaders compiled with FXC at run time: the depth conversion
+//! (`twin`) and the tests' shaders.
 //!
 //! Wine's HLSL compiler cannot build some of them (unbounded descriptor
 //! tables, root signatures that D3DMetal refuses), so under Wine the bytes
 //! that Microsoft's compiler made on a Windows runner are used instead
-//! (`test_bytecode.rs`, written by `cargo xtask embed-test-shaders`). On
+//! (`fxc_bytecode.rs`, written by `cargo xtask embed-test-shaders`). On
 //! Windows, `VICTORY_DUMP_TEST_SHADERS=<folder>` saves every compiled shader
 //! there under its key, which is what the test-shaders workflow uploads.
 
@@ -36,7 +37,7 @@ fn wine() -> bool {
 pub(crate) fn compile(source: &str, name: &str, profile: &str, flags: u32) -> Result<Vec<u8>, String> {
     let key = key(source, profile, flags);
     if wine()
-        && let Some((_, bytes)) = crate::test_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
+        && let Some((_, bytes)) = crate::fxc_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
     {
         return Ok(bytes.to_vec());
     }

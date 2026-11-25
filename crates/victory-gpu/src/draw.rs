@@ -1848,7 +1848,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// A compute shader with its root signature inside (`RS`).
     fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let bytes = crate::test_hlsl::compile(source, "root", "cs_5_1", 0).unwrap();
+        let bytes = crate::fxc::compile(source, "root", "cs_5_1", 0).unwrap();
         let bytes = &bytes[..];
         let host = crate::host::host().unwrap();
         // SAFETY: a compiled shader with its root signature inside.
@@ -2117,6 +2117,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // A host without castable formats (D3DMetal) gives each format
+            // its own host texture and copies between them; the texels below
+            // must come out the same either way.
+            let shared = shared && !a.castable.is_empty();
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);

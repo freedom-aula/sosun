@@ -19,8 +19,8 @@ pub fn run(root: &Path, folder: &Path) -> Result<()> {
     }
     shaders.sort();
     let mut text = String::from(
-        "//! Test shaders compiled by Microsoft's FXC on a Windows runner, for the\n\
-         //! tests under Wine (`test_hlsl`). Written by `cargo xtask\n\
+        "//! Shaders compiled by Microsoft's FXC on a Windows runner, for use\n\
+         //! under Wine (`fxc`). Written by `cargo xtask\n\
          //! embed-test-shaders`.\n\n\
          pub(crate) const SHADERS: &[(u64, &[u8])] = &[\n",
     );
@@ -36,8 +36,8 @@ pub fn run(root: &Path, folder: &Path) -> Result<()> {
         text.push_str("    ]),\n");
     }
     text.push_str("];\n");
-    let out = root.join("crates/victory-gpu/src/test_bytecode.rs");
-    std::fs::write(&out, text).context("writing test_bytecode.rs")?;
+    let out = root.join("crates/victory-gpu/src/fxc_bytecode.rs");
+    std::fs::write(&out, text).context("writing fxc_bytecode.rs")?;
     println!("embedded {} test shaders", shaders.len());
     Ok(())
 }

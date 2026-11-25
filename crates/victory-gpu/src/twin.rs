@@ -22,11 +22,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 use crate::object::This;
@@ -515,25 +512,16 @@ fn converter() -> Option<&'static Converter> {
 }
 
 fn compile() -> windows::core::Result<Converter> {
+    // Compiled before the device is asked for, so that the test-shaders
+    // workflow saves it on a runner without a GPU.
+    let bytes = crate::fxc::compile(SOURCE, "depth", "cs_5_1", 0).map_err(|e| {
+        tracing::warn!("depth conversion: {e}");
+        windows::core::Error::empty()
+    })?;
+    let bytes = &bytes[..];
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the shader's own bytes; the root signature is inside it.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -547,6 +535,13 @@ fn compile() -> windows::core::Result<Converter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conversion shader compiles (and, with
+    /// `VICTORY_DUMP_TEST_SHADERS`, is saved for Wine) without a GPU.
+    #[test]
+    fn the_conversion_shader_compiles() {
+        crate::fxc::compile(SOURCE, "depth", "cs_5_1", 0).expect("the depth conversion compiles");
+    }
 
     /// The material-depth frame of Grand Theft Auto VI: written through
     /// unordered views, read as a shader resource in the same list, written

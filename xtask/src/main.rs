@@ -31,7 +31,7 @@ enum Cmd {
     /// Write crates/victory-gpu/src/clamp_bytecode.rs from the output of
     /// the clamp-bytecode workflow (a folder with clamp.dxil and clamp.dxbc).
     EmbedClamp { folder: PathBuf },
-    /// Write crates/victory-gpu/src/test_bytecode.rs from the output of the
+    /// Write crates/victory-gpu/src/fxc_bytecode.rs from the output of the
     /// test-shaders workflow (a folder of `<key>.bin` files).
     EmbedTestShaders { folder: PathBuf },
 }

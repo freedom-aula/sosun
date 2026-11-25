@@ -547,7 +547,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     ) {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
         use windows::Win32::Graphics::Direct3D12::*;
-        let bytes = crate::test_hlsl::compile(SOURCE, "memory", "cs_5_1", D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES).unwrap();
+        let bytes = crate::fxc::compile(SOURCE, "memory", "cs_5_1", D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES).unwrap();
         let bytes = &bytes[..];
         let host = crate::host::host().unwrap();
         // SAFETY: the blob's own bytes; a compiled shader with its root

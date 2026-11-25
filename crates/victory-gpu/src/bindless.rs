@@ -366,7 +366,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let bytes = crate::test_hlsl::compile(SOURCE, "heap", "cs_5_1", 0).unwrap();
+        let bytes = crate::fxc::compile(SOURCE, "heap", "cs_5_1", 0).unwrap();
         let bytes = &bytes[..];
         let host = crate::host::host().unwrap();
         // SAFETY: a compiled shader with its root signature inside.

@@ -29,6 +29,10 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod fxc;
+#[cfg(windows)]
+mod fxc_bytecode;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -58,10 +62,6 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
-#[cfg(all(test, windows))]
-mod test_bytecode;
-#[cfg(all(test, windows))]
-mod test_hlsl;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
