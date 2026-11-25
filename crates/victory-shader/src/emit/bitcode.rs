@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use crate::structure::Map;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -198,9 +200,9 @@ enum MdDef {
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, u32>,
+    type_ids: Map<TypeDef, u32>,
     consts: Vec<(Ty, Const)>,
-    const_ids: HashMap<(Ty, Const), u32>,
+    const_ids: Map<(Ty, Const), u32>,
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
@@ -210,7 +212,7 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
-    pub chosen: HashMap<V, (V, V)>,
+    pub chosen: Map<V, (V, V)>,
 }
 
 impl Module {
@@ -254,12 +256,15 @@ impl Module {
     }
 
     fn constant(&mut self, ty: Ty, c: Const) -> V {
-        if let Some(&i) = self.const_ids.get(&(ty, c.clone())) {
+        // The key is built once and only copied on a miss: a hit (the common
+        // case) must not clone an aggregate's fields.
+        let key = (ty, c);
+        if let Some(&i) = self.const_ids.get(&key) {
             return V::Const(i);
         }
         let i = self.consts.len() as u32;
-        self.consts.push((ty, c.clone()));
-        self.const_ids.insert((ty, c), i);
+        self.consts.push(key.clone());
+        self.const_ids.insert(key, i);
         V::Const(i)
     }
 
@@ -1219,6 +1224,27 @@ mod tests {
         assert!(successors(Some(Term::Ret)).is_empty());
         assert_eq!(&*successors(Some(Term::Br(7))), &[7]);
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
+    }
+
+    /// Types and constants are numbered as they are first made, and asking
+    /// again (an aggregate included) finds the same one.
+    #[test]
+    fn types_and_constants_are_numbered_in_first_interning_order() {
+        let mut m = Module::default();
+        let (i32t, f32t) = (m.int(32), m.float());
+        let (a, b, c) = (m.i32(7), m.f32(7), m.i32(9));
+        let table = m.array(2, i32t);
+        let (t1, t2) = (m.aggregate(table, &[a, c]), m.aggregate(table, &[c, a]));
+        assert_eq!([i32t, f32t, table], [Ty(0), Ty(1), Ty(2)]);
+        assert_eq!([a, b, c, t1, t2], [0, 1, 2, 3, 4].map(V::Const));
+        assert_eq!(
+            (m.int(32), m.float(), m.array(2, i32t)),
+            (i32t, f32t, table)
+        );
+        assert_eq!([m.i32(7), m.f32(7), m.i32(9)], [a, b, c]);
+        assert_eq!(m.aggregate(table, &[c, a]), t2);
+        assert_eq!(m.aggregate(table, &[a, c]), t1);
+        assert_eq!((m.types.len(), m.consts.len()), (3, 5));
     }
 
     /// The written bytes are pinned to what the writer produced before the

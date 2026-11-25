@@ -75,9 +75,10 @@ pub struct Bools {
     overflow: bool,
 }
 
-/// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
+/// The tables below have small integer keys; SipHash dominated run time. The
+/// emitter's tables (`emit::lower`, `emit::bitcode`) use the same hasher.
+pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+pub type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
 
 /// A set of what a walk has met: a list scan while it is small (most lane
 /// masks are a handful of nodes), a hash set once it grows.
@@ -116,7 +117,7 @@ impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
-struct Fx(u64);
+pub struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
@@ -454,24 +455,24 @@ pub struct Structured {
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
-    pub masks: HashMap<Value, Bool>,
+    pub masks: Map<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
-    pub other: HashMap<Value, Bool>,
+    pub other: Map<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
-    pub highs: HashMap<Value, Value>,
+    pub highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
-    pub active: HashSet<Value>,
+    pub active: Set<Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
-    pub restored: HashMap<Value, Value>,
+    pub restored: Map<Value, Value>,
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
-    pub discards: HashMap<(usize, usize), Bool>,
+    pub discards: Map<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -546,7 +547,7 @@ struct Lanes<'a> {
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
-    active: HashSet<Value>,
+    active: Set<Value>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
     /// A pixel's discards (see [`Structured::discards`]) by block and
@@ -614,7 +615,7 @@ impl<'a> Lanes<'a> {
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
-            active: HashSet::new(),
+            active: Set::default(),
             restored: Map::default(),
             kills: HashSet::new(),
         };
@@ -885,7 +886,7 @@ impl<'a> Lanes<'a> {
                 Map::default()
             },
             active: self.active,
-            restored: self.restored.into_iter().collect(),
+            restored: self.restored,
             discards: self
                 .kills
                 .iter()
