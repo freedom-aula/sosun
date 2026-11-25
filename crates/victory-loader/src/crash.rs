@@ -58,6 +58,13 @@ static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "diagnostics")]
 static SKIP_TITLE_INT3: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 
+/// Diagnostics: on the first title `int3`, write the title's subsystem-registry
+/// state to files in this directory, so an assert that checks the registry can
+/// be read after the fact (the singleton, its tables, and their raw memory).
+/// From `VICTORY_DUMP_REGISTRY=<dir>` (#24).
+#[cfg(feature = "diagnostics")]
+static DUMP_REGISTRY: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// The RVAs in a `VICTORY_SKIP_TITLE_INT3` list (hex, `0x` optional,
 /// comma-separated); entries that do not parse are left out.
 #[cfg(any(feature = "diagnostics", test))]
@@ -208,6 +215,10 @@ pub fn report_crashes() {
     SKIP_TITLE_INT3.get_or_init(|| {
         std::env::var("VICTORY_SKIP_TITLE_INT3").map(|v| skip_list(&v)).unwrap_or_default()
     });
+    #[cfg(feature = "diagnostics")]
+    if let Some(dir) = std::env::var_os("VICTORY_DUMP_REGISTRY") {
+        let _ = DUMP_REGISTRY.set(std::path::PathBuf::from(dir));
+    }
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -575,6 +586,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     #[cfg(feature = "diagnostics")]
+    if code == EXCEPTION_BREAKPOINT && DUMP_REGISTRY.get().is_some() {
+        // SAFETY: the context record is valid for the faulting thread.
+        unsafe { dump_title_registry(&*(*info).ContextRecord) };
+    }
+    #[cfg(feature = "diagnostics")]
     if code == EXCEPTION_BREAKPOINT
         && let Some(list) = SKIP_TITLE_INT3.get()
         && !list.is_empty()
@@ -907,6 +923,113 @@ fn memory_at(address: usize) -> String {
         Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
         _ => protect,
     }
+}
+
+/// Whether the page at `address` is committed and readable (so a read of it
+/// will not fault inside this handler).
+#[cfg(feature = "diagnostics")]
+fn page_readable(address: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && info.Protect & 0xff != PAGE_NOACCESS
+}
+
+/// Reads up to `len` bytes from `address`, stopping at the first page that is
+/// not committed and readable, so a wild or partly-mapped pointer is safe.
+#[cfg(feature = "diagnostics")]
+fn read_guarded(address: usize, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = address;
+    while out.len() < len {
+        if !page_readable(at) {
+            break;
+        }
+        let take = ((at & !0xfff) + 0x1000).min(address + len) - at;
+        // SAFETY: `take` bytes from `at` stay inside a committed, readable page.
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(at as *const u8, take) });
+        at += take;
+    }
+    out
+}
+
+/// Reads a `usize` at `address`, or `None` if its page is not readable.
+#[cfg(feature = "diagnostics")]
+fn read_usize(address: usize) -> Option<usize> {
+    let bytes = read_guarded(address, 8);
+    (bytes.len() == 8).then(|| usize::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// On the first title `int3`, write the title's subsystem-registry state to
+/// files, so an assert that checks the registry can be understood after the
+/// fact. The guard at `image+0x1dac680` reads a singleton `*[image+0x7f00510]`
+/// with a main hash table (`+0x2b0`; descriptor `+0x30` cap / `+0x38` base)
+/// and a second table (`+0x2a8`; `+0x8` cap / `+0x10` base); the enforced id's
+/// 32-bit key is at `image+0x63011dc`. Reads only: no title code is called,
+/// every read is page-guarded, and it runs once.
+#[cfg(feature = "diagnostics")]
+unsafe fn dump_title_registry(context: &CONTEXT) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Some(dir) = DUMP_REGISTRY.get() else {
+        return;
+    };
+    // The first title int3 is the registry assert; later ones add nothing.
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Some(base) = crate::threads::title_image_base(context.Rip as usize) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let mut txt = String::new();
+    let mut add = |l: String| {
+        eprintln!("  registry: {l}");
+        txt.push_str(&l);
+        txt.push('\n');
+    };
+    add(format!("image base {base:#x} (rip {:#x})", context.Rip));
+    let key = read_guarded(base + 0x63011dc, 4);
+    let key = (key.len() == 4).then(|| u32::from_le_bytes(key.try_into().unwrap()));
+    add(format!("enforced id key {key:#010x?}"));
+    let Some(g) = read_usize(base + 0x7f00510).filter(|&g| g != 0) else {
+        add("singleton *[image+0x7f00510] null or unreadable".into());
+        let _ = std::fs::write(dir.join("registry.txt"), &txt);
+        return;
+    };
+    add(format!("singleton G {g:#x}"));
+    let _ = std::fs::write(dir.join("g.bin"), read_guarded(g, 0x400));
+    // Main table: id present here means registered; descriptor at [G+0x2b0].
+    if let Some(desc) = read_usize(g + 0x2b0).filter(|&d| d != 0) {
+        let cap = read_usize(desc + 0x30).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(desc + 0x38).unwrap_or(0);
+        add(format!("main desc {desc:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("main.bin"), read_guarded(tbl, n));
+        }
+    }
+    // Second table (`verify`'s deeper check): empty here means the id is
+    // declared but never activated.
+    if let Some(x) = read_usize(g + 0x2a8).filter(|&v| v != 0) {
+        let cap = read_usize(x + 0x8).unwrap_or(0) & 0xffff_ffff;
+        let tbl = read_usize(x + 0x10).unwrap_or(0);
+        add(format!("second {x:#x} cap {cap} base {tbl:#x}"));
+        if tbl != 0 && (1..=0x10_0000).contains(&cap) {
+            let n = cap.saturating_mul(0x110).min(8 << 20);
+            let _ = std::fs::write(dir.join("second.bin"), read_guarded(tbl, n));
+        }
+    } else {
+        add("second table [G+0x2a8] is null".into());
+    }
+    let _ = std::fs::write(dir.join("registry.txt"), &txt);
 }
 
 #[cfg(test)]
