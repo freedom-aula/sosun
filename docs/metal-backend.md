@@ -32,7 +32,7 @@ already assumes ("a resource's GPU address is its CPU address"). On Metal that c
 | committed/placed resources, buffers (`resource.rs`) | buffers: `MTLBuffer` over title memory (below). Textures: `MTLTexture` from `MTLHeap` (replaces `placement.rs`) |
 | title GPU address = CPU address | a constant or table offset from title address to GPU address (below) |
 | pipeline states (`pipeline.rs`, `pipeline/*`): made at first draw, ~60,000 created, dozens drawn | same laziness. Compute: `MTLComputePipelineState` from the converted function. Graphics: `MTLRenderPipelineState`, with the stage-in function, blending and render-target formats the converter needs at link time; mesh shaders (`ms_6_6`) map to Metal mesh pipelines |
-| `shader_cache.rs` (translated DXIL by content hash) | cache the converted `.metallib` next to it; conversion measured at 8-55 ms per shader |
+| `shader_cache.rs` (translated DXIL by content hash) | cache the converted `.metallib` next to it; conversion averages 84 ms (compute), 32 ms (pixel) over the corpus below |
 | `twin.rs` (depth also written by UAV: colour twin) | Metal textures allow `shaderWrite` on depth-format views only through a pixel-format view; likely still needs the twin until checked on real shaders |
 | `query.rs` | `MTLCounterSampleBuffer` / visibility result buffer |
 | `signature.rs` (ExecuteIndirect) | indirect command buffers (`MTLIndirectCommandBuffer`), or compute-generated arguments |
@@ -150,10 +150,8 @@ undocumented LLVM dialect), and every shader path would be tested again.
 **Recommendation: A first, B later and narrowly.** The DXIL emitter is the product of a long effort and
 is tested; MSC takes it as it is. Prototype results:
 
-- It converted 5 of 6 DXIL containers left in an earlier session's scratch dump (they look like victory-shader output for title shaders, not regenerated here; all compute,
-  11-127 KB, 8-54 ms each), and Metal loaded and built a compute pipeline from every converted library.
-- The sixth failed with `IRError` code 6 (probably `UnsupportedWaveSize`, not confirmed against the
-  header); to look at next, with the wave size the emitter requests (GFX10 wave32/wave64).
+- The whole cached GTA VI corpus converts except the compute shaders that ask for wave64 (next section:
+  "Shader corpus"). Every converted library loads in Metal and builds its pipeline state.
 - An end-to-end shader (HLSL compiled to DXIL by dxc, `cs_6_0`, root signature `RootConstants(2),
   SRV(t0), UAV(u0)`) converted and ran over a `bytesNoCopy` buffer: root SRV and UAV are 64-bit GPU
   addresses in the top-level argument buffer, root constants inline. 4096 of 4096 outputs correct
@@ -173,17 +171,32 @@ reference) from `developer.apple.com/metal/shader-converter/` (links to
 `metal_irconverter_runtime.h`. Requires macOS 13 and Xcode 15 or later; the output requires argument
 buffers tier 2 (every Apple Silicon Mac).
 
-On this machine a copy of the library is already present inside the D3DMetal framework bundled with
-GPTK/CrossOver (`.../D3DMetal.framework/Versions/A/Resources/libmetalirconverter.dylib`, with
-`libdxcompiler.dylib`; version.plist 4.0b3). It is **x86_64 only**, so a native arm64 process cannot load
-it; the prototype was built for `x86_64-apple-darwin` and run under Rosetta to use it. For the real
-backend install Apple's download (it is a universal macOS binary, expected, not checked here). The
-library's licence is Apple's: do not commit it or its headers; load it at run time (the prototype
-`dlopen`s `VICTORY_MSC_DYLIB` and declares the half-dozen C functions itself) and keep the path in the
-config. Conversion could also run offline in `victory translate --cache`, caching `.metallib`s.
+Installed here by Apple's package: `/usr/local/lib/libmetalirconverter.dylib` (a universal binary,
+arm64 and x86_64), `/usr/local/bin/metal-shaderconverter`, headers in `/usr/local/include/metal_irconverter*`.
+`victory-metal` loads `/usr/local/lib/libmetalirconverter.dylib` natively by `dlopen`; `VICTORY_MSC_DYLIB` overrides the
+path. (The copy inside D3DMetal.framework is x86_64 only and was what the first prototype ran under Rosetta;
+no longer needed. `--demo` still needs the x86_64 `libdxcompiler` of that bundle to make its HLSL
+shader, so it is the one thing that runs under Rosetta; the test shader is now committed as a fixture.)
+The library's licence is Apple's: nothing of it, nor its headers, is vendored. Conversion could also run
+offline in `victory translate --cache`, caching `.metallib`s.
 
-The converter header was not available to read, so `crates/victory-metal/src/msc.rs` declares the C
-signatures from Apple's published sample; the enum values (stage 8 = compute) come from observation.
+Facts read from the installed headers (`metal_irconverter.h`, `metal_irconverter_runtime.h`):
+
+- `IRErrorCode`: 0 NoError, 1 ShaderRequiresRootSignature, 2 UnrecognizedRootSignatureDescriptor,
+  3 UnrecognizedParameterTypeInRootSignature, 4 ResourceNotReferencedByRootSignature,
+  5 ShaderIncompatibleWithDualSourceBlending, **6 UnsupportedWaveSize**, 7 UnsupportedInstruction, 8 CompilationError,
+  9 FailedToSynthesizeStageInFunction, 10 ...StreamOutFunction, 11 ...IndirectIntersectionFunction,
+  12 UnableToVerifyModule, 13 UnableToLinkModule, 14 UnrecognizedDXILHeader, 15 InvalidRaytracingAttribute,
+  16 NullHullShaderInputOutputMismatch, 17 InvalidRaytracingUserAttributeSize, 18 IncorrectHitgroupType, 19 FP64Usage.
+  `IRErrorGetPayload` is documented only as "cast to the payload struct for the code"; in practice for these
+  codes it points at the message text, which is what `msc.rs` reads.
+- `IRShaderStage`: 1 Vertex, 2 Fragment, 3 Hull, 4 Domain, 5 Mesh, 6 Amplification, 7 Geometry, **8 Compute**, ...
+- Binding layout, `kIR*BindPoint`: **0 resource descriptor heap, 1 sampler heap, 2 top-level argument buffer**,
+  3 hull/domain argument buffer, 4 draw arguments, 5 uniforms, 6 vertex buffer. A descriptor table entry is
+  `IRDescriptorTableEntry { u64 gpuVA; u64 textureViewID; u64 metadata; }`, 24 bytes. This matches the
+  table in section 1 and what `backend` binds (slot 2 only so far; heaps are step 5 below).
+- `IRStageInCodeGenerationMode`: 0 UseMetalVertexFetch (default, a `MTLVertexDescriptor` at pipeline creation),
+  1 UseSeparateStageInFunction.
 
 ## Prototype: `crates/victory-metal`
 
@@ -192,12 +205,9 @@ the D3D12 workspace and its clippy gate are untouched). `objc2-metal` 0.3, `libc
 
 ```
 cargo run --release -p victory-metal                       # memory + latency probe
-# DXIL conversion (libmetalirconverter is x86_64 in GPTK; Apple's download should run natively):
-cargo build --release -p victory-metal --target x86_64-apple-darwin
-R=.../D3DMetal.framework/Versions/A/Resources
-VICTORY_MSC_DYLIB=$R/libmetalirconverter.dylib ./target/x86_64-apple-darwin/release/victory-metal shader.dxil...
-VICTORY_MSC_DYLIB=$R/libmetalirconverter.dylib VICTORY_DXC_DYLIB=$R/libdxcompiler.dylib \
-  ./target/x86_64-apple-darwin/release/victory-metal --demo
+cargo run --release -p victory-metal -- shader.dxil...     # convert, load, build a compute PSO
+cargo run --release -p victory-metal -- --corpus <cache>/shaders [--threads 8] [--fails out.txt]
+cargo test -p victory-metal                                # compute backend tests (skip if MSC is not installed)
 ```
 
 Submit-to-complete latency (3000 iterations, release, native arm64; Wine/D3D12 today ~5000-8000 us):
@@ -215,21 +225,133 @@ GPU time of the tiny dispatch is 2 us, so the 140 us is wake-up and completion l
 pipelining removes: a frame of 35 submissions with one wait is about 0.35 ms of submission overhead, not
 175-280 ms.
 
+## Shader corpus
+
+`victory-metal --corpus <cache dir>` walks a victory shader cache (`<build>/<xx>/<hash>`; each file is
+`VSH1 stage dxil...` or `VSHE reason`, `victory-gpu/src/shader_cache.rs`), counts each container once (the
+DXBC digest and length, across the cache's builds), converts it and builds the pipeline state its stage
+allows. It prints counts only, writes nothing but stats (optionally a list of failing hashes with `--fails`)
+and keeps no shader or converted output. Run on the cache of the Wine prefix
+(`target/wineprefix-play/.../victory/cache/shaders`, written by earlier runs and warm-ups: 29 614 entries
+from 12 translator builds; GTA VI was not launched). That is every shader the title has asked for so far,
+not necessarily the whole game. Entries are the Wine-flavoured translation (view marks, atomic locks,
+narrow waves where those options were on), which is what the host would be given today.
+
+Measured on the M5 Pro, native arm64 converter, 8 threads, 522 s for the lot.
+
+| Stage | unique DXIL | DXIL MB | converted | failed in converter | pipeline state built | failed building |
+|---|---|---|---|---|---|---|
+| Compute (`cs`) | 3 549 | 678 | 3 021 | 528 (IRError 6) | 3 021 | 0 |
+| Pixel (`ps`) | 2 635 | 256 | 2 635 | 0 | 2 635 | 0 |
+| Vertex (`vs`) | 367 | 4.1 | 367 | 0 | 367 | 0 |
+| Mesh (`ms`) | 721 | 28 | 721 | 0 | 693 | 28 (mesh too large) |
+| **Total** | **7 272** | **966** | **6 744 (92.7 %)** | **528** | **6 716** | **28** |
+
+Besides those, the translator itself refused 216 cache entries (9 distinct reasons, all GFX10 constructs:
+lane masks read as data 90, descriptors read only as data or neither loaded nor built 59, `v_cvt_f32_f64` 19,
+barycentrics read directly 17, a lane-mask join of an untracked mask 11, a descriptor chosen by control flow 11, `v_permlanex16_b32` 9); they never
+produce DXIL, so they are not in the table. No hull, domain, geometry or ray stages occur in the cache.
+
+Failures:
+
+- **IRError 6, `IRErrorCodeUnsupportedWaveSize`** (header: `metal_irconverter.h`, enum value 6; message
+  "Wave size is not supported. Must be 32."): 528 compute shaders, 14.9 % of compute. The emitter writes
+  `WaveSize(64)` into a compute shader whose console wave is 64 lanes and that uses wave operations or LDS
+  that is not synchronised (`emit/lower.rs`: `s.wave_size = Some(64)`; `narrow_waves` avoids it only where
+  the program fits 32 lanes). Apple GPUs run 32-lane SIMD groups, and the converter accepts only wave size
+  32 (the same limit D3DMetal reports, hence `narrow_waves` under Wine; there those shaders simply do not
+  run, "nothing written"). Not a converter bug: a translator output to change for a Metal host. Options: emit
+  wave32 code for these (two waves per group, lane-mask ops split, group barriers where LDS is shared;
+  `narrow_waves` already does part of it), or run the 64 lanes as two simdgroups with explicit exchange.
+  This is the largest open item of the shader path.
+- Mesh pipeline, 28 shaders: Metal rejects "Total mesh size exceeds the maximum mesh size allowed (32768)"
+  at 34 816 to 38 400 bytes (vertex plus primitive output memory of the shader's declared maxima).
+  Needs the translator to declare tighter output maxima, or a split.
+- Nothing else failed: no `UnsupportedInstruction`, `CompilationError`, root-signature or link errors.
+
+How pipelines were built (a harness, not the real render path, so the pixel and vertex numbers say "Metal
+accepts the converted function", not "the right pipeline"): compute: `MTLComputePipelineState`; vertex:
+render pipeline with no fragment function and a `MTLVertexDescriptor` made from the function's vertex
+attributes; pixel: a generated pass-through vertex function that writes the user varyings the fragment
+function reads (their names and types are found from Metal's own mismatch errors), colour targets
+of float, uint or sint and a depth target; mesh: a mesh pipeline with rasterisation off.
+Conversion costs 84 ms average for compute 32 ms pixel, 13 ms mesh, 3 ms vertex;
+Metal pipeline creation under 8 threads averages 0.58 s compute, 0.76 s pixel (device compilation, the cost
+the pipeline cache must hide); the converter prints "Shader might rely on forward progress/persistent
+thread" for some compute shaders (a warning, not an error).
+
+One harness pitfall worth keeping: **`newLibraryWithURL` caches by URL**. Writing different metallibs to
+one temp file name returned stale libraries (wrong functions, "unlowered function call air.read..."). Use
+a fresh name per library, or `newLibraryWithData`.
+
+## Compute backend, first slice (`backend.rs`, `metal.rs`)
+
+`victory_metal::backend::ComputeBackend` is the seam: a platform-neutral trait (no Metal types) with
+`create_queue`, `create_fence`, `wrap_title_memory`, `gpu_address`, `create_compute_pipeline(dxil)`,
+`submit(queue, Submission)`, `signal`, `completed`, `wait`. A `Submission` is what one
+`ExecuteCommandLists` is: fence waits, dispatches (pipeline, root arguments, resident buffers, group counts),
+fence signals. `submit` never waits for the GPU. `metal::Metal` implements it:
+
+| Trait | Metal |
+|---|---|
+| queue | `MTLCommandQueue` (any number) |
+| fence | `MTLSharedEvent`; GPU `encodeWaitForEvent` / `encodeSignalEvent` in the command buffer, CPU `setSignaledValue`, `signaledValue`, `waitUntilSignaledValue` |
+| `wrap_title_memory` | `newBufferWithBytesNoCopy`, shared; `gpu_address` = buffer GPU address + offset of the title address in the range |
+| `create_compute_pipeline` | `IRCompilerAllocCompileAndLink` -> metallib -> `MTLComputePipelineState` |
+| `submit` | one command buffer: waits, one compute encoder with every dispatch in order, signals, `commit` |
+| dispatch | `RootArgs` (inline root constants, root SRV/UAV/CBV as 64-bit GPU addresses, in root-parameter order) set with `setBytes` at slot 2; `useResource` for the wrapped buffers |
+
+Tests (`cargo test -p victory-metal`, `src/metal.rs`; the shader is `tests/affine.dxil`, 3.4 KB made by dxc
+from the HLSL of `--demo`, our own, not a title shader; skipped when the converter is not installed):
+
+- `queue_b_waits_for_queue_a_over_the_same_buffer`: the D3D12 pattern. Queue B is submitted first, waits for
+  fence value 7 and dispatches `c = b * 3`; the test checks B has not run (`wait` times out after 50 ms), then
+  queue A dispatches `b = a * 2 + 1` and signals 7; the CPU waits on B's own fence; `c[i] == (a[i]*2+1)*3`
+  for all 4096, over one zero-copy buffer holding a, b and c.
+- `cpu_signal_releases_a_waiting_queue`: the title's CPU `Signal` (`hold.rs`) releases a queue held at a
+  `Wait`; result checked.
+- `many_submissions_in_flight_one_wait`: 64 dispatch submissions over 4 queues, chained by fence values
+  `k -> k+1`, all submitted before any is waited for, one CPU wait; each adds 1 over ping-pong arrays,
+  64 on every element (about 20 ms in all including first use; a queue runs its command buffers in order,
+  so submission is in order and only the fence orders across queues).
+
+### Where victory-gpu calls it
+
+`host.rs` today owns one D3D12 device and direct queue and waits after every submission; `queue.rs` holds
+Signals and memory-value waits (`hold.rs`); `fence.rs` keeps the 64-bit value and the waiting events. The
+title-facing COM objects stay; what they call changes:
+
+| victory-gpu | calls on the backend |
+|---|---|
+| `host.rs` device and queues; `queue::create` (`ID3D12CommandQueue`, a per-type queue: direct, compute, copy) | `create_queue` per title queue (GTA VI's four compute queues become four Metal queues) |
+| `fence::create`; `Fence` value | `create_fence(initial)` next to the `Fence` struct; the title may still read the value from memory, so the struct keeps its own atomic and the shared event is the GPU-visible twin |
+| `fence::signal` (CPU), `fence::set` | `signal`; waiters (`SetEventOnCompletion`) become `completed` plus a `notifyListener`, or `wait` on a helper thread, instead of the event list polled by `pump_held` |
+| `ExecuteCommandLists` in `queue.rs`, and `hold.rs` for a wait the GPU cannot express (`Wait32BitValueX` on memory) | `submit`: GPU fence waits and signals go into the `Submission`; only memory-value waits remain host-side holds |
+| `list.rs` recorded commands | recorded into `Dispatch` (compute) and, later, render passes; the `Submission` is built at `ExecuteCommandLists` |
+| `shader_cache.rs` `HostShader` | `create_compute_pipeline(dxil)` (cache the metallib beside it) |
+| `shadow.rs`/`watch.rs`/`memory.rs` | `wrap_title_memory` and `gpu_address` for each pool, from the native host's map events |
+
+The trait would move to a small crate both backends depend on, once victory-gpu uses it; for now it lives
+beside the Metal implementation and victory-gpu is untouched.
+
+Not in this slice: descriptor heaps (slots 0 and 1; entries are 24 bytes, `IRDescriptorTableEntry`, built
+from the title's RDNA descriptors), static samplers, root descriptor tables, render passes, textures,
+`MTLResidencySet`, command-buffer error and timeout handling (a GPU fault is only seen as a missing signal
+here), thread-safety of the types (they are not `Send`).
+
 ## Next steps
 
-1. Get Apple's MSC 4.0 and run native arm64: confirm the universal dylib, drop the Rosetta build.
-2. Find why one of six shader containers fails (code 6) and run the rest of the victory-shader test
-   corpus through MSC with a compute PSO build; list what does not convert.
+1. Wave64 compute shaders: decide how the translator serves a wave32 host (528 of 3 549 compute shaders,
+   IRError 6). Mesh output sizes (28 shaders).
+2. Real render pipelines: pass vertex and fragment functions of one pipeline together (the harness used a
+   synthetic partner), stage-in layout, blend and target formats, then mesh and amplification pipelines.
 3. Add the host interface above to the native-host agent's work, then wrap real pools and re-run the
    probe on them (memory entry mappings, guard pages, 64 KiB mapping granularity on 16 KiB pages).
-4. A `victory-gpu` backend trait around `host.rs`, `queue.rs`, `fence.rs`: the title-facing
-   objects stay, the host calls go to D3D12 or Metal. Start with queues, fences (`MTLSharedEvent`),
-   and compute dispatch of the converted shaders, since compute (GTA VI's four compute queues) needs no
-   render pipeline.
+4. Implement the seam in victory-gpu behind a feature: D3D12 and Metal implementations of `ComputeBackend`,
+   `queue.rs`/`fence.rs` calling it, with `hold.rs` keeping only memory-value waits.
 5. Descriptor heaps: the title writes 32-byte RDNA descriptors itself; build the MSC-format heap from
-   them (the existing `HostHeap` does this for D3D12), then bind slot 0/1/2.
+   them (the existing `HostHeap` does this for D3D12), then bind slots 0/1/2.
 6. Replace the page-table "Title memory" contract in `victory_shader::emit` by the arena/offset one,
    and delete copy-back, view marks and the shadow (`shadow.rs`, `watch.rs`) behind a feature once the
    Metal path runs.
-7. Compute detile of the console texture layouts reading title memory; render pipelines (stage-in,
-   blend, mesh); present on `CAMetalLayer`; then pipeline many submissions with events instead of waits.
+7. Compute detile of the console texture layouts reading title memory; present on `CAMetalLayer`.
