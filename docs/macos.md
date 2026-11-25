@@ -101,3 +101,11 @@ The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new sha
 - Gather positions. D3DMetal's gather truncates the position where the console rounds it, as WARP's does, so `gathers_at_a_level_match_the_hardware` skips the same comparison it already skipped for WARP.
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
+
+## Masked stores into protected pages hang Rosetta
+
+On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpectedly need to EmulateForward on a synchronous exception` and the process hangs (issue #1). The faulting instruction is `vpmaskmovd [rax], ymm6, ymm4`, an AVX2 masked store in a loop that steps 32 bytes at a time.
+
+The reproducer from issue #1, extended with `vpmaskmovd`, shows the cause without game files. Under CrossOver Wine 26.3.0 with `ROSETTA_ADVERTISE_AVX=1`, SSE and AVX `vmovups` stores survive in every layout, and so does a masked store wholly inside a protected page. A masked store that starts in writable memory and ends in a protected page hangs Rosetta with the same error, both in a block guarded the way `victory-gpu/src/watch.rs` guards it and in `MEM_WRITE_WATCH` memory, which Wine emulates with page protection. Rosetta seems to have written the first lanes before the fault and cannot finish the instruction afterwards.
+
+VIctory used both kinds of protection to see which title GPU memory changed. Under Rosetta, which `victory_gpu::fault_tracking` detects as Wine on Darwin, it now uses neither. The runtime's pools are allocated without a write watch, and host copies of title memory take it whole every time, as they already do for memory that is not the runtime's. That costs copy time but no fault can reach Rosetta. `VICTORY_FAULT_TRACKING=1` turns tracking back on to test a newer Rosetta, and `0` turns it off anywhere.
