@@ -517,6 +517,106 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
     assert!(what.contains("lane-mask join"), "{what}");
 }
 
+/// A register array (v3-v14) indexed through M0 in waterfall loops, as
+/// `tiled_lighting:CS_PrescalarizeLightLoop` builds its per-tile light
+/// masks: each lane's index (clamped to 0-11 by `v_med3_u32`) becomes M0 in
+/// the loop pass that handles the lanes holding it; a `v_movrels` reads the
+/// lane's array element, a `v_movreld` writes it back with the lane's bit
+/// added. Twice, so the second pass reads what the first wrote.
+#[test]
+fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    ];
+    w.extend((3..15u32).map(|k| 0x7E00_0280 | k << 17)); // v_mov_b32 vk, 0
+    w.extend([
+        0x2C38_0081, // v_lshrrev_b32 v28, 1, v0
+        0xD559_001C,
+        0x022D_011C, // v_med3_u32 v28, v28, 0, 11
+        0x7E3A_0281, // v_mov_b32 v29, 1
+        0x343A_3B00, // v_lshlrev_b32 v29, v0, v29
+    ]);
+    let pass = [
+        0xBEA4_037E, // s_mov_b32 s36, exec_lo
+        0x7E4C_051C, // read: v_readfirstlane_b32 s38, v28
+        0xD4C2_0006,
+        0x0002_3826, // v_cmp_eq_u32 s6, s38, v28
+        0xBE86_3C06, // s_and_saveexec_b32 s6, s6
+        0xBEFC_0326, // s_mov_b32 m0, s38
+        0x7E3E_8703, // v_movrels_b32 v31, v3
+        0x897E_067E, // s_xor_b32 exec_lo, exec_lo, s6
+        0xBF89_FFF8, // s_cbranch_execnz read
+        0xBEFE_0324, // s_mov_b32 exec_lo, s36
+        0x383A_3B1F, // v_or_b32 v29, v31, v29
+        0x7E4C_051C, // write: v_readfirstlane_b32 s38, v28
+        0xD4C2_0006,
+        0x0002_3826, // v_cmp_eq_u32 s6, s38, v28
+        0xBE86_3C06, // s_and_saveexec_b32 s6, s6
+        0xBEFC_0326, // s_mov_b32 m0, s38
+        0x7E06_851D, // v_movreld_b32 v3, v29
+        0x897E_067E, // s_xor_b32 exec_lo, exec_lo, s6
+        0xBF89_FFF8, // s_cbranch_execnz write
+        0xBEFE_0324, // s_mov_b32 exec_lo, s36
+    ];
+    w.extend(pass);
+    w.extend([0x7E3A_02FF, 0x8000_0000]); // v_mov_b32 v29, 0x80000000
+    w.extend(pass);
+    for k in 3..15u32 {
+        // buffer_store_dword vk, v16, s[40:43], 0 offen offset:128 * (k - 3)
+        w.extend([0xE070_1000 | (128 * (k - 3)), 0x800A_0010 | k << 8]);
+    }
+    w.push(0xBF81_0000); // s_endpgm
+    let shader = build(&w).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(12 * 32),
+    ];
+    let want: Vec<u32> = (0..12u32)
+        .flat_map(|k| (0..32u32).map(move |lane| if (lane >> 1).min(11) == k { 1 << lane | 0x8000_0000 } else { 0 }))
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp, "{label}: no pipeline for a wave of 32");
+            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+    }
+}
+
 #[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler
