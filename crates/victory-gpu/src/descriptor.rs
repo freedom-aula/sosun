@@ -12,6 +12,9 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+// Also built for tests, which run where `host` cannot.
+#[cfg(any(windows, test))]
+mod paged;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
