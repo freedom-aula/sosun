@@ -353,7 +353,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            let ranges = t.take(start, start + size);
+            if ranges.is_empty() {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
@@ -361,11 +362,18 @@ impl Staging {
             // double each texture's system memory.
             let mut read = vec![0u8; size];
             crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            // Its pages also hold other data the title writes (64 KiB pages,
-            // small textures): its own bytes decide.
-            let hash = blake3::hash(&read);
-            if last.hash.replace(hash) == Some(hash) {
-                return (size, false);
+            // A changed page that holds only texture bytes says it changed.
+            // Pages it shares with other data the title writes (small
+            // textures): its own bytes decide. (Hashing a movie frame cost
+            // 8 ms a frame.)
+            let page = crate::watch::PAGE;
+            if ranges.iter().any(|&(f, e)| f.next_multiple_of(page) + page <= e) {
+                last.hash = None;
+            } else {
+                let hash = blake3::hash(&read);
+                if last.hash.replace(hash) == Some(hash) {
+                    return (size, false);
+                }
             }
             self.detile(&read);
             #[cfg(feature = "diagnostics")]

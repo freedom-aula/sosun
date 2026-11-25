@@ -2394,6 +2394,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (n, x) = submit(Some(0x80));
         assert_eq!(n, 1, "written: uploaded again");
         assert!((x - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(submit(Some(0x80)).0, 0, "the same bytes in a shared page: not uploaded");
+    }
+
+    /// A texture written in a page that holds only its own bytes is uploaded
+    /// without hashing them (a movie frame rewritten every frame), so even
+    /// the same bytes again are uploaded.
+    #[test]
+    fn a_texture_owning_its_pages_is_uploaded_on_any_write() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, _) = host.shared_buffer(64 * 64 * 16).unwrap();
+        // RGBA8 128x128, linear: one whole 64 KiB page.
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(128, 128, 28, 0x100, 0));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        slots.make(0, &view);
+        let submit = || {
+            // SAFETY: the texture's memory, one page.
+            unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, crate::watch::PAGE) };
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            let before = crate::texture::UPLOADS.load(Ordering::Relaxed);
+            host.execute(&[&list]);
+            crate::texture::UPLOADS.load(Ordering::Relaxed) - before
+        };
+        assert_eq!(submit(), 1);
+        assert_eq!(submit(), 1, "its own page written: uploaded");
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the
