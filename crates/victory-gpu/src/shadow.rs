@@ -812,6 +812,31 @@ pub(crate) fn take_reads() -> Vec<u32> {
     new
 }
 
+/// The heap slots shaders read texture views at since the last call (both
+/// bitmaps), whose marks are cleared: what the title used (eviction stamps,
+/// `crate::resource::evict`). Between submissions, after [`take_reads`]
+/// has seen every mark: its own record of slots seen keeps a slot read
+/// again from being reported as new.
+pub(crate) fn reads_since() -> Vec<u32> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut slots = Vec::new();
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        // SAFETY: the mapped bitmap's read marks; no submission runs.
+        let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut x = std::mem::take(word);
+            while x != 0 {
+                slots.push(w as u32 * 32 + x.trailing_zeros());
+                x &= x - 1;
+            }
+        }
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
 /// Heap slot `slot` now holds a texture view left null: its next read is
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {

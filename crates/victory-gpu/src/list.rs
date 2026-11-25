@@ -326,7 +326,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(crate::host::legal_state(&texture, wanted)),
             })
         }
         1 => Some(Barrier {
@@ -408,8 +408,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
-        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        let state = crate::host::legal_state(&texture, state);
+        let barrier = crate::host::transition(&texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -463,8 +463,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
+            if crate::texture::title_written(&from) {
+                crate::texture::upload(list, src, &from);
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
@@ -472,7 +472,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { list.list.CopyResource(&to, &from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -558,8 +558,8 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
+            if crate::texture::title_written(&texture) {
+                crate::texture::upload(list, src.resource, &texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
@@ -667,8 +667,8 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
         return;
     };
-    if crate::texture::title_written(texture) {
-        crate::texture::upload(list, src.resource, texture);
+    if crate::texture::title_written(&texture) {
+        crate::texture::upload(list, src.resource, &texture);
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
@@ -770,7 +770,7 @@ extern "system" fn resolve(
             let format = DXGI_FORMAT(format as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
-                    .ResolveSubresource(to, dst_sub, from, src_sub, format);
+                    .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -780,11 +780,11 @@ extern "system" fn resolve(
                     bottom: a.Height.min(b.Height) as i32,
                 };
                 list1.ResolveSubresourceRegion(
-                    to,
+                    &to,
                     dst_sub,
                     0,
                     0,
-                    from,
+                    &from,
                     src_sub,
                     Some(&rect),
                     format,
@@ -833,13 +833,13 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(texture, record.desc().as_ref());
+        let rtv = host.rtv(&texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
+                    &texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
@@ -881,7 +881,7 @@ extern "system" fn clear_dsv(
         });
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

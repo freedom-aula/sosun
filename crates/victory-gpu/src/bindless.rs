@@ -154,9 +154,9 @@ fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
+        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -207,7 +207,11 @@ pub(crate) fn uploads(
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
         // Made open.
-        None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
+        None => {
+            let list = crate::host::host()?.new_list().ok()?;
+            list.set_ours();
+            guard.0 = Some(list);
+        }
     }
     let list = guard.0.as_ref()?;
     let mut recorded = false;
@@ -231,10 +235,11 @@ pub(crate) fn uploads(
             if !done.insert(r) {
                 continue;
             }
-            let Some(texture) = crate::resource::host_resource(r as This) else {
+            // Not made (given up, or never read): nothing to bring up.
+            let Some(texture) = crate::resource::made_copy(r as This) else {
                 continue;
             };
-            if crate::texture::upload_changed(list, r as This, texture) {
+            if crate::texture::upload_changed(list, r as This, &texture.texture) {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
                 #[cfg(feature = "diagnostics")]

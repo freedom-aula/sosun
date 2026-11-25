@@ -257,7 +257,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     // SAFETY: an open list; live resources in the states named.
     unsafe {
         for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
+            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
@@ -265,7 +265,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         for i in 0..n {
-            l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

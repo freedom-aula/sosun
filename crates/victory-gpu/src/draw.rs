@@ -337,7 +337,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -345,7 +345,7 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -1319,7 +1319,7 @@ impl State {
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[all]) };
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
-                let read = crate::capture::read_back(&host.device, &list.list, t);
+                let read = crate::capture::read_back(&host.device, &list.list, &t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
@@ -1759,9 +1759,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &t);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
@@ -2398,6 +2398,47 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(n, 1, "written: uploaded again");
         assert!((x - 128.0 / 255.0).abs() < 1e-6);
         assert_eq!(submit(Some(0x80)).0, 0, "the same bytes in a shared page: not uploaded");
+    }
+
+    /// A texture fed from title memory given up (`resource::evict`) while a
+    /// recorded list names it: the list still reads it, and the next use
+    /// makes it again with its bytes from title memory.
+    #[test]
+    fn a_texture_given_up_is_made_again_with_its_bytes_and_recorded_lists_keep_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        let record = || {
+            slots.make(0, &view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            list
+        };
+        // SAFETY: inside the mapped output.
+        let texel = || unsafe { (data as *const [f32; 4]).read() }[0];
+        let list = record();
+        assert!(crate::resource::give_up_now(object), "fed from title memory");
+        assert!(crate::resource::made_copy(object).is_none(), "its title texture let go");
+        host.execute(&[&list]);
+        assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "the recorded list read it");
+        // SAFETY: inside the mapped output.
+        unsafe { std::ptr::write_bytes(data, 0, 16) };
+        let list = record();
+        host.execute(&[&list]);
+        assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "made again with its bytes");
+        assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
     }
 
     /// A texture written in a page that holds only its own bytes is uploaded

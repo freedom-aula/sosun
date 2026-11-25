@@ -778,9 +778,10 @@ struct Resource {
     heap_flags: u32,
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007), made on first use
-    /// ([`Resource::host`]); buffers do not yet.
+    /// ([`Resource::host`]); buffers do not yet. `None`: not made (yet, or
+    /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
@@ -817,6 +818,11 @@ pub(crate) struct HostTexture {
     used: std::sync::atomic::AtomicBool,
     /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
     pub(crate) viewed: std::sync::atomic::AtomicBool,
+    /// The memory it copies, for title textures fed from it.
+    key: Option<MemoryKey>,
+    /// When the title last used it: presented frame and milliseconds since
+    /// the first stamp ([`HostTexture::stamp`]).
+    last: [std::sync::atomic::AtomicU64; 2],
 }
 
 #[cfg(windows)]
@@ -843,7 +849,36 @@ impl HostTexture {
             bytes,
             used: false.into(),
             viewed: false.into(),
+            key: None,
+            last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// The title used it now: a list of the title's names it, or a shader
+    /// read a heap slot viewing it (`crate::descriptor::make_read`).
+    pub(crate) fn stamp(&self) {
+        self.stamp_at(crate::queue::presented(), now_ms());
+    }
+
+    /// Used at presented frame `frame`, `ms` milliseconds in.
+    fn stamp_at(&self, frame: u64, ms: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.last[0].store(frame, Relaxed);
+        self.last[1].store(ms, Relaxed);
+    }
+
+    /// When the title last used it: presented frame and milliseconds
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn last_used(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.last[0].load(Relaxed), self.last[1].load(Relaxed))
+    }
+
+    /// Forgets its uses (tests: a stamp is then seen to happen).
+    #[cfg(test)]
+    pub(crate) fn unstamp(&self) {
+        self.stamp_at(0, 0);
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -1021,15 +1056,24 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
-/// The host GPU's copy of a title resource, if it has one.
+/// The host GPU's copy of a title resource, if it has one (made on first
+/// use). Owned: [`evict`] may give the host texture up meanwhile.
 #[cfg(windows)]
-pub(crate) fn host_resource<'a>(
-    this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+pub(crate) fn host_resource(this: This) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
-    resource(this).host().map(|h| &h.texture)
+    resource(this).host().map(|h| h.texture.clone())
+}
+
+/// A title texture's host copy if it is made, without making it: for work
+/// that is no use of the title's (uploads of what heap slots view).
+#[cfg(windows)]
+pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1038,7 +1082,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host().cloned()
+    resource(this).host()
 }
 
 /// The host description of a title texture: the same, without the
@@ -1184,8 +1228,11 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let mut t = make_texture(&d, state, clear)?;
+    t.key = key;
+    let t = std::sync::Arc::new(t);
     if let Some(k) = key {
+        remade(&k);
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(?k, "a texture memory's host texture replaced by one with more uses or another format");
@@ -1216,13 +1263,14 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(Some(h)), Some(k)) = (r.host.get(), memory_key(r.data() as u64, &r.desc)) else {
+    let made = r.host.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (Some(Some(h)), Some(k)) = (made, memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|m| m.get(&k)?.upgrade())
-        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
+        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
 /// A host texture of host description `d` in GPU memory, castable to
@@ -1361,14 +1409,17 @@ impl Resource {
     /// of the title's textures are never used (decision 0007, "Host
     /// textures made on first use").
     #[cfg(windows)]
-    fn host(&self) -> Option<&std::sync::Arc<HostTexture>> {
-        self.host
-            .get_or_init(|| {
-                let (state, clear) = self.made_with;
-                let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
-                shared_texture(self.data() as u64, &self.desc, state, clear)
-            })
-            .as_ref()
+    fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
+        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return made;
+        }
+        // Made without the lock held (`shared_texture` takes the memory
+        // maps, which `evict` holds while it takes this lock).
+        let (state, clear) = self.made_with;
+        let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
+        let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        // A texture made meanwhile by another thread is the memory's too.
+        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }
 
     fn data(&self) -> *mut u8 {
@@ -1392,6 +1443,221 @@ fn resource<'a>(this: This) -> &'a Resource {
     unsafe { &*this.cast::<Resource>() }
 }
 
+/// A title texture's host texture if it is made.
+#[cfg(windows)]
+fn made(r: &Resource) -> Option<std::sync::Arc<HostTexture>> {
+    r.host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
+}
+
+/// Milliseconds since the first call: host textures' use stamps.
+#[cfg(windows)]
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// A host texture fed from title memory that the title has not used for
+/// this long (and this many presented frames) is given up ([`evict`]).
+/// Two minutes: of the textures given up after 20 s, nine in ten were
+/// read again within a minute (run evict4).
+#[cfg(windows)]
+pub(crate) const IDLE_MS: u64 = 120_000;
+/// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
+/// the textures of a cutscene's alternating shots (run evict2), and 30
+/// frames gave up what the menus and loading made (at 30 fps) before the
+/// world read it (run evict3). At 30 fps the idle time decides; slower, the
+/// card's budget does.
+#[cfg(windows)]
+pub(crate) const IDLE_FRAMES: u64 = 300;
+/// Past this share of the card's memory budget, host textures fed from
+/// title memory are given up least recently used first, until the card's
+/// use is back under [`BUDGET_LOW`].
+#[cfg(windows)]
+const BUDGET_HIGH: f64 = 0.90;
+#[cfg(windows)]
+const BUDGET_LOW: f64 = 0.85;
+/// A texture made again within this many frames of being given up counts
+/// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
+#[cfg(windows)]
+const SOON_FRAMES: u64 = 10;
+
+/// Host textures given up, their bytes, those made again since, and those
+/// made again within [`SOON_FRAMES`].
+#[cfg(windows)]
+pub(crate) static EVICTIONS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Memories whose host texture was given up, with the frame it was.
+#[cfg(windows)]
+static GIVEN_UP: std::sync::Mutex<Option<std::collections::HashMap<MemoryKey, u64>>> = std::sync::Mutex::new(None);
+
+/// A host texture is made for memory `k`: counted if it had been given up.
+#[cfg(windows)]
+fn remade(k: &MemoryKey) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = given.as_mut().and_then(|g| g.remove(k)) {
+        EVICTIONS[2].fetch_add(1, Relaxed);
+        if crate::queue::presented().saturating_sub(at) <= SOON_FRAMES {
+            EVICTIONS[3].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Whether host texture `t` may be given up: its contents come from title
+/// memory alone (no render target, depth or unordered access, no host copy
+/// or resolve wrote it), so a texture made again has them back.
+#[cfg(windows)]
+fn evictable(t: &HostTexture) -> bool {
+    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Once per presented frame, before a submission (`Host::execute`, one at a
+/// time, the last one has run): gives up host textures fed from title memory
+/// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
+/// the card's budget the least recently used ones until [`BUDGET_LOW`].
+#[cfg(windows)]
+pub(crate) fn evict_unused() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, Relaxed) == frame {
+        return;
+    }
+    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+    });
+    evict(frame, now_ms(), over);
+}
+
+/// A host texture and the title textures (resource objects) holding it.
+#[cfg(windows)]
+pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
+
+/// Gives up the host textures fed from title memory that the title has
+/// not used for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms),
+/// then least recently used ones until `over` bytes are gone
+/// ([`give_up`]). Returns how many and their bytes.
+#[cfg(windows)]
+fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+    // Read through the heap since the last pass: used (a slot's read mark is
+    // reported as new only once, so its first read alone stamped it; run
+    // evict1 gave up and made again hundreds of textures a frame).
+    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    evict_among(&candidates(), &read, frame, now, over)
+}
+
+/// [`evict`] among `candidates`, with `read` (raw pointers) the host
+/// textures shaders read through the heap since the last pass.
+#[cfg(windows)]
+pub(crate) fn evict_among(
+    candidates: &[Owned],
+    read: &std::collections::HashSet<usize>,
+    frame: u64,
+    now: u64,
+    over: u64,
+) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (t, _) in candidates {
+        if read.contains(&(windows::core::Interface::as_raw(&t.texture) as usize)) {
+            t.stamp_at(frame, now);
+        }
+    }
+    let uses: Vec<(u64, u64, u64)> =
+        candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
+    let chosen = choose(&uses, frame, now, over);
+    let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
+    give_up(&gone, frame)
+}
+
+/// The host textures that may be given up ([`evictable`]), each with the
+/// title textures holding it.
+#[cfg(windows)]
+fn candidates() -> Vec<Owned> {
+    let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
+    for &r in at.values().flatten() {
+        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
+            by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
+        }
+    }
+    by.into_values().collect()
+}
+
+/// Of textures last used at (frame, ms) taking (bytes) each, those to give
+/// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
+/// [`IDLE_MS`], then the least recently used others until `over` bytes are
+/// gone (indices).
+fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
+    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+    let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
+    let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    rest.sort_by_key(|&i| uses[i].1);
+    for i in rest {
+        if over == 0 {
+            break;
+        }
+        over = over.saturating_sub(uses[i].2);
+        gone.push(i);
+    }
+    gone
+}
+
+/// Gives up host textures `gone` at `frame`: first every heap slot viewing
+/// one gets a null view (made again when a draw or a shader reads it), then
+/// the title textures let go of it. Lists recorded before hold it until
+/// they are reset, so no GPU work reads it freed; the next use makes it
+/// again from title memory.
+/// shortcut: a use racing this (a title thread recording) may view the
+/// texture made again in a list that moved the one given up; the pass
+/// gives up only textures unused for a while, or the least recently used.
+#[cfg(windows)]
+fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if gone.is_empty() {
+        return (0, 0);
+    }
+    {
+        use windows::core::Interface;
+        let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
+        crate::descriptor::evict(&raws);
+    }
+    let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
+    let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
+    let given = given.get_or_insert_with(Default::default);
+    given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
+    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
+    for (t, owners) in gone {
+        for &r in owners.iter().filter(|r| live.contains(r)) {
+            let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
+                *h = None;
+            }
+        }
+        if let Some(k) = t.key {
+            given.insert(k, frame);
+        }
+    }
+    EVICTIONS[0].fetch_add(gone.len() as u64, Relaxed);
+    EVICTIONS[1].fetch_add(bytes, Relaxed);
+    (gone.len() as u64, bytes)
+}
+
+/// Gives up `this`'s host texture as [`evict`] would (tests); false if it
+/// has none or may not be given up.
+#[cfg(all(windows, test))]
+pub(crate) fn give_up_now(this: This) -> bool {
+    owned(this).is_some_and(|o| give_up(&[o], crate::queue::presented()).0 == 1)
+}
+
+/// `this`'s host texture with the title textures holding it, if it may be
+/// given up (tests: [`evict_among`] over textures of their own).
+#[cfg(all(windows, test))]
+pub(crate) fn owned(this: This) -> Option<Owned> {
+    let t = made(resource(this))?;
+    candidates().into_iter().find(|(c, _)| std::sync::Arc::ptr_eq(c, &t))
+}
+
 // The creation methods' own arguments, passed on.
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
@@ -1413,7 +1679,7 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: std::sync::OnceLock::new(),
+        host: std::sync::Mutex::new(None),
         // The clear value names the format too: format, then color or
         // depth and stencil (5 words), kept for when the texture is made.
         #[cfg(windows)]
@@ -1469,7 +1735,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((a.host.get(), b.host.get()), (Some(Some(x)), Some(Some(y))) if !std::sync::Arc::ptr_eq(x, y))
+                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
         })
 }
 
@@ -1477,11 +1743,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 impl Drop for Resource {
     fn drop(&mut self) {
         #[cfg(feature = "diagnostics")]
-        if self
-            .host
-            .get()
-            .and_then(Option::as_ref)
-            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+        if made(self).is_some_and(|h| std::sync::Arc::strong_count(&h) > 2)
         {
             // Before lists held their textures, this freed a texture that
             // lists not yet run still named (a GPU page fault).
@@ -1496,7 +1758,7 @@ impl Drop for Resource {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(Some(h)) = self.host.get() {
+        if let Some(h) = made(self) {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
@@ -2053,7 +2315,7 @@ mod tests {
         };
         let read = place(&texture(64, 64, 28, 1));
         let written = place(&ResourceDesc { flags: UNORDERED, ..texture(64, 64, 28, 1) });
-        assert!(resource(read).host.get().is_none() && resource(written).host.get().is_none(), "made at creation");
+        assert!(made(resource(read)).is_none() && made(resource(written)).is_none(), "made at creation");
         let first = host_copy(read).expect("a host texture");
         // SAFETY: a live resource.
         assert_ne!(unsafe { first.texture.GetDesc() }.Flags.0 as u32 & UNORDERED, 0, "the memory's uses");
@@ -2062,6 +2324,62 @@ mod tests {
             assert_eq!(slot::<Release>(r, 0x10)(r), 0);
         }
         assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Host textures the GPU writes (render target, depth, unordered access)
+    /// are never given up, and the title releasing its texture frees its
+    /// host texture (nothing else holds it); one fed from title memory is
+    /// given up and made again on its next use.
+    #[cfg(windows)]
+    #[test]
+    fn only_textures_fed_from_title_memory_are_given_up() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |offset: u64, desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, offset, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        let read = place(0, &texture(64, 64, 28, 1));
+        let target = place(1 << 18, &ResourceDesc { flags: 1, ..texture(64, 64, 28, 1) });
+        let (r, t) = (host_copy(read).unwrap(), host_copy(target).unwrap());
+        let listed = candidates();
+        assert!(listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &r)), "fed from title memory");
+        assert!(!listed.iter().any(|(c, _)| std::sync::Arc::ptr_eq(c, &t)), "the GPU writes it");
+        let (weak_r, weak_t) = (std::sync::Arc::downgrade(&r), std::sync::Arc::downgrade(&t));
+        drop((listed, r, t));
+        let (r, t) = (weak_r, weak_t);
+        assert!(!give_up_now(target), "never given up");
+        assert!(give_up_now(read));
+        // (Not checked freed: a pass in another test may hold it a moment.)
+        assert!(made(resource(read)).is_none(), "given up");
+        drop(r);
+        assert!(host_copy(read).is_some(), "made again on its next use");
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        assert!(t.upgrade().is_none(), "freed with its title texture");
+        assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
+    }
+
+    /// Textures idle for the idle time and frames are given up; past the
+    /// budget the least recently used others follow until the excess is
+    /// gone.
+    #[test]
+    fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
+        let (frame, now) = (1_000, 1_000_000);
+        let recent = (frame, now - 1_000, 10);
+        let idle = (frame - IDLE_FRAMES, now - IDLE_MS, 10);
+        let older = (frame, now - 5_000, 30);
+        let uses = [recent, idle, older];
+        assert_eq!(choose(&uses, frame, now, 0), vec![1], "idle only");
+        assert_eq!(choose(&uses, frame, now, 10), vec![1], "the idle one covers the excess");
+        assert_eq!(choose(&uses, frame, now, 11), vec![1, 2], "then the least recently used");
+        assert_eq!(choose(&uses, frame, now, 1 << 20), vec![1, 2, 0], "all of them if need be");
+        let early = (frame - 1, now - IDLE_MS, 10);
+        assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }
 
     /// Title textures of one memory share a key in any format of the same
@@ -2488,7 +2806,7 @@ mod tests {
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
             back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
+                &host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
