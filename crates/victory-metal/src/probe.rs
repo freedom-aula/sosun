@@ -257,6 +257,31 @@ pub fn run() {
         }
     }
 
+    // Does a command buffer that names a huge buffer pay for it (page wiring)? First use vs later.
+    println!("\n[4b] cost of a dispatch that binds a big buffer (first, second, third use)");
+    for (gib, touch) in [(4usize, true), (8, true), (16, false)] {
+        let len = gib << 30;
+        let r = Region::new(len, None).unwrap();
+        if touch {
+            // SAFETY: the mapping is `len` bytes.
+            unsafe { libc::memset(r.ptr.cast(), 1, len) };
+        }
+        let big = wrap(&dev, r.ptr, len).unwrap();
+        let mut us = Vec::new();
+        for _ in 0..3 {
+            let t = Instant::now();
+            dispatch(&q, &nop, 64, |e| bind(e, Some(&big), 0, 0));
+            us.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        println!(
+            "  {gib:>2} GiB {}: {:.0} / {:.0} / {:.0} us",
+            if touch { "touched  " } else { "untouched" },
+            us[0],
+            us[1],
+            us[2]
+        );
+    }
+
     // ---- latency ----
     println!(
         "\n[5] submit -> complete latency (commit + waitUntilCompleted), Wine/D3D12 baseline ~5000-8000 us"
