@@ -85,6 +85,9 @@ pub(crate) struct Tracked {
     start: usize,
     end: usize,
     changed: Arc<Changed>,
+    /// Parts of the range on pages that are not the runtime's memory (in
+    /// order): not tracked, copied whole at each use ([`Tracked::untracked`]).
+    untracked: Vec<(usize, usize)>,
 }
 
 struct Guards {
@@ -209,46 +212,87 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// written through other views showing the same pages: the title fills
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
+///
+/// Only the pages of the range that are such memory are tracked; the rest is
+/// never guarded and is copied whole at each use, as memory with no tracker.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    if len == 0 || !runtime_memory(start, views) {
+    if len == 0 {
+        return None;
+    }
+    let end = start + len;
+    let pages = runtime_pages(start, end, views);
+    if pages.is_empty() {
         return None;
     }
     install();
-    let end = start + len;
-    let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default(), AtomicBool::new(true)));
+    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), AtomicBool::new(true)));
     let mut g = guards();
-    for page in pages {
+    for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
+    }
+    // The rest of the range, as byte runs.
+    let mut untracked: Vec<(usize, usize)> = Vec::new();
+    let mut at = start;
+    for &page in pages.iter().chain([&usize::MAX]) {
+        let (a, b) = ((page.saturating_mul(PAGE)).max(start).min(end), (page.saturating_add(1).saturating_mul(PAGE)).min(end));
+        if at < a {
+            untracked.push((at, a));
+        }
+        at = at.max(b);
     }
     Some(Tracked {
         start,
         end,
         changed,
+        untracked,
     })
 }
 
-/// Whether memory at `at` is the runtime's GPU memory: a write-watched
-/// pool, or (with `views`) a view or a placeholder (anything but plain
-/// committed memory).
-fn runtime_memory(at: usize, views: bool) -> bool {
+/// The pages of `[start, end)` that are the runtime's GPU memory: a
+/// write-watched pool, or (with `views`) anything but plain committed memory
+/// and images (views, placeholders, nothing mapped yet). Decided for every
+/// region the range covers, and a page touching any other memory is left
+/// out: a range can run past its allocation (a 4 MiB window of memory
+/// outside buffers, `crate::shadow`), and when the first page alone decided,
+/// a window starting in free memory had the process heap's pages after it
+/// guarded; the heap's own code then faulted while holding its lock, and the
+/// guard handler waited for the guard lock, whose holder waited for the heap
+/// lock (the crate's tests hung).
+///
+/// shortcut: memory free or reserved when the range is tracked counts as the
+/// runtime's; another allocator committing it before the first take would
+/// have it guarded.
+fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
-    let page = at & !(4096 - 1);
-    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
-    // SAFETY: room for one answer; no reset, so nothing changes.
-    let watched = unsafe {
-        GetWriteWatch(0, page as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity)
-    } == 0;
-    if watched || !views {
-        return watched;
+    let watched = |at: usize, len: usize| {
+        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: room for one answer; no reset, so nothing changes.
+        unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+    };
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // One pool holds it all (the common case; asking `VirtualQuery` costs
+    // milliseconds in the runtime's big pools).
+    if watched(start & !(4096 - 1), end - (start & !(4096 - 1))) {
+        return (first..last).collect();
     }
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
+    let (mut runtime, mut other) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    let mut at = start & !(4096 - 1);
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
+        let ours = watched(at, next - at)
+            || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+        (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
+        at = next;
+    }
+    runtime.difference(&other).copied().collect()
 }
 
 impl Drop for Tracked {
@@ -371,7 +415,17 @@ impl Tracked {
     /// finds nothing, and asking costs no lock. A write racing this answer
     /// is found by the next asking, as one racing a take.
     pub(crate) fn clean(&self) -> bool {
-        !self.changed.2.load(Ordering::Acquire)
+        self.untracked.is_empty() && !self.changed.2.load(Ordering::Acquire)
+    }
+
+    /// The parts of `[from, to)` that are not tracked (see
+    /// [`Tracked::untracked`] field): to be copied whole at each use.
+    pub(crate) fn untracked(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        self.untracked
+            .iter()
+            .map(|&(a, b)| (a.max(from), b.min(to)))
+            .filter(|&(a, b)| a < b)
+            .collect()
     }
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
@@ -727,6 +781,54 @@ pub(crate) mod tests {
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
         free(p);
+    }
+
+    /// A range running from free memory over another allocation into a pool
+    /// (a 4 MiB window of memory outside buffers) tracks the pool's pages
+    /// and leaves the other allocation alone: taking guards the pool only.
+    #[test]
+    fn a_range_over_foreign_memory_guards_only_the_runtimes() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        const WINDOW: usize = 4 << 20;
+        // In a free 4 MiB-aligned window: plain committed memory (as the
+        // process heap's) 1 MiB in, a pool 2 MiB in. Other tests allocate
+        // meanwhile, so a window taken under our feet is tried again.
+        let (base, foreign, pool) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations in the window it left free, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * WINDOW, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let base = p.next_multiple_of(WINDOW);
+                    let at = |offset: usize, kind: u32| {
+                        VirtualAlloc((base + offset) as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (foreign, pool) = (at(1 << 20, 0), at(2 << 20, MEM_WRITE_WATCH));
+                    if p != 0 && foreign == base + (1 << 20) && pool == base + (2 << 20) {
+                        return Some((base, foreign, pool));
+                    }
+                    [foreign, pool].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("a free window");
+        let t = track(base, WINDOW, true).expect("the pool is tracked");
+        let taken = t.take(base, base + WINDOW);
+        assert!(taken.iter().any(|&(a, b)| a <= pool && pool + PAGE <= b), "{taken:x?}");
+        assert!(!taken.iter().any(|&(a, b)| a < foreign + PAGE && foreign < b), "{taken:x?}");
+        let protection = |p: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
+        assert_eq!(protection(foreign), PAGE_READWRITE, "the other allocation is not");
+        drop(t);
+        free(foreign);
+        free(pool);
     }
 
     /// A page only partly in the range asked is copied in part and stays

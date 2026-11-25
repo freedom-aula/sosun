@@ -576,7 +576,19 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
-            let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            // Parts on memory that is not the runtime's: whole, as below.
+            for (a, b) in t.untracked(from, to) {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                copied += self.copy(a, b);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::WholeBytes, (b - a) as u64);
+                    add(C::WholeUs, started.elapsed().as_micros() as u64);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1064,6 +1076,70 @@ mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    /// A title buffer over a pool and, after it, a plain allocation (memory
+    /// that is not the runtime's): the pool is tracked and guarded; the
+    /// plain allocation's bytes are copied at each use and never guarded,
+    /// so a value the title keeps there reaches the copy, and again after
+    /// the title changes it.
+    #[test]
+    fn bytes_off_the_runtimes_memory_are_copied_at_each_use() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        // A pool page and a plain one right after it, in two pages found free
+        // (other tests allocate meanwhile: tried again if taken).
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // allocations where it was, freed below.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(q as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return; // no host GPU here
+        };
+        let word = (plain + 64) as *mut u32;
+        let protection = |p: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        // SAFETY: a word of our plain allocation.
+        unsafe { word.write_volatile(0x1234) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x1234]);
+        assert!(!copy.clean(), "never clean: part of it is not tracked");
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0x5678) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
+        assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
+        assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        unregister(pool, pool as u64);
+        // The pages stay allocated (as the other tests' pools): a copy some
+        // page table still holds must not name memory reused meanwhile.
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
