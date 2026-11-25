@@ -160,12 +160,18 @@ impl Drop for Changed {
 struct Saved {
     armed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    /// Digests of the copy's bytes of pages equal to title memory, given
+    /// after they were taken ([`Tracked::digested`]).
+    digests: std::collections::HashMap<usize, u64>,
 }
 
 impl Changed {
-    /// Page `page` was taken: what it saved of it is stale.
+    /// Page `page` was taken: what it saved of it is stale, and so is its
+    /// digest.
     fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.bytes.remove(&page);
+        saved.digests.remove(&page);
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -682,6 +688,20 @@ impl Tracked {
     /// since it was taken, if it was armed then (and so changed).
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    }
+
+    /// The caller's copy of pages (page numbers) it just took equals title
+    /// memory, and has these digests: kept until a page is taken again.
+    /// While the page has not changed since, title memory still holds the
+    /// bytes of the digest ([`Tracked::digest`]).
+    pub(crate) fn digested(&self, pages: &[(usize, u64)]) {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).digests.extend(pages.iter().copied());
+    }
+
+    /// The digest [`Tracked::digested`] gave page `page`, if it was not
+    /// taken since.
+    pub(crate) fn digest(&self, page: usize) -> Option<u64> {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).digests.get(&page).copied()
     }
 }
 

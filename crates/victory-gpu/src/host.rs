@@ -169,6 +169,13 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Holds off submissions (tests): no other test's copy-back takes the
+/// write marks meanwhile.
+#[cfg(test)]
+pub(crate) fn hold_submissions() -> Option<std::sync::MutexGuard<'static, u64>> {
+    host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
