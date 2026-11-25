@@ -58,6 +58,9 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     read: Vec<u8>,
+    /// `read` holds the memory last detiled (untracked memory): not before
+    /// the first read, nor after a read that failed part way.
+    valid: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -315,25 +318,34 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        if !committed(self.memory, size) {
+        // Compared with the bytes last detiled, which tracked memory keeps
+        // as well. Hashing them instead ran at 0.45 GB/s under Wine on
+        // Rosetta (blake3's AVX2 code, emulated), where no memory is
+        // tracked: 30-250 ms per frame; the comparison runs at memory speed.
+        // Read through the kernel, which refuses an unmapped page (streamed
+        // textures may be unmapped until their pages arrive) instead of
+        // faulting: asking `VirtualQuery` first cost about 2 ms in the
+        // title's big pools (see `crate::host::copy_mapped`).
+        let memory = self.memory;
+        let changed = SCRATCH.with_borrow_mut(|scratch| {
+            scratch.resize(COMPARE_CHUNK, 0);
+            read_changed(last, size, scratch, |at, to| {
+                crate::host::read_into(memory.wrapping_add(at), to)
+            })
+        });
+        let Some(changed) = changed else {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
                 size,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
+                "a sampled texture's memory is not readable"
             );
             return (0, false);
-        }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        // Compared with the bytes last detiled, which tracked memory keeps
-        // as well. Hashing them instead ran at 0.45 GB/s under Wine on
-        // Rosetta (blake3's AVX2 code, emulated), where no memory is
-        // tracked: 30-250 ms per frame; the comparison runs at memory speed.
+        };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if !take_changed(&mut last.read, tiled) {
+        if !changed {
             return (size, false);
         }
         self.detile(&last.read);
@@ -374,15 +386,57 @@ impl Staging {
     }
 }
 
-/// Whether `memory` differs from `last`, the bytes last detiled, which then
-/// take its bytes.
-fn take_changed(last: &mut Vec<u8>, memory: &[u8]) -> bool {
-    if last[..] == *memory {
-        return false;
+/// Bytes of title memory read at a time to compare it: small enough to stay
+/// in the cache between the read and the comparison, large enough that a
+/// texture takes few kernel calls.
+const COMPARE_CHUNK: usize = 1 << 20;
+
+thread_local! {
+    /// Where [`read_changed`] reads a chunk (`COMPARE_CHUNK` bytes).
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads the `size` bytes of title memory behind `read` (`read(at, to)` fills
+/// `to` with the bytes from `at` on, false if a page of them is not
+/// readable) into `last.read`, the bytes last detiled, if they differ from
+/// them: whether they did, or none if a page was not readable (the texture
+/// then keeps what it was last given).
+///
+/// The memory is read a `scratch` at a time and compared with `last.read`
+/// there, so memory that did not change is read once, as comparing it alone
+/// reads it, and not copied; from the first chunk that differs, the rest is
+/// read straight into `last.read`. A read that fails after that leaves
+/// `last.read` half new: it stays invalid until all of the memory has been
+/// read, which then counts as a change however the bytes compare.
+fn read_changed(
+    last: &mut Last,
+    size: usize,
+    scratch: &mut [u8],
+    read: impl Fn(usize, &mut [u8]) -> bool,
+) -> Option<bool> {
+    last.read.resize(size, 0);
+    let mut at = 0;
+    while last.valid && at < size {
+        let n = scratch.len().min(size - at);
+        let chunk = &mut scratch[..n];
+        if !read(at, chunk) {
+            return None;
+        }
+        let kept = &mut last.read[at..at + n];
+        at += n;
+        if *kept != *chunk {
+            kept.copy_from_slice(chunk);
+            last.valid = false;
+        }
     }
-    last.clear();
-    last.extend_from_slice(memory);
-    true
+    if last.valid {
+        return Some(false);
+    }
+    if at < size && !read(at, &mut last.read[at..]) {
+        return None;
+    }
+    last.valid = true;
+    Some(true)
 }
 
 /// Bytes available in the staging buffer for a subresource at `offset`.
@@ -509,16 +563,118 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
     }
 
+    /// `read_changed` over `memory` in chunks of 1000 bytes, the bytes from
+    /// `hole` on unreadable (a read of them copies what comes before it and
+    /// fails, as the kernel's does): its answer, and the bytes read.
+    fn changed(last: &mut Last, memory: &[u8], hole: usize) -> (Option<bool>, usize) {
+        let read_bytes = std::cell::Cell::new(0);
+        let answer = read_changed(last, memory.len(), &mut [0u8; 1000], |at, to| {
+            let n = hole.saturating_sub(at).min(to.len());
+            to[..n].copy_from_slice(&memory[at..at + n]);
+            read_bytes.set(read_bytes.get() + n);
+            n == to.len()
+        });
+        (answer, read_bytes.get())
+    }
+
     #[test]
     fn untracked_memory_reads_as_changed_once_per_change() {
-        let mut last = Vec::new();
-        let mut memory = vec![1u8; 4096];
-        assert!(take_changed(&mut last, &memory), "never detiled");
-        assert!(!take_changed(&mut last, &memory));
-        memory[4095] = 2;
-        assert!(take_changed(&mut last, &memory));
-        assert_eq!(last, memory);
-        assert!(!take_changed(&mut last, &memory));
+        let mut last = Last::default();
+        let mut memory: Vec<u8> = (0..4500).map(|i| i as u8).collect();
+        let all = usize::MAX;
+        assert_eq!(
+            changed(&mut last, &memory, all),
+            (Some(true), 4500),
+            "never detiled"
+        );
+        assert_eq!(last.read, memory);
+        // Read once either way, whether or not it changed and wherever: first
+        // chunk, last byte of one, first of the next, middle, tail.
+        assert_eq!(changed(&mut last, &memory, all), (Some(false), 4500));
+        for at in [0, 999, 1000, 2500, 4499] {
+            memory[at] ^= 0xff;
+            assert_eq!(
+                changed(&mut last, &memory, all),
+                (Some(true), 4500),
+                "at {at}"
+            );
+            assert_eq!(last.read, memory);
+            assert_eq!(changed(&mut last, &memory, all), (Some(false), 4500));
+        }
+    }
+
+    #[test]
+    fn a_page_that_cannot_be_read_keeps_the_last_bytes_unless_it_overwrote_them() {
+        let mut last = Last::default();
+        let mut memory = vec![7u8; 4500];
+        // Never read: nothing to keep, and nothing detiled.
+        assert_eq!(changed(&mut last, &memory, 3000).0, None);
+        assert!(!last.valid);
+        assert_eq!(changed(&mut last, &memory, 4500).0, Some(true));
+        // Unchanged up to the page: what was detiled is still there.
+        assert_eq!(changed(&mut last, &memory, 3000).0, None);
+        assert!(last.valid);
+        assert_eq!(last.read, memory);
+        // Changed before the page: `last.read` is half new, and not trusted.
+        memory[10] = 8;
+        assert_eq!(changed(&mut last, &memory, 3000).0, None);
+        assert!(!last.valid);
+        // Readable again, the memory as it was then: detiled whatever the
+        // bytes of `last.read` say, and once.
+        assert_eq!(changed(&mut last, &memory, 4500), (Some(true), 4500));
+        assert_eq!(last.read, memory);
+        assert_eq!(changed(&mut last, &memory, 4500).0, Some(false));
+    }
+
+    #[test]
+    fn kernel_reads_refuse_the_pages_committed_refuses() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const PAGE: usize = 4096;
+        // SAFETY: reserving and committing three private pages for the test,
+        // freed below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!base.is_null());
+        // SAFETY: the three pages are ours.
+        unsafe { base.write_bytes(7, 3 * PAGE) };
+        let protect = |protection| {
+            let mut old = 0;
+            // SAFETY: the middle page of the allocation above.
+            let done = unsafe { VirtualProtect(base.add(PAGE).cast(), PAGE, protection, &mut old) };
+            assert_ne!(done, 0);
+        };
+        let read = |at, to: &mut [u8]| crate::host::read_into(base.wrapping_add(at), to);
+        let mut last = Last::default();
+        let mut scratch = [0u8; PAGE];
+        protect(PAGE_NOACCESS);
+        assert!(!committed(base, 3 * PAGE));
+        assert_eq!(read_changed(&mut last, 3 * PAGE, &mut scratch, read), None);
+        protect(PAGE_READWRITE);
+        assert!(committed(base, 3 * PAGE));
+        assert_eq!(
+            read_changed(&mut last, 3 * PAGE, &mut scratch, read),
+            Some(true)
+        );
+        assert_eq!(
+            read_changed(&mut last, 3 * PAGE, &mut scratch, read),
+            Some(false)
+        );
+        // Out of reach again: unchanged as far as can be told.
+        protect(PAGE_NOACCESS);
+        assert_eq!(read_changed(&mut last, 3 * PAGE, &mut scratch, read), None);
+        assert!(last.valid);
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]
