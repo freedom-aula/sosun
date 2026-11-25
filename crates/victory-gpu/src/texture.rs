@@ -53,21 +53,18 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// (memory not tracked).
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
-    read: Vec<u8>,
 }
 
-/// Bytes of live staging buffers and of title memory read for them (the
-/// fps line's companion).
+/// Bytes of live staging buffers (the fps line's companion).
 pub(crate) static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        let read = self.last.get_mut().map_or(0, |l| l.read.capacity()) as u64;
-        STAGING_BYTES.fetch_sub(self.size + read, std::sync::atomic::Ordering::Relaxed);
+        STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -331,12 +328,11 @@ impl Staging {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            let had = last.read.capacity();
-            last.read.resize(size, 0);
-            STAGING_BYTES.fetch_add((last.read.capacity() - had) as u64, std::sync::atomic::Ordering::Relaxed);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            // big pools is too slow to ask page by page. Not kept: it would
+            // double each texture's system memory.
+            let mut read = vec![0u8; size];
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
