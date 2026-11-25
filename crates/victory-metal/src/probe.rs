@@ -23,7 +23,7 @@ kernel void nop(device uint* o [[buffer(0)]], uint i [[thread_position_in_grid]]
 "#;
 
 /// Wraps `ptr..ptr+len` without copying. `None` if Metal refuses (alignment, size).
-fn wrap(dev: &Dev, ptr: *mut u8, len: usize) -> Option<Buf> {
+pub fn wrap(dev: &Dev, ptr: *mut u8, len: usize) -> Option<Buf> {
     let p = NonNull::new(ptr.cast())?;
     // SAFETY: the caller keeps the memory mapped for the buffer's lifetime (no deallocator).
     unsafe {
@@ -36,7 +36,12 @@ fn wrap(dev: &Dev, ptr: *mut u8, len: usize) -> Option<Buf> {
     }
 }
 
-fn bind(e: &ProtocolObject<dyn MTLComputeCommandEncoder>, b: Option<&Buf>, off: usize, idx: usize) {
+pub fn bind(
+    e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    b: Option<&Buf>,
+    off: usize,
+    idx: usize,
+) {
     // SAFETY: offset is inside the buffer in every use here.
     unsafe { e.setBuffer_offset_atIndex(b.map(|b| &**b), off, idx) }
 }
@@ -201,9 +206,9 @@ pub fn run() {
         unsafe { w.write_volatile(100) };
         dispatch(&q, &nop, 64, |e| bind(e, Some(&b), 0, 0));
         // SAFETY: as above.
+        let v = unsafe { w.read_volatile() };
         println!(
-            "  unaligned (+16) buffer: CPU wrote 100, GPU did +=1, CPU reads {} (101 = same memory)",
-            unsafe { w.read_volatile() }
+            "  unaligned (+16) buffer: CPU wrote 100, GPU did +=1, CPU reads {v} (101 = same memory)"
         );
     }
 
