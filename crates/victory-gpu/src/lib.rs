@@ -21,7 +21,6 @@ mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
-mod clamp_bytecode;
 #[cfg(windows)]
 mod compute;
 pub mod console;
@@ -31,10 +30,6 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
-#[cfg(windows)]
-mod fxc;
-#[cfg(windows)]
-mod fxc_bytecode;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
@@ -62,6 +57,9 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod switch;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
