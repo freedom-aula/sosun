@@ -52,9 +52,10 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the memory last detiled (memory
-/// not tracked, compared to tell a change), or room to read tracked memory
-/// into.
+/// What a texture's staging buffer holds: the memory last detiled, of memory
+/// not tracked (compared to tell a change). Tracked memory tells from its
+/// pages that it changed, and keeps nothing (`read` stays empty): it is read
+/// into [`TRACKED_COPY`] to be detiled.
 #[derive(Default)]
 struct Last {
     read: Vec<u8>,
@@ -315,16 +316,25 @@ impl Staging {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            // big pools is too slow to ask page by page. Detiled from a copy
+            // no title write can change halfway through, which nothing reads
+            // after: one scratch for every texture of the thread, not one
+            // kept for each.
+            debug_assert!(last.read.is_empty(), "tracked memory keeps no copy");
+            TRACKED_COPY.with_borrow_mut(|copy| {
+                if copy.len() < size {
+                    copy.resize(size, 0);
+                }
+                let tiled = &mut copy[..size];
+                crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+                self.detile(tiled);
+            });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        // Compared with the bytes last detiled, which tracked memory keeps
-        // as well. Hashing them instead ran at 0.45 GB/s under Wine on
+        // Compared with the bytes last detiled, which tracked memory does
+        // not keep. Hashing them instead ran at 0.45 GB/s under Wine on
         // Rosetta (blake3's AVX2 code, emulated), where no memory is
         // tracked: 30-250 ms per frame; the comparison runs at memory speed.
         // Read through the kernel, which refuses an unmapped page (streamed
@@ -399,6 +409,9 @@ const COMPARE_CHUNK: usize = 1 << 20;
 thread_local! {
     /// Where [`read_changed`] reads a chunk (`COMPARE_CHUNK` bytes).
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Where a refresh of tracked memory copies a texture's bytes to detile
+    /// them: as long as the largest it has refreshed on this thread.
+    static TRACKED_COPY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Reads the `size` bytes of title memory behind `read` (`read(at, to)` fills
