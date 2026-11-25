@@ -190,8 +190,8 @@ parse_counts() { # LOG
         END { if (n) print p + 0, f + 0, g + 0 }' "$1"
 }
 
-counts_json() { # LOG -> {"passed":..,"failed":..,"ignored":..} or null
-    local c
+counts_json() { # LOG [EXIT STATUS] -> {passed, failed, ignored} or null
+    local c status=${2:-0}
     c=$(parse_counts "$1")
     if [ -z "$c" ]; then
         echo null
@@ -199,6 +199,12 @@ counts_json() { # LOG -> {"passed":..,"failed":..,"ignored":..} or null
     fi
     # shellcheck disable=SC2086 # three numbers
     set -- $c
+    # Passing binaries do not prove the suite finished: a later build or runner
+    # can fail. Keep counted test failures, but mark other unsuccessful runs null.
+    if [ "$status" -ne 0 ] && [ "$2" -eq 0 ]; then
+        echo null
+        return
+    fi
     jq -cn --argjson p "$1" --argjson f "$2" --argjson i "$3" '{passed: $p, failed: $f, ignored: $i}'
 }
 
