@@ -232,51 +232,105 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Logs what the title presents whenever it changes: the number of planes
-/// and each resource of the first (its size and host format), since only
-/// the first resource is shown (#15: a title texture presented black while
-/// a larger render target held the picture). Planes after the first are
-/// not read, because only the start of a plane description is known.
+/// Every plane's resources. Only the start of a plane description is
+/// known (token, count, resources), so the planes after the first are
+/// found by their stride: the first offset past the first plane where the
+/// same frame token is followed by a count of 1 to 16 and a list whose
+/// first entry is one of our resources. All reads there are checked.
 #[cfg(windows)]
-fn log_planes(frame: u64, planes: u32, plane: *const Plane) {
+fn plane_resources(planes: u32, plane: *const Plane) -> Vec<Vec<This>> {
+    let read_u64 = |at: usize| {
+        let mut b = [0u8; 8];
+        crate::host::read_into(at as *const u8, &mut b).then(|| u64::from_le_bytes(b))
+    };
+    let list = |at: usize| -> Option<Vec<This>> {
+        let count = read_u64(at + 8)? as u32;
+        let resources = read_u64(at + 16)? as usize;
+        if !(1..=16).contains(&count) || resources == 0 {
+            return None;
+        }
+        let all: Option<Vec<This>> = (0..count as usize)
+            .map(|i| read_u64(resources + 8 * i).map(|r| r as This))
+            .collect();
+        all.filter(|r| r.iter().all(|&r| crate::resource::is_resource(r)))
+    };
+    let base = plane as usize;
+    if planes == 0 || base == 0 {
+        return Vec::new();
+    }
+    let Some(first) = list(base) else {
+        return Vec::new();
+    };
+    let mut all = vec![first];
+    if planes > 1
+        && let Some(token) = read_u64(base)
+        && let Some(stride) = (24..=256)
+            .step_by(8)
+            .find(|&o| read_u64(base + o) == Some(token) && list(base + o).is_some())
+    {
+        for k in 1..planes.min(4) as usize {
+            match list(base + k * stride) {
+                Some(r) => all.push(r),
+                None => break,
+            }
+        }
+    }
+    all
+}
+
+/// Logs what the title presents whenever it changes: each plane's
+/// resources as (width, height, host format) (#15: the first plane held a
+/// black 1920x1080 texture while a larger render target held the picture).
+#[cfg(windows)]
+fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
     use std::sync::Mutex;
     /// A resource's width, height and host format.
     type Shown = (u64, u32, i32);
-    static LAST: Mutex<Option<(u32, Vec<Shown>)>> = Mutex::new(None);
-    if planes == 0 {
-        return;
-    }
-    // SAFETY: the title passes `planes` plane descriptions.
-    let Some(first) = (unsafe { plane.as_ref() }) else {
-        return;
-    };
-    let count = if first.resources.is_null() { 0 } else { first.count.min(16) };
-    let resources: Vec<Shown> = (0..count as usize)
-        .map(|i| {
-            // SAFETY: the plane lists `count` resources.
-            let r = unsafe { *first.resources.add(i) };
-            crate::resource::host_resource(r).map_or((0, 0, -1), |t| {
-                // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                (d.Width, d.Height, d.Format.0)
-            })
+    static LAST: Mutex<Option<(u32, Vec<Vec<Shown>>)>> = Mutex::new(None);
+    let sizes: Vec<Vec<Shown>> = found
+        .iter()
+        .map(|plane| {
+            plane
+                .iter()
+                .map(|&r| {
+                    crate::resource::host_resource(r).map_or((0, 0, -1), |t| {
+                        // SAFETY: a live resource.
+                        let d = unsafe { t.GetDesc() };
+                        (d.Width, d.Height, d.Format.0)
+                    })
+                })
+                .collect()
         })
         .collect();
-    let now = Some((planes, resources));
+    let now = Some((planes, sizes));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if *last != now {
-        let (planes, resources) = now.as_ref().expect("just set");
+        let (planes, sizes) = now.as_ref().expect("just set");
         tracing::info!(
             frame,
             planes,
-            resources = ?resources,
-            "presented planes: the first plane's resources as (width, height, format), the first one shown"
+            found = sizes.len(),
+            shown,
+            resources = ?sizes,
+            "presented planes: each plane's resources as (width, height, format); the first resource of plane `shown` is shown"
         );
         *last = now;
     }
 }
 
-/// Shows the first plane's first resource in our window.
+/// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
+/// (counted from 0) when that plane was found, else the first.
+#[cfg(windows)]
+fn shown_plane(found: usize) -> usize {
+    static PLANE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let want = *PLANE.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if want < found { want } else { 0 }
+}
+
+/// Shows the first resource of one plane in our window (the first plane
+/// unless `VICTORY_PRESENT_PLANE` picks another).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -323,15 +377,13 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
-    log_planes(frame, planes, plane_parameters);
+    let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
-    if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+    let shown = shown_plane(found.len());
+    #[cfg(windows)]
+    log_planes(frame, planes, &found, shown);
+    #[cfg(windows)]
+    if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -516,6 +568,40 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Two planes 64 bytes apart (as a longer plane description would
+    /// place them), each listing one of our textures, are both found; a
+    /// list naming something else is not taken for a plane.
+    #[cfg(windows)]
+    #[test]
+    fn planes_after_the_first_are_found_by_their_stride() {
+        let texture = || {
+            let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+            // SAFETY: a non-zero size; leaked, as title memory outlives a test.
+            let address = unsafe { std::alloc::alloc_zeroed(layout) } as u64;
+            let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x105, 0, 0];
+            let iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+            let mut out = std::ptr::null();
+            let made = crate::resource::create_at_address(std::ptr::null(), address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut out);
+            assert_eq!(made, S_OK);
+            out
+        };
+        let (a, b) = (texture(), texture());
+        let (list_a, list_b) = (Box::new([a]), Box::new([b]));
+        let mut planes = [0u64; 16];
+        planes[0] = 7;
+        planes[1] = 1;
+        planes[2] = list_a.as_ptr() as u64;
+        planes[8] = 7;
+        planes[9] = 1;
+        planes[10] = list_b.as_ptr() as u64;
+        let found = plane_resources(2, planes.as_ptr().cast());
+        assert_eq!(found, vec![vec![a], vec![b]]);
+        // The second plane names a list of something that is not ours.
+        let bogus = Box::new([planes.as_ptr() as This]);
+        planes[10] = bogus.as_ptr() as u64;
+        assert_eq!(plane_resources(2, planes.as_ptr().cast()), vec![vec![a]]);
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
