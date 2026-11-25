@@ -163,9 +163,39 @@ pub(crate) fn note_use(pipeline: &str) {
     stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
 }
 
+/// Frames presented, and the last one in which a list using title memory
+/// read or wrote memory with no copy ([`MISS_NEVER`] if none has).
+static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MISSED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MISS_NEVER);
+const MISS_NEVER: u64 = u64::MAX;
+
+/// A list using title memory read or wrote memory with no copy.
+pub(crate) fn note_missed() {
+    use std::sync::atomic::Ordering::Relaxed;
+    MISSED_IN.store(FRAMES.load(Relaxed), Relaxed);
+}
+
+/// Whether what lists using title memory wrote stays out of title memory
+/// (in the host copies, for the GPU): some such list missed memory this
+/// frame or the one before. A list that missed computed from zeros, and
+/// the lists after it compute from its results in the host copies, the
+/// BVH builder's write addresses among them, so withholding only the lists
+/// that missed broke the title's own data (run drops1: an AABB's +inf/-inf
+/// in a pointer the title followed). The frame before counts too: its
+/// lists' results are read in this one, before this frame's first miss.
+pub(crate) fn withholding() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    withheld_in(FRAMES.load(Relaxed), MISSED_IN.load(Relaxed))
+}
+
+fn withheld_in(frame: u64, missed: u64) -> bool {
+    missed != MISS_NEVER && frame <= missed.saturating_add(1)
+}
+
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
+    FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -440,10 +470,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
-        // the title's own data (garbage pointers in title threads, run c1).
-        // shortcut: root UAV writes of such a list still go back (their
-        // bytes, `Shadow::gpu_writes`).
-        let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        // the title's own data (garbage pointers in title threads, run c1),
+        // nor while any list using title memory misses ([`withholding`]).
+        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
@@ -474,6 +503,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes of lists using title memory are held back from a frame with a
+    /// miss through the next one, then go back again.
+    #[test]
+    fn a_miss_holds_back_its_frame_and_the_next() {
+        assert!(!withheld_in(0, MISS_NEVER));
+        assert!(!withheld_in(u64::MAX, MISS_NEVER));
+        assert!(withheld_in(7, 7));
+        assert!(withheld_in(8, 7), "the next frame reads this one's results");
+        assert!(!withheld_in(9, 7));
+    }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.
