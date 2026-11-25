@@ -417,24 +417,3 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         q
     }
 }
-
-/// Bytes committed in every heap of the process (ours and the title's C
-/// runtime share the process heap).
-pub(crate) fn heaps_committed() -> u64 {
-    use windows_sys::Win32::System::Memory::{GetProcessHeaps, HEAP_SUMMARY, HeapSummary};
-    let mut heaps = vec![std::ptr::null_mut(); 256];
-    // SAFETY: a buffer of that many handles.
-    let n = unsafe { GetProcessHeaps(heaps.len() as u32, heaps.as_mut_ptr()) } as usize;
-    heaps.truncate(n.min(heaps.len()));
-    heaps
-        .iter()
-        .map(|&h| {
-            let mut s = HEAP_SUMMARY {
-                cb: size_of::<HEAP_SUMMARY>() as u32,
-                ..Default::default()
-            };
-            // SAFETY: a live heap handle and a sized structure.
-            if unsafe { HeapSummary(h, 0, &mut s) } != 0 { s.cbCommitted as u64 } else { 0 }
-        })
-        .sum()
-}

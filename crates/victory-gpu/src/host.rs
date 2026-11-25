@@ -2543,10 +2543,9 @@ impl Meter {
                     tracing::info!(
                         "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
                          {system:.0} MB of {system_budget:.0} MB in system memory; process commit {:.0} MB, \
-                         working set {:.0} MB; process heaps {:.0} MB (Rust {:.0} MB); texture staging {:.0} MB;                          placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB",
+                         working set {:.0} MB; Rust heap {:.0} MB; texture staging {:.0} MB;                          placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB",
                         commit as f64 / 1e6,
                         working_set as f64 / 1e6,
-                        crate::copystat::heaps_committed() as f64 / 1e6,
                         crate::copystat::HEAP_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                         crate::texture::STAGING_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                         crate::resource::PLACED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
