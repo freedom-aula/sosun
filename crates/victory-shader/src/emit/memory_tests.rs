@@ -180,6 +180,7 @@ fn program() -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: false,
     })
     .expect("lower");
@@ -407,6 +408,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: false,
     })
     .expect("lower");
@@ -550,6 +552,7 @@ fn writes_through_views_mark_their_pages() {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: true,
     })
     .expect("lower");

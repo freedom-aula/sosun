@@ -2406,6 +2406,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A texture written through an unordered view and copied into a title
+    /// buffer (a read back) reaches the buffer's title memory once the
+    /// submission has run (#50: the title waited on such a copy).
+    #[test]
+    fn a_texture_copied_to_a_buffer_reaches_title_memory() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let slots = Slots::new(1);
+        let address = title_memory(1 << 22);
+        let words = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 41, 1, 0, 0, 4, 0];
+        let texture = texture_at_address(address, &words);
+        let unordered = View::Unordered(texture as usize, 0, Some([41, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        slots.make(0, &unordered);
+        let write = compile_cs(
+            "RWTexture2D<float> o : register(u0);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id.xy] = id.x + id.y * 64; }",
+            WRITES,
+        );
+        let dst = buffer(256 * 64);
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &unordered, false);
+        run(&list, &slots, &write, 0, None, (8, 8));
+        let footprint = crate::resource::PlacedFootprint::new(0, 41, 64, 64, 256);
+        let to = crate::list::CopyLocation::placed(dst, footprint);
+        let from = crate::list::CopyLocation::whole(texture);
+        assert!(crate::list::texture_to_buffer(&list, &to, (0, 0, 0), &from, std::ptr::null()), "recorded");
+        list.close();
+        host.execute(&[&list]);
+        let (bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        // SAFETY: inside the buffer: texel (7, 2) at a 256-byte pitch.
+        let got = unsafe { (bytes.add(2 * 256 + 7 * 4) as *const f32).read() };
+        assert_eq!(got, (7 + 2 * 64) as f32);
+    }
+
     /// A structured view the title places off its buffer's elements (the
     /// culling constants at a ring position) is made over a copy of its own
     /// bytes; one on an element views the buffer's copy.

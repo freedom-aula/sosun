@@ -141,6 +141,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        bias_as_gradients: false,
         view_marks: false,
     })?;
 
@@ -1241,6 +1242,7 @@ fn lower_cs32_with(
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks,
+        bias_as_gradients: super::host::under_wine(),
         view_marks: false,
     })
     .expect("lower");

@@ -80,6 +80,9 @@ pub(crate) struct Parts<'a> {
     /// 64-bit image atomics run under per-texel locks (`emit`, "Atomic
     /// locks").
     pub atomic_locks: bool,
+    /// Compute-stage biased samples run as gradient samples scaled by
+    /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
+    pub bias_as_gradients: bool,
 }
 
 enum Stop {
@@ -2328,19 +2331,19 @@ impl<'a> Lower<'a> {
         let nan = self.s.m.cmp(c, pred::UNO, part, part);
         let r = self.s.m.select(c, nan, part, r);
         if cosine {
-            r
-        } else {
-            // Preserve a zero's sign as integer bits. A host sin or float
-            // select may canonicalize -0 under Metal's fast-math lowering.
-            let bits = self.as_int(x);
-            let mask = self.s.m.i32(0x7fff_ffff);
-            let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
-            let zero = self.s.m.i32(0);
-            let is_zero = self.s.m.cmp(c, pred::EQ, magnitude, zero);
-            let result = self.as_int(r);
-            let result = self.s.m.select(c, is_zero, bits, result);
-            self.as_float(result)
+            return r;
         }
+        // sin(±0) is ±0. Some Metal GPUs (M2) drop the sign through the
+        // host's sin or a float select, so a zero input is passed through
+        // as integer bits (from nickorlabs's #30).
+        let bits = self.as_int(x);
+        let mask = self.s.m.i32(0x7fff_ffff);
+        let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+        let zero = self.s.m.i32(0);
+        let is_zero = self.s.m.cmp(c, pred::EQ, magnitude, zero);
+        let result = self.as_int(r);
+        let result = self.s.m.select(c, is_zero, bits, result);
+        self.as_float(result)
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -8299,9 +8302,10 @@ impl<'a> Lower<'a> {
                 61 => {
                     let bias = addr_val(self, 0)?;
                     let bias = to_float(self, bias);
-                    if self.x.native.stage == HwStage::Cs {
-                        // D3DMetal ignores SampleBias in compute shaders.
-                        // Scale explicit quad gradients by 2^bias instead:
+                    if self.x.bias_as_gradients && self.x.native.stage == HwStage::Cs {
+                        // D3DMetal ignores SampleBias in compute shaders
+                        // (found by nickorlabs, #30). Scale explicit quad
+                        // gradients by 2^bias instead:
                         // log2(rho * 2^bias) = log2(rho) + bias.
                         let scale = self.unary(21, bias);
                         let mut gradients = vec![fu; 6];
@@ -8314,25 +8318,11 @@ impl<'a> Lower<'a> {
                         args.extend(&os);
                         args.extend(gradients);
                         args.push(fu);
-                        self.s.op(
-                            c,
-                            "sampleGrad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            63,
-                            &args,
-                        )
+                        self.s.op(c, "sampleGrad.f32", Attr::ReadOnly, self.s.t.res_ret, 63, &args)
                     } else {
                         args.extend(&os);
                         args.extend([bias, fu]);
-                        self.s.op(
-                            c,
-                            "sampleBias.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            61,
-                            &args,
-                        )
+                        self.s.op(c, "sampleBias.f32", Attr::ReadOnly, self.s.t.res_ret, 61, &args)
                     }
                 }
                 63 if kind == 5 => {
@@ -10172,6 +10162,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+            bias_as_gradients: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -10224,6 +10215,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+            bias_as_gradients: false,
             view_marks: false,
         })
     }
@@ -10415,6 +10407,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+            bias_as_gradients: false,
             view_marks: false,
         })
         .unwrap();

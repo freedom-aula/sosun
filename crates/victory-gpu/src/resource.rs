@@ -332,6 +332,12 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A footprint at `offset` (tests).
+    #[cfg(test)]
+    pub(crate) fn new(offset: u64, format: u32, width: u32, height: u32, row_pitch: u32) -> Self {
+        Self { offset, format, width, height, depth: 1, row_pitch }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1316,6 +1322,16 @@ impl Resource {
             Backing::Address(at) => at,
         }
     }
+}
+
+/// Whether `p` points at one of our resource objects: its first word, read
+/// without faulting, is the resource method table.
+#[cfg(windows)]
+pub(crate) fn is_resource(p: This) -> bool {
+    let mut word = [0u8; 8];
+    !p.is_null()
+        && crate::host::read_into(p.cast(), &mut word)
+        && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 
 fn resource<'a>(this: This) -> &'a Resource {

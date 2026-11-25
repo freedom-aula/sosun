@@ -64,13 +64,7 @@ It also refuses any list that names the packed formats `R8G8_B8G8_UNORM` and `G8
 
 D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
 
-## Additional M2 compatibility checks
-
-With CrossOver 26.3 and its bundled D3DMetal 3.0, creating a new pipeline library requires a null blob pointer. A non-null pointer with length zero (as supplied by Rust's empty slice wrapper) returns `0x887e0002`, while null with length zero succeeds. The library creation path now passes null explicitly for an empty blob.
-
-The sine lowering also preserves zero's sign with an integer selection after the host trigonometric operation. This keeps `sin(-0.0)` negative without disabling its exact-bit assertion under Wine.
-
-These checks used the public synthetic tests built with Rust's Windows MSVC target and run in a separate CrossOver bottle, not a game build. The depth/twin copy test still fails on this D3DMetal 3.0 setup; successful sampling, atomics, and pipeline tests do not establish full graphics compatibility.
+D3DMetal 3.0, as bundled with CrossOver 26.2 and 26.3, returns zeros when a 24-bit depth texture (`R24G8_TYPELESS` or `D24_UNORM_S8_UINT`) is filled by a copy or copied out, while a clear reads back correctly in a shader (#33, with a standalone repro). 32-bit depth works. GPTK 4.0 beta 3 does not have this problem, and `a_depth_texture_written_through_unordered_views_reads_as_depth` passes there, so VIctory needs D3DMetal 4.0 or newer for depth copies. The test stays as it is on 3.0 so the failure remains visible.
 
 ## Route A: next steps
 
@@ -91,6 +85,18 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
+## The game needs D3DMetal 4.0 beta 3
+
+On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30), so host pipelines are never kept there. Use 4.0 beta 3 or newer for the game.
+
+## Stacks during a freeze
+
+In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well (in a build with `VICTORY_DIAGNOSTICS=1`), the dumps go to that file instead. The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
+
+## Presented planes
+
+On Series S the game presents two planes. Plane 0 is a 1920x1080 overlay and plane 1 is the 3840x2160 picture (#15). The window shows the plane whose first resource has the most pixels, and `VICTORY_PRESENT_PLANE=<n>` picks another one. With `VICTORY_PRESENT_COMPOSITE=1` the other plane is also blended over the shown one by a compute pass (`victory-gpu/src/composite.rs`), scaled to it and using its alpha as straight alpha. The blend is off by default until a run with the game shows that the overlay is clear where the picture should show.
+
 ## D3DMetal's shader cache needs unique shader hashes
 
 D3DMetal keeps a compiled-shader cache for each executable, in `$(getconf DARWIN_USER_CACHE_DIR)d3dm/<exe name>/shaders.cache`. It finds shaders by the DXIL container's shader hash (the `HASH` part), apparently together with the shader's length: two shaders collided only when their lengths matched. VIctory used to write the same all-zero shader hash into every container. So two different shaders of the same length shared a cache entry, and the one compiled second ran the first one's code. The cache is on disk, so the wrong code also came back on every later run of that executable.
@@ -104,13 +110,25 @@ This was the "signed zero in minimums" difference listed here before. Each `v_mi
 The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new shader tests, and three of them find real differences in D3DMetal 4.0 beta 3 on an M4. The tests skip only those checks under Wine, so the rest of each test still runs.
 
 - 64-bit image atomics. D3DMetal reports `AtomicInt64OnTypedResourceSupported` and `AtomicInt64OnDescriptorHeapResourceSupported`, but its 64-bit atomics in `image_atomics_of_64_bits` leave every texel at zero. The game's alpha prepasses use them. Under Wine the translator now emulates them (`Options::atomic_locks`, the module notes' "Atomic locks", `VICTORY_ATOMIC_LOCKS=0` or `1` to override): the lanes of a wave take turns in a loop over lane indices, and in its turn a lane takes a 32-bit lock word, reads the texel, writes the result and frees the lock. Two simpler forms failed under D3DMetal and are worth knowing about. Lanes of one wave spinning on each other's locks never finish, and `WaveIsFirstLane` and `WaveReadLaneFirst` inside a divergent loop return other lanes' values. The spin is bounded at 65536 tries so a fault can never hang the GPU.
-- Sample bias in compute programs. D3DMetal's native biased sample ignores the bias: a bias of 1 reads level 1 where the console reads level 2. The translator now lowers compute-stage biased samples to explicit gradients scaled by `2^bias`, preserving the requested LOD shift. The bias cases in `image_addresses_of_16_bits_and_clamps` run under Wine again; all cases pass on an M2 Max with CrossOver 26.3 and D3DMetal 3.0, and in a Windows WARP check. Pixel-stage samples retain their existing lowering.
+- Sample bias in compute programs. D3DMetal ignores the bias of a sample in a compute shader: a bias of 1 reads level 1 where the console reads level 2. Under Wine the translator now runs those samples as gradient samples with the quad gradients scaled by `2^bias` (`Options::bias_as_gradients`, found by nickorlabs in #30; `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides). The bias cases in `image_addresses_of_16_bits_and_clamps` run under Wine again and pass. Pixel shaders keep the plain biased sample.
 - 24-bit depth. Apple GPUs have no 24-bit depth format, so D3DMetal keeps it as 32-bit float and rounds down when it stores 24 bits. The depth test clears to 0.75, where both roundings agree (PR #6).
 - Root signature blobs. D3DMetal accepts a truncated root signature blob and crashes on garbage, where Windows returns `E_INVALIDARG`, so `malformed_blobs_are_rejected_by_the_host` skips under Wine.
 - Hard links. `a_kept_blob_past_the_link_limit_is_copied` needs NTFS's limit of 1024 links to a file, and APFS has no such limit, so the test skips where the 1025th link succeeds.
 - Gather positions. D3DMetal's own gather rounds the position as the console does, but from u × size taken in f32, where the console takes the exact product. On an M5 Pro it starts a texel over on all 12 lanes of `gathers_at_a_level_match_the_hardware` where the two products fall on either side of a texel's threshold, and matches the console on the others. Truncating, as WARP does, would have kept the console's texel on those lanes. VIctory's gathers at a level follow the console, but its level-0 gathers are the host's own, so they can differ there. The test checks that the host's own gather is either the console's or this one.
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
+
+## Host view heaps are filled with other threads' submissions held off
+
+Under Wine on D3DMetal, a list that one thread submits while another thread fills a new host view heap can lose its views: its shaders' writes are dropped and its reads give zeros, whatever heap the list binds (issue #31). Each host view heap has 2,359,296 slots, and `HostHeap::fill_null` makes every one null with 36 copies of 65,536 null views. On an M5 Pro with D3DMetal 4.0 beta 3 that takes 30 to 50 ms, and the victory-gpu tests fill several at once when they start.
+
+A texture that a dispatch wrote in that time read back as zeros. A copy of it by the copy engine was zeros too, and so was the same write and read in fresh lists, with fresh pipelines or with the views made again. It took writes again by itself 31 to 49 ms later, once the fills had ended. Skipping the fill, or holding submissions off while a heap is made and filled, stopped it. Holding them off only while its upload buffers were made did not.
+
+So `Host::quiet` holds the submission lock while a view heap is made and filled (`HostHeap::new`, and the first `Heap::host` of a title view heap, which also writes the views queued before it). The fill waits for the submission running then, and the next submission waits for the fill. That happens once per view heap. Elsewhere than Wine nothing is held. In 100 runs of the victory-gpu library tests on that Mac, the four texture tests this hit (1D and 3D, placed view, depth through unordered views, overlay) failed 62 times before, often several in one run, and not once after.
+
+A standalone D3D12 program did not reproduce it: 16 threads writing and reading textures, while 3 or 4 other threads made heaps of the same size and filled them the same way, bound in submissions or not. Something else VIctory does is needed as well, and it is not known what.
+
+Buffers are another matter, still open. `root_views_reach_their_copy_and_read_zeros_past_it` and the two `heap_views_` tests still fail in a few runs in a hundred, with or without the change. In a failed `root_views` run the source's host copy held the title's values while the output stayed zero, when run again at once, 100 ms later and with its view written again, so it does not come back by itself as the textures do.
 
 ## Masked stores into protected pages hang Rosetta
 
@@ -119,3 +137,6 @@ On macOS 27.3 (M3 Max) the game stops at start-up with `rosetta error: unexpecte
 The reproducer from issue #1, extended with `vpmaskmovd`, shows the cause without game files. Under CrossOver Wine 26.3.0 with `ROSETTA_ADVERTISE_AVX=1`, SSE and AVX `vmovups` stores survive in every layout, and so does a masked store wholly inside a protected page. A masked store that starts in writable memory and ends in a protected page hangs Rosetta with the same error, both in a block guarded the way `victory-gpu/src/watch.rs` guards it and in `MEM_WRITE_WATCH` memory, which Wine emulates with page protection. Rosetta seems to have written the first lanes before the fault and cannot finish the instruction afterwards.
 
 VIctory used both kinds of protection to see which title GPU memory changed. Under Rosetta, which `victory_gpu::fault_tracking` detects as Wine on Darwin, it now uses neither. The runtime's pools are allocated without a write watch, and host copies of title memory take it whole every time, as they already do for memory that is not the runtime's. That costs copy time but no fault can reach Rosetta. `VICTORY_FAULT_TRACKING=1` turns tracking back on to test a newer Rosetta, and `0` turns it off anywhere.
+
+
+The game's executable holds 1130 masked stores (789 `vpmaskmovd`, 160 `vpmaskmovq`, 180 `vmaskmovps` and 1 `vmaskmovpd`), which `victory` reports at start-up. `VICTORY_PATCH_MASKED=all` (or a comma list of hex RVAs) rewrites each one at load time as a jump to a small trampoline that does the same stores one lane at a time with plain `mov`s, which Rosetta can resume after a fault (`victory-loader/src/masked.rs`). With that, `VICTORY_FAULT_TRACKING=1` can be tried under Rosetta, so copies of title memory no longer have to be taken whole (about 129 GB per frame once the world streams in, #50). Both switches are off by default until runs with the game confirm them. The scan reads bytes, so a rare false match could be patched with `all`, and naming RVAs avoids that. Run 11 in #50 showed that `vcvtps2ph` stores to memory hang Rosetta the same way, so the scan and the patch also cover `vcvtps2ph`, `vextractf128` and `vextracti128` stores. Those are redone into the stack and then copied out with plain `mov`s. With the masked stores patched, copies during loading fell from 158.7 MB to 0.7 MB per frame and frames from 125.7 ms to 38.3 ms.
