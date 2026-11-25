@@ -662,7 +662,15 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A placed texture's view left null below is made when a draw reads
+        // the slot through a table; until then the slot is not made again
+        // (heap syncs revisit it at every submission).
+        let lazy = || {
+            for_draw
+                && is_placed_texture(&view)
+                && self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_none()
+        };
+        if made[index as usize] != key || lazy() {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -672,7 +680,7 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            made[index as usize] = key;
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -715,6 +723,12 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
+
+    /// Whether slot `index` holds a host view of a resource (tests).
+    #[cfg(test)]
+    pub(crate) fn kept(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
     }
 }
 
@@ -1427,6 +1441,38 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A placed texture's view the title writes into a heap is left null
+    /// and noted once: heap syncs (every submission) pass it by, a draw
+    /// reading it through a table makes it.
+    #[test]
+    fn a_placed_texture_slot_left_null_is_made_once_a_draw_reads_it() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        for _ in 0..2 {
+            assert!(host.mirror(0, title_heap.start, false).is_some());
+            assert!(host.made(0), "the record is noted");
+            assert!(!host.kept(0), "no host texture for it yet");
+        }
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made for the draw");
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
