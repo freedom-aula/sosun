@@ -638,8 +638,11 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
+    // Marked, not opened: nothing writes through them now, and opening
+    // them only made the next take guard them again, one Wine call each
+    // (two thirds of all protection changes in #50's world).
     for page in others {
-        changed_here(g, page, page + 1, save);
+        mark(g, page, page + 1, save);
     }
     guarded
 }
@@ -651,6 +654,13 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     for &page in &guarded {
         open(g, page);
     }
+    mark(g, first, last, save);
+    !guarded.is_empty()
+}
+
+/// Marks pages `[first, last)` changed in every tracker holding them,
+/// leaving their protection as it is.
+fn mark(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
@@ -661,7 +671,6 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    !guarded.is_empty()
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -1189,6 +1198,7 @@ pub(crate) mod tests {
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
         // SAFETY: the second view of the pages, guarded by the take.
         unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
+        assert!(read_only(a + PAGE), "marked, still guarded: no call to guard it again");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
         // SAFETY: the tracked view, which shows the write.
         assert_eq!(unsafe { ((a + PAGE + 4) as *const u32).read_volatile() }, 7);
