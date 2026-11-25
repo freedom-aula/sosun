@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::paged::Paged;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
@@ -29,8 +30,10 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    /// With it the view's own copy of title memory, if it has one.
-    kept: Mutex<Vec<Kept>>,
+    /// With it the view's own copy of title memory, if it has one. Paged:
+    /// the title views through a fraction of the slots, and a dense table
+    /// of them all was 37.7 MB, written when the heap was made.
+    kept: Mutex<Paged<Held>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -204,7 +207,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -530,7 +533,8 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
+        // A slot that held nothing and gets nothing is left alone (no page).
+        if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
             let old = std::mem::replace(slot, resource);
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
@@ -714,7 +718,7 @@ impl HostHeap {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -887,10 +891,16 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any, and the view's
-/// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
-/// it, so that draws reading the view find and refresh that copy.
-type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+/// The host resource a slot made by [`make`] views, and the view's own copy
+/// of title memory ([`crate::shadow::for_view`]): the slot holds it, so that
+/// draws reading the view find and refresh that copy.
+type Held = (
+    ID3D12Resource,
+    Option<std::sync::Arc<crate::shadow::Shadow>>,
+);
+
+/// What a slot made by [`make`] holds, if anything.
+type Kept = Option<Held>;
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
