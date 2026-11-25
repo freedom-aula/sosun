@@ -6,8 +6,9 @@ gives anyone a reason to ask for the repository to be taken down. This page
 sets out the rules, the reasons for them, and what happens if a rights holder
 gets in touch.
 
-This is general information, not legal advice. Every contributor is
-responsible for following the law where they live.
+It covers Australian, United States and international law. It is general
+information, not legal advice. Every contributor is responsible for
+following the law where they live.
 
 ## The rules
 
@@ -23,28 +24,50 @@ Everyone who joins the fleet agrees to these. Workers accept them with
 
 ## Why the fleet is limited to this
 
-### Australian law
+Volunteers join from many countries, and the repository is hosted in the
+United States. Rather than relying on the most generous rule anywhere, the
+fleet follows the strictest common ground of the laws below: **no copying or
+sharing of game material, no circumvention, and no tools, services or
+instructions for circumvention.** Inside those limits, testing the project's
+own open-source code is lawful everywhere listed here.
 
-The project's maintainers follow Australian law strictly. The fleet is
-designed around the *Copyright Act 1968* (Cth):
+### Australia
 
-- **Copying and communicating works** (Part III, Part IV). Game files, assets and screenshots are copyright works. Posting or hosting them would infringe, and none of the exceptions covers it. The fleet never handles them.
-- **Technological protection measures** (Part V, Division 2A, ss 116AK–116AQ, and the offences in Part V, Division 5). Getting around an access-control measure, or supplying a device or service that does, is prohibited unless an exception applies. Console games are encrypted, and it is untested whether the interoperability exception covers running a whole console game on another platform. The fleet therefore never asks for, uses or describes a game dump, and this repository contains no decryption code or keys.
-- **Interoperability** (s 47D). Making copies of a program that are reasonably needed to make independent software work with it is allowed, within limits. Under s 47H, a contract term that tries to exclude this has no effect. This is part of why working on the project's own code is lawful. The fleet still stays clear of the game itself.
-- **Authorisation** (s 36, s 101). Someone who authorises another person's infringement can be liable too. The fleet never hands out work that needs a game, so it authorises nothing of that kind.
+The *Copyright Act 1968* (Cth):
 
-It also respects the *Trade Marks Act 1995* (Cth) and the Australian Consumer
-Law (*Competition and Consumer Act 2010* (Cth), Schedule 2, ss 18 and 29).
-Third-party names appear only to describe compatibility. The fleet uses no
-logos or artwork and claims no affiliation.
+- **Copying and communicating works** (Parts III and IV). Game files, assets and screenshots are copyright works. Posting or hosting them would infringe, and none of the exceptions covers it.
+- **Technological protection measures** (Part V, Division 2A, ss 116AK–116AQ, and the offences in Part V, Division 5). Getting around an access-control measure, or supplying a device or service that does, is prohibited unless an exception applies. Console games are encrypted, and it is untested whether the interoperability exception covers running a whole console game on another platform.
+- **Interoperability** (s 47D). Making copies of a program that are reasonably needed to make independent software work with it is allowed, within limits. Under s 47H, a contract term that tries to exclude this has no effect.
+- **Authorisation** (ss 36 and 101). Someone who authorises another person's infringement can be liable too.
 
-### Hosting on GitHub
+Also the *Trade Marks Act 1995* (Cth), and the Australian Consumer Law
+(*Competition and Consumer Act 2010* (Cth), Schedule 2, ss 18 and 29) on
+misleading claims of affiliation.
 
-GitHub is a United States service. It handles copyright notices under the
-DMCA notice-and-takedown process (17 U.S.C. § 512). Claims about getting
-around protection measures are made under § 1201. GitHub has said that it
-reviews circumvention claims with extra care before it acts on them. The
-fleet is built so that neither kind of claim would have a basis:
+### United States
+
+- **Copyright** (17 U.S.C. § 106). As in Australia, sharing game material infringes. Courts have treated copying done only to reverse-engineer for interoperability as fair use (§ 107; *Sega v. Accolade*, 1992; *Sony v. Connectix*, 2000). That covers building compatibility software. It does not cover distributing games.
+- **Anti-circumvention** (DMCA, 17 U.S.C. § 1201). § 1201(a)(1) prohibits circumventing access controls. §§ 1201(a)(2) and (b) prohibit trafficking in circumvention tools and services. § 1201(f) allows narrow circumvention for interoperability, but has never been clearly held to cover running a console game on another platform. The Copyright Office's three-yearly exemptions (37 C.F.R. § 201.40) have not covered jailbreaking video game consoles. The fleet therefore contains no circumvention code, keys or instructions, and never needs a dump.
+- **Secondary liability.** People who induce infringement can be liable (*MGM v. Grokster*, 2005). A tool with substantial lawful uses is not infringing in itself (*Sony v. Universal*, 1984). The fleet only runs open-source tests, so it has no infringing use to induce.
+- **Trade marks** (Lanham Act, 15 U.S.C. §§ 1114 and 1125). Naming a product only to describe compatibility is nominative fair use. Logos, artwork, and anything suggesting endorsement are not.
+- **Hosting.** GitHub handles copyright notices under § 512 (notice, takedown and counter-notice, with penalties for knowingly false claims under § 512(f)). It handles circumvention claims under § 1201. GitHub has said it reviews circumvention claims with extra care before acting.
+
+### International
+
+- **Treaties.** The Berne Convention and TRIPS give game copyright protection in almost every country. The WIPO Copyright Treaty (art. 11) and the WIPO Performances and Phonograms Treaty require member states to protect technological measures. So "it's legal where I live" is rarely true for sharing game material or circumventing protection.
+- **European Union.** The InfoSoc Directive (2001/29/EC, art. 6) protects technological measures, which must be proportionate (*Nintendo v. PC Box*, CJEU C-355/12, 2014). The Software Directive (2009/24/EC) allows observing and testing a program (art. 5(3)) and decompiling it for interoperability (art. 6), and contract terms against these are void (art. 8). The Digital Services Act requires hosts to act on notices of illegal content.
+- **United Kingdom.** The *Copyright, Designs and Patents Act 1988*: decompilation for interoperability (s 50B), and technological measures and circumvention devices (ss 296–296ZF).
+- **Canada.** The *Copyright Act*: technological protection measures (s 41.1) and a narrow interoperability exception (s 41.12).
+- **Japan.** The *Copyright Act* and the *Unfair Competition Prevention Act* restrict circumvention and strictly prohibit supplying circumvention devices or services, including console "mod" tools.
+
+Elsewhere, assume the same: protection measures are protected, game material
+can't be shared, and only interoperability work on your own code is safe.
+If your local law is stricter than these rules, follow your local law.
+
+### How this keeps the repository clear of takedowns
+
+The fleet is built so that a copyright or circumvention notice in any of
+these countries would have nothing to point at:
 
 - The fleet's files are plain-text scripts and documents written for this project. The repository's asset policy (`cargo xtask policy`, [asset-policy.md](asset-policy.md)) checks every commit.
 - Fleet results are checked against a strict schema. Free text, links and file contents cannot pass.
@@ -68,7 +91,8 @@ formal notice. If it was committed, we also rewrite git history, as
 ## If a formal notice arrives
 
 - We follow GitHub's process and take down anything that breaks these rules.
-- If a notice is mistaken, for example if it targets our own code, which contains no game material and no circumvention, we may file a counter-notice through GitHub's process.
+- If a notice is mistaken, for example if it targets our own code, which contains no game material and no circumvention, we may file a counter-notice through GitHub's process (17 U.S.C. § 512(g)).
+- Notices under other laws, such as EU Digital Services Act notices, get the same treatment: we remove anything that breaks these rules and respond to anything that doesn't.
 - We never re-upload removed material, and we never use mirrors to get around a takedown.
 
 ## Maintainer checklist
