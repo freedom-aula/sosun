@@ -4,6 +4,7 @@
 #   tools/fleet/maintainer.sh labels               create or update the fleet labels
 #   tools/fleet/maintainer.sh tasks COMMIT [CHIP…]  open one test-matrix task per chip
 #                                                  (default: every chip in fleet.json)
+#   tools/fleet/maintainer.sh report               Markdown report of every accepted result
 set -euo pipefail
 # shellcheck source=tools/fleet/lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -44,14 +45,36 @@ cmd_tasks() {
     done
 }
 
+# Re-reads each accepted result from its issue and re-checks it, so the
+# report only ever contains results that match the schema.
+cmd_report() {
+    gh issue list -R "$REPO" --state closed --label "$(label "done")" --limit 1000 \
+        --json number,closedAt,body,author,assignees |
+        jq -c '.[] | {n: .number, closed: .closedAt, body, author: .author.login, who: (.assignees[0].login // "")}' |
+        while read -r issue; do
+            local n closed who task body json
+            n=$(jq -r .n <<< "$issue")
+            closed=$(jq -r .closed <<< "$issue")
+            who=$(jq -r .who <<< "$issue")
+            is_maintainer "$(jq -r .author <<< "$issue")" || continue
+            task=$(parse_task "$(jq -r .body <<< "$issue")") || continue
+            body=$(gh api --paginate "repos/$REPO/issues/$n/comments?per_page=100" |
+                jq -rs --arg w "$who" '[add // [] | .[] | select(.user.login == $w and (.body | startswith("/result")))] | last | .body // empty')
+            json=$(result_json "$body") || continue
+            validate_result "$json" "${task% *}" "${task#* }" > /dev/null || continue
+            jq -c --argjson n "$n" --arg closed "$closed" '. + {n: $n, closed: $closed}' <<< "$json"
+        done | report_markdown
+}
+
 case "${1:-}" in
     labels) cmd_labels ;;
+    report) cmd_report ;;
     tasks)
         shift
         cmd_tasks "$@"
         ;;
     *)
-        sed -n '2,6p' "$0" >&2
+        sed -n '2,7p' "$0" >&2
         exit 2
         ;;
 esac

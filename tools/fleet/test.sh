@@ -130,5 +130,16 @@ eq "no test run gives null" null "$(counts_json "$tmp/broken.log")"
 eq "chip family" m3 "$(chip_family_of "Apple M3 Pro")"
 eq "chip family of an Intel Mac" "" "$(chip_family_of "Intel(R) Core(TM) i7")"
 
+# --- report
+r1=$(jq -c '. + {n: 1, closed: "2026-11-20T10:00:00Z"}' <<< "$good")
+r2=$(jq -c '. + {n: 2, closed: "2026-11-21T10:00:00Z", chip: "Apple M1", hw_model: "MacBookAir10,1", failed_tests: [], wine: {passed: 343, failed: 0, ignored: 0}}' <<< "$good")
+r3=$(jq -c '. + {n: 3, closed: "2026-11-22T10:00:00Z", chip: "Apple M2", setup: "failed", native: null, wine: null, failed_tests: []}' <<< "$good")
+report=$(printf '%s\n%s\n%s\n' "$r1" "$r2" "$r3" | report_markdown)
+ok "report counts results" grep -q '^3 accepted results across 1 commits' <<< "$report"
+ok "report coverage" grep -q '3 of 5: m1, m2, m3 | 2 of 3' <<< "$report"
+ok "report chip-specific failure" grep -q 'victory_gpu::tests::depth16`: fails on m3; passes on m1' <<< "$report"
+ok "report lists every result" grep -q '^| #3 |' <<< "$report"
+eq "empty report" "None found." "$(: | report_markdown | sed -n '/^## Tests/{n;n;p;}')"
+
 echo "fleet tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

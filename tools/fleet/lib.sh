@@ -195,3 +195,31 @@ counts_json() { # LOG -> {"passed":..,"failed":..,"ignored":..} or null
 failed_names() { # LOG PREFIX
     sed -nE 's/^test (.+) \.\.\. FAILED$/\1/p' "$1" | grep -E '^[A-Za-z0-9_:]{1,200}$' | sed "s|^|$2/|" || true
 }
+
+# Turns accepted results (one JSON object per line, each with "n" for the
+# issue number and "closed" for when it closed) into a Markdown report: every
+# result, coverage per commit, and tests that fail only on some chips.
+report_markdown() {
+    jq -rs --argjson chips "$(jq -c .chips "$FLEET_CONF")" '
+        def fam: .chip | ascii_downcase | capture("(?<f>m[0-9]+)").f;
+        def pf($c): if $c == null then "-" else "\($c.passed) / \($c.failed)" end;
+        def failing: .setup != "ok" or .native == null or .wine == null or .native.failed > 0 or .wine.failed > 0;
+        sort_by(.closed) as $rs
+        | ($rs | group_by(.upstream_commit) | sort_by(map(.closed) | min)) as $commits
+        | "# Mac test fleet report\n\n\($rs | length) accepted results across \($commits | length) commits.\n\n"
+        + "## Coverage by commit\n\n| Commit | First result | Chip families | Results failing |\n|---|---|---|---|\n"
+        + ($commits | map(
+            (map(fam) | unique) as $f
+            | "| `\(.[0].upstream_commit[0:12])` | \(map(.closed) | min | .[0:10]) | \($f | length) of \($chips | length): \($f | join(", ")) | \(map(select(failing)) | length) of \(length) |")
+          | join("\n"))
+        + "\n\n## Tests that fail on some chips but not others\n\n"
+        + ([$commits[] | . as $g
+            | ($g | map(select(.native != null and .wine != null)) | map(fam) | unique) as $ran
+            | ($g | map(fam as $c | .failed_tests[] | {t: ., c: $c}) | group_by(.t)[]
+               | {t: .[0].t, bad: (map(.c) | unique)})
+            | select((.bad | length) < ($ran | length))
+            | "- `\($g[0].upstream_commit[0:12])` `\(.t)`: fails on \(.bad | join(", ")); passes on \($ran - .bad | join(", "))"]
+           | if length == 0 then "None found." else join("\n") end)
+        + "\n\n## All results\n\n| Task | Closed | Commit | Chip | Model | macOS | Toolkit | Native passed / failed | Wine passed / failed |\n|---|---|---|---|---|---|---|---|---|\n"
+        + ($rs | map("| #\(.n) | \(.closed[0:10]) | `\(.upstream_commit[0:12])` | \(.chip) | \(.hw_model) | \(.macos) | \(.gptk) | \(pf(.native)) | \(pf(.wine)) |") | join("\n"))'
+}

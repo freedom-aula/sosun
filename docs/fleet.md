@@ -103,9 +103,23 @@ tools/fleet/maintainer.sh tasks <sha> m1 m2   # or for chosen chips
 ```
 
 - The list of people allowed to open tasks is `maintainers` in `tools/fleet/fleet.json`.
-- Results are easiest to read with: `gh issue list --label fleet:done --state closed`.
+- `tools/fleet/maintainer.sh report > report.md` writes a Markdown report: coverage per commit, tests that fail only on some chips, and every result. It re-checks each result against the schema.
 - To screen every issue in the repository, not just fleet issues, set the repository variable `FLEET_MODERATE_ALL` to `true`.
 - Turn on private vulnerability reporting so that rights holders have a private contact route.
+
+## Is it helping?
+
+The fleet answers one question: does each commit pass on every kind of Mac? It doesn't measure progress inside a game. Run `maintainer.sh report` after each round of tasks and watch:
+
+| Signal | What good looks like |
+| --- | --- |
+| Coverage | Every chip family has a result for each tasked commit, ideally on more than one macOS version. |
+| Time to result | Hours, not days, from opening tasks to the last result. |
+| Chip-specific failures | The report's "fail on some chips" list. Each entry is a hardware or OS difference found before a user hit it. Turn each one into an issue or a fix. |
+| Trend | Failing results per commit go down over time, and the chip-specific list empties as fixes land. |
+| Fleet health | Few expired leases and few rejected results. Many of either means the join instructions or the worker need work. |
+
+The fleet pays off when entries in the chip-specific list turn into fixes. Link those fixes to the task issue so the connection is visible.
 
 ## Development
 
