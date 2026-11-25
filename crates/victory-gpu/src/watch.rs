@@ -508,6 +508,10 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
     let set = |from: usize, to: usize| {
+        #[cfg(feature = "diagnostics")]
+        counted(1, (to - from) as u64);
+        #[cfg(test)]
+        tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
@@ -528,11 +532,20 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     // heap lock then faulted while another held `Guards` and allocated,
     // a deadlock. Pages left out stay changed, so they are copied whole.
     // Pages guarded already passed this check when they were guarded.
+    // With each page, where its region is known to end: `VirtualProtect`
+    // takes one view at a time under Wine, so a run that crossed two views
+    // (the runtime's page mappings make one per page) failed and was then
+    // guarded page by page, one call more than needed.
     let mut allowed = RuntimeRegions::default();
-    let pages: Vec<usize> = pages
+    let (pages, ends): (Vec<usize>, Vec<usize>) = pages
         .into_iter()
-        .filter(|&p| g.protected.contains(&p) || allowed.contains(p))
-        .collect();
+        .filter_map(|p| {
+            if g.protected.contains(&p) {
+                return Some((p, usize::MAX));
+            }
+            allowed.region(p).map(|end| (p, end))
+        })
+        .unzip();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -540,15 +553,17 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
             i += 1;
             continue;
         }
-        // A run of consecutive pages not guarded yet.
+        // A run of consecutive pages not guarded yet, in one region.
         let first = i;
-        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 && !g.protected.contains(&pages[i + 1]) {
+        while i + 1 < pages.len()
+            && pages[i + 1] == pages[i] + 1
+            && pages[i + 1] < ends[first]
+            && !g.protected.contains(&pages[i + 1])
+        {
             i += 1;
         }
         let run = &pages[first..=i];
         i += 1;
-        #[cfg(feature = "diagnostics")]
-        counted(1, run.len() as u64);
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
@@ -576,27 +591,29 @@ struct RuntimeRegions {
 }
 
 impl RuntimeRegions {
-    fn contains(&mut self, page: usize) -> bool {
+    /// If `page` is the runtime's GPU memory, the page its region is known
+    /// to end before (`usize::MAX` for a pool, whose end is not asked).
+    fn region(&mut self, page: usize) -> Option<usize> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
         if let Some((a, b, yes)) = self.last
             && (a..b).contains(&page)
         {
-            return yes;
+            return yes.then_some(b);
         }
         // A pool's write watch answers with one lookup. `VirtualQuery` walks
         // Wine's page table to the region's end, under the guard lock that
         // every fault waits for.
         if runtime_memory(page * PAGE, false) {
-            return true;
+            return Some(usize::MAX);
         }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
         if n == 0 {
-            return false;
+            return None;
         }
         // Not watched: what `runtime_memory` asks of views, from this query.
         let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
@@ -605,7 +622,7 @@ impl RuntimeRegions {
         // only shares.
         let (a, b) = (base.div_ceil(PAGE).min(page), ((base + size) / PAGE).max(page + 1));
         self.last = Some((a, b, yes));
-        yes
+        yes.then_some(b)
     }
 }
 
@@ -1068,6 +1085,98 @@ pub(crate) mod tests {
             title_memory_aliased(b + k, &[a + k]);
         }
         (a, b)
+    }
+
+    thread_local! {
+        /// `VirtualProtect` calls this thread made in `protect`.
+        pub(super) static PROTECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// `single` views of one page each side by side, as the runtime's page
+    /// mappings make them, then one view of `single` pages: the address of
+    /// the first, and of the long one.
+    fn views_side_by_side(single: usize) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let len = 2 * single * PAGE;
+        // SAFETY: a pagefile section and a placeholder of our own, split
+        // and filled with views of the section; the test keeps them.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let base = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(base, 0);
+            let map = |at: usize, offset: usize, n: usize| {
+                VirtualFree(at as *mut _, n * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    at as *const _,
+                    offset as u64,
+                    n * PAGE,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, at);
+            };
+            for k in 0..single {
+                map(base + k * PAGE, k * PAGE, 1);
+            }
+            let long = base + single * PAGE;
+            map(long, single * PAGE, single);
+            (base, long)
+        }
+    }
+
+    /// Guarding pages of separate views takes one call per view, not a
+    /// call over all of them that fails first and then one per page.
+    #[test]
+    fn takes_guard_one_view_per_call() {
+        let calls = || PROTECTS.with(std::cell::Cell::get);
+        // Four one-page views and a four-page view, taken together.
+        let (base, _) = views_side_by_side(4);
+        let t = track(base, 8 * PAGE, true).expect("views are tracked");
+        let before = calls();
+        assert_eq!(t.take(base, base + 8 * PAGE), [(base, base + 8 * PAGE)]);
+        assert_eq!(calls() - before, 5);
+        assert!((0..8).all(|k| read_only(base + k * PAGE)));
+        drop(t);
+        // Each kind alone, written after: the guards catch it.
+        let (base, long) = views_side_by_side(4);
+        for (at, want) in [(base, 4), (long, 1)] {
+            let t = track(at, 4 * PAGE, true).expect("views are tracked");
+            let before = calls();
+            assert_eq!(t.take(at, at + 4 * PAGE), [(at, at + 4 * PAGE)]);
+            assert_eq!(calls() - before, want, "calls for the views at {at:#x}");
+            for k in 0..4 {
+                assert!(read_only(at + k * PAGE), "page {k} at {at:#x} guarded");
+            }
+            // Guarded, they mark the tracker when written.
+            // SAFETY: a page of the views; the handler opens it.
+            unsafe { ((at + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
+            assert!(t.changed(at / PAGE + 2));
+            assert!(!t.changed(at / PAGE + 1));
+        }
     }
 
     /// A write through another mapping of the same pages marks the tracker
