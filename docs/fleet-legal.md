@@ -55,6 +55,25 @@ misleading claims of affiliation.
 - **Trade marks** (Lanham Act, 15 U.S.C. §§ 1114 and 1125). Naming a product only to describe compatibility is nominative fair use. Logos, artwork, and anything suggesting endorsement are not.
 - **Hosting.** GitHub handles copyright notices under § 512 (notice, takedown and counter-notice, with penalties for knowingly false claims under § 512(f)). It handles circumvention claims under § 1201. GitHub has said it reviews circumvention claims with extra care before acting.
 
+### India
+
+The *Copyright Act, 1957*:
+
+- **Copying and communicating works** (ss 14 and 51). A computer program is a literary work (s 2(o)), and game assets, music and video are protected too. Copying or sharing game material infringes, and knowingly doing so is an offence under s 63.
+- **Interoperability and testing** (s 52(1)(ab) and (ac)). Doing what is needed to get the information essential for an independently created program to work with another program is not infringement, as long as that information is not otherwise readily available. Observing, studying and testing how a program works, to find the ideas behind it, is allowed while doing what the licence permits. These cover building and testing compatibility software. They do not cover sharing games.
+- **Technological protection measures** (s 65A, added in 2012). Circumventing an effective protection measure *with the intention of infringing* is an offence, punishable with up to two years in prison and a fine. Unlike the United States and Australia, India makes the intention to infringe part of the offence and does not separately ban supplying circumvention tools. Section 65A(2) lists exceptions, including acts the Act does not otherwise prohibit. The fleet still follows the stricter common ground above.
+- **Rights management information** (s 65B). Removing or altering it without authority is an offence.
+
+Also the *Information Technology Act, 2000*: s 79 gives hosts such as GitHub a
+safe harbour if they remove unlawful content once they have actual knowledge
+of it, and the *Information Technology (Intermediary Guidelines and Digital
+Media Ethics Code) Rules, 2021* set out how they must respond. The *Copyright
+Rules, 2013* (rule 75) let a rights holder ask a host to disable access to
+infringing material for 21 days, after which the host needs a court order to
+keep it down. The *Trade Marks Act, 1999* (ss 29 and 30) allows naming a
+product to describe compatibility, but not logos or suggestions of
+endorsement.
+
 ### International
 
 - **Treaties.** The Berne Convention and TRIPS give game copyright protection in almost every country. The WIPO Copyright Treaty (art. 11) and the WIPO Performances and Phonograms Treaty require member states to protect technological measures. So "it's legal where I live" is rarely true for sharing game material or circumventing protection.
