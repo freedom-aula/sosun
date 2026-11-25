@@ -527,8 +527,12 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     // #50 that guarded the process heap's header, and a thread holding the
     // heap lock then faulted while another held `Guards` and allocated,
     // a deadlock. Pages left out stay changed, so they are copied whole.
+    // Pages guarded already passed this check when they were guarded.
     let mut allowed = RuntimeRegions::default();
-    let pages: Vec<usize> = pages.into_iter().filter(|&p| allowed.contains(p)).collect();
+    let pages: Vec<usize> = pages
+        .into_iter()
+        .filter(|&p| g.protected.contains(&p) || allowed.contains(p))
+        .collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -573,11 +577,19 @@ struct RuntimeRegions {
 
 impl RuntimeRegions {
     fn contains(&mut self, page: usize) -> bool {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
         if let Some((a, b, yes)) = self.last
             && (a..b).contains(&page)
         {
             return yes;
+        }
+        // A pool's write watch answers with one lookup. `VirtualQuery` walks
+        // Wine's page table to the region's end, under the guard lock that
+        // every fault waits for.
+        if runtime_memory(page * PAGE, false) {
+            return true;
         }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -586,7 +598,8 @@ impl RuntimeRegions {
         if n == 0 {
             return false;
         }
-        let yes = runtime_memory(page * PAGE, true);
+        // Not watched: what `runtime_memory` asks of views, from this query.
+        let yes = !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         let (base, size) = (info.BaseAddress as usize, info.RegionSize);
         // In our pages, rounded inward so the region never claims a page it
         // only shares.
