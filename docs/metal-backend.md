@@ -207,7 +207,7 @@ the D3D12 workspace and its clippy gate are untouched). `objc2-metal` 0.3, `libc
 cargo run --release -p victory-metal                       # memory + latency probe
 cargo run --release -p victory-metal -- shader.dxil...     # convert, load, build a compute PSO
 cargo run --release -p victory-metal -- --corpus <cache>/shaders [--threads 8] [--fails out.txt]
-cargo test -p victory-metal                                # compute backend tests (skip if MSC is not installed)
+cargo test -p victory-metal                                # compute, heap/texture and render tests (skip if MSC is not installed)
 ```
 
 Submit-to-complete latency (3000 iterations, release, native arm64; Wine/D3D12 today ~5000-8000 us):
@@ -334,10 +334,141 @@ title-facing COM objects stay; what they call changes:
 The trait would move to a small crate both backends depend on, once victory-gpu uses it; for now it lives
 beside the Metal implementation and victory-gpu is untouched.
 
-Not in this slice: descriptor heaps (slots 0 and 1; entries are 24 bytes, `IRDescriptorTableEntry`, built
-from the title's RDNA descriptors), static samplers, root descriptor tables, render passes, textures,
-`MTLResidencySet`, command-buffer error and timeout handling (a GPU fault is only seen as a missing signal
-here), thread-safety of the types (they are not `Send`).
+Not in this slice (the next section adds heaps, textures and render passes): static samplers,
+`MTLResidencySet` for the title pools, command-buffer error and timeout handling (a GPU fault is only
+seen as a missing signal here), thread-safety of the types (they are not `Send`).
+
+## Heaps, textures, render passes (second slice: `resources.rs`, `gfx.rs`)
+
+`resources.rs` is the platform-neutral half (no Metal types): `ResourceBackend: ComputeBackend` (heaps,
+descriptor writes, textures, views, samplers) and `GraphicsBackend: ResourceBackend` (render pipelines,
+`submit_passes`). `gfx.rs` implements both for `Metal`; compute `submit` is now a thin wrapper over
+`submit_passes` with one compute pass. Tests are integration tests (`tests/resources.rs`,
+`tests/render.rs`, helpers in `tests/common`), native arm64, skipped without the converter.
+
+### Fixtures
+
+`tests/fixtures/*.hlsl` are our own shaders; the `.dxil` beside each is what dxc made of it and is
+committed (3-4 KB each; `.gitignore` has a `!crates/victory-metal/tests/**/*.dxil` exception: the
+`affine.dxil` of the first slice had been ignored and never committed). Regenerate with the x86_64 build
+under Rosetta, which can `dlopen` the x86_64 `libdxcompiler` of the D3DMetal bundle:
+
+```
+cargo build --target x86_64-apple-darwin -p victory-metal      # toolchain 1.98.1 has the x86_64 std
+VICTORY_DXC_DYLIB=<D3DMetal.framework>/Versions/A/Resources/libdxcompiler.dylib \
+  target/x86_64-apple-darwin/debug/victory-metal --dxc in.hlsl out.dxil cs_6_0
+```
+
+No title shader or title code is used anywhere.
+
+### Descriptor heaps
+
+A heap is an `MTLBuffer` of 24-byte `IRDescriptorTableEntry { gpuVA, textureViewID, metadata }`, written
+with the layout of `IRDescriptorTableSetBuffer/Texture/Sampler` (`metal_irconverter_runtime.h`),
+re-implemented in a few lines (`Metal::write_buffer/write_texture/write_sampler`), so Apple's header is
+not needed to build:
+
+| Entry | gpuVA | textureViewID | metadata |
+|---|---|---|---|
+| raw buffer SRV/UAV | buffer GPU address (title address + delta) | 0 | size in bytes (low 32 bits) |
+| texture SRV/UAV | 0 | `MTLTexture.gpuResourceID` | `f32` bits of min LOD clamp (low 32 bits) |
+| sampler | `MTLSamplerState.gpuResourceID` | 0 | `f32` bits of LOD bias |
+
+A root descriptor table is the **GPU address of its first entry** in the top-level argument buffer
+(`heap_address(heap, i)` pushed with `RootArgs::address`, like a root view); `DescriptorTable(SRV(t0),
+UAV(u0))` is two adjacent entries and a second `DescriptorTable(Sampler(s0))` points into the sampler
+heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]` (the
+tests only use tables). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
+`Buffer<T>`) are not written yet.
+
+Proven by `srv_and_uav_through_a_descriptor_table` (a compute shader reads an SRV and writes a UAV, both
+zero-copy buffers, through a table at heap entry 5; then entry 5 is rewritten to point elsewhere and the
+next dispatch follows it) and by every sampling test below.
+
+### Residency (what a heap needs)
+
+Resources reached only through a heap entry are **not** resident unless named. Measured: with neither a
+residency set nor `useResource`, every heap test returns wrong data (Apple Silicon does not make an
+unnamed resource work by luck). So a heap carries its own `MTLResidencySet` holding the heap buffer and
+each resource written into it (`addAllocation` on every `write_*`, `commit` before the next command
+buffer that uses it, then `useResidencySet` on that command buffer). Where `newResidencySetWithDescriptor`
+is missing (macOS before 15) or `VICTORY_METAL_NO_RESIDENCY_SETS` is set, the fallback names every entry
+to every encoder with `useResource` (O(entries) per dispatch: fine for tests, not for a heap of a million
+entries). The heap tests run in both modes (`common::backends()`). Not done: removing a replaced entry's
+old resource from the set (it stays resident until the heap is dropped); a set for the title pools (they
+are named with `useResource` per dispatch through `Dispatch::resources`, a handful of buffers; a
+queue-level `addResidencySet` is the cheaper end state); `useHeap` for `MTLHeap`-placed textures.
+
+### Textures and samplers
+
+`create_texture` takes `TextureDesc`: 2D, 2D array, 3D; formats RGBA8 (unorm, sRGB), BGRA8, RGBA16F,
+R32F, D32F, BC1-BC7; mips; render-target and UAV flags (usage always includes `PixelFormatView`). Shared
+storage everywhere (Apple Silicon allows it for render targets and depth too). `upload_texture` /
+`read_texture` are `replaceRegion` / `getBytes` of a whole mip, BC in blocks (`Format::row_bytes`).
+Findings:
+
+- All seven BC formats create and upload; a BC1 texture samples correctly (four colour blocks). RGBA8,
+  RGBA16F, R32F, 2D array (per-slice values) and 3D (per-voxel values) sample exactly at texel centres.
+- Views (`newTextureView...levels:slices:`): a mip-1-only view and an sRGB reinterpretation of an RGBA8
+  texture sample as expected. **Metal does not allow `Depth32Float` to be viewed as `R32Float`**
+  (an assertion abort, not an error return: "not castable"); a depth texture is written to the heap
+  itself and the shader samples it as `Texture2D<float4>` (depth in `.x`), which works. So `twin.rs`'s
+  colour twin is still the way to a UAV on depth, to be checked on real shaders. `create_texture_view`
+  should validate format compatibility before calling Metal.
+- Samplers: `MTLSamplerDescriptor` with `supportArgumentBuffers = true` (without it there is no resource
+  ID). Linear blends and nearest does not, through a sampler heap.
+- **Textures over zero-copy memory**: `newTextureWithDescriptor:offset:bytesPerRow:` on the wrapped title
+  buffer. 2D, one mip, one slice only (Metal's rule for buffer-backed textures); offset and row pitch must
+  be multiples of `minimumLinearTextureAlignmentForPixelFormat` (`linear_alignment`). A CPU write into
+  title memory after the texture exists is seen by the next dispatch. Mips, arrays, 3D, BC and the
+  console's tiled layouts are not linear, so those still need the compute detile into an `MTLTexture`.
+
+### Render passes
+
+`RenderPipelineDesc` (VS and optional PS DXIL, input elements and streams, target and depth formats,
+depth test, cull) -> `MTLRenderPipelineState` + `MTLDepthStencilState`. `Pass::Render(RenderPass)` has
+colour and depth targets (clear or load) and `Draw`s: pipeline, topology, root arguments, heaps, vertex
+buffers, index buffer, `DrawCall::Arrays | Indexed`. A submission interleaves compute and render passes
+in order in one command buffer.
+
+Vertex fetch uses the converter's default **Metal vertex fetch**
+(`IRStageInCodeGenerationModeUseMetalVertexFetch`): the vertex function has `[[stage_in]]`, so the host
+supplies an `MTLVertexDescriptor`. Observed, and what `gfx.rs` relies on: input element *k* of the VS
+input signature is attribute `kIRStageInAttributeStartIndex + k` = 11 + k, and vertex buffer slot *s* is
+Metal buffer index `kIRVertexBufferBindPoint + s` = 6 + s (indices 0-5 are the converter's: heaps 0/1, root
+arguments 2, hull/domain 3, draw arguments 4, uniforms 5). Vertex pulling (a table of
+`IRRuntimeVertexBuffer { addr, length, stride }` at slot 6, no descriptor) is the alternative when the
+title's input layout is dynamic; not built. A draw must set what `IRRuntimeDrawPrimitives` /
+`IRRuntimeDrawIndexedPrimitives` set, which is reimplemented: a 5-word `IRRuntimeDrawParams` (count,
+instances, start, base vertex/instance) with `setVertexBytes` at slot 4 and the index type (0 =
+non-indexed, 1 = u16, 2 = u32) at slot 5. The root arguments go to both stages (`setVertexBytes` and
+`setFragmentBytes` at slot 2), heaps likewise.
+
+`tests/render.rs`: `triangle_offscreen` (clear to blue, one non-indexed triangle in a 16x16 RGBA8 target:
+inside red, corners blue, orientation checked); `indexed_draw_with_depth_test_and_depth_sampling` (a
+u16-indexed quad at z 0.25 and a later full-screen triangle at z 0.75 on a D32F attachment with a less
+test: quad pixels green, triangle only where it is alone; then, in the same command buffer, a compute pass
+samples the depth attachment: 0.25 and 0.75 exactly); `depth_test_rejects_a_draw_behind`. The pixel
+shader multiplies the vertex colour by a texture sampled through a descriptor table and a sampler heap, so
+heaps are exercised by a draw too.
+
+Not covered: blending and colour write masks, stencil, multiple render targets (the code takes several,
+untested), MSAA, viewport/scissor from the list (full target only), instancing with a per-instance stream,
+topologies beyond triangle lists, primitive restart, mesh and amplification pipelines,
+hull/domain/geometry emulation, stream-out, indirect draws, UAV writes from pixel shaders,
+`ExecuteIndirect`, queries, pipeline caching.
+
+### Mapping into victory-gpu (not done; victory-gpu is untouched)
+
+| victory-gpu today | calls on `ResourceBackend` / `GraphicsBackend` |
+|---|---|
+| `descriptor.rs` / host heap (`CreateDescriptorHeap`, `HostHeap` writes of RDNA descriptors) | `create_heap(kind, count)`; each title descriptor write becomes `write_buffer` / `write_texture` / `write_sampler` at the heap index. The title writes 32-byte RDNA descriptors itself, so the host decodes them (base, size, format, tiling) into one of the three calls, as `HostHeap` already does for D3D12 |
+| `root.rs` / `pipeline/host.rs` root parameters | `RootArgs`: constants inline, views as addresses, tables as `heap_address(heap, first)` |
+| `resource.rs` committed/placed textures, `texture.rs` | `create_texture`, `create_texture_view` (SRV/UAV/RTV/DSV formats); the detile compute writes the texture, or `create_texture_over_memory` where the layout is linear |
+| `placement.rs` heaps | not yet: textures are individual allocations here; an `MTLHeap` variant of `create_texture` plus `useHeap` residency |
+| `pipeline.rs` graphics pipelines made at first draw | `create_render_pipeline` (the shader cache's DXIL, input layout, formats, depth); blend state is the missing field |
+| `list.rs` draws, clears, barriers | `RenderPass` (clears are load actions; a mid-pass clear splits the pass), `Draw`; barriers are implicit between passes and encoders |
+| `queue.rs` `ExecuteCommandLists` | `submit_passes` |
 
 ## Next steps
 
@@ -349,8 +480,8 @@ here), thread-safety of the types (they are not `Send`).
    probe on them (memory entry mappings, guard pages, 64 KiB mapping granularity on 16 KiB pages).
 4. Implement the seam in victory-gpu behind a feature: D3D12 and Metal implementations of `ComputeBackend`,
    `queue.rs`/`fence.rs` calling it, with `hold.rs` keeping only memory-value waits.
-5. Descriptor heaps: the title writes 32-byte RDNA descriptors itself; build the MSC-format heap from
-   them (the existing `HostHeap` does this for D3D12), then bind slots 0/1/2.
+5. Descriptor heaps are in the backend (second slice); remaining: decode the title's 32-byte RDNA
+   descriptors into the three `write_*` calls, typed buffer views, `MTLHeap` placement.
 6. Replace the page-table "Title memory" contract in `victory_shader::emit` by the arena/offset one,
    and delete copy-back, view marks and the shadow (`shadow.rs`, `watch.rs`) behind a feature once the
    Metal path runs.

@@ -2,6 +2,8 @@
 //! and converted by the Metal Shader Converter) reach buffers and textures only through descriptor
 //! tables in a heap. Each test runs with `MTLResidencySet` residency and with `useResource` fallback.
 
+#![cfg(target_os = "macos")]
+
 mod common;
 
 use common::*;

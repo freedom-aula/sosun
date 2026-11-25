@@ -733,7 +733,7 @@ impl Metal {
                         .index_buffer
                         .ok_or("indexed draw without an index buffer")?;
                     let width = if wide { 4 } else { 2 };
-                    let off = *&title as usize - b.base as usize + first_index as usize * width;
+                    let off = title as usize - b.base as usize + first_index as usize * width;
                     dp = [
                         index_count,
                         instance_count,
