@@ -93,6 +93,28 @@ fn give_back(v: Vec<u8>) {
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
 
+/// A 64-bit digest of `bytes`, at memory speed: eight lanes of words, each
+/// step a bijection of the lane and of the word, so bytes differing in one
+/// word always give another digest.
+// shortcut: other changes collide once in 2^64; a page whose digest
+// collides keeps title memory's bytes (copy-back of marked pages).
+fn digest(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let step = |h: u64, w: u64| (h ^ w).wrapping_mul(K).rotate_left(29);
+    let mut lanes = [0u64, 1, 2, 3, 4, 5, 6, 7];
+    let (blocks, rest) = bytes.as_chunks::<64>();
+    for block in blocks {
+        for (lane, w) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
+            *lane = step(*lane, u64::from_le_bytes(*w));
+        }
+    }
+    let mut h = bytes.len() as u64;
+    for (i, &b) in rest.iter().enumerate() {
+        h = step(h, u64::from(b) << (i % 8 * 8) | (i as u64) << 56);
+    }
+    lanes.into_iter().fold(h, step)
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -269,6 +291,9 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if self.null() {
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -385,7 +410,24 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                let a = start + at;
+                if host == old {
+                } else if self
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|t| !t.changed(a / PAGE) && t.untracked(a, a + n).is_empty())
+                {
+                    // The title has not written the page since the copy took
+                    // it: title memory holds the bytes from before, and the
+                    // copy's are what goes back, title memory unread (a
+                    // wineserver round trip).
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareUnread, 1);
+                    let _writing = crate::watch::writing(a, n);
+                    crate::host::write_mapped(a as *mut u8, host.as_ptr(), n);
+                    written += n;
+                    synced.push(a / PAGE);
+                } else if crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
@@ -468,6 +510,28 @@ impl Shadow {
             let n = to - from;
             // SAFETY: inside the mapping; only the submitting thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+            let whole = from == page && to == page + PAGE;
+            // Title memory still holds the bytes the copy had when it last
+            // took the page: if the copy has them too, the shaders changed
+            // nothing; else the copy goes back whole, title memory unread
+            // (each read is a wineserver round trip: most of copy-back's
+            // time, ~1,000 pages a world frame, most of them unchanged).
+            if saved.is_none()
+                && whole
+                && let Some(before) = t.digest(page / PAGE)
+            {
+                let now = digest(host);
+                if now == before {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::MarkedSame, 1);
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MarkedUnread, 1);
+                writes.push((from, host.to_vec()));
+                taken.push((page / PAGE, now));
+                continue;
+            }
             let mut title = vec![0u8; n];
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
@@ -499,8 +563,8 @@ impl Shadow {
                 writes.push((from, title));
             }
             // Equal to title memory now: taken, unless it holds the page in part.
-            if from == page && to == page + PAGE {
-                taken.push(page / PAGE);
+            if whole {
+                taken.push((page / PAGE, digest(host)));
             }
         }
         let mut written = 0;
@@ -522,7 +586,8 @@ impl Shadow {
             }
         }
         if !taken.is_empty() {
-            t.taken(&taken);
+            t.taken(&taken.iter().map(|&(page, _)| page).collect::<Vec<_>>());
+            t.digested(&taken);
         }
         written
     }
@@ -530,7 +595,18 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
-        self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+        self.null() || self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
+    }
+
+    /// The copy of the lowest window of the address space ([`loose`]): the
+    /// null page and the host's own memory (Wine's TEB, PEB and mapped
+    /// files), never the title's. Shaders following a null pointer read it,
+    /// so it exists, but it stays zeros: never brought up to date (it is
+    /// not tracked, so it was copied whole at each submission using title
+    /// memory, through the copy fallback: 60-200 ms a frame), and what
+    /// shaders write there never goes back.
+    fn null(&self) -> bool {
+        self.start == 0
     }
 
     /// Its tracker's bit: `crate::watch::clean_bit` of it is
@@ -596,7 +672,9 @@ impl Shadow {
     /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
     fn update_busy(&self, from: usize, to: usize) -> usize {
         let runs = match &self.tracked {
-            Some(t) => t.take(from, to),
+            // The parts off the runtime's memory whole, as `update_free`
+            // copies them.
+            Some(t) => t.take(from, to).into_iter().chain(t.untracked(from, to)).collect(),
             None => vec![(from, to)],
         };
         if runs.is_empty() {
@@ -1307,6 +1385,17 @@ pub(crate) fn near(va: u64) -> String {
 pub(crate) mod tests {
     use super::*;
 
+    /// The lowest window's copy (a null pointer's target) stays zeros: it is
+    /// clean, so no refresh copies the host's bytes into it.
+    #[test]
+    fn the_lowest_window_reads_zeros() {
+        let copy = find(0x11000, 256).expect("a copy of the lowest window");
+        assert_eq!(copy.range(), (0, WINDOW));
+        assert!(copy.clean(), "never brought up to date");
+        assert_eq!(copy.update(0, WINDOW as usize), 0, "nothing copied");
+        assert!(copy.read_host(0x11000, 64).iter().all(|&w| w == 0), "zeros, not the host's memory");
+    }
+
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
     pub(crate) fn mark_read(memory: bool, slot: u32) {
@@ -1453,6 +1542,20 @@ pub(crate) mod tests {
         assert_eq!(copy.read_host(word as u64, 1), [0x5678], "the title's change reaches the copy");
         assert_eq!(protection(pool), PAGE_READONLY, "the pool is guarded");
         assert_eq!(protection(plain), PAGE_READWRITE, "the plain allocation is not");
+        // Under a range shaders write, declared before its refresh (as a
+        // submission's steps may come): the change reaches the copy and its
+        // snapshot, so copy-back takes it for nobody's and leaves the
+        // title's later write.
+        copy.writing(pool, len, false);
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0x9abc) };
+        copy.update(pool, len);
+        assert_eq!(copy.read_host(word as u64, 1), [0x9abc], "the change under the busy range");
+        // SAFETY: as above.
+        unsafe { word.write_volatile(0xdef0) };
+        assert_eq!(copy.copy_back(pool, len), 0, "nothing the GPU wrote");
+        // SAFETY: as above.
+        assert_eq!(unsafe { word.read_volatile() }, 0xdef0, "the title's later write stays");
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
@@ -1527,6 +1630,7 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        let _one = crate::host::hold_submissions();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1569,11 +1673,74 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// A marked page taken at its last copy-back is told apart by its
+    /// digest: left alone when the shaders changed nothing, written back
+    /// when they changed it; and once the title wrote it and a refresh took
+    /// it again, the digest is gone: shaders putting back the bytes it had
+    /// still overwrite the title's.
+    #[test]
+    fn marked_pages_taken_before_go_back_by_their_digest() {
+        let _one = crate::host::hold_submissions();
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        // One submission: the shaders write `value` at +10 (if any) and
+        // mark the page.
+        let submit = |value: Option<u8>| {
+            copy.writing(p, PAGE, true);
+            if let Some(v) = value {
+                copy.write_host((p + 10) as u64, &[v]);
+            }
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+            copy_back_marks(&[], false);
+            copy.copy_back(p, PAGE);
+        };
+        let title = (p + 10) as *mut u8;
+        // SAFETY: (title reads and writes below) a byte of our pool.
+        let read = || unsafe { title.read_volatile() };
+        copy.update(p, PAGE);
+        submit(Some(0xaa));
+        assert_eq!(read(), 0xaa, "read and written back; digested");
+        submit(None);
+        assert_eq!(read(), 0xaa, "unchanged: left alone");
+        submit(Some(0xbb));
+        assert_eq!(read(), 0xbb, "changed: written back unread");
+        // SAFETY: as above.
+        unsafe { title.write_volatile(0x11) };
+        copy.update(p, PAGE);
+        assert_eq!(copy.read_host(p as u64 + 8, 1)[0] >> 16 & 0xff, 0x11, "taken again");
+        submit(Some(0xbb));
+        assert_eq!(read(), 0xbb, "the bytes of the old digest still go back");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn digests_tell_one_word_apart() {
+        let page: Vec<u8> = (0..PAGE).map(|i| (i * 7 % 251) as u8).collect();
+        let d = digest(&page);
+        assert_eq!(d, digest(&page.clone()));
+        for at in [0, 7, 8, 63, 64, 4095, PAGE - 1] {
+            let mut other = page.clone();
+            other[at] ^= 1;
+            assert_ne!(digest(&other), d, "byte {at} flipped");
+        }
+        let mut swapped = page.clone();
+        swapped.swap(0, 64);
+        assert_ne!(digest(&swapped), d, "two words of a lane swapped");
+        assert_ne!(digest(&page[..100]), digest(&page[..101]));
+    }
+
     /// Marks of shaders using title memory stay out of title memory while
     /// their results are held back, and are cleared; the other shaders'
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        let _one = crate::host::hold_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
