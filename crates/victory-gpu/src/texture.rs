@@ -582,8 +582,10 @@ impl Staging {
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page. Not kept: it would
-            // double each texture's system memory.
-            let mut read = vec![0u8; size];
+            // double each texture's system memory. Only the touched spans
+            // are written, and only they are hashed and detiled.
+            let mut scratch = Scratch::take(size);
+            let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
             for &i in &touched {
@@ -617,7 +619,7 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(&read, &fresh);
+            let buffer = self.detile(read, &fresh);
             if buffer.is_none() {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
@@ -668,14 +670,18 @@ impl Staging {
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
         let (buffer, at, data) = staging_space(self.size)?;
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                memory = ?self.memory,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
-            );
-        } else {
-            tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
+        // Scanned only when its message is wanted: a pass over every
+        // texture read, in timing runs too.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if tiled.iter().all(|&b| b == 0) {
+                tracing::debug!(
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                );
+            } else {
+                tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
+            }
         }
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
@@ -696,6 +702,36 @@ impl Staging {
             }
         }
         Some((buffer, at))
+    }
+}
+
+/// A buffer for the title memory a refresh reads, kept by the thread for
+/// its next refresh: a fresh one for each texture cost a zero-fill and a
+/// page fault per 4 KiB (129,000 faults in a frame, run placed1).
+struct Scratch(Vec<u8>);
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+impl Scratch {
+    /// The thread's buffer, at least `size` bytes.
+    fn take(size: usize) -> Self {
+        let mut v = SCRATCH.take();
+        if v.len() < size {
+            v.resize(size, 0);
+        }
+        Scratch(v)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // The largest textures' buffers are not kept.
+        const KEEP: usize = 32 << 20;
+        if self.0.len() <= KEEP {
+            SCRATCH.set(std::mem::take(&mut self.0));
+        }
     }
 }
 
