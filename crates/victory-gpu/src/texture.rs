@@ -207,7 +207,20 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
-    if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
+    if is_host_written(resource) {
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
+                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+                // SAFETY: a live resource.
+                let desc = unsafe { texture.GetDesc() };
+                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
+            }
+        }
+        return;
+    }
+    if !list.first_use(texture.as_raw() as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -362,6 +375,8 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
+        } else {
+            tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
