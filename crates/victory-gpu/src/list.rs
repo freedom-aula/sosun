@@ -1102,7 +1102,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (`copy_mapped`:
 /// an unmapped source page reads as zeros). Ranges that overlap are moved
 /// with `memmove`, which the kernel's copy does not promise to do, once
-/// both are known to be committed, as work that may write anywhere.
+/// both are known to be committed, as work that writes the destination.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
@@ -1113,7 +1113,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
         } else {
             let len = len as usize;
-            list.defer(move || {
+            list.defer(dst as usize, len, move || {
                 if crate::texture::committed(src as *const u8, len)
                     && crate::texture::committed(dst as *const u8, len)
                 {

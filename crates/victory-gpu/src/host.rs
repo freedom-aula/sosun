@@ -978,8 +978,8 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` into it or a
     /// `Run` intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// Work that writes title memory (destination, bytes) and nothing more.
+    Run(usize, usize, Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
@@ -2379,9 +2379,10 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    /// `work` writes title memory `[dst, dst + len)` and nothing more
+    /// (refreshes after it copy what it can have changed again).
+    pub(crate) fn defer(&self, dst: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Run(dst, len, Box::new(work)));
         self.deferred().refreshed.clear();
     }
 
@@ -2415,7 +2416,7 @@ impl HostList {
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::Run(..) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -2451,9 +2452,9 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                Step::Run(_, _, work) | Step::Host(work) => {
+                    if let &Step::Run(dst, len, _) = step {
+                        batch.title_copied(dst, len);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -2553,6 +2554,8 @@ impl Batch {
     /// Before a step that may write any title memory: pending refreshes are
     /// done first, and copies are checked again after it.
     fn title_written(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WideWrites, 1);
         self.flush();
         self.current.clear();
     }
@@ -2566,8 +2569,6 @@ impl Batch {
     // bytes any copy holds.
     fn title_copied(&mut self, at: usize, len: usize) {
         if crate::watch::aliased(at, len) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
             return self.title_written();
         }
         self.flush();
