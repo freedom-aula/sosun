@@ -86,7 +86,7 @@ fn give_back(v: Vec<u8>) {
 }
 
 /// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
