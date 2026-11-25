@@ -7,8 +7,8 @@
 //!
 //! "Changed" means a page of the memory changed since the last detiling
 //! ([`crate::watch`], which follows writes through every mapping of the
-//! same physical pages) in the runtime's memory; elsewhere, a content hash
-//! of the whole memory at every submission that samples it.
+//! same physical pages) in the runtime's memory; elsewhere, the whole memory
+//! compared with the bytes last detiled at every submission that samples it.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Textures read through descriptor tables are brought up to date, and for
@@ -47,16 +47,16 @@ pub(crate) struct Staging {
     mips: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
-    /// memory, hashed instead).
+    /// memory, compared instead).
     tracked: Option<crate::watch::Tracked>,
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
+/// What a texture's staging buffer holds: the memory last detiled (memory
+/// not tracked, compared to tell a change), or room to read tracked memory
+/// into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
     read: Vec<u8>,
 }
 
@@ -327,14 +327,16 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        // Compared with the bytes last detiled, which tracked memory keeps
+        // as well. Hashing them instead ran at 0.45 GB/s under Wine on
+        // Rosetta (blake3's AVX2 code, emulated), where no memory is
+        // tracked: 30-250 ms per frame; the comparison runs at memory speed.
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !take_changed(&mut last.read, tiled) {
             return (size, false);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
@@ -370,6 +372,17 @@ impl Staging {
             }
         }
     }
+}
+
+/// Whether `memory` differs from `last`, the bytes last detiled, which then
+/// take its bytes.
+fn take_changed(last: &mut Vec<u8>, memory: &[u8]) -> bool {
+    if last[..] == *memory {
+        return false;
+    }
+    last.clear();
+    last.extend_from_slice(memory);
+    true
 }
 
 /// Bytes available in the staging buffer for a subresource at `offset`.
@@ -494,6 +507,18 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn untracked_memory_reads_as_changed_once_per_change() {
+        let mut last = Vec::new();
+        let mut memory = vec![1u8; 4096];
+        assert!(take_changed(&mut last, &memory), "never detiled");
+        assert!(!take_changed(&mut last, &memory));
+        memory[4095] = 2;
+        assert!(take_changed(&mut last, &memory));
+        assert_eq!(last, memory);
+        assert!(!take_changed(&mut last, &memory));
     }
 
     #[test]
