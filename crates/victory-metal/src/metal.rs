@@ -3,8 +3,9 @@
 
 use crate::backend::{ComputeBackend, Submission};
 use crate::msc::Msc;
+use crate::resources::GraphicsBackend;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::*;
 use std::ptr::NonNull;
@@ -12,40 +13,61 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
-/// `kIRArgumentBufferBindPoint`: where the converter reads the top-level argument buffer
-/// (`metal_irconverter_runtime.h`; heaps are at 0 (resources) and 1 (samplers)).
-const ARGUMENT_BUFFER_SLOT: usize = 2;
-
 pub struct Metal {
-    dev: Dev,
-    msc: Msc,
+    pub(crate) dev: Dev,
+    pub(crate) msc: Msc,
+    /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
+    pub(crate) residency_sets: bool,
 }
 
 /// Library file names are unique per process, not per backend: Metal keeps libraries by URL.
 static LIBRARIES: AtomicU64 = AtomicU64::new(0);
 
-pub struct Queue(Retained<ProtocolObject<dyn MTLCommandQueue>>);
-pub struct Fence(Retained<ProtocolObject<dyn MTLSharedEvent>>);
-pub struct Pipeline(Retained<ProtocolObject<dyn MTLComputePipelineState>>);
+pub struct Queue(pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>);
+pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
+pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
 
 /// A wrapped range of title memory.
 pub struct Buffer {
-    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
-    base: *const u8,
+    pub(crate) buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    pub(crate) base: *const u8,
 }
 
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     pub fn new() -> Result<Metal, String> {
+        let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        let residency_sets = std::env::var_os("VICTORY_METAL_NO_RESIDENCY_SETS").is_none()
+            && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
         Ok(Metal {
-            dev: MTLCreateSystemDefaultDevice().ok_or("no Metal device")?,
+            dev,
             msc: Msc::open_default(),
+            residency_sets,
         })
     }
-}
 
-fn event(f: &Fence) -> &ProtocolObject<dyn MTLEvent> {
-    ProtocolObject::from_ref(&*f.0)
+    /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
+    pub fn with_residency_sets(mut self, on: bool) -> Metal {
+        self.residency_sets = on;
+        self
+    }
+
+    /// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
+    /// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
+    /// is a dependency.
+    pub(crate) fn load_library(
+        &self,
+        lib: &[u8],
+    ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+        let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
+        let file =
+            std::env::temp_dir().join(format!("victory-metal-{}-{n}.metallib", std::process::id()));
+        std::fs::write(&file, lib).map_err(|e| e.to_string())?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap()));
+        let l = self.dev.newLibraryWithURL_error(&url);
+        let _ = std::fs::remove_file(&file);
+        l.map_err(|e| e.localizedDescription().to_string())
+    }
 }
 
 impl ComputeBackend for Metal {
@@ -53,6 +75,7 @@ impl ComputeBackend for Metal {
     type Fence = Fence;
     type Buffer = Buffer;
     type Pipeline = Pipeline;
+    type Heap = crate::gfx::Heap;
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
@@ -87,16 +110,7 @@ impl ComputeBackend for Metal {
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
         let (_, lib) = self.msc.convert(dxil, None).map_err(|e| e.to_string())?;
-        // shortcut: the library goes through a file (no dispatch_data here); one name per library,
-        // because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2 is a dependency.
-        let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
-        let file =
-            std::env::temp_dir().join(format!("victory-metal-{}-{n}.metallib", std::process::id()));
-        std::fs::write(&file, &lib).map_err(|e| e.to_string())?;
-        let url = NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap()));
-        let l = self.dev.newLibraryWithURL_error(&url);
-        let _ = std::fs::remove_file(&file);
-        let l = l.map_err(|e| e.localizedDescription().to_string())?;
+        let l = self.load_library(&lib)?;
         let name = l
             .functionNames()
             .iter()
@@ -111,47 +125,15 @@ impl ComputeBackend for Metal {
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
-        let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
-        for (f, v) in work.waits {
-            cb.encodeWaitForEvent_value(event(f), *v);
-        }
-        if !work.dispatches.is_empty() {
-            let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
-            for d in work.dispatches {
-                e.setComputePipelineState(&d.pipeline.0);
-                if !d.root.0.is_empty() {
-                    // SAFETY: setBytes copies `root` (at most 4 KiB) before returning.
-                    unsafe {
-                        e.setBytes_length_atIndex(
-                            NonNull::new(d.root.0.as_ptr().cast_mut().cast()).unwrap(),
-                            d.root.0.len(),
-                            ARGUMENT_BUFFER_SLOT,
-                        )
-                    };
-                }
-                for b in &d.resources {
-                    e.useResource_usage(
-                        ProtocolObject::from_ref(&*b.buf),
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    );
-                }
-                let size = |a: [usize; 3]| MTLSize {
-                    width: a[0],
-                    height: a[1],
-                    depth: a[2],
-                };
-                e.dispatchThreadgroups_threadsPerThreadgroup(
-                    size(d.groups),
-                    size(d.threads_per_group),
-                );
-            }
-            e.endEncoding();
-        }
-        for (f, v) in work.signals {
-            cb.encodeSignalEvent_value(event(f), *v);
-        }
-        cb.commit();
-        Ok(())
+        use crate::resources::{Pass, PassSubmission};
+        self.submit_passes(
+            queue,
+            &PassSubmission {
+                waits: work.waits,
+                passes: &[Pass::Compute(work.dispatches)],
+                signals: work.signals,
+            },
+        )
     }
 
     fn signal(&self, fence: &Fence, value: u64) {
@@ -235,6 +217,7 @@ mod tests {
                 .address(mem.gpu(m, src))
                 .address(mem.gpu(m, dst)),
             resources: vec![&mem.buf],
+            heaps: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
         }

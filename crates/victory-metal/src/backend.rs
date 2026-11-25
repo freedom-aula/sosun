@@ -30,10 +30,27 @@ impl RootArgs {
 pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub pipeline: &'a B::Pipeline,
     pub root: RootArgs,
-    /// Every buffer the shader reaches through `root` or a descriptor heap.
+    /// Every title buffer the shader reaches through `root` (heap-referenced resources are made
+    /// resident by the heaps themselves).
     pub resources: Vec<&'a B::Buffer>,
+    pub heaps: Heaps<'a, B>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
+}
+
+/// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.
+pub struct Heaps<'a, B: ComputeBackend + ?Sized> {
+    pub resource: Option<&'a B::Heap>,
+    pub sampler: Option<&'a B::Heap>,
+}
+
+impl<B: ComputeBackend + ?Sized> Default for Heaps<'_, B> {
+    fn default() -> Self {
+        Heaps {
+            resource: None,
+            sampler: None,
+        }
+    }
 }
 
 /// Work for one queue: wait for fence values, run dispatches in order, signal fence values.
@@ -52,6 +69,8 @@ pub trait ComputeBackend {
     type Buffer;
     /// A compute pipeline state.
     type Pipeline;
+    /// A descriptor heap (`ID3D12DescriptorHeap`): resource (CBV/SRV/UAV) or sampler.
+    type Heap;
 
     fn create_queue(&self) -> Result<Self::Queue, String>;
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
