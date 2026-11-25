@@ -361,6 +361,38 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+use super::files::host;
+
+/// The thread's start routine (`ThreadQuerySetWin32StartAddress`), 0 if
+/// unknown.
+fn start_address(thread: *mut c_void) -> usize {
+    let mut start = 0usize;
+    host!("ntdll.dll", "NtQueryInformationThread": extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32)(
+        thread, 9, (&raw mut start).cast(), size_of::<usize>() as u32, std::ptr::null_mut(),
+    );
+    start
+}
+
+/// Suspends only the title's own threads. Under Wine on Rosetta, a thread
+/// of ours suspended while Wine held its virtual memory lock left the lock
+/// held for good, and every thread that allocated or faulted waited on it
+/// (#50: a shader pipeline worker suspended inside a server call made from
+/// `NtQueryVolumeInformationFile`). Threads that start outside the title's
+/// images (VIctory's, Wine's, D3DMetal's) are reported as suspended
+/// without being stopped; the title cannot tell, as it never made them.
+pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
+    let start = start_address(thread);
+    if !victory_loader::in_title_image(start) {
+        static SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, start = format_args!("{start:#x}"), "the title asked to suspend a thread it did not make; left running");
+        }
+        return 0;
+    }
+    host!("kernel32.dll", "SuspendThread": extern "system" fn(*mut c_void) -> u32)(thread)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -393,6 +425,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SuspendThread),
         ],
     }
 }
@@ -606,6 +639,29 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A thread of ours (started outside any title image) is not stopped
+    /// when the title asks to suspend it.
+    #[test]
+    fn threads_the_title_did_not_make_are_not_suspended() {
+        use std::os::windows::io::AsRawHandle;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        let worker = std::thread::spawn(|| {
+            while !STOP.load(Ordering::Relaxed) {
+                COUNT.fetch_add(1, Ordering::Relaxed);
+                std::hint::spin_loop();
+            }
+        });
+        let handle = worker.as_raw_handle().cast();
+        assert_eq!(SuspendThread(handle), 0);
+        let before = COUNT.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(COUNT.load(Ordering::Relaxed) > before, "it kept running");
+        STOP.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+    }
 
     #[test]
     // The title names its images with Windows paths.
