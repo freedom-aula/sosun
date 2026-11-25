@@ -2516,6 +2516,24 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // What is presented, whenever it changes: the title's texture in its
+        // host format, and the swap chain format it is copied into.
+        static SHOWN: Mutex<Option<(u64, u32, i32)>> = Mutex::new(None);
+        let shown = Some((desc.Width, desc.Height, desc.Format.0));
+        let mut last = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != shown {
+            *last = shown;
+            tracing::info!(
+                frame,
+                width = desc.Width,
+                height = desc.Height,
+                texture_format = desc.Format.0,
+                flags = desc.Flags.0,
+                swap_format = format.0,
+                "presenting a title texture"
+            );
+        }
+        drop(last);
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
