@@ -648,7 +648,10 @@ impl State {
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    not_run("a root view's offset: no root view, or outside title buffers");
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -790,10 +793,17 @@ impl State {
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
+            not_run("a root view the title did not set");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            not_run("a root view outside title buffers");
+            return None;
+        };
+        let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
+            not_run("a root view 4 GiB or more into its copy");
+            return None;
+        };
         shadow.refresh(list, address, shadow.left(address));
         if uav {
             // Writes through the view are marked wherever they land in the
@@ -802,11 +812,15 @@ impl State {
             shadow.gpu_writes(list, address, len, true);
         }
         let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
+            0 => (MEMORY_HEAP, crate::memory::heap()),
             h => (
                 std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
+                crate::descriptor::heap(h as This).host(),
             ),
+        };
+        let Some(host) = host else {
+            not_run("a root view without a host view heap");
+            return None;
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
@@ -816,6 +830,7 @@ impl State {
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
+                not_run("no dynamic slots for root views");
                 return None;
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
