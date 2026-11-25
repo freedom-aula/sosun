@@ -62,6 +62,37 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether this process runs under Wine (so on D3DMetal on a Mac), for the
+/// tests' known differences there (docs/macos.md, "Open differences").
+pub fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: ntdll is always loaded; both names end with a NUL.
+    unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"wine_get_version".as_ptr().cast()) }
+        .is_some()
+}
+
+impl Host {
+    /// Whether the device runs 64-bit atomics on typed resources in the
+    /// descriptor heap. `victory_gpu` refuses pipelines that need them on
+    /// devices without (D3DMetal 4.0 beta 3 has none).
+    pub fn heap_atomics64(&self) -> bool {
+        let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+        // SAFETY: each query writes its own structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, (&raw mut typed).cast(), size_of_val(&typed) as u32)
+                .is_ok()
+                && self
+                    .device
+                    .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, (&raw mut heap).cast(), size_of_val(&heap) as u32)
+                    .is_ok()
+        };
+        ok && typed.AtomicInt64OnTypedResourceSupported.as_bool()
+            && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {

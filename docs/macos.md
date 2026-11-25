@@ -75,3 +75,13 @@ D3DMetal keeps a compiled-shader cache for each executable, in `$(getconf DARWIN
 This was the "signed zero in minimums" difference listed here before. Each `v_min_f32` and `v_min3_f32` test shader is the same length as the maximum built just before it, so the minimum ran the maximum's code and gave +0 where the console gives -0. Selecting on the integer bits could not help, because the shader that ran was never the one being changed. It also made `v_cmp_class_f16_matches_rdna2` fail whenever the max/min test ran before it, as it does with `--test-threads=1`. The `v_max3_f32` shader and that test's first shader are both 2316 bytes.
 
 `container::shader_hash` now writes the MD5 of the program into the `HASH` part. The minimum cases run under Wine again, and both tests pass in every order on an M5 Pro with D3DMetal 4.0 beta 3. Cache entries written under the old zero hash are never looked up again, so old caches need no cleaning.
+
+## Open differences under D3DMetal
+
+The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new shader tests, and three of them find real differences in D3DMetal 4.0 beta 3 on an M4. The tests skip only those checks under Wine, so the rest of each test still runs.
+
+- 64-bit image atomics. D3DMetal reports `AtomicInt64OnTypedResourceSupported` and `AtomicInt64OnDescriptorHeapResourceSupported`, so `victory_gpu` builds pipelines that use them, but the atomics in `image_atomics_of_64_bits` leave every texel at zero. The game's alpha prepasses use them, so those prepasses will be wrong on a Mac until the translator emulates them or D3DMetal is fixed. The test host now also checks the two features, as the runtime does.
+- Sample bias in compute programs. In `image_addresses_of_16_bits_and_clamps`, a sample with a bias of 1 reads level 1 where the console reads level 2, so the bias is ignored. The gather and clamp cases of that test pass.
+- Gather positions. D3DMetal's gather truncates the position where the console rounds it, as WARP's does, so `gathers_at_a_level_match_the_hardware` skips the same comparison it already skipped for WARP.
+
+The seven victory-gpu tests that compile HLSL at run time now take the bytes that Microsoft's FXC made on a Windows runner (the test-shaders workflow and `cargo xtask embed-test-shaders`), because Wine's compiler cannot build them. The depth conversion in `twin.rs` goes through the same table, so depth textures written through unordered views are converted on the Mac too.

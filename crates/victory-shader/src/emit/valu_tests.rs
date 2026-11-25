@@ -1098,6 +1098,11 @@ fn image_addresses_of_16_bits_and_clamps() {
             continue;
         };
         for (shader, k, want) in cases {
+            // D3DMetal ignores a sample's bias in compute programs
+            // (docs/macos.md, "Open differences").
+            if std::ptr::eq(shader, &biased) && super::host::under_wine() {
+                continue;
+            }
             let (root, pso) = host
                 .compute_pipeline(shader)
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
@@ -1188,6 +1193,13 @@ fn image_atomics_of_64_bits() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // D3DMetal says it has them but leaves the texels untouched
+        // (docs/macos.md, "Open differences").
+        if !host.heap_atomics64() || super::host::under_wine() {
+            // The runtime refuses such pipelines on this device.
+            eprintln!("no 64-bit typed heap atomics on the {label} device; skipped");
+            continue;
+        }
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: {e}"));

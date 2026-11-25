@@ -264,8 +264,9 @@ fn gathers_at_a_level_match_the_hardware() {
                 at(sext(offset), sext(offset >> 8)),
                 "{label}: lane {lane}, offset"
             );
-            // WARP's own gather truncates where the hardware rounds.
-            if lane < 16 && !warp {
+            // WARP's own gather truncates where the hardware rounds, and so
+            // does D3DMetal's (docs/macos.md, "Open differences").
+            if lane < 16 && !warp && !super::host::under_wine() {
                 assert_eq!(got(2), got(0), "{label}: lane {lane} against its gather");
             }
         }
