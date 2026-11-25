@@ -332,6 +332,12 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A footprint at `offset` (tests).
+    #[cfg(test)]
+    pub(crate) fn new(offset: u64, format: u32, width: u32, height: u32, row_pitch: u32) -> Self {
+        Self { offset, format, width, height, depth: 1, row_pitch }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
