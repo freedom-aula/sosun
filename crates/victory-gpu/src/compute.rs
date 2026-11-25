@@ -8,6 +8,9 @@
 //! signature is version 1.1 with no flags, as Microsoft's compilers build
 //! it from an HLSL root signature string.
 
+// Tables, root views and their ranges are used only by tests so far.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Error, PCSTR, Result};
