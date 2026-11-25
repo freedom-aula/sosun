@@ -2790,6 +2790,34 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
+    /// (host copies of title memory among them) in video memory the CPU maps
+    /// (a GPU upload heap, where the host has one), to measure how much of
+    /// the GPU's time is shaders reading the copies over the bus. CPU reads
+    /// of them (snapshots, copy-backs) become slow: for that measurement only.
+    #[cfg(feature = "diagnostics")]
+    fn copies_in_video_memory(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            if !crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY") {
+                return false;
+            }
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            tracing::warn!(on = ok, "host copies of title memory in video memory (diagnostics)");
+            ok
+        })
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
@@ -2800,6 +2828,12 @@ impl Host {
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
             MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
             ..Default::default()
+        };
+        #[cfg(feature = "diagnostics")]
+        let heap = if self.copies_in_video_memory() {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
+        } else {
+            heap
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
