@@ -393,6 +393,28 @@ mod tests {
 
     use super::*;
 
+    /// Shaders that use title memory mark their reads in their own bitmap:
+    /// read marks of both bitmaps are taken, each slot once until it is
+    /// forgotten, and a forgotten slot's next read is taken again.
+    #[test]
+    fn read_marks_of_both_bitmaps_are_taken() {
+        let Some(host) = host() else { return };
+        // No submission takes the marks meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
+        crate::shadow::tests::mark_read(false, plain);
+        crate::shadow::tests::mark_read(true, memory);
+        let taken = crate::shadow::take_reads();
+        assert!(taken.contains(&plain), "a plain shader's read");
+        assert!(taken.contains(&memory), "a read by a shader that uses title memory");
+        let again = crate::shadow::take_reads();
+        assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
+        crate::shadow::forget_read(memory);
+        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        crate::shadow::tests::mark_read(true, memory);
+        assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+    }
+
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };

@@ -777,27 +777,32 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
-    let Some(b) = bitmap() else {
-        return Vec::new();
-    };
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-    // (one submission runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+    // Both bitmaps: shaders that use title memory mark their reads in theirs.
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+        // (one submission runs at a time).
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return Vec::new();
+    }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
     seen.resize(words, 0);
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
         if w < words {
-            bits[w] &= !bit;
+            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
             seen[w] &= !bit;
         }
     }
     let mut new = Vec::new();
-    for (w, (x, s)) in bits.iter().zip(seen.iter_mut()).enumerate() {
-        let mut fresh = *x & !*s;
+    for (w, s) in seen.iter_mut().enumerate() {
+        let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
         *s |= fresh;
         while fresh != 0 {
             new.push(w as u32 * 32 + fresh.trailing_zeros());
@@ -1228,8 +1233,18 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A shader's read mark of heap slot `slot` in the bitmap of shaders
+    /// that use title memory (`memory`) or of the others.
+    pub(crate) fn mark_read(memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let bit = victory_shader::emit::VIEW_READS + slot;
+        // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
+        // holds the submission lock).
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
