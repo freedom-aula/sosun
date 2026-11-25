@@ -626,32 +626,62 @@ fn writes_through_views_mark_their_pages() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// Reads of texture views from the heap mark their heap index (`emit`,
-/// "Read marks"): an `image_load` through a table whose user data places it
-/// at heap index 1 sets exactly bit [`super::VIEW_READS`] + 1.
+/// Reads of texture views the program takes from the resource heap itself
+/// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
+/// at heap byte offset 32 (index 1) sets exactly bit [`super::VIEW_READS`] +
+/// 1. The same read through a table marks nothing (a table read makes its
+/// slot on the host).
 #[test]
-fn texture_reads_mark_their_heap_index() {
-    let mut w = vec![s_mov_b32(5, ZERO as u8)];
-    w.extend(s_load(3, 12, 4, 0));
-    w.push(S_WAITCNT_ALL);
-    w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
-    // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
-    w.extend([0xF000_1F08, 0x0003_0200]);
-    w.push(S_WAITCNT_ALL);
-    w.push(S_ENDPGM);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
-        layout: vec![RootParam {
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            sgprs: 1,
-            base_register: 0,
-            user_data: 4,
-            slot: 0,
-        }],
-        used: vec![UsedResource {
+fn heap_direct_texture_reads_mark_their_heap_index() {
+    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
+        let mut w = vec![s_mov_b32(5, ZERO as u8)];
+        w.extend(s_load(3, 12, 4, offset));
+        w.push(S_WAITCNT_ALL);
+        w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
+        // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        w.extend([0xF000_1F08, 0x0003_0200]);
+        w.push(S_WAITCNT_ALL);
+        w.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: true,
+        })
+        .expect("lower")
+    };
+    let table = lower_with(
+        RootType::Table,
+        vec![UsedResource {
             kind: ResourceType::Srv,
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -661,30 +691,11 @@ fn texture_reads_mark_their_heap_index() {
             user_data: 4,
             slot: 0,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
-            threads: [1, 1, 1],
-        }),
-        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: true,
-    })
-    .expect("lower");
-    assert!(l.view_marks, "reads marked");
+        0,
+    );
+    assert!(!table.view_marks, "a table read marks nothing");
+    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -716,11 +727,8 @@ fn texture_reads_mark_their_heap_index() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        for u in &shader.user_data {
-            // The table at heap index 1 (a byte offset in the heap).
-            ud[u.index as usize] = 32;
-        }
+        // The heap's base is 0 in the user data (`emit`, "Binding").
+        let ud = vec![0u32; shader.user_data_dwords() as usize];
         let out = host
             .dispatch(
                 &root,

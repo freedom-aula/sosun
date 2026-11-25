@@ -4913,12 +4913,16 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A handle for the descriptor `src` read at `site`; a texture shader
-    /// view's heap index is noted for the instruction's read mark (handles
-    /// are made once per block, often before the instruction).
+    /// A handle for the descriptor `src` read at `site`; the heap index of
+    /// a texture shader view the program takes from the heap itself is noted
+    /// for the instruction's read mark (handles are made once per block,
+    /// often before the instruction). A view read through a table needs
+    /// none: the host makes the slot for the draw.
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
-        if let Some(&index) = self.s.texture_index.get(&h) {
+        if let Some(&index) = self.s.texture_index.get(&h)
+            && self.is_heap_direct(src)
+        {
             self.s.texture_reads.push(index);
         }
         Ok(h)

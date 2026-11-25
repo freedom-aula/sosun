@@ -167,8 +167,9 @@
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
-//!   every image instruction that reads a texture shader view from the
-//!   resource heap (tables or the heap itself) also sets bit
+//!   every image instruction that reads a texture shader view the program
+//!   takes from the resource heap itself (not through a table, whose slots
+//!   the host makes for the draw) also sets bit
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
