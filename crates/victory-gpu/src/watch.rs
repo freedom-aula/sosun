@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, what it saves of
-/// pages it armed, and its bit in [`DIRTY`] (none: always taken as dirty).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>);
+/// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
+/// whether it is a host buffer copy's (the only trackers [`retake`] marks).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -266,6 +267,16 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// Only the pages of the range that are such memory are tracked; the rest is
 /// never guarded and is copied whole at each use, as memory with no tracker.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, false)
+}
+
+/// [`track`] for a host buffer copy: what shaders write lands in it, so a
+/// [`retake`] of its memory marks it.
+pub(crate) fn track_copy(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, true)
+}
+
+fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked> {
     if len == 0 {
         return None;
     }
@@ -288,7 +299,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit));
+    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -723,10 +734,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
-/// every copy holding the memory takes it from title memory again at its
-/// next refresh (the pages count as changed in each, aliases too). Title
-/// memory itself did not change, so its guards stay (opened page by page,
-/// they cost ~15 % of the submitting thread at each frame end, run perf15).
+/// every host buffer copy holding the memory takes it from title memory
+/// again at its next refresh (the pages count as changed in each, aliases
+/// too). Title memory itself did not change, so its guards stay (opened page
+/// by page, they cost ~15 % of the submitting thread at each frame end, run
+/// perf15), and other trackers (textures' staging, heaps) are left alone:
+/// shaders' writes never reach them (marked, textures over withheld ranges
+/// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let g = guards();
@@ -737,10 +751,11 @@ pub(crate) fn retake(at: usize, len: usize) {
     }
 }
 
-/// Pages `[first, last)` count as changed in every tracker holding them.
+/// Pages `[first, last)` count as changed in every host buffer copy's
+/// tracker holding them.
 fn mark(g: &Guards, first: usize, last: usize) {
     for (&page, holders) in g.holders.range(first..last) {
-        for c in holders {
+        for c in holders.iter().filter(|c| c.3) {
             let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
             set_dirty(c.2, true);
             set.insert(page);
@@ -1151,8 +1166,8 @@ pub(crate) mod tests {
             info.Protect
         };
         let (a, b) = twin_views(2);
-        let t = track(a, 2 * PAGE, true).expect("views are tracked");
-        let u = track(b, 2 * PAGE, true).expect("views are tracked");
+        let t = track_copy(a, 2 * PAGE, true).expect("views are tracked");
+        let u = track_copy(b, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
         assert_eq!(u.take(b, b + 2 * PAGE), [(b, b + 2 * PAGE)]);
         assert!(t.clean() && u.clean());
@@ -1177,6 +1192,25 @@ pub(crate) mod tests {
         drop(u);
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
         assert!(t.clean());
+    }
+
+    /// A retake marks host buffer copies holding the memory, not other
+    /// trackers of it (a texture's staging): shaders' writes reach only the
+    /// copies. A title write still marks both.
+    #[test]
+    fn a_retake_marks_buffer_copies_alone() {
+        let p = pool(2);
+        let copy = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+        let texture = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert_eq!(texture.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        retake(p + PAGE, 16);
+        assert!(copy.changed(p / PAGE + 1), "the copy takes it again");
+        assert!(!texture.changed(p / PAGE + 1) && texture.clean(), "the texture's tracker is left alone");
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        // SAFETY: a page of our pool, guarded: the handler opens it.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        assert!(copy.changed(p / PAGE + 1) && texture.changed(p / PAGE + 1), "a title write marks both");
     }
 
     /// A write or mapping that runs past the end of the address space (a
