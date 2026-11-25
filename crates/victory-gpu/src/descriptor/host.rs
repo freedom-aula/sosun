@@ -1525,6 +1525,11 @@ mod tests {
             heap.make_null(slot);
             assert!(references(&buffer) >= 2, "the slot's, retired");
             crate::host::release_retired();
+            // Released on a thread of its own.
+            let since = std::time::Instant::now();
+            while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
             assert_eq!(references(&buffer), 1, "ours");
         }
         let a = heap.dynamic(heap.dynamic - 100).unwrap();

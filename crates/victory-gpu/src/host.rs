@@ -1092,8 +1092,10 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        // The submission has run and the next waits for our lock.
+        // The submission has run and the next waits for our lock. Host
+        // copies the title gave up meanwhile may have their last holder here.
         release_retired();
+        release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -2801,7 +2803,26 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
-    drop(retired);
+    if !retired.is_empty() {
+        release_later(Box::new(retired));
+    }
+}
+
+/// Drops `what` on a thread of its own: releasing a D3D12 resource is a
+/// kernel call (~5 % of a world frame on the title's submitting thread,
+/// run perf1). Only for objects no GPU work in flight uses.
+fn release_later(what: Box<dyn std::any::Any + Send>) {
+    type Release = std::sync::mpsc::Sender<Box<dyn std::any::Any + Send>>;
+    static RELEASE: OnceLock<Release> = OnceLock::new();
+    let release = RELEASE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn std::any::Any + Send>>();
+        // Without the thread the receiver is gone: sends fail and drop here.
+        let _ = std::thread::Builder::new()
+            .name("victory-release".into())
+            .spawn(move || rx.into_iter().for_each(drop));
+        tx
+    });
+    let _ = release.send(what);
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
