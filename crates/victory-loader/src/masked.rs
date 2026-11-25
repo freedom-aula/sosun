@@ -29,6 +29,10 @@ pub enum MaskedKind {
     Vpmaskmovq,
     Vmaskmovps,
     Vmaskmovpd,
+    /// Not masked, but a vector store Rosetta also cannot resume (#50).
+    Vcvtps2ph,
+    Vextractf128,
+    Vextracti128,
 }
 
 /// The masked store whose encoding starts at `at`, if one does: a
@@ -39,15 +43,18 @@ fn decode(code: &[u8], at: usize) -> Option<(MaskedKind, bool)> {
     let &[c4, b1, b2, opcode, modrm] = code.get(at..at + 5)? else {
         return None;
     };
-    if c4 != 0xc4 || b1 & 0x1f != 2 || b2 & 3 != 1 || modrm >> 6 == 3 {
+    if c4 != 0xc4 || b2 & 3 != 1 || modrm >> 6 == 3 {
         return None;
     }
     let w = b2 & 0x80 != 0;
-    let kind = match opcode {
-        0x8e if w => MaskedKind::Vpmaskmovq,
-        0x8e => MaskedKind::Vpmaskmovd,
-        0x2e => MaskedKind::Vmaskmovps,
-        0x2f => MaskedKind::Vmaskmovpd,
+    let kind = match (b1 & 0x1f, opcode) {
+        (2, 0x8e) if w => MaskedKind::Vpmaskmovq,
+        (2, 0x8e) => MaskedKind::Vpmaskmovd,
+        (2, 0x2e) => MaskedKind::Vmaskmovps,
+        (2, 0x2f) => MaskedKind::Vmaskmovpd,
+        (3, 0x1d) if !w => MaskedKind::Vcvtps2ph,
+        (3, 0x19) if !w && b2 & 4 != 0 => MaskedKind::Vextractf128,
+        (3, 0x39) if !w && b2 & 4 != 0 => MaskedKind::Vextracti128,
         _ => return None,
     };
     Some((kind, b2 & 4 != 0))
@@ -91,12 +98,15 @@ pub fn summary(found: &[MaskedStore]) -> String {
         .map(|f| format!("{:#x}", f.rva))
         .collect();
     format!(
-        "{} in code (vpmaskmovd {}, vpmaskmovq {}, vmaskmovps {}, vmaskmovpd {}), first at {}{}",
+        "{} in code (vpmaskmovd {}, vpmaskmovq {}, vmaskmovps {}, vmaskmovpd {}, vcvtps2ph {}, vextractf128 {}, vextracti128 {}), first at {}{}",
         found.len(),
         count(MaskedKind::Vpmaskmovd),
         count(MaskedKind::Vpmaskmovq),
         count(MaskedKind::Vmaskmovps),
         count(MaskedKind::Vmaskmovpd),
+        count(MaskedKind::Vcvtps2ph),
+        count(MaskedKind::Vextractf128),
+        count(MaskedKind::Vextracti128),
         first.join(" "),
         if found.len() > 16 { " ..." } else { "" }
     )
@@ -154,7 +164,7 @@ mod tests {
         ];
         assert_eq!(
             summary(&found),
-            "2 in code (vpmaskmovd 1, vpmaskmovq 0, vmaskmovps 1, vmaskmovpd 0), first at 0x1000 0x2000"
+            "2 in code (vpmaskmovd 1, vpmaskmovq 0, vmaskmovps 1, vmaskmovpd 0, vcvtps2ph 0, vextractf128 0, vextracti128 0), first at 0x1000 0x2000"
         );
         assert_eq!(summary(&[]), "none in code");
     }
@@ -179,6 +189,9 @@ pub(crate) struct Store {
     pub modrm: u8,
     pub sib: Option<u8>,
     pub disp: i32,
+    /// For an unmasked store (`vcvtps2ph`, `vextract*128`): the VEX
+    /// prefix's two bytes, the opcode, the immediate and the bytes stored.
+    pub plain: Option<(u8, u8, u8, u8, u8)>,
 }
 
 impl Store {
@@ -231,7 +244,21 @@ pub(crate) fn decode_store(code: &[u8], at: usize) -> Option<Store> {
         _ => 0,
     };
     len += disp_len;
+    let plain = match kind {
+        MaskedKind::Vcvtps2ph | MaskedKind::Vextractf128 | MaskedKind::Vextracti128 => {
+            let imm = *code.get(at + len)?;
+            len += 1;
+            let bytes = if kind == MaskedKind::Vcvtps2ph && !ymm {
+                8
+            } else {
+                16
+            };
+            Some((b1, b2, code[at + 3], imm, bytes))
+        }
+        _ => None,
+    };
     Some(Store {
+        plain,
         len,
         wide_lanes: matches!(kind, MaskedKind::Vpmaskmovq | MaskedKind::Vmaskmovpd),
         ymm,
@@ -280,6 +307,27 @@ pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
         };
         c.extend_from_slice(&disp.to_le_bytes());
     }
+    if let Some((b1, b2, opcode, imm, bytes)) = s.plain {
+        // The same instruction into [rsp] (X and B cleared, ModRM.reg
+        // kept), then the bytes copied out 8 at a time with plain moves.
+        c.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]); // sub rsp, 32
+        c.extend_from_slice(&[
+            0xc4,
+            b1 | 0x60,
+            b2,
+            opcode,
+            0x40 | (s.modrm & 0x38) | 4,
+            0x24,
+            0,
+            imm,
+        ]);
+        for k in 0..bytes / 8 {
+            c.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, k * 8]); // mov rcx, [rsp + 8k]
+            c.extend_from_slice(&[0x48, 0x89, 0x48, k * 8]); // mov [rax + 8k], rcx
+        }
+        c.extend_from_slice(&[0x48, 0x83, 0xc4, 0x20]); // add rsp, 32
+        return tail(c, site, s.len, at);
+    }
     c.extend_from_slice(&[0x48, 0x83, 0xec, 0x40]); // sub rsp, 64
     // vmovdqu [rsp], mask; vmovdqu [rsp + 32], src (F3 0F 7F /r).
     for (reg, disp) in [(s.mask, None), (s.src, Some(0x20u8))] {
@@ -312,8 +360,13 @@ pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
         c.extend_from_slice(&[0x89, 0x48, off]);
     }
     c.extend_from_slice(&[0x48, 0x83, 0xc4, 0x40]); // add rsp, 64
+    tail(c, site, s.len, at)
+}
+
+/// Restores flags, rcx and rax, and jumps back past the store.
+fn tail(mut c: Vec<u8>, site: u64, len: usize, at: u64) -> Option<Vec<u8>> {
     c.extend_from_slice(&[0x9d, 0x59, 0x58]); // popfq; pop rcx; pop rax
-    let back = (site as i64) + s.len as i64;
+    let back = (site as i64) + len as i64;
     let next = at as i64 + c.len() as i64 + 5;
     c.push(0xe9);
     c.extend_from_slice(&i32::try_from(back - next).ok()?.to_le_bytes());
@@ -464,6 +517,16 @@ mod patch_tests {
     }
 
     #[test]
+    fn the_store_from_the_second_hang_decodes() {
+        // vcvtps2ph [r8+rdx*2], ymm0, 3 from run 11 in #50.
+        let s = decode_store(&[0xc4, 0xc3, 0x7d, 0x1d, 0x04, 0x50, 0x03], 0).unwrap();
+        assert_eq!(
+            (s.len, s.b, s.x, s.sib, s.plain.map(|p| (p.3, p.4))),
+            (7, true, false, Some(0x50), Some((3, 16)))
+        );
+    }
+
+    #[test]
     fn the_jump_pads_to_the_store_length() {
         assert_eq!(
             jump(0x1000, 7, 0x2000).unwrap(),
@@ -488,10 +551,14 @@ mod patch_tests {
         use windows_sys::Win32::System::Memory::*;
         // f(dst rcx, mask rdx, src r8): vmovdqu ymm1, [rdx]; vmovdqu ymm2,
         // [r8]; <store>; vzeroupper; ret.
-        let cases: [&[u8]; 3] = [
+        let cases: [&[u8]; 7] = [
             &[0xc4, 0xe2, 0x75, 0x8e, 0x11],       // vpmaskmovd [rcx], ymm1, ymm2
             &[0xc4, 0xe2, 0xf5, 0x8e, 0x51, 0x08], // vpmaskmovq [rcx+8], ymm1, ymm2
             &[0xc4, 0xe2, 0x71, 0x2e, 0x54, 0x01, 0x04], // vmaskmovps [rcx+rax+4], xmm1, xmm2 (rax 0)
+            &[0xc4, 0xe3, 0x7d, 0x1d, 0x09, 0x00],       // vcvtps2ph [rcx], ymm1, 0
+            &[0xc4, 0xe3, 0x79, 0x1d, 0x49, 0x04, 0x03], // vcvtps2ph [rcx+4], xmm1, 3
+            &[0xc4, 0xe3, 0x7d, 0x19, 0x49, 0x10, 0x01], // vextractf128 [rcx+16], ymm1, 1
+            &[0xc4, 0xe3, 0x7d, 0x39, 0x09, 0x01],       // vextracti128 [rcx], ymm1, 1
         ];
         for (k, store) in cases.into_iter().enumerate() {
             let mut code = vec![
