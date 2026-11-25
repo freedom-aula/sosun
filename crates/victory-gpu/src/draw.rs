@@ -2410,7 +2410,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let slots = Slots::new(2);
         let read = compile_cs(READ);
-        let (out, _) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // RGBA8 128x128, linear: one whole 64 KiB page.
         let address = crate::watch::tests::pool(1) as u64;
         let object = texture_at_address(address, &texture_words(128, 128, 28, 0x100, 0));
@@ -2418,19 +2418,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
         let view = View::Shader(object as usize, Some(desc));
         slots.make(0, &view);
-        let submit = || {
+        let submit = |byte: u8| {
             // SAFETY: the texture's memory, one page.
-            unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, crate::watch::PAGE) };
+            unsafe { std::ptr::write_bytes(address as *mut u8, byte, crate::watch::PAGE) };
             let list = host.new_list().unwrap();
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 0, Some(&out), (8, 8));
             list.close();
             let before = crate::texture::uploads(object);
             host.execute(&[&list]);
-            crate::texture::uploads(object) - before
+            // SAFETY: inside the mapped output.
+            let texel = unsafe { (data as *const [f32; 4]).read() };
+            (crate::texture::uploads(object) - before, texel[0])
         };
-        assert_eq!(submit(), 1);
-        assert_eq!(submit(), 1, "its own page written: uploaded");
+        assert_eq!(submit(0x40).0, 1);
+        assert_eq!(submit(0x40).0, 1, "its own page written: uploaded");
+        let (n, x) = submit(0x80);
+        assert_eq!(n, 1);
+        assert!((x - 128.0 / 255.0).abs() < 1e-6, "a reused staging buffer carries the new bytes: {x}");
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the

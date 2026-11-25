@@ -202,6 +202,7 @@ pub(crate) fn uploads(
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    crate::texture::recycle();
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
@@ -212,8 +213,10 @@ pub(crate) fn uploads(
     let mut recorded = false;
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
-        if staged.insert(Arc::as_ptr(staging)) && staging.refresh() {
-            crate::texture::record_upload(list, copy, staging);
+        if staged.insert(Arc::as_ptr(staging))
+            && let Some(buffer) = staging.refresh()
+        {
+            crate::texture::record_upload(list, copy, staging, &buffer);
             recorded = true;
             #[cfg(feature = "diagnostics")]
             UPLOADED.fetch_add(1, Relaxed);
