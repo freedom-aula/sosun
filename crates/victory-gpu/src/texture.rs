@@ -635,7 +635,16 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return (0, None);
+            // Never uploaded: zeros, as a committed texture starts (one in
+            // a heap of textures starts with whatever the range held).
+            if last.hash.is_some() {
+                return (0, None);
+            }
+            let zeros = vec![0u8; size];
+            let every = all();
+            let buffer = self.detile(&zeros, &every);
+            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };

@@ -820,6 +820,9 @@ pub(crate) struct HostTexture {
     pub(crate) viewed: std::sync::atomic::AtomicBool,
     /// The memory it copies, for title textures fed from it.
     key: Option<MemoryKey>,
+    /// Its range in a heap of textures (`crate::placement`), given back
+    /// when it goes; `None` for a committed texture.
+    placement: Option<crate::placement::Placement>,
     /// When the title last used it: presented frame and milliseconds since
     /// the first stamp ([`HostTexture::stamp`]).
     last: [std::sync::atomic::AtomicU64; 2],
@@ -850,6 +853,7 @@ impl HostTexture {
             used: false.into(),
             viewed: false.into(),
             key: None,
+            placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
     }
@@ -949,6 +953,9 @@ pub(crate) fn texture_census() -> [[u64; 3]; 2] {
 #[cfg(windows)]
 impl Drop for HostTexture {
     fn drop(&mut self) {
+        if let Some(p) = self.placement.take() {
+            crate::placement::free(self.texture.clone(), p);
+        }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
@@ -1306,25 +1313,54 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
-    if !castable_formats.is_empty()
+    // In a heap of textures if it fits there (`crate::placement`).
+    // SAFETY: the description has the host layout (checked size).
+    let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    let mut placement = None;
+    if clear_value.is_none()
+        && crate::placement::fits(&host.device, &plain)
+        && let Some((heap, p)) = crate::placement::place(&host.device, &plain)
+    {
+        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        let made = match host.device.cast::<ID3D12Device10>() {
+            Ok(device) if !formats.is_empty() => {
+                let desc1 = desc1_of(&plain);
+                // SAFETY: a range of the heap for this description; the
+                // list of formats lives through the call.
+                unsafe {
+                    device.CreatePlacedResource2(&heap, p.offset(), &desc1, D3D12_BARRIER_LAYOUT_COMMON, None, Some(&formats), &mut texture)
+                }
+                .map(|()| 0)
+            }
+            _ => {
+                // SAFETY: as above.
+                unsafe {
+                    host.device.CreatePlacedResource(&heap, p.offset(), &plain, D3D12_RESOURCE_STATES(initial as i32), None, &mut texture)
+                }
+                .map(|()| {
+                    castable_formats.clear();
+                    initial
+                })
+            }
+        };
+        match made {
+            Ok(state) => {
+                initial = state;
+                placement = Some(p);
+            }
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(error = %e, desc = ?d, "a texture not placed in a heap: committed"));
+                crate::placement::unplace(p);
+                texture = None;
+            }
+        }
+    }
+    if texture.is_none()
+        && !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
-        // SAFETY: the description has the host layout (checked size).
-        let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
-        // The plain description plus the sampler feedback region (none).
-        let desc1 = D3D12_RESOURCE_DESC1 {
-            Dimension: p.Dimension,
-            Alignment: p.Alignment,
-            Width: p.Width,
-            Height: p.Height,
-            DepthOrArraySize: p.DepthOrArraySize,
-            MipLevels: p.MipLevels,
-            Format: p.Format,
-            SampleDesc: p.SampleDesc,
-            Layout: p.Layout,
-            Flags: p.Flags,
-            SamplerFeedbackMipRegion: Default::default(),
-        };
+        let desc1 = desc1_of(&plain);
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
@@ -1375,7 +1411,27 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some(HostTexture::new(texture, initial, castable_formats))
+    let mut t = HostTexture::new(texture, initial, castable_formats);
+    t.placement = placement;
+    Some(t)
+}
+
+/// A plain description plus the sampler feedback region (none).
+#[cfg(windows)]
+fn desc1_of(p: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1 {
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC1 {
+        Dimension: p.Dimension,
+        Alignment: p.Alignment,
+        Width: p.Width,
+        Height: p.Height,
+        DepthOrArraySize: p.DepthOrArraySize,
+        MipLevels: p.MipLevels,
+        Format: p.Format,
+        SampleDesc: p.SampleDesc,
+        Layout: p.Layout,
+        Flags: p.Flags,
+        SamplerFeedbackMipRegion: Default::default(),
+    }
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1535,6 +1591,9 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        // Free space in the heaps of textures takes the card's memory but
+        // is not in use: new textures go there first.
+        let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
     evict(frame, now_ms(), over);
