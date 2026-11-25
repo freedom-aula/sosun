@@ -634,10 +634,12 @@ mod tests {
     /// table and the heap's views, as translated shaders do, into `dst`
     /// from byte `at`.
     const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=3, b0)"
 ByteAddressBuffer views[] : register(t0);
 ByteAddressBuffer table : register(t0, space2);
 RWByteAddressBuffer dst : register(u0);
 cbuffer c : register(b0) { uint lo; uint hi; uint at; }
+[RootSignature(RS)]
 [numthreads(4, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint a = lo + id.x * 4;
