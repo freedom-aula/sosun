@@ -31,9 +31,6 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// The slots each kept texture is viewed in (by its raw pointer), for
-    /// textures given up ([`HostHeap::evict`]).
-    by_texture: Mutex<std::collections::HashMap<usize, Vec<u32>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -197,7 +194,6 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            by_texture: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -521,23 +517,6 @@ impl HostHeap {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             let old = std::mem::replace(slot, resource);
-            // Textures (views without a copy of title memory) by slot.
-            let raw = |k: &Kept| k.as_ref().filter(|k| k.1.is_none()).map(|k| windows::core::Interface::as_raw(&k.0) as usize);
-            let (was, now) = (raw(&old), raw(slot));
-            if was != now {
-                let mut by = self.by_texture.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(was) = was
-                    && let Some(slots) = by.get_mut(&was)
-                {
-                    slots.retain(|&i| i != index);
-                    if slots.is_empty() {
-                        by.remove(&was);
-                    }
-                }
-                if let Some(now) = now {
-                    by.entry(now).or_default().push(index);
-                }
-            }
             #[cfg(feature = "diagnostics")]
             if let Some((old, _)) = &old
                 && !self.sampler
@@ -779,10 +758,21 @@ impl HostHeap {
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
     /// mark, cleared) makes it again.
+    /// The slots are found by a walk of the heap, once per pass that gives
+    /// textures up: a map of each texture's slots, kept at every slot the
+    /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
+    /// slots had its list searched each time; 62,000 slots a frame, run
+    /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
         let slots: Vec<u32> = {
-            let by = self.by_texture.lock().unwrap_or_else(|e| e.into_inner());
-            textures.iter().filter_map(|t| by.get(t)).flatten().copied().collect()
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (0..kept.len() as u32)
+                .filter(|&i| {
+                    kept[i as usize]
+                        .as_ref()
+                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                })
+                .collect()
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
