@@ -108,8 +108,10 @@ impl Host {
                 factory.EnumWarpAdapter().map_err(err)?
             } else {
                 let adapter = factory.EnumAdapters1(0).map_err(err)?;
-                if adapter.GetDesc1().map_err(err)?.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-                {
+                let desc = adapter.GetDesc1().map_err(err)?;
+                // GitHub's runner shows Microsoft's Basic Render Driver
+                // (vendor 0x1414) without the software flag.
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || desc.VendorId == 0x1414 {
                     return Err("no hardware adapter".into());
                 }
                 adapter
