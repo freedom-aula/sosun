@@ -1689,6 +1689,7 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
+#[cfg(windows)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
@@ -2495,6 +2496,7 @@ mod tests {
     /// Textures idle for the idle time and frames are given up; past the
     /// budget the least recently used others follow until the excess is
     /// gone.
+    #[cfg(windows)]
     #[test]
     fn idle_textures_go_and_past_the_budget_the_least_recently_used() {
         let (frame, now) = (1_000, 1_000_000);
