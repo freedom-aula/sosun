@@ -69,6 +69,9 @@ pub fn run(
         }
         None => println!("build          unknown ({hash})"),
     }
+    // Rosetta cannot resume these when they fault partway (#14, #50).
+    let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
+    println!("masked stores  {}", victory_loader::masked::summary(&masked));
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
