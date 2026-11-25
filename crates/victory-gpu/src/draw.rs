@@ -2242,7 +2242,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(u32::from(byte), ((x ^ y) & 0xff) as u32);
         }
         // Rendered as depth (a clear of both planes), then used through
-        // the unordered view: copied to the twin, converted back.
+        // the unordered view: copied to the twin, converted back. The clear
+        // is 0.75 (12582911.25 in 24 bits), not on a rounding tie: D3DMetal
+        // rounds float depth down to 24 bits, so a tie such as 0.5
+        // (8388607.5) stores 8388607 there and 8388608 on Windows GPUs, and
+        // converts to 32767 or 32768.
         list.reset();
         crate::list::ensure_state(&list, depth, 0x10);
         let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
@@ -2253,7 +2257,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let handle = host.dsv(&copy.texture, Some(&dsv));
         // SAFETY: an open list, the texture in the depth write state.
         unsafe {
-            list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
+            list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.75, 0x11, None)
         };
         readable(&list, &used(ResourceType::Uav), &planes[0]);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
@@ -2283,7 +2287,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                     raw_data.add(g[1].Offset as usize + y * g[1].Footprint.RowPitch as usize + x).read(),
                 )
             };
-            assert_eq!(half, 32768, "16-bit depth at {x},{y}");
+            assert_eq!(half, 49151, "16-bit depth at {x},{y}");
             assert_eq!(byte, 0x11, "stencil at {x},{y}");
         }
     }
