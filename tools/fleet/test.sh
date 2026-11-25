@@ -142,6 +142,12 @@ eq "counts json" '{"passed":2,"failed":2,"ignored":1}' "$(counts_json "$tmp/nati
 eq "failed names keep only plain names" "native/a::two" "$(failed_names "$tmp/native.log" native)"
 printf 'error: could not compile\n' > "$tmp/broken.log"
 eq "no test run gives null" null "$(counts_json "$tmp/broken.log")"
+printf 'test result: ok. 3 passed; 0 failed; 1 ignored;\nerror: a later test binary failed to build\n' > "$tmp/partial.log"
+eq "successful command keeps its counts" '{"passed":3,"failed":0,"ignored":1}' "$(counts_json "$tmp/partial.log" 0)"
+eq "failed command cannot pass on partial counts" null "$(counts_json "$tmp/partial.log" 101)"
+eq "aborted command cannot pass on partial counts" null "$(counts_json "$tmp/partial.log" 137)"
+eq "counted failures retain their counts" '{"passed":2,"failed":2,"ignored":1}' "$(counts_json "$tmp/native.log" 101)"
+eq "failed command with no tests gives null" null "$(counts_json "$tmp/broken.log" 101)"
 eq "chip family" m3 "$(chip_family_of "Apple M3 Pro")"
 eq "chip family of an Intel Mac" "" "$(chip_family_of "Intel(R) Core(TM) i7")"
 
@@ -162,6 +168,8 @@ cat > "$tmp/worker-cleanup.sh" <<'EOF'
 case_dir=$1
 setup_status=$2
 validation_status=$3
+stub_native_status=$4
+stub_wine_status=$5
 set -- help
 . "$0" > /dev/null
 CACHE="$case_dir/cache"
@@ -169,7 +177,7 @@ WORK="$case_dir/work"
 mkdir -p "$WORK/tools/macos"
 printf '#!/bin/sh\nexit %s\n' "$setup_status" > "$WORK/setup.sh"
 chmod +x "$WORK/setup.sh"
-printf '#!/bin/sh\necho "test result: ok. 1 passed; 0 failed; 0 ignored;"\n' > "$WORK/tools/macos/test-wine.sh"
+printf '#!/bin/sh\necho "test result: ok. 1 passed; 0 failed; 0 ignored;"\nexit %s\n' "$stub_wine_status" > "$WORK/tools/macos/test-wine.sh"
 chmod +x "$WORK/tools/macos/test-wine.sh"
 accepted() { return 0; }
 load_task() { T_COMMIT=0123456789abcdef0123456789abcdef01234567; T_CHIP=m3; }
@@ -179,7 +187,7 @@ gh() { echo 'unexpected GitHub call' >&2; exit 99; }
 # Replace the heartbeat subshell itself with sleep, so tests leave no sleep child.
 sleep() { exec /bin/sleep 30; }
 kill() { printf '%s\n' "$1" > "$case_dir/killed-pid"; builtin kill "$@"; }
-cargo() { echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; }
+cargo() { echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; return "$stub_native_status"; }
 sysctl() { echo Mac15,11; }
 sw_vers() { echo 15.4; }
 brand() { echo 'Apple M3 Max'; }
@@ -193,7 +201,7 @@ EOF
 worker_case() {
     local dir="$tmp/worker-$1" status=0
     mkdir -p "$dir"
-    bash -c '. "$1" "$2" "$3" "$4"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" > "$dir/output" 2>&1 || status=$?
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" > "$dir/output" 2>&1 || status=$?
     eq "worker $1 exit status" "$4" "$status"
     no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
     ok "worker $1 ran heartbeat cleanup" test -s "$dir/killed-pid"
@@ -216,6 +224,22 @@ worker_case() {
 worker_case success 0 0 0 ok
 worker_case setup-failure 1 0 0 failed
 worker_case invalid-result 0 1 1 unused
+
+# A test command can print passing binaries and still fail or crash later.
+suite_exit_case() {
+    worker_case "$1" 0 0 0 ok "$2" "$3"
+    local result
+    result=$(cat "$tmp/worker-$1/cache/logs/1/result.json")
+    eq "$1 native counts" "$4" "$(jq -c .native <<< "$result")"
+    eq "$1 Wine counts" "$5" "$(jq -c .wine <<< "$result")"
+    ok "$1 is a failing result" result_failing "$result"
+    ok "$1 still passes schema" validate_result "$result" "$SHA" m3
+}
+passed_counts='{"passed":1,"failed":0,"ignored":0}'
+suite_exit_case native-error 101 0 null "$passed_counts"
+suite_exit_case wine-error 0 101 "$passed_counts" null
+suite_exit_case both-error 101 101 null null
+suite_exit_case wine-aborted 0 137 "$passed_counts" null
 
 # --- claim polling (GitHub updates the assignee and labels separately)
 cat > "$tmp/worker-claim.sh" <<'EOF'

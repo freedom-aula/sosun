@@ -85,7 +85,10 @@ anything that does not match and says why.
 }
 ```
 
-- `native` and `wine` are `null` when the suite did not run.
+- `native` and `wine` are `null` when the suite did not run, or its command
+  exited unsuccessfully without any counted test failures (for example, a later
+  test binary failed to build or crashed). A `null` suite makes the result
+  failing. Counted test failures retain their counts.
 - `failed_tests` holds up to 100 names, each prefixed with `native/` or `wine/`.
 
 An accepted result closes the task with `fleet:done`, plus `fleet:passing` or
