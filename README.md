@@ -18,6 +18,11 @@ It is built on <a href="https://github.com/Marvisak/VIctory">VIctory</a>, which 
 If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTRIBUTING.md">CONTRIBUTING.md</a>. Help is welcome at every level.
 </p>
 
+> [!WARNING]
+> **A note from the maintainer.** I am a student, and I run this project with Claude on a free Claude Pro plan from Anthropic. Reviewing pull requests, answering issues and fixing bugs today used up half of my weekly Claude limit in a single day. My limit resets on Saturday, 28 November, so until then I will be slower to review, reply and merge. Thank you for your patience, and please keep sending reports and pull requests in the meantime.
+>
+> If you would like to help, a sponsored Claude Pro or Max subscription or some Anthropic API credits would let me keep up with the project at its current pace. I would be very grateful for either. Please reach out on email if you can help: pragyaangaur12@gmail.com
+
 > [!IMPORTANT]
 > **The game is not playable yet, on the Mac or anywhere else.** On testers' Macs the game starts, plays its intro and audio, shows its loading screens, and on 25 November the game world appeared on two Macs (#50). Nobody has reached gameplay yet. The loading freezes testers hit on 25 November were two deadlocks inside Wine, found by LakshanSivakumar and fixed in #72, #75 and #78. With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` the game now loads into the world without freezing on an M5 Pro and an M3 Max, and stays there for over 20 minutes. It is still far too slow to play, but getting faster: #111 cut world frames from about 4.5 seconds to 2.4 to 2.9 seconds on an M5 Pro (#50). With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1`, loading now runs at about 26 to 30 fps instead of 8 (#59, #60). VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
 
