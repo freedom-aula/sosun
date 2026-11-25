@@ -232,6 +232,50 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Logs what the title presents whenever it changes: the number of planes
+/// and each resource of the first (its size and host format), since only
+/// the first resource is shown (#15: a title texture presented black while
+/// a larger render target held the picture). Planes after the first are
+/// not read, because only the start of a plane description is known.
+#[cfg(windows)]
+fn log_planes(frame: u64, planes: u32, plane: *const Plane) {
+    use std::sync::Mutex;
+    /// A resource's width, height and host format.
+    type Shown = (u64, u32, i32);
+    static LAST: Mutex<Option<(u32, Vec<Shown>)>> = Mutex::new(None);
+    if planes == 0 {
+        return;
+    }
+    // SAFETY: the title passes `planes` plane descriptions.
+    let Some(first) = (unsafe { plane.as_ref() }) else {
+        return;
+    };
+    let count = if first.resources.is_null() { 0 } else { first.count.min(16) };
+    let resources: Vec<Shown> = (0..count as usize)
+        .map(|i| {
+            // SAFETY: the plane lists `count` resources.
+            let r = unsafe { *first.resources.add(i) };
+            crate::resource::host_resource(r).map_or((0, 0, -1), |t| {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                (d.Width, d.Height, d.Format.0)
+            })
+        })
+        .collect();
+    let now = Some((planes, resources));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != now {
+        let (planes, resources) = now.as_ref().expect("just set");
+        tracing::info!(
+            frame,
+            planes,
+            resources = ?resources,
+            "presented planes: the first plane's resources as (width, height, format), the first one shown"
+        );
+        *last = now;
+    }
+}
+
 /// Shows the first plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
@@ -278,6 +322,8 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(windows)]
+    log_planes(frame, planes, plane_parameters);
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
