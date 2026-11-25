@@ -60,6 +60,8 @@ Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26
 
 D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
 
+It also refuses any list that names the packed formats `R8G8_B8G8_UNORM` and `G8R8_G8B8_UNORM` (68 and 69), which every 2-byte format's list did, so no 2-byte texture took castable formats. After the first refusal, VIctory gave each format of one memory its own host texture, and a run on a 16 GB M5 grew to 6.9 GB of host textures and ran out of GPU memory (issue #15). `castable` leaves both out. With all three left out, D3DMetal 4.0 beta 3 takes all 96 lists `castable` makes, checked by creating each format's texture with its list.
+
 D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
 
 ## Route A: next steps

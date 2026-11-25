@@ -1085,16 +1085,21 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// formats among block formats of the same block size), but depth ones
 /// (refused in lists on the RX 6700 XT and WARP alike), typeless ones (no
 /// view takes them) and R10G10B10_XR_BIAS_A2_UNORM (D3DMetal has no Metal
-/// format for it and refuses every list that names it).
+/// format for it and refuses every list that names it), nor the packed
+/// R8G8_B8G8_UNORM and G8R8_G8B8_UNORM (refused the same way).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     const XR_BIAS: u32 = 89;
+    // R8G8_B8G8_UNORM and G8R8_G8B8_UNORM: D3DMetal refuses any list that
+    // names them, as it does XR_BIAS, so no 2-byte texture took castable
+    // formats on a Mac (VIctory-macOS issue #15).
+    const PACKED_PAIRS: [u32; 2] = [68, 69];
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
         .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
-        .filter(|&f| f != XR_BIAS)
+        .filter(|&f| f != XR_BIAS && !PACKED_PAIRS.contains(&f))
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -1970,6 +1975,7 @@ mod tests {
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
+        assert!(castable(57).contains(&56) && !castable(57).contains(&68) && !castable(57).contains(&69));
     }
 
     #[test]
