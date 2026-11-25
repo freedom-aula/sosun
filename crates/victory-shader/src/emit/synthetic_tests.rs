@@ -235,6 +235,9 @@ fn gathers_at_a_level_match_the_hardware() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         ran += 1;
+        // Lanes 0-15: the host's own gather, ours, and the host's own as it
+        // would be with u × 24 taken in f32.
+        let mut own = Vec::new();
         for (lane, r) in records.iter().enumerate() {
             let got = |k: usize| -> Vec<f32> {
                 out[0][lane * 12 + 4 * k..][..4]
@@ -264,10 +267,36 @@ fn gathers_at_a_level_match_the_hardware() {
                 at(sext(offset), sext(offset >> 8)),
                 "{label}: lane {lane}, offset"
             );
-            // WARP's own gather truncates where the hardware rounds, and so
-            // does D3DMetal's (docs/macos.md, "Open differences").
-            if lane < 16 && !warp && !super::host::under_wine() {
-                assert_eq!(got(2), got(0), "{label}: lane {lane} against its gather");
+            if lane < 16 && !warp {
+                let u = f32::from_bits(u);
+                let x = if u.is_finite() {
+                    rounded(u)
+                } else {
+                    first(u, 24)
+                };
+                let y = first(f32::from_bits(v), 16);
+                let in_f32 = vec![
+                    texel(0, x, y + 1),
+                    texel(0, x + 1, y + 1),
+                    texel(0, x + 1, y),
+                    texel(0, x, y),
+                ];
+                own.push((lane, got(2), got(0), in_f32));
+            }
+        }
+        // WARP's own gather truncates where the hardware rounds. D3DMetal's
+        // rounds as the hardware does, but from u × 24 taken in f32, so on
+        // the lanes where that product and the exact one fall on either
+        // side of a texel's threshold it starts a texel over (docs/macos.md,
+        // "Open differences"). Ours follows the console's hardware, so such
+        // a host is not compared with it.
+        let in_f32 = own.iter().any(|(_, host, ours, _)| host != ours)
+            && own.iter().all(|(_, host, _, in_f32)| host == in_f32);
+        if in_f32 {
+            eprintln!("{label}: the host's own gather takes u × 24 in f32; not compared with ours");
+        } else {
+            for (lane, host, ours, _) in &own {
+                assert_eq!(host, ours, "{label}: lane {lane} against its gather");
             }
         }
     }

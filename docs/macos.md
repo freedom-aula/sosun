@@ -55,7 +55,7 @@ Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26
 
 - It ignores `[RootSignature]` (warning W5302) and writes no root signature into the bytecode, so `CreateRootSignature` on that bytecode fails with `E_FAIL`. Build run-time compute shaders with `compute::pipeline` in `victory-gpu`, which serializes the root signature itself.
 - `RWByteAddressBuffer` has no `Load`, and `RWStructuredBuffer` stores are not implemented. The depth converter in `twin.rs` reads its scratch buffer through a structured view and writes it through a raw one.
-- Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. Shaders that need them have to be compiled on Windows, as the clamp shader is. The one test that needs them (`lists_share_a_table_and_copies_keep_their_views`) prints that it was skipped.
+- Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. So `lists_share_a_table_and_copies_keep_their_views` skips under Wine. Embedding FXC's bytes instead is ruled out by VIctory's asset policy, which refuses long runs of embedded hex.
 - It still compiles plain `cs_5_1` shaders, and D3DMetal runs their bytecode.
 
 D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
@@ -98,7 +98,7 @@ The merge of VIctory's changes up to 70564ae on 25 November 2026 brought new sha
 - 24-bit depth. Apple GPUs have no 24-bit depth format, so D3DMetal keeps it as 32-bit float and rounds down when it stores 24 bits. The depth test clears to 0.75, where both roundings agree (PR #6).
 - Root signature blobs. D3DMetal accepts a truncated root signature blob and crashes on garbage, where Windows returns `E_INVALIDARG`, so `malformed_blobs_are_rejected_by_the_host` skips under Wine.
 - Hard links. `a_kept_blob_past_the_link_limit_is_copied` needs NTFS's limit of 1024 links to a file, and APFS has no such limit, so the test skips where the 1025th link succeeds.
-- Gather positions. D3DMetal's gather truncates the position where the console rounds it, as WARP's does, so `gathers_at_a_level_match_the_hardware` skips the same comparison it already skipped for WARP.
+- Gather positions. D3DMetal's own gather rounds the position as the console does, but from u × size taken in f32, where the console takes the exact product. On an M5 Pro it starts a texel over on all 12 lanes of `gathers_at_a_level_match_the_hardware` where the two products fall on either side of a texel's threshold, and matches the console on the others. Truncating, as WARP does, would have kept the console's texel on those lanes. VIctory's gathers at a level follow the console, but its level-0 gathers are the host's own, so they can differ there. The test checks that the host's own gather is either the console's or this one.
 
 Run-time compute shaders are built with explicit root signatures (`compute.rs`, PR #6), which Wine's compiler can build. The one exception is the memory test's shader, which needs shader model 5.1 resource arrays, so that test skips under Wine.
 
