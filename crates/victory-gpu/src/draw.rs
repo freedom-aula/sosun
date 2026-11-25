@@ -89,6 +89,21 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// What was set straight onto the host list, for the next segment of
+    /// the list ([`State::cut`]).
+    fixed: Fixed,
+}
+
+/// Fixed-function state the title set, as it set it.
+#[derive(Default)]
+struct Fixed {
+    viewports: Option<Vec<D3D12_VIEWPORT>>,
+    scissors: Option<Vec<RECT>>,
+    blend_factor: Option<Option<[f32; 4]>>,
+    stencil_ref: Option<u32>,
+    /// Render target and depth view handles.
+    targets: Option<(Vec<u64>, u64)>,
+    topology: bool,
 }
 
 impl Drop for State {
@@ -230,6 +245,7 @@ impl State {
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
+        self.fixed.topology = true;
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -247,6 +263,73 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// Fixed-function state, straight onto the host list (and kept for the
+    /// list's next segment).
+    pub(crate) fn viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        self.fixed.viewports = Some(viewports.to_vec());
+        // SAFETY: an open list.
+        unsafe { list.list.RSSetViewports(viewports) };
+    }
+
+    pub(crate) fn scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.fixed.scissors = Some(rects.to_vec());
+        // SAFETY: an open list.
+        unsafe { list.list.RSSetScissorRects(rects) };
+    }
+
+    pub(crate) fn blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.fixed.blend_factor = Some(factor.copied());
+        // SAFETY: an open list.
+        unsafe { list.list.OMSetBlendFactor(factor) };
+    }
+
+    pub(crate) fn stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.fixed.stencil_ref = Some(reference);
+        // SAFETY: an open list.
+        unsafe { list.list.OMSetStencilRef(reference) };
+    }
+
+    /// The title list goes on in a fresh host list (a segment after a wait,
+    /// `crate::list`): the state it set is given to `list` again.
+    ///
+    /// Replayed: topology, viewports, scissors, blend factor, stencil
+    /// reference, render targets and depth (set at once); heaps, root
+    /// signatures, pipelines, root arguments, vertex and index buffers are
+    /// set by the next draw or dispatch from what this state holds (the
+    /// host caches are cleared). Made again in the new segment, so their
+    /// submission-time work (refreshes, uploads) runs with it: fresh tables,
+    /// root views and the title-memory page table. Not replayed, as nothing
+    /// of it is on the host list: depth bounds and shading rate (ignored),
+    /// queries (resolved with plain values), the 0x4a0 upload memory (the
+    /// title list's own), texture states and twins (each segment has its
+    /// own, made from the real states at its submission). Clears and copies
+    /// are commands, recorded once in the segment they belong to.
+    pub(crate) fn cut(&mut self, list: &HostList) {
+        self.host_state_lost();
+        self.fresh_tables.clear();
+        self.root_slots.clear();
+        self.memory = None;
+        let fixed = std::mem::take(&mut self.fixed);
+        if fixed.topology {
+            self.set_topology(list, self.topology);
+        }
+        if let Some(v) = &fixed.viewports {
+            self.viewports(list, v);
+        }
+        if let Some(r) = &fixed.scissors {
+            self.scissors(list, r);
+        }
+        if let Some(f) = fixed.blend_factor {
+            self.blend_factor(list, f.as_ref());
+        }
+        if let Some(s) = fixed.stencil_ref {
+            self.stencil_ref(list, s);
+        }
+        if let Some((targets, depth)) = &fixed.targets {
+            self.set_targets(list, targets, *depth);
+        }
     }
 
     /// Others recorded into the host list (`crate::external`): its heaps,
@@ -318,6 +401,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.fixed.targets = Some((handles.to_vec(), depth));
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1867,27 +1951,6 @@ const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
-
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
-}
-
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
-}
-
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
-}
 
 #[cfg(test)]
 mod tests {

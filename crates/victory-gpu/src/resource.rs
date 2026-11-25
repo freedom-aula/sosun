@@ -3008,6 +3008,106 @@ mod tests {
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
+    /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
+    /// then waits for a value a graphics list writes at its end, then reads
+    /// back the texture that graphics list fills. Submitted first, its first
+    /// part runs at once and the rest waits for the graphics list, then
+    /// reads what it wrote.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_waiting_for_another_queues_write_reads_what_it_wrote() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut source, mut target, mut early, mut words) = (null, null, null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        };
+        // A plain texture: its contents are the host's from the graphics
+        // list's submission on (`texture::host_writes`), not from when the
+        // compute list was recorded.
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut image);
+        created(&buffer(1024), 0, &mut source);
+        created(&buffer(1024), 0, &mut target);
+        created(&buffer(1024), 0, &mut early);
+        created(&buffer(256), 0, &mut words);
+        let (data, _) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let (out, _) = buffer_bytes(target).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        unsafe { std::ptr::write_bytes(out, 0xEE, 1024) };
+        let (flag, _) = buffer_bytes(words).unwrap();
+        let flag = flag.cast::<u64>();
+
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        let (mut graphics, mut compute, mut allocator, mut drawing, mut computing) = (null, null, null, null, null);
+        for (kind, queue) in [(0u32, &mut graphics), (2, &mut compute)] {
+            let desc = [kind, 0, 0, 0];
+            assert_eq!(crate::queue::create(null, desc.as_ptr().cast(), &queue_iid, queue), S_OK);
+        }
+        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
+        for (kind, list) in [(0u32, &mut drawing), (2, &mut computing)] {
+            assert_eq!(crate::list::create_list(null, 0, kind, allocator, null, &list_iid, list), S_OK);
+        }
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let image_at = Location { resource: image, kind: 0, footprint: rows };
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type CopyBuffer = extern "system" fn(This, This, u64, This, u64, u64);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        const GREATER_EQUAL: u32 = 7;
+
+        // Compute: [copy source → early][wait flag ≥ 1][image → target].
+        slot::<CopyBuffer>(computing, 0x78)(computing, early, 0, source, 0, 1024);
+        crate::list::wait64(computing, flag as u64, GREATER_EQUAL, 1, 0);
+        let into_target = Location { resource: target, kind: 1, footprint: rows };
+        slot::<Copy>(computing, 0x80)(computing, &into_target, 0, 0, 0, &image_at, null.cast());
+        slot::<Close>(computing, 0x48)(computing);
+        // Graphics: [source → image][flag = 1 at its end].
+        let from_source = Location { resource: source, kind: 1, footprint: rows };
+        slot::<Copy>(drawing, 0x80)(drawing, &image_at, 0, 0, 0, &from_source, null.cast());
+        crate::list::write64(drawing, flag as u64, 1, 0, 0);
+        slot::<Close>(drawing, 0x48)(drawing);
+
+        slot::<Execute>(compute, 0x50)(compute, 1, &computing);
+        let (copied, _) = buffer_bytes(early).unwrap();
+        // SAFETY: the buffers hold 1024 bytes; nothing runs meanwhile.
+        let read = |at: *mut u8| unsafe { std::slice::from_raw_parts(at, 1024) }.to_vec();
+        assert_eq!(read(copied), bytes, "the part before the wait ran");
+        assert!(read(out).iter().all(|&b| b == 0xEE), "the part after it waits");
+        // SAFETY: the buffer holds 256 bytes.
+        assert_eq!(unsafe { flag.read_volatile() }, 0);
+        // D3D12 lets the title reset a list as soon as it has submitted it:
+        // the held part keeps its own host list and what it reads.
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        assert_eq!(slot::<Reset>(computing, 0x50)(computing, allocator, null), S_OK);
+        slot::<Close>(computing, 0x48)(computing);
+
+        slot::<Execute>(graphics, 0x50)(graphics, 1, &drawing);
+        // SAFETY: as above.
+        assert_eq!(unsafe { flag.read_volatile() }, 1);
+        let read = read(out);
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}: the texture as the graphics list filled it");
+        }
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

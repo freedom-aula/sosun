@@ -786,6 +786,13 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+// SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
+// title list's one recording thread, then run by one submission at a time
+// (the queues hold it between, `crate::hold`).
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -952,6 +959,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// The memory values the list waits for before it starts (a list the
+    /// title records with a wait after commands is cut there,
+    /// `crate::list`).
+    waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
@@ -2052,6 +2063,30 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// A memory value the list waits for before it starts.
+    pub(crate) fn defer_wait(&self, wait: crate::hold::ValueWait) {
+        self.deferred().waits.push(wait);
+    }
+
+    /// The memory values the list waits for before it starts.
+    pub(crate) fn waits(&self) -> Vec<crate::hold::ValueWait> {
+        self.deferred().waits.clone()
+    }
+
+    /// Whether nothing has been recorded since the list was made or reset
+    /// that a wait recorded now would have to follow: no work, texture
+    /// use, bottom-of-pipe write or pipeline (state settings alone carry
+    /// over).
+    pub(crate) fn is_empty(&self) -> bool {
+        let d = self.deferred();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        drop(d);
+        deferred_empty
+            && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
