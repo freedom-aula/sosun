@@ -7689,6 +7689,32 @@ impl<'a> Lower<'a> {
         !self.x.st.bools.meet(&self.lane_edge(q, b))
     }
 
+    /// Whether, at a per-lane join `b` of a lane mask whose register holds
+    /// data along edge `n`, some edge brings a mask and no lane taking edge
+    /// `n` is in any of them (a compare inside a region those lanes skip).
+    /// The console wave runs one path: on a mask edge, the lanes of edge `n`
+    /// read their bit of that mask, 0. The compiler merges no value for them,
+    /// so it holds none for them either where the whole wave skips (the data
+    /// there is a reused register): 0 is theirs.
+    fn no_mask_lane_on_edge(&self, b: usize, args: &[Value], n: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        let on_n = self.lane_edge(preds[n], b);
+        let mut some = false;
+        for (k, arg) in args.iter().enumerate() {
+            let Some(&m) = st.masks.get(arg).filter(|_| k != n) else {
+                continue;
+            };
+            some = true;
+            let mut lanes = on_n.clone();
+            lanes.push((m, true));
+            if st.bools.meet(&lanes) {
+                return false;
+            }
+        }
+        some
+    }
+
     /// Whether IR block `b` can reach itself.
     fn on_cycle(&self, b: usize) -> bool {
         let blocks = &self.x.p.blocks;
@@ -10228,6 +10254,9 @@ impl<'a> Lower<'a> {
                 let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
+                        self.s.m.bool(false)
+                    }
                     (None, _) => return Err(unsupported(offset, UNTRACKED)),
                 };
                 incoming.push((x, qb));

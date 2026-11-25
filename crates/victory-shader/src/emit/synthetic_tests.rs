@@ -438,6 +438,85 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
     }
 }
 
+/// A lane mask a compare makes inside a region the other lanes skip, joined
+/// with data in the same register on the skip edge (a reused register): the
+/// skipping lanes read 0, their bit of the compare, as on the console. A
+/// mask holding lanes outside its edge (the saved EXEC) stays refused.
+#[test]
+fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xD4C4_0006,
+        0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0xD501_0003,
+        0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let shader = build(&words).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let want: Vec<u32> = (0..32).map(|lane| u32::from(lane < 8)).collect();
+    {
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                assert!(warp, "{label}: no pipeline for a wave of 32");
+                eprintln!("{label}: no pipeline for a wave of 32; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0], want, "{label}");
+        }
+    }
+    // The saved EXEC instead (every lane): the skipping lanes' bit would be
+    // 1 on the console.
+    words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+    let Err(crate::ShaderError::Unsupported { what, .. }) = build(&words) else {
+        panic!("a mask holding lanes off its edge joined with data translated");
+    };
+    assert!(what.contains("lane-mask join"), "{what}");
+}
+
 #[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler
