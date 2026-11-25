@@ -19,7 +19,7 @@ If you want to see GTA VI on a Mac, please star the repo and read <a href="CONTR
 </p>
 
 > [!IMPORTANT]
-> **The game is not playable yet, on the Mac or anywhere else.** VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
+> **The game is not playable yet, on the Mac or anywhere else.** On testers' Macs the game starts, plays its intro and audio, shows its loading screens, and on 25 November the game world appeared on two Macs (#50). Nobody has reached gameplay yet. The loading freezes testers hit on 25 November were two deadlocks inside Wine, found by LakshanSivakumar and fixed in #72, #75 and #78. With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` the game now loads into the world without freezing, but there it runs at only 0.1 to 0.2 fps. With `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1`, loading now runs at about 26 to 30 fps instead of 8 (#59, #60). VIctory on Windows boots the game, runs its menus, loads the world and now draws it, but only at one or two seconds per frame and with unlit surfaces and missing geometry. This project makes the whole VIctory platform run on a Mac, so the Mac moves forward as VIctory does. No game files are included here or ever will be. You need your own copy of the game.
 
 ## What works today
 
@@ -38,6 +38,32 @@ Every part of VIctory now runs on an Apple Silicon Mac, and its full test suite 
 This is the real result of a clean run of `./setup.sh` followed by the test suite on a MacBook with an M4 chip.
 
 Getting there took a few Mac-specific fixes, and each one is explained in [docs/macos.md](docs/macos.md). Two of them fixed real bugs that would have broken the picture on screen. Texture uploads were being skipped because Wine cannot see the memory that D3DMetal maps, and Metal's `sin` and `cos` return 0 where the console GPU returns NaN.
+
+## What testers see in the game
+
+Several people who own the game have run it on their Macs and reported back in the issues. The game starts, plays its audio and runs its menus, and on current main the picture shows on Series X. Here is what they have seen so far.
+
+| Mac | What happened | Issue |
+| --- | --- | --- |
+| M5 MacBook Air | Got past the early Rosetta hang. The intro animation and the menu appeared with a local workaround that showed the game's 3840x2160 image directly, and the first scene's audio played. Without the workaround the window stays black. | #1, #15 |
+| M5 Pro | With the Series S profile the game presented 64 frames of real drawing, all of them black, and then stopped on one of the game's own checks during start-up. Packages kept one per subfolder made it stop even earlier, and VIctory now says so at start-up. | #24 |
+| M5 | At the Player prompt the game's 3840x2160 image held the picture while the 1920x1080 image sent to the window was black. | #15 |
+| M2 Max | Account selection, the first setup screens with keyboard input, and the loading artwork all worked, and then the window went black. | #28 |
+| M5 Pro, 24 GB, Series X | On 25 November, with the store patch and fault tracking on, the account picker, the setup screens and the legal notices ran at 25 to 30 fps. About three minutes in, the game reached the "Vice City, two years ago" title card at 2 to 5 seconds per frame and stayed alive there. | #65 |
+| M5 Pro, Series X | On 25 November, with no variables set, the game ran its intro and loading at 25 to 30 fps, then its draw count jumped to 3,000 to 3,900 per frame, which suggests it was drawing the world, though the screen stayed grey at 0.1 fps. A later run with `VICTORY_PATCH_MASKED=all` only went on into the world and drew a dark city skyline, still at 0.1 fps. After the freeze fixes, plain main with `VICTORY_PATCH_MASKED=all VICTORY_FAULT_TRACKING=1` loaded into the world with up to 5,400 draws per frame and no freeze, at 0.2 fps while it copied 57 to 83 GB of memory per frame. With the store patch and fault tracking on, copies stayed under a few MB per frame through loading, and it froze about three minutes in. That freeze led to #63. | #50 |
+| M3 Max, Series X | On 25 November the picture showed with no workaround. The intro played and the game reached the "Vice City, two years ago" title card, where it froze while Apple's shader compiler kept crashing. A second run with a warm shader cache had no compiler crashes, but the window went black after the loading artwork. In a later run the game world appeared on screen before the game's own watchdog stopped it, with frames taking up to 28 seconds, most of it copying memory. With the store patch from #59 and #60 and fault tracking on, loading ran at 26 fps instead of 8 and copies fell from 158.7 MB to under 1 MB per frame, until a freeze about three minutes in. | #50 |
+
+<p align="center"><img src="https://github.com/user-attachments/assets/a05ca6bd-2427-4035-8d35-942e797f3307" width="720" alt="The game's title screen on an M3 Max under VIctory"><br><sub>The title screen on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
+
+<p align="center"><img src="https://github.com/user-attachments/assets/7b1d3b68-3a27-46ca-ac46-10dde3156aee" width="720" alt="The game world on screen on an M3 Max under VIctory"><br><sub>The game world on jjlange's M3 Max, 25 November 2026 (#50).</sub></p>
+
+<p align="center"><img src="https://github.com/user-attachments/assets/3d324ff6-05e0-42f4-9793-297da0475bc0" width="720" alt="The game's loading artwork on an M5 Pro under VIctory"><br><sub>Loading artwork on LakshanSivakumar's M5 Pro, 25 November 2026 (#50).</sub></p>
+
+<p align="center"><img src="https://github.com/user-attachments/assets/5ce34eca-cc47-4934-ad67-b999324ee791" width="720" alt="The game world, a city skyline at night, on an M5 Pro under VIctory"><br><sub>The game world on LakshanSivakumar's M5 Pro at 0.1 fps, 25 November 2026 (#50).</sub></p>
+
+<p align="center"><video src="https://github.com/user-attachments/assets/61b2b07c-5401-44bd-8fbe-829acec5903f" width="720" controls></video><br><sub>Current main loading into the world without freezing on LakshanSivakumar's M5 Pro, at 0.2 fps, 25 November 2026 (#50).</sub></p>
+
+The black screen from #15 is solved: VIctory now shows the larger of the images the game presents, and `VICTORY_PRESENT_COMPOSITE=1` also draws the Series S overlay on top. Loading used to crawl because VIctory copied all of the game's memory on every submission, since tracking which pages changed hangs Rosetta on the game's AVX stores. #59 and #60 rewrite those 1,234 stores at load time so tracking can run. The loading freeze is fixed: Wine's file metadata calls from our shader cache (#72, #75) and write guards that reached the process heap (#78) caused two deadlocks. The open problems now are the game's speed in the world (0.1 to 0.2 fps, mostly copying memory between the game and the GPU) and crashes in Apple's shader compiler while the game builds its world shaders.
 
 ## How it works
 
@@ -60,7 +86,7 @@ git clone https://github.com/pragyaangaur/VIctory-macOS.git
 cd VIctory-macOS
 ```
 
-**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it.
+**2. Download Apple's Game Porting Toolkit.** Apple only gives D3DMetal to signed-in developers, so this is the one step nobody can do for you. Open the [Apple developer downloads](https://developer.apple.com/download/all/?q=game%20porting%20toolkit), sign in with any Apple account (a free one works), and download the newest **Game Porting Toolkit** `.dmg`. Leave it in your Downloads folder and do not open it. Use version 4.0 beta 3 or newer. The D3DMetal 3.0 that CrossOver bundles runs the tests, but with it the game stops at one of its own start-up checks about seven seconds in, while the same game files get to the game world with 4.0 beta 3 (#24, #50).
 
 **3. Run the setup.**
 
@@ -78,7 +104,7 @@ tools/macos/victory.sh config
 
 ## Running the game
 
-Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it:
+Put your own copy of the Xbox Series build in a folder, set `game_dir` in `victory.toml` to that folder, and start it. Every package's files must sit directly in that folder, so `appdata0.rpf` is at `<game_dir>/appdata0.rpf` and not in an `appdata0` subfolder. With one subfolder per package the title asserts early at `+0x2237178`, and `victory` now stops before that and says which file is misplaced (#24).
 
 ```bash
 tools/macos/victory.sh run --execute <the game's executable>
@@ -107,6 +133,17 @@ Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/flee
 ```
 
 Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run the fleet by hand with `tools/fleet/fleet.sh`.
+
+## Debugging switches
+
+These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ...`) and are for chasing problems, not for playing.
+
+| Variable | What it does |
+| --- | --- |
+| `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |
+| `VICTORY_STACKS_FILE=<path>` | Writes those dumps to a file without taking locks, for freezes. |
+| `VICTORY_SKIP_TITLE_INT3=<rva>,...` | Steps over the game's own `int3` asserts at those hex RVAs and logs each one. Every other assert still stops the run. |
+| `VICTORY_GPU_TIMING=1` | Submits and times each GPU list on its own. |
 
 ## Where things are
 

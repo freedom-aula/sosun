@@ -46,6 +46,20 @@ no "task with short commit" parse_task "$(task_body 0123abc m3 "$REPO")"
 no "task without a block" parse_task "commit: $SHA"
 no "task with another kind" parse_task "$(sed 's/^kind: test-matrix/kind: shader/' <<< "$body")"
 
+# --- toolkit filenames
+eq "toolkit 4 beta 3 filename" "4.0-beta3" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_3.dmg')"
+eq "toolkit 2 beta 3 filename" "2.0-beta3" "$(gptk_version_of 'Game_Porting_Toolkit_2.0_beta_3.dmg')"
+eq "toolkit stable filename" "3.0" "$(gptk_version_of 'Game_Porting_Toolkit_3.0.dmg')"
+eq "toolkit legacy beta filename" "3.0-beta4" "$(gptk_version_of 'Game_Porting_Toolkit_3.0-beta4.dmg')"
+eq "toolkit beta without number" "4.0-beta" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta.dmg')"
+eq "toolkit version prefix" "3.0" "$(gptk_version_of 'Game_Porting_Toolkit_v3.0.dmg')"
+eq "toolkit path with spaces" "4.0-beta3" "$(gptk_version_of '/tmp/path with spaces/Game_Porting_Toolkit_4.0 beta 3.dmg')"
+eq "missing toolkit filename" "unknown" "$(gptk_version_of '')"
+eq "unrecognized toolkit filename" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_latest.dmg')"
+eq "unrelated disk image" "unknown" "$(gptk_version_of '4.0.dmg')"
+eq "unfinished toolkit download" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_3.dmg.part')"
+eq "unsupported toolkit beta number" "unknown" "$(gptk_version_of 'Game_Porting_Toolkit_4.0_beta_10.dmg')"
+
 # --- commands
 eq "claim" claim "$(parse_command "/claim")"
 eq "claim with spaces" claim "$(parse_command "  /claim  ")"
@@ -102,6 +116,7 @@ no "not JSON" validate_result 'nope' "$SHA" m3
 no "too large" validate_result "$(printf '%9000s' x)" "$SHA" m3
 ok "null suites when setup failed" bad '.setup = "failed" | .native = null | .wine = null | .failures = [] | .binaries = []'
 ok "unknown toolkit version" bad '.gptk = "unknown"'
+ok "normalized toolkit beta version passes schema" bad '.gptk = "4.0-beta3"'
 ok "MacBook model id" bad '.hw_model = "MacBookAir10,1"'
 ok "failing result" result_failing "$good"
 no "passing result" result_failing "$(jq -c '.wine.failed = 0' <<< "$good")"
@@ -204,6 +219,14 @@ slower=$(jq -c '.binaries[1].seconds = 40' <<< "$good")
 eq "slowdown found" "wine/victory_gpu	20.5	40" "$(slowdowns "$good" "$slower")"
 eq "small slowdowns ignored" "" "$(slowdowns "$good" "$(jq -c '.binaries[0].seconds = 3' <<< "$good")")"
 
+printf 'error: could not compile\n' > "$tmp/broken.log"
+eq "no test run gives null" null "$(counts_json "$tmp/broken.log")"
+printf 'test result: ok. 3 passed; 0 failed; 1 ignored;\nerror: a later test binary failed to build\n' > "$tmp/partial.log"
+eq "successful command keeps its counts" '{"passed":3,"failed":0,"ignored":1}' "$(counts_json "$tmp/partial.log" 0)"
+eq "failed command cannot pass on partial counts" null "$(counts_json "$tmp/partial.log" 101)"
+eq "aborted command cannot pass on partial counts" null "$(counts_json "$tmp/partial.log" 137)"
+eq "counted failures retain their counts" '{"passed":2,"failed":2,"ignored":1}' "$(counts_json "$tmp/native.log" 101)"
+eq "failed command with no tests gives null" null "$(counts_json "$tmp/broken.log" 101)"
 eq "chip family" m3 "$(chip_family_of "Apple M3 Pro")"
 eq "chip family of an Intel Mac" "" "$(chip_family_of "Intel(R) Core(TM) i7")"
 
@@ -239,6 +262,140 @@ ok "report slowest binaries" grep -q 'm3 (`0123456789ab`): wine/victory_gpu 20.5
 r4=$(jq -c '. + {n: 4, closed: "2026-11-23T10:00:00Z", upstream_commit: "fedcba9876543210fedcba9876543210fedcba98", binaries: [{suite: "wine", name: "victory_gpu", seconds: 40}]}' <<< "$good")
 ok "report slowdowns" grep -q 'm3: wine/victory_gpu 20.5 s at `0123456789ab` -> 40 s at `fedcba987654`' <<< "$(printf '%s\n%s\n' "$r1" "$r4" | report_markdown)"
 eq "empty report" "None found." "$(: | report_markdown | sed -n '/^## Tests/{n;n;p;}')"
+
+# --- worker EXIT cleanup (stub all network, checkout and build operations)
+# A separate shell makes EXIT run after cmd_run's locals have gone out of scope.
+cat > "$tmp/worker-cleanup.sh" <<'EOF'
+case_dir=$1
+setup_status=$2
+validation_status=$3
+stub_native_status=$4
+stub_wine_status=$5
+set -- help
+. "$0" > /dev/null
+CACHE="$case_dir/cache"
+WORK="$case_dir/work"
+mkdir -p "$WORK/tools/macos"
+printf '#!/bin/sh\nexit %s\n' "$setup_status" > "$WORK/setup.sh"
+chmod +x "$WORK/setup.sh"
+printf '#!/bin/sh\necho "test result: ok. 1 passed; 0 failed; 0 ignored;"\nexit %s\n' "$stub_wine_status" > "$WORK/tools/macos/test-wine.sh"
+chmod +x "$WORK/tools/macos/test-wine.sh"
+accepted() { return 0; }
+load_task() { T_COMMIT=0123456789abcdef0123456789abcdef01234567; T_CHIP=m3; T_MACOS=""; }
+require_lease() { return 0; }
+git() { if [ "${3:-}" = rev-parse ]; then echo "$T_COMMIT"; fi; return 0; }
+gh() { echo 'unexpected GitHub call' >&2; exit 99; }
+# Replace the heartbeat subshell itself with sleep, so tests leave no sleep child.
+sleep() { exec /bin/sleep 30; }
+kill() { printf '%s\n' "$1" > "$case_dir/killed-pid"; builtin kill "$@"; }
+cargo() { echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; return "$stub_native_status"; }
+sysctl() { echo Mac15,11; }
+sw_vers() { echo 15.4; }
+brand() { echo 'Apple M3 Max'; }
+gptk_version() { echo 4.0-beta3; }
+say() {
+    case "$*" in "running setup.sh"*) jobs -p > "$case_dir/heartbeat-pid" ;; esac
+}
+if [ "$validation_status" != 0 ]; then validate_result() { return 1; }; fi
+cmd_run 1
+EOF
+worker_case() {
+    local dir="$tmp/worker-$1" status=0
+    mkdir -p "$dir"
+    bash -c '. "$1" "$2" "$3" "$4" "$5" "$6"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" "${6:-0}" "${7:-0}" > "$dir/output" 2>&1 || status=$?
+    eq "worker $1 exit status" "$4" "$status"
+    no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
+    ok "worker $1 ran heartbeat cleanup" test -s "$dir/killed-pid"
+    if [ -s "$dir/heartbeat-pid" ]; then
+        local pid
+        pid=$(cat "$dir/heartbeat-pid")
+        no "worker $1 heartbeat stopped" kill -0 "$pid"
+        # Always stop this test's job, including when testing the original bug.
+        kill "$pid" 2> /dev/null || true
+        if [ -s "$dir/killed-pid" ]; then
+            eq "worker $1 cleaned up its own heartbeat" "$pid" "$(cat "$dir/killed-pid")"
+        fi
+    else
+        ok "worker $1 started heartbeat" test -s "$dir/heartbeat-pid"
+    fi
+    if [ -f "$dir/cache/logs/1/result.json" ]; then
+        eq "worker $1 setup result" "$5" "$(jq -r .setup "$dir/cache/logs/1/result.json")"
+    fi
+}
+worker_case success 0 0 0 ok
+worker_case setup-failure 1 0 0 failed
+worker_case invalid-result 0 1 1 unused
+
+# A test command can print passing binaries and still fail or crash later.
+suite_exit_case() {
+    worker_case "$1" 0 0 0 ok "$2" "$3"
+    local result
+    result=$(cat "$tmp/worker-$1/cache/logs/1/result.json")
+    eq "$1 native counts" "$4" "$(jq -c .native <<< "$result")"
+    eq "$1 Wine counts" "$5" "$(jq -c .wine <<< "$result")"
+    ok "$1 is a failing result" result_failing "$result"
+    ok "$1 still passes schema" validate_result "$result" "$SHA" m3
+}
+passed_counts='{"passed":1,"failed":0,"ignored":0}'
+suite_exit_case native-error 101 0 null "$passed_counts"
+suite_exit_case wine-error 0 101 "$passed_counts" null
+suite_exit_case both-error 101 101 null null
+suite_exit_case wine-aborted 0 137 "$passed_counts" null
+
+# --- claim polling (GitHub updates the assignee and labels separately)
+cat > "$tmp/worker-claim.sh" <<'EOF'
+case_dir=$1
+scenario=$2
+set -- help
+. "$0" > /dev/null
+REPO=example/VIctory-macOS
+accepted() { return 0; }
+me() { echo worker; }
+sleep() { :; }
+gh() { printf '%s\n' "$*" >> "$case_dir/posts"; }
+load_count=0
+load_task() {
+    load_count=$((load_count + 1))
+    printf '%s\n' "$load_count" > "$case_dir/loads"
+    T_STATE=OPEN
+    T_ASSIGNEE=""
+    T_LABELS="fleet:open"
+    [ "$load_count" -gt 1 ] || return 0
+    case "$scenario" in
+        delayed-label)
+            T_ASSIGNEE=worker
+            if [ "$load_count" = 3 ]; then T_LABELS=""; fi
+            if [ "$load_count" -ge 4 ]; then T_LABELS="fleet:leased"; fi
+            ;;
+        delayed-assignee)
+            if [ "$load_count" -ge 3 ]; then T_ASSIGNEE=worker; T_LABELS="fleet:leased"; fi
+            ;;
+        immediate) T_ASSIGNEE=worker; T_LABELS="fleet:leased" ;;
+        other-worker) T_ASSIGNEE=another-worker; T_LABELS="fleet:leased" ;;
+        missing-label) T_ASSIGNEE=worker ;;
+    esac
+}
+# The claim reads the issue (load_issue) whatever its kind, then the
+# task's fields once: the scenario counts issue reads only.
+eval "fake_load() $(declare -f load_task | tail -n +2)"
+load_task() { :; }
+load_issue() { fake_load "$@"; T_KIND=task; }
+cmd_claim 1
+EOF
+claim_case() {
+    local dir="$tmp/claim-$1" status=0
+    mkdir -p "$dir"
+    bash -c '. "$1" "$2" "$3"' "$FLEET_DIR/fleet.sh" "$tmp/worker-claim.sh" "$dir" "$1" > "$dir/output" 2>&1 || status=$?
+    eq "claim $1 exit status" "$2" "$status"
+    ok "claim $1 outcome" grep -q "$3" "$dir/output"
+    eq "claim $1 polling count" "$4" "$(cat "$dir/loads")"
+    eq "claim $1 posts once" 'issue comment 1 -R example/VIctory-macOS --body /claim' "$(cat "$dir/posts")"
+}
+claim_case delayed-label 0 '#1 is yours' 4
+claim_case delayed-assignee 0 '#1 is yours' 3
+claim_case immediate 0 '#1 is yours' 2
+claim_case other-worker 1 'went to someone else' 2
+claim_case missing-label 1 'no lease after 3 minutes' 37
 
 echo "fleet tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

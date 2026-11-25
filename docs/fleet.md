@@ -98,7 +98,7 @@ anything that does not match and says why.
 }
 ```
 
-- `native` and `wine` are `null` when the suite did not run.
+- `native` and `wine` are `null` when the suite did not run, or its command exited unsuccessfully without any counted test failures (for example, a later test binary failed to build or crashed). A `null` suite makes the result failing. Counted test failures keep their counts.
 - `failures` holds up to 100 entries. `test` is the suite, the test binary and the test path. `topic` is chosen from the test's crate and its failure text: shader, gpu, d3dmetal, hle, loader, formats, pipeline, game-support, core, wine, memory, timeout, numerics, build, performance or other.
 - `sig` is a hash of the test and its failure text, after paths, numbers and addresses are removed so that the same failure gives the same hash on every Mac. The text itself never leaves the Mac.
 - `timings` are wall-clock seconds for setup and each suite. `binaries` gives the time each test binary took, as cargo reports it.

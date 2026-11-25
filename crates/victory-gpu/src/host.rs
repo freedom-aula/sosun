@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -35,6 +35,34 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+
+thread_local! {
+    /// The thread holds the submission lock ([`Host::execute`] or
+    /// [`Host::quiet`]).
+    static HOLDS_SUBMISSIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The thread holds the submission lock while this lives.
+struct Holding(bool);
+
+impl Holding {
+    fn enter() -> Self {
+        Holding(HOLDS_SUBMISSIONS.with(|h| h.replace(true)))
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        HOLDS_SUBMISSIONS.with(|h| h.set(self.0));
+    }
+}
+
+/// Submissions held off ([`Host::quiet`]).
+pub(crate) struct Quiet<'a> {
+    // Dropped in this order: the mark, then the lock.
+    _holding: Holding,
+    _held: std::sync::MutexGuard<'a, u64>,
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -637,8 +665,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether they mark the pages they write (no snapshot then).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -798,11 +827,61 @@ impl Host {
         }
     }
 
+    /// Waits until the host fence reaches `value`. The event is only a
+    /// wake-up: the fence's completed value decides. Under D3DMetal a
+    /// submission's work can finish without its event ever being set
+    /// (#50: the title's main thread slept for good in this wait while the
+    /// queue was idle), so the wait wakes every second to check the fence
+    /// itself. A late event left set by an earlier wait cannot end a later
+    /// wait early, as the fence is checked after every wake-up too.
+    fn wait_for(&self, value: u64) {
+        use std::sync::atomic::AtomicU64;
+        static MISSED: AtomicU64 = AtomicU64::new(0);
+        let mut seconds = 0u32;
+        loop {
+            // SAFETY: our event and fence.
+            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            // SAFETY: as above.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= value {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
+                    }
+                }
+                return;
+            }
+            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                seconds += 1;
+                if seconds.is_power_of_two() {
+                    tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+                }
+            }
+        }
+    }
+
+    /// Holds other threads' submissions off until dropped, around the making
+    /// of a shader-visible host view heap and its fill with null views
+    /// (millions of descriptor copies). Under Wine on D3DMetal, lists other
+    /// threads submitted during such a fill lost their views: their
+    /// shaders' writes were dropped and their reads gave zeros, whatever
+    /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
+    /// that holds the submission lock already, nor off Wine.
+    pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
+        if !crate::shader_cache::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            return None;
+        }
+        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        Some(Quiet { _holding: Holding::enter(), _held: held })
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -904,9 +983,7 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
+                    Ok(()) => self.wait_for(*submitted),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
@@ -985,7 +1062,7 @@ impl Host {
             // the title's own data (runs c1, c4).
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                if let Step::GpuWrite(shadow, address, len, _) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= !missed,
@@ -997,6 +1074,14 @@ impl Host {
                 }
             }
         }
+        // Pages shaders marked first: the copy-backs below end what the
+        // copies keep for them.
+        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
+            .iter()
+            .filter(|b| !b.3)
+            .map(|(s, a, n, _)| (s.clone(), *a, *n))
+            .collect();
+        crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1668,16 +1753,18 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (`marked`: the pages they mark).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -1881,10 +1968,13 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                Step::GpuWrite(shadow, address, len, marked) => {
+                    // The shaders start from the title's data, which a
+                    // snapshot must hold (marked ranges keep none).
+                    if !marked {
+                        batch.flush();
+                    }
+                    shadow.writing(*address, *len, *marked);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -2045,21 +2135,63 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    // that fails), zeros for what cannot be read. A piece that fails on an
+    // unreadable page skips that page's whole region: each failed read is a
+    // fault, about 30 us under Wine on Rosetta, where copies are not tracked
+    // and so taken whole, and the world's met 160 MB of unmapped pages per
+    // frame, 40 000 failed 4 KiB reads that took seconds.
+    let (start, end) = (src as usize, src as usize + len);
+    let mut at = start;
+    while at < end {
+        let next = ((at >> 16) + 1).saturating_mul(1 << 16).min(end);
+        let to = dst.wrapping_add(at - start);
+        if read(at as *const u8, to, next - at) {
+            at = next;
+            continue;
         }
-    });
+        if let Some(gap) = unreadable_until(at) {
+            let gap = gap.min(end);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, (gap - at) as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, gap - at) };
+            at = gap;
+            continue;
+        }
+        for_pieces(at, next - at, 4 << 10, |at, n| {
+            let to = dst.wrapping_add(at - start);
+            if !read(at as *const u8, to, n) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                // SAFETY: inside the destination, which is mapped.
+                unsafe { to.write_bytes(0, n) };
+            }
+        });
+        at = next;
+    }
+}
+
+/// Where the unreadable region holding `at` ends (none: the page at `at` is
+/// readable); at least the end of its page.
+fn unreadable_until(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let page_end = (at | 0xfff).saturating_add(1);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return Some(page_end);
+    }
+    let readable = info.State == MEM_COMMIT
+        && info.Protect != 0
+        && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0;
+    (!readable).then(|| {
+        (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .max(page_end)
+    })
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -2178,6 +2310,41 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn long_unmapped_stretches_read_as_zeros() {
+        // 64 reserved blocks: the first and 8 KiB of the second committed,
+        // and the last: a hole starting inside a block and spanning many.
+        const N: usize = 64;
+        let commit = |at: *mut u8, len: usize, fill: u8| {
+            // SAFETY: inside the reservation below, ours to fill.
+            unsafe {
+                assert!(!VirtualAlloc(at.cast(), len, MEM_COMMIT, PAGE_READWRITE).is_null());
+                at.write_bytes(fill, len);
+            }
+        };
+        // SAFETY: a fresh reservation, released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), N * BLOCK, MEM_RESERVE, PAGE_NOACCESS) };
+        let base = base.cast::<u8>();
+        assert!(!base.is_null());
+        commit(base, BLOCK + (8 << 10), 7);
+        // SAFETY: the last block of the reservation.
+        commit(unsafe { base.add((N - 1) * BLOCK) }, BLOCK, 9);
+        // Neither end aligned.
+        let mut to = vec![0xeeu8; N * BLOCK - 200];
+        // SAFETY: inside the reservation.
+        copy_mapped(
+            to.as_mut_ptr(),
+            unsafe { base.add(100) },
+            N * BLOCK - 200,
+            false,
+        );
+        let (hole, last) = (BLOCK + (8 << 10) - 100, (N - 1) * BLOCK - 100);
+        assert!(to[..hole].iter().all(|&b| b == 7));
+        assert!(to[hole..last].iter().all(|&b| b == 0));
+        assert!(to[last..].iter().all(|&b| b == 9));
+        release(base);
     }
 
     #[test]
@@ -2339,6 +2506,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The overlay blend pass, once tried (#15).
+    compositor: Option<std::result::Result<crate::composite::Compositor, ()>>,
+    /// The texture the blend pass writes.
+    blended: Option<ID3D12Resource>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -2478,14 +2649,33 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `overlay` (a
+    /// texture and its host state, which it keeps) blended over it when
+    /// `VICTORY_PRESENT_COMPOSITE=1`. `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
+        let Some(picture_format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
+        };
+        // The overlay with its view format, when it is to be blended in.
+        let overlay = overlay.filter(|_| crate::composite::wanted()).and_then(|(o, s)| {
+            // SAFETY: a live resource.
+            let f = swap_format(unsafe { o.GetDesc() }.Format)?;
+            Some((o, s, f))
+        });
+        let format = if overlay.is_some() {
+            crate::composite::result_format(picture_format)
+        } else {
+            picture_format
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -2502,6 +2692,47 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        // The blend pass and the texture it writes, made on first use.
+        let mut blended = None;
+        if let Some(overlay) = overlay {
+            if p.compositor.is_none() {
+                p.compositor = Some(crate::composite::Compositor::new(&self.device).map_err(|e| {
+                    tracing::warn!(error = %e, "no overlay blending: the pass did not compile");
+                }));
+            }
+            if let Some(Ok(compositor)) = &p.compositor {
+                let current = p.blended.as_ref().is_some_and(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    (d.Width, d.Height, d.Format) == (desc.Width, desc.Height, format)
+                });
+                if !current {
+                    p.blended =
+                        crate::composite::result_texture(&self.device, desc.Width, desc.Height, format).ok();
+                }
+                if let Some(result) = &p.blended {
+                    blended = Some((compositor, result.clone(), overlay));
+                }
+            }
+        }
+        // What is presented, whenever it changes: the title's texture in its
+        // host format, and the swap chain format it is copied into.
+        static SHOWN: Mutex<Option<(u64, u32, i32)>> = Mutex::new(None);
+        let shown = Some((desc.Width, desc.Height, desc.Format.0));
+        let mut last = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != shown {
+            *last = shown;
+            tracing::info!(
+                frame,
+                width = desc.Width,
+                height = desc.Height,
+                texture_format = desc.Format.0,
+                flags = desc.Flags.0,
+                swap_format = format.0,
+                "presenting a title texture"
+            );
+        }
+        drop(last);
         if (p.width, p.height, p.format) != (width, height, format) {
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
@@ -2532,14 +2763,32 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // What is copied to the back buffer: the blend or the picture,
+            // and the state it returns to afterwards.
+            let (source, state) = match &blended {
+                Some((compositor, result, (o, ostate, oformat))) => {
+                    let ostate = D3D12_RESOURCE_STATES(*ostate as i32);
+                    list.ResourceBarrier(&[transition(texture, state, READ), transition(o, ostate, READ)]);
+                    compositor.record(&self.device, list, (texture, picture_format), (o, *oformat), result, format);
+                    list.ResourceBarrier(&[
+                        transition(texture, READ, state),
+                        transition(o, READ, ostate),
+                        transition(result, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    ]);
+                    (result.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                }
+                None => {
+                    list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    (texture.clone(), state)
+                }
+            };
+            let texture = &source;
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -2614,6 +2863,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
+                blended: None,
             })
         }
     }
