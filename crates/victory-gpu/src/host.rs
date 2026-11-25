@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -799,6 +799,40 @@ impl Host {
         }
     }
 
+    /// Waits until the host fence reaches `value`. The event is only a
+    /// wake-up: the fence's completed value decides. Under D3DMetal a
+    /// submission's work can finish without its event ever being set
+    /// (#50: the title's main thread slept for good in this wait while the
+    /// queue was idle), so the wait wakes every second to check the fence
+    /// itself. A late event left set by an earlier wait cannot end a later
+    /// wait early, as the fence is checked after every wake-up too.
+    fn wait_for(&self, value: u64) {
+        use std::sync::atomic::AtomicU64;
+        static MISSED: AtomicU64 = AtomicU64::new(0);
+        let mut seconds = 0u32;
+        loop {
+            // SAFETY: our event and fence.
+            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            // SAFETY: as above.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed >= value {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
+                    }
+                }
+                return;
+            }
+            if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                seconds += 1;
+                if seconds.is_power_of_two() {
+                    tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+                }
+            }
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -905,9 +939,7 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
+                    Ok(()) => self.wait_for(*submitted),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
