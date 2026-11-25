@@ -810,6 +810,15 @@ impl HostHeap {
             .collect()
     }
 
+    /// The view of slot `index` if it is a placed texture's left without a
+    /// host view (made when read).
+    pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
+        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        (is_placed_texture(&view) && !kept).then_some(view)
+    }
+
     /// A shader read slot `index` through the heap: the texture it views
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
@@ -1758,6 +1767,51 @@ mod tests {
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made again for the draw");
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
+    }
+
+    /// The textures of slots shaders read are made without the heaps' lock:
+    /// a title thread writing a view meanwhile is not held up by the make.
+    #[test]
+    fn views_written_while_read_slots_get_their_textures_do_not_wait() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1024, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (read, written) = (900u32, 901u32);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slot = |i: u32| title_heap.start + u64::from(i) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, slot(read));
+        let host = title_heap.host().expect("a host view heap");
+        assert!(!host.kept(read), "left null until read");
+        let (done, waited) = std::sync::mpsc::channel();
+        let at = slot(written);
+        *crate::descriptor::tests::WHILE_MAKING.lock().unwrap() = Some((
+            read,
+            Box::new(move || {
+                std::thread::spawn(move || {
+                    crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, at);
+                    done.send(()).unwrap();
+                });
+                assert!(
+                    waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+                    "a view written while a read slot's texture is made waits"
+                );
+            }),
+        ));
+        crate::descriptor::make_read(&[read]);
+        assert!(crate::descriptor::tests::WHILE_MAKING.lock().unwrap().is_none(), "the make ran");
+        assert!(host.kept(read), "made for the read");
     }
 
     /// A heap sync makes the slots whose records the title changed as bytes

@@ -202,6 +202,27 @@ pub(crate) fn sync_heaps() {
 /// they view as used (`crate::resource::evict`).
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
+    // The placed textures those slots view are made first, without the
+    // heaps' lock, which every title thread writing a view waits on (making
+    // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
+    // runs evict2, noevict1). They are never released, so they outlive it;
+    // the lock is held only to look the slots up and to make the views.
+    let placed: Vec<View> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            // SAFETY: registered heaps are live (removed when dropped).
+            .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+            .filter(|heap| heap.desc.kind == VIEWS_KIND)
+            .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
+            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .collect()
+    };
+    #[cfg(test)]
+    tests::while_making(slots);
+    for view in &placed {
+        let _ = host::placed_texture(view);
+    }
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -788,7 +809,24 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Work to run while `make_read` makes the textures of a read slot (the
+    /// slot), outside the heaps' lock.
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+
+    /// The work [`WHILE_MAKING`] runs.
+    pub(crate) type Work = Box<dyn FnOnce() + Send>;
+
+    pub(crate) fn while_making(slots: &[u32]) {
+        let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
+            && let Some((_, work)) = hook.take()
+        {
+            drop(hook);
+            work();
+        }
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 
