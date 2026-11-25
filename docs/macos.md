@@ -49,6 +49,19 @@ On an M4 with D3DMetal 4.0 beta 3 this gives 260 passed, 4 failed and 4 ignored.
 
 After these fixes the whole suite passes under CrossOver Wine with D3DMetal on an M4: 343 passed, 0 failed and 4 ignored.
 
+## Run-time HLSL and textures under Wine and D3DMetal
+
+Under Wine, `D3DCompile` is Wine's HLSL compiler (vkd3d-shader). In CrossOver 26.3 Wine it differs from Microsoft's compilers in four ways that matter here:
+
+- It ignores `[RootSignature]` (warning W5302) and writes no root signature into the bytecode, so `CreateRootSignature` on that bytecode fails with `E_FAIL`. Build run-time compute shaders with `compute::pipeline` in `victory-gpu`, which serializes the root signature itself.
+- `RWByteAddressBuffer` has no `Load`, and `RWStructuredBuffer` stores are not implemented. The depth converter in `twin.rs` reads its scratch buffer through a structured view and writes it through a raw one.
+- Shader model 5.1 resource arrays are not implemented, bounded or unbounded (`E_NOTIMPL`), and `NonUniformResourceIndex` is not defined. Shaders that need them have to be compiled on Windows, as the clamp shader is. The one test that needs them (`lists_share_a_table_and_copies_keep_their_views`) prints that it was skipped.
+- It still compiles plain `cs_5_1` shaders, and D3DMetal runs their bytecode.
+
+D3DMetal has no Metal format for `R10G10B10_XR_BIAS_A2_UNORM`. It refuses any castable format list that names it, and creating a texture in that format stops the process in Metal's validation. `castable` leaves it out, so 4-byte colour textures of one memory share one host texture under D3DMetal too.
+
+D3DMetal rounds float depth down when it stores 24-bit depth (a clear to 0.5 stores 8388607, not 8388608), where Windows GPUs round to nearest.
+
 ## Route A: next steps
 
 The first playable route is the upstream Windows build running under Wine, with D3D12 going to Metal through Apple's D3DMetal. DXMT cannot be used because it covers D3D11 only. Rosetta 2 runs the title's x86-64 code and has supported AVX2 since macOS 15.
