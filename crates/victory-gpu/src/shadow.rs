@@ -530,12 +530,13 @@ impl Shadow {
     /// dispatch read its sizes as zeros and looped until the device was
     /// removed). The same bytes go into the snapshot `writing` took, so
     /// copy-back neither takes them for the GPU's nor puts them back over a
-    /// later title write.
+    /// later title write. Untracked memory (not the runtime's, or any under
+    /// Rosetta) is copied whole, as [`Shadow::update_free`] copies it.
     fn update_busy(&self, from: usize, to: usize) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
+        let runs = match &self.tracked {
+            Some(t) => t.take(from, to),
+            None => vec![(from, to)],
         };
-        let runs = t.take(from, to);
         if runs.is_empty() {
             return 0;
         }
@@ -1056,6 +1057,48 @@ mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
         }
         unregister(p, p as u64);
+    }
+
+    /// The same where title memory is not tracked (what Rosetta gets for
+    /// all of it): the title's constant under the busy range still reaches
+    /// the copy, and copy-back still tells the shader's write from it.
+    #[test]
+    fn untracked_title_writes_under_a_busy_range_are_copied() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let len = 2 * PAGE;
+        // Private memory without write watching is not the runtime's.
+        // SAFETY: a fresh allocation, freed by the test.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert!(p != 0);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        assert!(copy.tracked.is_none(), "plain private memory is not tracked");
+        let title = |at: usize| (p + at) as *mut u8;
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(p, len);
+        copy.writing(p, len);
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert_eq!(copy.update(p + PAGE + 16, 16), 16, "the busy range is copied");
+        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        assert_eq!(copy.copy_back(p, len), PAGE, "the shader's page goes back");
+        // SAFETY: bytes of our allocation.
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!(title(PAGE + 20).read_volatile(), 0x55, "the constant is not undone");
+        }
+        drop(copy);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
