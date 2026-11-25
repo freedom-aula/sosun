@@ -595,13 +595,36 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Title memory (below 2^40, as the runtime places it): 1, 2 and
         // (from the second submission on) 1 page, write-watched as its pools.
         let pool = |pages: usize| -> usize {
-            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-            (0..256u64)
-                .map(|k| 0x40_0000_0000 + (k << 28))
-                // SAFETY: a fresh allocation where nothing is mapped, or none.
-                .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
-                .find(|&p| p != 0)
-                .expect("memory below 2^40")
+            use windows_sys::Win32::System::Memory::{
+                MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
+                PAGE_READWRITE, VirtualAlloc2,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // Placed by address requirements, as the runtime places title
+            // memory (`XMemVirtualAlloc`): Wine refuses fixed addresses there.
+            let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: (1usize << 32) as *mut _,
+                HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+                Alignment: 0,
+            };
+            let mut parameter = MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+            // SAFETY: a fresh allocation; the parameter points at
+            // `requirements`, which outlives the call.
+            let p = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                    &mut parameter,
+                    1,
+                )
+            } as usize;
+            assert!(p != 0 && p < 1 << 40, "memory below 2^40");
+            p
         };
         let memory = [pool(1), pool(2), pool(1)];
         let copy = |p: usize, pages: usize| {
