@@ -280,6 +280,79 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
+/// pipeline (ms, commands) and lists' wall time against the sum of their
+/// commands' (ms), since the last frame-rate line.
+#[cfg(feature = "diagnostics")]
+type GpuTimes = (std::collections::HashMap<String, (f64, u64)>, f64, f64);
+#[cfg(feature = "diagnostics")]
+static GPU_TIMES: Mutex<Option<GpuTimes>> = Mutex::new(None);
+
+/// Adds a timed list's commands (from [`HostList::slowest`]) to [`GPU_TIMES`],
+/// by the command's kind and pipeline: its note before the first ` | `,
+/// without counts and addresses.
+#[cfg(feature = "diagnostics")]
+fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
+    let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
+    *wall_ms += wall.as_secs_f64() * 1e3;
+    for (ms, note) in commands {
+        let head = note.split(" | ").next().unwrap_or_default();
+        let key: Vec<&str> = head
+            .split(' ')
+            .filter(|w| !w.starts_with(|c: char| c.is_ascii_digit()) && !w.starts_with("0x"))
+            .collect();
+        let e = by.entry(key.join(" ")).or_default();
+        (e.0, e.1) = (e.0 + ms, e.1 + 1);
+        *sum += ms;
+    }
+}
+
+/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_times(frames: f64) {
+    let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    tracing::info!(
+        "GPU timing: lists {:.1} ms/frame of wall time, their commands {:.1} ms/frame",
+        wall / frames,
+        sum / frames
+    );
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    for (key, (ms, n)) in by.iter().take(25) {
+        tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
+    }
+}
+
+/// Diagnostics: the host device's video memory use and budget, in MB, local
+/// (on the card) and non-local (system memory the GPU reads), as the
+/// system's memory manager sees them: use over budget makes it page
+/// allocations at submissions.
+#[cfg(feature = "diagnostics")]
+fn video_memory() -> Option<[(f64, f64); 2]> {
+    static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
+    let adapter = ADAPTER
+        .get_or_init(|| {
+            let device = &host()?.device;
+            // SAFETY: plain device and DXGI queries.
+            unsafe {
+                let luid = device.GetAdapterLuid();
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+                factory.EnumAdapterByLuid(luid).ok()
+            }
+        })
+        .as_ref()?;
+    let info = |group| {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: a valid out pointer.
+        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+        Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+    };
+    Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -809,7 +882,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -911,6 +988,12 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
+            }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
@@ -2398,7 +2481,14 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                if let Some([(local, budget), (system, system_budget)]) = video_memory() {
+                    tracing::info!(
+                        "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
+                         {system:.0} MB of {system_budget:.0} MB in system memory"
+                    );
+                }
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                log_gpu_times(copy_frames);
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
