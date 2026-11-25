@@ -179,7 +179,9 @@ cmd_claim() {
             say "task #$1 is yours. Next: tools/fleet/fleet.sh run $1"
             return
         fi
-        [ -n "$T_ASSIGNEE" ] && die "task #$1 went to someone else; run tools/fleet/fleet.sh next"
+        # Assignment can appear before the queue finishes updating the labels.
+        [ -n "$T_ASSIGNEE" ] && [ "$T_ASSIGNEE" != "$who" ] &&
+            die "task #$1 went to someone else; run tools/fleet/fleet.sh next"
     done
     die "no lease after 3 minutes; read the replies on https://github.com/$REPO/issues/$1"
 }

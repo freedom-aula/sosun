@@ -217,5 +217,55 @@ worker_case success 0 0 0 ok
 worker_case setup-failure 1 0 0 failed
 worker_case invalid-result 0 1 1 unused
 
+# --- claim polling (GitHub updates the assignee and labels separately)
+cat > "$tmp/worker-claim.sh" <<'EOF'
+case_dir=$1
+scenario=$2
+set -- help
+. "$0" > /dev/null
+REPO=example/VIctory-macOS
+accepted() { return 0; }
+me() { echo worker; }
+sleep() { :; }
+gh() { printf '%s\n' "$*" >> "$case_dir/posts"; }
+load_count=0
+load_task() {
+    load_count=$((load_count + 1))
+    printf '%s\n' "$load_count" > "$case_dir/loads"
+    T_STATE=OPEN
+    T_ASSIGNEE=""
+    T_LABELS="fleet:open"
+    [ "$load_count" -gt 1 ] || return 0
+    case "$scenario" in
+        delayed-label)
+            T_ASSIGNEE=worker
+            if [ "$load_count" = 3 ]; then T_LABELS=""; fi
+            if [ "$load_count" -ge 4 ]; then T_LABELS="fleet:leased"; fi
+            ;;
+        delayed-assignee)
+            if [ "$load_count" -ge 3 ]; then T_ASSIGNEE=worker; T_LABELS="fleet:leased"; fi
+            ;;
+        immediate) T_ASSIGNEE=worker; T_LABELS="fleet:leased" ;;
+        other-worker) T_ASSIGNEE=another-worker; T_LABELS="fleet:leased" ;;
+        missing-label) T_ASSIGNEE=worker ;;
+    esac
+}
+cmd_claim 1
+EOF
+claim_case() {
+    local dir="$tmp/claim-$1" status=0
+    mkdir -p "$dir"
+    bash -c '. "$1" "$2" "$3"' "$FLEET_DIR/fleet.sh" "$tmp/worker-claim.sh" "$dir" "$1" > "$dir/output" 2>&1 || status=$?
+    eq "claim $1 exit status" "$2" "$status"
+    ok "claim $1 outcome" grep -q "$3" "$dir/output"
+    eq "claim $1 polling count" "$4" "$(cat "$dir/loads")"
+    eq "claim $1 posts once" 'issue comment 1 -R example/VIctory-macOS --body /claim' "$(cat "$dir/posts")"
+}
+claim_case delayed-label 0 'task #1 is yours' 4
+claim_case delayed-assignee 0 'task #1 is yours' 3
+claim_case immediate 0 'task #1 is yours' 2
+claim_case other-worker 1 'went to someone else' 2
+claim_case missing-label 1 'no lease after 3 minutes' 37
+
 echo "fleet tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]
