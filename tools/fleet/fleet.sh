@@ -203,7 +203,9 @@ cmd_run() {
     # Keep the lease alive while the suites run.
     (while sleep 3000; do gh issue comment "$n" -R "$REPO" --body "/beat" > /dev/null 2>&1 || true; done) &
     local beat_pid=$!
-    trap 'kill "$beat_pid" 2> /dev/null || true' EXIT
+    # Capture the PID now; cmd_run's locals are gone when EXIT runs.
+    # shellcheck disable=SC2064
+    trap "kill $beat_pid 2> /dev/null || true" EXIT
 
     say "running setup.sh (the first run builds Wine and takes about an hour); log: $logs/setup.log"
     (cd "$WORK" && ./setup.sh) > "$logs/setup.log" 2>&1 && setup=ok || setup=failed
