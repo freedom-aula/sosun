@@ -236,6 +236,71 @@ pub struct Region {
 /// The mapped region containing `addr` (a run of pages with one protection),
 /// or `None` if nothing is mapped there.
 pub fn query(addr: usize) -> Option<Region> {
+    next_region(addr).filter(|r| r.base <= addr)
+}
+
+/// Reserves `len` bytes (no access) at the lowest free address that is a
+/// multiple of `align` and at or above `lowest`, provided the range ends at
+/// or below `highest` (inclusive). First fit from `lowest`, so a miss means
+/// no free range of that size below `highest` exists.
+///
+/// # Safety
+/// A reservation is the caller's to release.
+pub unsafe fn reserve_in(
+    lowest: usize,
+    highest: usize,
+    len: usize,
+    align: usize,
+) -> io::Result<*mut u8> {
+    let mut addr = lowest as u64;
+    // SAFETY: anonymous memory placed by the kernel; nothing of the caller's is touched.
+    check("mach_vm_map", unsafe {
+        mach_vm_map(
+            task(),
+            &mut addr,
+            len as u64,
+            align.max(page_size()).next_power_of_two() as u64 - 1,
+            VM_FLAGS_ANYWHERE,
+            0,
+            0,
+            0,
+            0,
+            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+            VM_INHERIT_NONE,
+        )
+    })?;
+    if (addr as usize)
+        .checked_add(len)
+        .is_none_or(|end| end - 1 > highest)
+    {
+        // SAFETY: just mapped.
+        unsafe { release(addr as *mut u8, len) }?;
+        return Err(io::Error::other("no free address range below the limit"));
+    }
+    Ok(addr as *mut u8)
+}
+
+/// The process's memory footprint in bytes (what the system charges it for).
+pub fn footprint() -> usize {
+    const TASK_VM_INFO: i32 = 22;
+    unsafe extern "C" {
+        fn task_info(task: MachPort, flavor: i32, info: *mut u64, count: *mut u32) -> KernReturn;
+    }
+    // `task_vm_info`: `phys_footprint` is the u64 at byte 144.
+    let mut info = [0u64; 64];
+    let mut count = 128u32;
+    // SAFETY: a buffer of `count` 32-bit words.
+    let kr = unsafe { task_info(task(), TASK_VM_INFO, info.as_mut_ptr(), &mut count) };
+    if kr == KERN_SUCCESS && count >= 38 {
+        info[18] as usize
+    } else {
+        0
+    }
+}
+
+/// The first mapped region that ends above `addr`: the one containing it, or
+/// the next one up. `None` if nothing is mapped from there on.
+pub fn next_region(addr: usize) -> Option<Region> {
     let mut at = addr as u64;
     let mut size = 0u64;
     let mut info = RegionBasicInfo64::default();
@@ -253,8 +318,7 @@ pub fn query(addr: usize) -> Option<Region> {
             &mut object,
         )
     };
-    // The call returns the next region at or after `addr`.
-    (kr == KERN_SUCCESS && at <= addr as u64).then_some(Region {
+    (kr == KERN_SUCCESS).then_some(Region {
         base: at as usize,
         len: size as usize,
         protect: Protect(info.protection as u32),

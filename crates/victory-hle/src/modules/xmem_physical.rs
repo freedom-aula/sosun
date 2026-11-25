@@ -33,8 +33,6 @@ use victory_platform::mem::{self, PagePool, Protect, Window};
 
 #[cfg(windows)]
 use super::xmem::{commit_refused, on_wine};
-#[cfg(target_os = "macos")]
-use crate::{HleModule, hle_export};
 
 pub(super) const PAGE: usize = 64 << 10;
 
@@ -742,22 +740,6 @@ fn remap(physical: &mut Physical, (at, len, slice): (usize, usize, Slice)) {
         // The cut kept the pages' own entries in `shown`; only the view is
         // new.
         physical.views.insert(at, (len, slice));
-    }
-}
-
-/// What the native macOS host serves of `xmem.dll` so far: the physical
-/// pages (`XMemVirtualAlloc` and the rest are still Windows only).
-#[cfg(target_os = "macos")]
-pub(crate) fn module() -> HleModule {
-    HleModule {
-        name: "xmem",
-        dlls: &["xmem.dll"],
-        exports: vec![
-            hle_export!(XMemAllocatePhysicalPages),
-            hle_export!(XMemFreePhysicalPages),
-            hle_export!(XMemMapPhysicalPages),
-            hle_export!(XMemMapPhysicalPagesScatter),
-        ],
     }
 }
 

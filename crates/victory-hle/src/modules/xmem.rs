@@ -9,28 +9,40 @@
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{ERROR_COMMITMENT_LIMIT, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{
     MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RELEASE,
     MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2,
     VirtualFree, VirtualQueryEx,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
+#[cfg(windows)]
 use windows_sys::core::BOOL;
+
+#[cfg(not(windows))]
+use super::xmem_posix::{BOOL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, find_export};
+#[cfg(not(windows))]
+pub use super::xmem_posix::{BasicInformation, XMemVirtualAlloc, XMemVirtualQuery};
 
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
+#[cfg(windows)]
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
@@ -49,19 +61,20 @@ static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
 /// privilege.
-const PAGES_2M: u32 = 0x2000_0000;
+pub(super) const PAGES_2M: u32 = 0x2000_0000;
 /// With `PAGES_2M`: 64 KiB pages; the host reads it as AWE memory.
-const PAGES_64K_BIT: u32 = 0x40_0000;
+pub(super) const PAGES_64K_BIT: u32 = 0x40_0000;
 pub(super) const PAGES_64K: u32 = PAGES_2M | PAGES_64K_BIT;
 /// The host's protection constants and `PAGE_GUARD`. Above them the console
 /// adds GPU access bits (0x800-0x40000). Write-combining and uncached are
 /// dropped too: our GPU side reads this memory through the CPU.
-const HOST_PROTECTION: u32 = 0x1ff;
+pub(super) const HOST_PROTECTION: u32 = 0x1ff;
 /// XMem flags of memory both processors reach: all of ours.
-const GRAPHICS: u64 = 3;
+pub(super) const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
+#[cfg(windows)]
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
@@ -71,7 +84,7 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// title memory there, and its ray-tracing structures must be (Grand Theft
 /// Auto VI's BVH builder refuses one above; the title asks for its GPU heap
 /// with no field). Decision 0001.
-fn address_range(flags: u64) -> (usize, usize) {
+pub(super) fn address_range(flags: u64) -> (usize, usize) {
     let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
         (0, 0) => 40,
         (0, field) => 47 - field,
@@ -80,6 +93,7 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
+#[cfg(windows)]
 pub extern "system" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
@@ -179,6 +193,7 @@ pub extern "system" fn XMemVirtualAlloc(
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
 /// same), then the XMem flags and tag.
+#[cfg(windows)]
 #[repr(C)]
 pub struct BasicInformation {
     host: MEMORY_BASIC_INFORMATION,
@@ -191,6 +206,7 @@ pub struct BasicInformation {
 // all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
+#[cfg(windows)]
 pub extern "system" fn XMemVirtualQuery(
     process: HANDLE,
     address: *const c_void,
@@ -243,12 +259,7 @@ fn hooks() -> [usize; 2] {
         // Looked up once the title is mapped, which is before it runs.
         None => match crate::runtime::main_image() {
             Some(base) => *AT.get_or_init(|| {
-                use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-                // SAFETY: a mapped image and a NUL-terminated name.
-                let at = unsafe {
-                    GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
-                }
-                .map_or(0, |f| f as usize);
+                let at = export(base, c"__XMemAllocationHooks__");
                 tracing::info!(found = at != 0, "xmem allocation hooks");
                 at
             }),
@@ -260,6 +271,21 @@ fn hooks() -> [usize; 2] {
     }
     // SAFETY: the export is two routine pointers.
     unsafe { (at as *const [usize; 2]).read() }
+}
+
+/// Address of a named export of the mapped image at `base`, 0 if none.
+fn export(base: usize, name: &std::ffi::CStr) -> usize {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+        // SAFETY: a mapped image and a NUL-terminated name.
+        unsafe { GetProcAddress(base as _, name.as_ptr().cast()) }.map_or(0, |f| f as usize)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: a mapped image.
+        unsafe { find_export(base, name) }.unwrap_or(0)
+    }
 }
 
 /// The title's general allocator, for middleware too: its hook if it has
@@ -331,7 +357,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            #[cfg(windows)]
             VirtualFree(address, 0, MEM_RELEASE);
+            #[cfg(not(windows))]
+            super::xmem_posix::release_reservation(address as usize);
             return;
         }
         let user = address.cast::<u8>();
@@ -354,6 +383,7 @@ pub use super::xmem_physical::*;
 /// Reports memory the host would not give: at the Windows commit limit to
 /// `crashes.log`, since the title usually faults soon after on the null it
 /// gets; otherwise as a warning.
+#[cfg(windows)]
 pub(super) fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
@@ -373,6 +403,7 @@ pub(super) fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     }
 }
 
+#[cfg(windows)]
 fn commit_limit_message(
     len: usize,
     what: &str,
@@ -426,16 +457,22 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
+    #[cfg(windows)]
+    let used = {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        counters.PagefileUsage
     };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    #[cfg(not(windows))]
+    let used = victory_platform::mem::footprint();
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: used,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
@@ -491,11 +528,15 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
+        #[cfg(windows)]
         // SAFETY: a pseudo handle needs no closing.
         let process = unsafe { GetCurrentProcess() };
+        #[cfg(not(windows))]
+        let process = std::ptr::null_mut();
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
     }
@@ -512,10 +553,15 @@ mod tests {
             XMemFree(p, attributes);
         }
         let p = XMemAlloc(4096, ALLOC_32BIT);
-        assert!(!p.is_null() && (p as usize) < 1 << 32);
-        XMemFree(p, ALLOC_32BIT);
+        // A macOS host reaches the low 4 GiB only if its executable is linked
+        // without the 4 GiB `__PAGEZERO` (`-pagezero_size`), which tests are not.
+        if cfg!(windows) || !p.is_null() {
+            assert!(!p.is_null() && (p as usize) < 1 << 32);
+            XMemFree(p, ALLOC_32BIT);
+        }
     }
 
+    #[cfg(windows)]
     #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;
@@ -587,6 +633,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
     }
 
+    #[cfg(windows)]
     #[test]
     fn commit_limit_report_includes_request_and_system_commit() {
         let error = std::io::Error::from_raw_os_error(ERROR_COMMITMENT_LIMIT as i32);

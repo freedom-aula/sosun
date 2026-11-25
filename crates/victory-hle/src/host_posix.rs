@@ -104,6 +104,16 @@ pub extern "system" fn Sleep(ms: u32) {
 /// the whole region.
 static REGIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
+/// Lets `VirtualFree(MEM_RELEASE)` release a region another module reserved
+/// (`xmem`'s `XMemVirtualAlloc`), and takes it back when that module frees it.
+pub(crate) fn adopt_region(base: usize, len: usize) {
+    lock(&REGIONS).insert(base, len);
+}
+
+pub(crate) fn forget_region(base: usize) {
+    lock(&REGIONS).remove(&base);
+}
+
 /// Win32 `PAGE_*` to a protection.
 fn protection(flags: u32) -> Option<Protect> {
     Some(match flags & 0xFF {

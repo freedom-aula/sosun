@@ -52,9 +52,18 @@ fn reserve_at_an_address_fails_when_taken() {
         let p = mem::reserve(None, g).unwrap();
         assert!(mem::reserve(Some(p as usize), g).is_err());
         mem::release(p, g).unwrap();
-        // Free again, so exactly there works.
-        let q = mem::reserve(Some(p as usize), g).unwrap();
-        assert_eq!(q, p);
+        // Free again, so exactly there works. Other tests reserve at the same
+        // time and may take the address between the release and here, so
+        // try new addresses until one is not taken.
+        let mut at = p;
+        let q = loop {
+            if let Ok(q) = mem::reserve(Some(at as usize), g) {
+                break q;
+            }
+            at = mem::reserve(None, g).unwrap();
+            mem::release(at, g).unwrap();
+        };
+        assert_eq!(q, at);
         mem::release(q, g).unwrap();
     }
 }
@@ -324,4 +333,36 @@ fn wait_on_address_wakes_and_times_out() {
     wake_one(&word);
     wake_all(&word);
     assert_eq!(t.join(), 5);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reserve_in_keeps_to_the_range_and_alignment() {
+    const MIB: usize = 1 << 20;
+    let (lowest, highest) = (1usize << 32, (1usize << 40) - 1);
+    // SAFETY: the test owns everything it reserves.
+    unsafe {
+        let p = mem::reserve_in(lowest, highest, 4 * MIB, 2 * MIB).unwrap();
+        let at = p as usize;
+        assert_eq!(at % (2 * MIB), 0);
+        assert!(at >= lowest && at + 4 * MIB - 1 <= highest);
+        assert_eq!(mem::query(at).unwrap().protect, Protect::NO_ACCESS);
+        // A range that cannot hold the request fails and leaves nothing behind.
+        assert!(mem::reserve_in(lowest, lowest + MIB, 4 * MIB, 0).is_err());
+        mem::release(p, 4 * MIB).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn next_region_finds_the_following_mapping() {
+    let g = mem::granularity();
+    // SAFETY: the test owns everything it reserves.
+    unsafe {
+        let p = mem::reserve(None, 2 * g).unwrap();
+        let inside = mem::next_region(p as usize + 1).unwrap();
+        assert!(inside.base <= p as usize && inside.base + inside.len >= p as usize + 2 * g);
+        mem::release(p, 2 * g).unwrap();
+    }
+    assert!(mem::footprint() > 0);
 }
