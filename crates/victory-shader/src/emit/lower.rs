@@ -2870,7 +2870,7 @@ impl<'a> Lower<'a> {
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
-        self.s.flags |= flags::WAVE_OPS;
+        self.s.flags |= flags::WAVE_OPS | flags::TYPED_UAV_LOADS | flags::INT64;
         let c = self.cur;
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
@@ -4402,7 +4402,8 @@ impl<'a> Lower<'a> {
         let nhi = self.s.m.cast(held, Cast::Trunc, nhi, i32t);
         let mut args = vec![h];
         args.extend(cs);
-        args.extend([nlo, nhi, nlo, nhi, self.s.m.i8(0x3)]);
+        // DXIL stores all four channels; an R32G32 view keeps two.
+        args.extend([nlo, nhi, nlo, nhi, self.s.m.i8(0xF)]);
         self.s
             .op(held, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
         self.s
