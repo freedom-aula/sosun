@@ -197,6 +197,18 @@ pub fn run(
 fn check_startup_archive(path: &Path) -> Result<()> {
     use std::io::Read;
 
+    // Some copies keep each package in a folder of its own name
+    // (`appdata0/appdata0.rpf`); the title finds nothing there (#24).
+    if !path.exists()
+        && let Some(nested) = nested_package(path)
+    {
+        anyhow::bail!(
+            "Cannot find startup archive {}, but {} exists. The archives must sit directly in the game folder, not one per subfolder. Move every package's files up into {}.",
+            path.display(),
+            nested.display(),
+            path.parent().unwrap_or(Path::new(".")).display()
+        );
+    }
     let mut magic = [0; 4];
     std::fs::File::open(path)
         .and_then(|mut file| file.read_exact(&mut magic))
@@ -212,6 +224,17 @@ fn check_startup_archive(path: &Path) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// `dir/<stem>/<name>` for `dir/<name>`, where a copy that keeps each
+/// package in a folder of its own name has it.
+#[cfg(windows)]
+fn nested_package(path: &Path) -> Option<std::path::PathBuf> {
+    let nested = path
+        .parent()?
+        .join(path.file_stem()?)
+        .join(path.file_name()?);
+    nested.is_file().then_some(nested)
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -485,6 +508,18 @@ mod absent_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn nested_packages_are_found() {
+        let dir = std::env::temp_dir().join(format!("victory-nested-{}", std::process::id()));
+        let flat = dir.join("appdata0.rpf");
+        assert_eq!(super::nested_package(&flat), None);
+        std::fs::create_dir_all(dir.join("appdata0")).unwrap();
+        let nested = dir.join("appdata0").join("appdata0.rpf");
+        std::fs::write(&nested, b"9FPR").unwrap();
+        assert_eq!(super::nested_package(&flat), Some(nested));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
