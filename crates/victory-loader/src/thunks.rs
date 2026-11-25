@@ -15,13 +15,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    DebugBreak, FlushInstructionCache, IsDebuggerPresent,
-};
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use victory_platform::mem::{self, Protect};
+use windows_sys::Win32::System::Diagnostics::Debug::{DebugBreak, IsDebuggerPresent};
 
 /// What an unimplemented import does when called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,20 +87,8 @@ impl ThunkBlock {
     pub(crate) fn new(count: usize) -> Result<Self> {
         let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
         // SAFETY: fresh anonymous allocation; no existing memory is touched.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                len,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        } as *mut u8;
-        if base.is_null() {
-            bail!(
-                "VirtualAlloc for import stubs failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let base = unsafe { mem::alloc(None, len, Protect::READ_WRITE) }
+            .map_err(|e| anyhow::anyhow!("VirtualAlloc for import stubs failed: {e}"))?;
         Ok(ThunkBlock { base, len, used: 0 })
     }
 
@@ -134,17 +117,11 @@ impl ThunkBlock {
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
-        let mut old = 0;
         // SAFETY: `base..base+len` is the allocation made in `new`.
-        let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
-        if ok == 0 {
-            bail!(
-                "VirtualProtect for import stubs failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        unsafe { mem::protect(self.base, self.len, Protect::READ_EXECUTE) }
+            .map_err(|e| anyhow::anyhow!("VirtualProtect for import stubs failed: {e}"))?;
         // SAFETY: flushing our own process's instruction cache for our own block.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        unsafe { mem::flush_icache(self.base, self.len) };
         Ok(())
     }
 }

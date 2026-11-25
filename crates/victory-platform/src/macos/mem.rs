@@ -135,6 +135,40 @@ pub unsafe fn reserve(at: Option<usize>, len: usize) -> io::Result<*mut u8> {
     Ok(addr as *mut u8)
 }
 
+/// Reserves and commits `len` bytes in one step (`at` as for [`reserve`]).
+///
+/// # Safety
+/// As [`reserve`].
+pub unsafe fn alloc(at: Option<usize>, len: usize, prot: Protect) -> io::Result<*mut u8> {
+    // SAFETY: forwarded from the caller.
+    let p = unsafe { reserve(at, len) }?;
+    // SAFETY: the reservation just made.
+    if let Err(e) = unsafe { commit(p, len, prot) } {
+        // SAFETY: as above.
+        unsafe { release(p, len) }?;
+        return Err(e);
+    }
+    Ok(p)
+}
+
+/// Makes code just written to `[addr, addr + len)` visible to the CPU. Only
+/// an arm64 host needs it.
+///
+/// # Safety
+/// The range must be mapped.
+pub unsafe fn flush_icache(addr: *mut u8, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *mut u8, len: usize);
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { sys_icache_invalidate(addr, len) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (addr, len);
+}
+
 /// Makes `[addr, addr + len)` of a reservation usable, zero filled.
 ///
 /// # Safety

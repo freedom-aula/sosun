@@ -1,5 +1,6 @@
 //! The same checks run against both implementations: natively on macOS
 //! (`cargo test`) and under Wine (`tools/macos/test-wine.sh -p victory-platform`).
+#![cfg(any(windows, target_os = "macos"))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

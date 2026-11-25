@@ -7,11 +7,11 @@
 //!
 //! `docs/native-host.md` lists every Win32 API still called directly and the
 //! order in which they move here. Only memory, threads and synchronisation
-//! have landed.
+//! have landed. On any other OS the crate is empty.
 
-#[cfg(not(any(windows, target_os = "macos")))]
-compile_error!("victory-platform supports Windows (and Wine) and macOS only");
-
+#[cfg(any(windows, target_os = "macos"))]
 pub mod mem;
+#[cfg(any(windows, target_os = "macos"))]
 pub mod sync;
+#[cfg(any(windows, target_os = "macos"))]
 pub mod thread;

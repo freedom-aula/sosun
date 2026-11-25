@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
-use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+use victory_platform::mem::{self, Protect};
 
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
@@ -284,19 +284,13 @@ impl LoadedImage {
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
             let slot = (self.base() + rva as usize) as *mut u64;
-            let mut old = 0;
             // SAFETY: the parser only yields slots inside the image.
-            if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
-                bail!(
-                    "VirtualProtect(IAT slot {rva:#x}) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
+            let old = unsafe { mem::protect(slot.cast(), 8, Protect::READ_WRITE) }
+                .map_err(|e| anyhow::anyhow!("VirtualProtect(IAT slot {rva:#x}) failed: {e}"))?;
             // SAFETY: inside the image, now writable, 8-byte aligned by the PE format.
             unsafe { slot.write_volatile(address as u64) };
-            let mut ignored = 0;
             // SAFETY: restoring the protection we just changed.
-            unsafe { VirtualProtect(slot as *const c_void, 8, old, &mut ignored) };
+            unsafe { mem::protect(slot.cast(), 8, old) }.ok();
         }
         Ok(())
     }

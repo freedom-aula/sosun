@@ -14,6 +14,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 victory-core = { path = "crates/victory-core" }
+victory-platform = { path = "crates/victory-platform" }
 victory-pe = { path = "crates/victory-pe" }
 victory-loader = { path = "crates/victory-loader" }
 victory-hle = { path = "crates/victory-hle" }

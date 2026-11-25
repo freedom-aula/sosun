@@ -7,16 +7,10 @@
 //! yields `&array[index]` instead, and the image's `_tls_index` (which CRT
 //! code does read, and adds to the array pointer) is set to 0.
 
-use std::ffi::c_void;
 
 use anyhow::{Result, bail};
 use victory_pe::ImageInfo;
-use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
-    VirtualAlloc, VirtualProtect,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use victory_platform::mem::{self, Protect};
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const TLS64_ADDRESS_OF_INDEX: usize = 16;
@@ -50,21 +44,16 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
-        let mut old = 0;
         // SAFETY: the section is part of the mapped image.
-        if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
-            bail!(
-                "VirtualProtect(code) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let old = unsafe { mem::protect(start as _, len, Protect::READ_WRITE_EXECUTE) }
+            .map_err(|e| anyhow::anyhow!("VirtualProtect(code) failed: {e}"))?;
         // SAFETY: writable now, and no title code runs yet.
         let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
         patched += patch(code, start, thunks);
         // SAFETY: restoring the protection we changed; flushing our own code.
         unsafe {
-            VirtualProtect(start as _, len, old, &mut old);
-            FlushInstructionCache(GetCurrentProcess(), start as _, len);
+            mem::protect(start as _, len, old).ok();
+            mem::flush_icache(start as _, len);
         }
     }
     // SAFETY: see `index_at`; `.data` is writable.
@@ -127,14 +116,9 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             )
         };
     }
-    let mut old = 0;
     // SAFETY: `block` is our allocation of one page.
-    if unsafe { VirtualProtect(block as _, 4096, PAGE_EXECUTE_READ, &mut old) } == 0 {
-        bail!(
-            "VirtualProtect(TLS thunks) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
+    unsafe { mem::protect(block, 4096, Protect::READ_EXECUTE) }
+        .map_err(|e| anyhow::anyhow!("VirtualProtect(TLS thunks) failed: {e}"))?;
     Ok(block as usize)
 }
 
@@ -153,17 +137,9 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
             Some(above + k * GRANULE),
         ] {
             let Some(hint) = hint else { continue };
-            // SAFETY: a fresh allocation at a free address, or null.
-            let p = unsafe {
-                VirtualAlloc(
-                    hint as *const c_void,
-                    4096,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                )
-            };
-            if !p.is_null() {
-                return Ok(p.cast());
+            // SAFETY: a fresh allocation at a free address.
+            if let Ok(p) = unsafe { mem::alloc(Some(hint), 4096, Protect::READ_WRITE) } {
+                return Ok(p);
             }
         }
     }
@@ -206,14 +182,13 @@ mod tests {
             let bytes = unsafe { std::slice::from_raw_parts_mut(page, code.len()) };
             bytes.copy_from_slice(&code);
             assert_eq!(patch(bytes, page as usize, thunks), 1);
-            let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
-            unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
+            unsafe { mem::protect(page, 4096, Protect::READ_EXECUTE) }.unwrap();
             // SAFETY: the page holds the patched load and a return.
             let f: extern "system" fn() -> usize = unsafe { std::mem::transmute(page) };
             assert_eq!(f(), tls_array() + 3 * 8, "REX {rex:#x} ModRM {modrm:#x}");
             // SAFETY: our page again.
-            unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
+            unsafe { mem::protect(page, 4096, Protect::READ_WRITE) }.unwrap();
         }
     }
 }

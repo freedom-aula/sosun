@@ -12,6 +12,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect,
     VirtualQuery,
 };
+use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -60,6 +61,29 @@ pub unsafe fn reserve(at: Option<usize>, len: usize) -> io::Result<*mut u8> {
         return Err(io::Error::last_os_error());
     }
     Ok(p.cast())
+}
+
+/// Reserves and commits `len` bytes in one step (`at` as for [`reserve`]).
+///
+/// # Safety
+/// As [`reserve`].
+pub unsafe fn alloc(at: Option<usize>, len: usize, prot: Protect) -> io::Result<*mut u8> {
+    let at = at.map_or(std::ptr::null(), |a| a as *const c_void);
+    // SAFETY: reserves fresh address space only.
+    let p = unsafe { VirtualAlloc(at, len, MEM_RESERVE | MEM_COMMIT, prot.0) };
+    if p.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(p.cast())
+}
+
+/// Makes code just written to `[addr, addr + len)` visible to the CPU.
+///
+/// # Safety
+/// The range must be mapped.
+pub unsafe fn flush_icache(addr: *mut u8, len: usize) {
+    // SAFETY: flushing our own process's instruction cache.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), addr.cast(), len) };
 }
 
 /// Makes `[addr, addr + len)` of a reservation usable, zero filled.
