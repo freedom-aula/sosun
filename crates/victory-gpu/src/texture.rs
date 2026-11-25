@@ -464,6 +464,11 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
+            // Most refreshes find nothing: the tracker's dense bit says so
+            // without its lock (123,000 refreshes a frame, run evict3).
+            if t.clean() {
+                return (0, None);
+            }
             let ranges = t.take(start, start + size);
             if ranges.is_empty() {
                 return (0, None);
