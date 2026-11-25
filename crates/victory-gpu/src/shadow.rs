@@ -591,11 +591,17 @@ impl Shadow {
         if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            let runs = t.take(from, to);
+            let (runs, unmapped) = t.take_split(from, to);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
             // Cut to the range: next to it shaders may be writing the copy.
             let mut copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
+            for (a, b) in unmapped {
+                // SAFETY: inside the mapping (`take_split` cuts to the buffer).
+                unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
+            }
             // Parts on memory that is not the runtime's: whole, as below.
             for (a, b) in t.untracked(from, to) {
                 #[cfg(feature = "diagnostics")]

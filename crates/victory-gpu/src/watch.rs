@@ -127,6 +127,9 @@ impl Changed {
     }
 }
 
+/// Byte runs `[start, end)` in order.
+pub(crate) type Runs = Vec<(usize, usize)>;
+
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
     start: usize,
@@ -387,9 +390,26 @@ impl Tracked {
     /// `[from, to)`, in order. A page whose part in the tracked memory lies
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (copy, zero) = self.take_split(from, to);
+        let mut runs: Vec<(usize, usize)> = copy.into_iter().chain(zero).collect();
+        runs.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+        for (a, b) in runs {
+            match merged.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => merged.push((a, b)),
+            }
+        }
+        merged
+    }
+
+    /// [`Tracked::take`], the runs on pages with nothing mapped apart: they
+    /// read as zeros, with no copy to try (each such page cost a dozen
+    /// failing kernel reads, 7-30 ms a frame in run perf4).
+    pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
@@ -400,7 +420,7 @@ impl Tracked {
             changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
         };
         if pages.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let whole: Vec<usize> = pages
             .iter()
@@ -421,22 +441,24 @@ impl Tracked {
         guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
-        for page in protect(&mut g, &whole) {
+        let mut unmapped = Vec::new();
+        for page in protect_noting(&mut g, &whole, &mut unmapped) {
             changed.remove(&page);
             self.changed.taken(page);
         }
         set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
-        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
             match runs.last_mut() {
                 Some((_, end)) if *end == a => *end = b,
                 _ => runs.push((a, b)),
             }
         }
-        runs
+        (copy, zero)
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -519,6 +541,12 @@ impl Tracked {
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
+    protect_noting(g, pages, &mut Vec::new())
+}
+
+/// [`protect`], also listing in `unmapped` the pages taken because nothing
+/// is mapped there.
+fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -571,6 +599,7 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
                 taken.push(page);
             } else if unmapped(page) {
                 taken.push(page);
+                unmapped_pages.push(page);
             }
         }
     }
@@ -901,6 +930,25 @@ pub(crate) mod tests {
         assert!(!b.clean() && !clean_bit(b.bit()));
         assert!(!clean_bit(None), "no bit: never clean");
         drop(b);
+        free(p);
+    }
+
+    /// A page with nothing mapped is taken as zeros: `take_split` lists it
+    /// apart from the pages to copy.
+    #[test]
+    fn unmapped_pages_are_taken_apart() {
+        // SAFETY: a fresh write-watched reservation of two pages, the first
+        // committed; freed below.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            p
+        };
+        let t = track(p, 2 * PAGE, true).expect("tracked");
+        assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![(p, p + PAGE)], vec![(p + PAGE, p + 2 * PAGE)]));
+        assert!(t.take(p, p + 2 * PAGE).is_empty(), "both taken");
+        drop(t);
         free(p);
     }
 
