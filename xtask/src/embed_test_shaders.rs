@@ -10,11 +10,14 @@ pub fn run(root: &Path, folder: &Path) -> Result<()> {
     let mut shaders = Vec::new();
     for entry in std::fs::read_dir(folder).context("reading the folder")? {
         let path = entry?.path();
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
         if path.extension().and_then(|e| e.to_str()) != Some("bin") {
             continue;
         }
-        let key = u64::from_str_radix(stem, 16).with_context(|| format!("{} is not a key", path.display()))?;
+        let key = u64::from_str_radix(stem, 16)
+            .with_context(|| format!("{} is not a key", path.display()))?;
         shaders.push((key, std::fs::read(&path)?));
     }
     shaders.sort();

@@ -21,20 +21,32 @@ pub(crate) fn key(source: &str, profile: &str, flags: u32) -> u64 {
     data.extend(profile.as_bytes());
     data.push(0);
     data.extend(flags.to_le_bytes());
-    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 /// Whether this process runs under Wine.
-fn wine() -> bool {
+pub(crate) fn wine() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: ntdll is always loaded; both names end with a NUL.
-    unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"wine_get_version".as_ptr().cast()) }
-        .is_some()
+    unsafe {
+        GetProcAddress(
+            GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+            c"wine_get_version".as_ptr().cast(),
+        )
+    }
+    .is_some()
 }
 
 /// The bytecode of `source`'s `main` for `profile`, or the compiler's
 /// errors.
-pub(crate) fn compile(source: &str, name: &str, profile: &str, flags: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn compile(
+    source: &str,
+    name: &str,
+    profile: &str,
+    flags: u32,
+) -> Result<Vec<u8>, String> {
     let key = key(source, profile, flags);
     if wine()
         && let Some((_, bytes)) = crate::fxc_bytecode::SHADERS.iter().find(|(k, _)| *k == key)
@@ -49,7 +61,8 @@ pub(crate) fn compile(source: &str, name: &str, profile: &str, flags: u32) -> Re
     let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
     let blob = |b: &ID3DBlob| {
         // SAFETY: the blob's own bytes.
-        unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }.to_vec()
+        unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }
+            .to_vec()
     };
     // SAFETY: the source and names outlive the call; out pointers are ours.
     let made = unsafe {

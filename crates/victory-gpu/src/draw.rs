@@ -2300,7 +2300,11 @@ void main(uint3 id : SV_DispatchThreadID) {
                     raw_data.add(g[1].Offset as usize + y * g[1].Footprint.RowPitch as usize + x).read(),
                 )
             };
-            assert_eq!(half, 32768, "16-bit depth at {x},{y}");
+            // D3DMetal keeps 24-bit depth as 32-bit float and truncates the
+            // clear where D3D12 rounds, which lands one step lower in 16 bits
+            // (docs/macos.md, "Open differences").
+            let slack = u16::from(crate::fxc::wine());
+            assert!(half.abs_diff(32768) <= slack, "16-bit depth at {x},{y}: {half}");
             assert_eq!(byte, 0x11, "stencil at {x},{y}");
         }
     }
