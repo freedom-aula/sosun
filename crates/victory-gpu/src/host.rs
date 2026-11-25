@@ -258,6 +258,20 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Diagnostics: our process's private commit and working set, bytes.
+#[cfg(feature = "diagnostics")]
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -2489,11 +2503,23 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
+                    let (commit, working_set) = process_memory();
                     tracing::info!(
                         "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
-                         {system:.0} MB of {system_budget:.0} MB in system memory"
+                         {system:.0} MB of {system_budget:.0} MB in system memory; process commit {:.0} MB, \
+                         working set {:.0} MB; texture staging {:.0} MB; placed textures made {:.0} MB",
+                        commit as f64 / 1e6,
+                        working_set as f64 / 1e6,
+                        crate::texture::STAGING_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                        crate::resource::PLACED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                     );
                 }
+                let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
+                tracing::info!(
+                    "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
+                     from title memory {:.0} {:.0} {:.0}",
+                    gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
+                );
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 log_gpu_times(copy_frames);
                 crate::copystat::log(copy_frames);

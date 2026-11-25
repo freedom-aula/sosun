@@ -26,8 +26,9 @@ enum Seen {
     /// A title texture (resource object) whose contents the title writes.
     Texture(usize),
     /// A view left without a host view (textures the title placed itself),
-    /// by kind (diagnostics: `KINDS`).
-    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] usize),
+    /// by kind (diagnostics: `KINDS`), with a placed texture's address and
+    /// console bytes.
+    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
 }
 
 /// Kinds of views left without a host view, for the census.
@@ -173,12 +174,15 @@ fn seen(view: &View) -> Option<Seen> {
     Some(Seen::Buffer(shadow, address, len, uav))
 }
 
-fn left_kind(view: &View) -> usize {
+fn left_kind(view: &View) -> (usize, u64, u64) {
     match view {
-        View::Placed(_, resource, _) if resource[0] != 1 => 2,
-        View::Unordered(..) | View::Placed(true, ..) => 1,
-        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => 0,
-        _ => 3,
+        View::Placed(_, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            (2, address, crate::resource::placed_size(resource).unwrap_or(0))
+        }
+        View::Unordered(..) | View::Placed(true, ..) => (1, 0, 0),
+        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => (0, 0, 0),
+        _ => (3, 0, 0),
     }
 }
 
@@ -305,13 +309,22 @@ pub(crate) fn log(frames: f64) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut left = [0u32; KINDS.len()];
         let (mut buffers, mut textures) = (0u32, 0u32);
+        // Placed textures left null: the largest at each address.
+        let mut placed = HashMap::new();
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
                 Seen::Texture(_) => textures += 1,
-                Seen::Left(k) => left[*k] += 1,
+                Seen::Left((k, address, bytes)) => {
+                    left[*k] += 1;
+                    if *k == 2 {
+                        let b = placed.entry(*address).or_insert(0u64);
+                        *b = (*b).max(*bytes);
+                    }
+                }
             }
         }
+        let placed_mb = placed.values().sum::<u64>() as f64 / 1e6;
         let bytes: u64 = inner.ranges.keys().map(|&(_, a, b, _)| b - a).sum();
         drop(inner);
         let hulls = viewed.ranges();
@@ -330,11 +343,13 @@ pub(crate) fn log(frames: f64) {
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
              {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
-             left null: {}; host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
+             left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
+             host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
             inner.textures.len(),
             left.join(", "),
+            placed.len(),
             all.len(),
             all_bytes as f64 / 1e6,
             all_hulls as f64 / 1e6,

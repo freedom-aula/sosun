@@ -786,6 +786,8 @@ pub(crate) struct HostTexture {
     bytes: u64,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
+    /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
+    pub(crate) viewed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(windows)]
@@ -811,6 +813,7 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
+            viewed: false.into(),
         }
     }
 
@@ -852,6 +855,23 @@ pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let shared = (SHARED.load(Relaxed), SAVED.load(Relaxed), REPLACED.load(Relaxed));
     (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
+}
+
+/// Bytes of the live host textures of title textures by what wrote them
+/// (index 0 the GPU: render target, depth or unordered access; 1 title
+/// memory) and how they were reached (0 by lists, 1 only by heap slots, 2
+/// neither).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_census() -> [[u64; 3]; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut bytes = [[0; 3]; 2];
+    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    for t in map.iter().flat_map(|m| m.values()).filter_map(std::sync::Weak::upgrade) {
+        let gpu = usize::from(!crate::texture::title_written(&t.texture));
+        let reach = if t.used.load(Relaxed) { 0 } else if t.viewed.load(Relaxed) { 1 } else { 2 };
+        bytes[1 - gpu][reach] += t.bytes;
+    }
+    bytes
 }
 
 #[cfg(windows)]
@@ -1598,6 +1618,19 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Console bytes of the placed textures [`texture_at`] made (they are never
+/// released).
+#[cfg(windows)]
+pub(crate) static PLACED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Console bytes of a texture of resource description `desc` (as words).
+#[cfg(windows)]
+pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
@@ -1634,6 +1667,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    PLACED_BYTES.fetch_add(placed_size(desc).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     map.insert((address, *desc), out as usize);
     resource(out).host.is_some().then_some(out)
 }

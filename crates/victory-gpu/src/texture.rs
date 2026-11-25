@@ -60,6 +60,17 @@ struct Last {
     read: Vec<u8>,
 }
 
+/// Bytes of live staging buffers and of title memory read for them (the
+/// fps line's companion).
+pub(crate) static STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let read = self.last.get_mut().map_or(0, |l| l.read.capacity()) as u64;
+        STAGING_BYTES.fetch_sub(self.size + read, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -308,7 +319,9 @@ impl Staging {
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
+            let had = last.read.capacity();
             last.read.resize(size, 0);
+            STAGING_BYTES.fetch_add((last.read.capacity() - had) as u64, std::sync::atomic::Ordering::Relaxed);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
@@ -466,6 +479,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    STAGING_BYTES.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         buffer,
