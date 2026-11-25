@@ -687,6 +687,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             view_marks: true,
             atomic_locks: false,
             bias_as_gradients: false,
+            narrow_waves: false,
         })
         .expect("lower")
     };
