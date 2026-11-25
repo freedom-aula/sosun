@@ -149,22 +149,28 @@ fn checksum(data: &[u8]) -> u64 {
     })
 }
 
-/// The library bytes with the mark in front.
-fn seal(blob: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(blob.len() + 12);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&checksum(blob).to_le_bytes());
-    out.extend_from_slice(blob);
-    out
+/// The mark that goes in front of the library bytes `blob` in the file. It is
+/// not joined to them: a save writes the two one after the other, so a library
+/// of hundreds of megabytes is not copied to put the mark in front of it.
+fn mark(blob: &[u8]) -> [u8; 12] {
+    let mut head = [0; 12];
+    head[..4].copy_from_slice(MAGIC);
+    head[4..].copy_from_slice(&checksum(blob).to_le_bytes());
+    head
 }
 
 /// The library bytes of a sealed file, or `None` if the mark or checksum is
 /// wrong. Not every host checks the bytes itself (D3DMetal accepts any), so
-/// a damaged file is refused here before the host sees it.
-fn unseal(file: Vec<u8>) -> Option<Vec<u8>> {
+/// a damaged file is refused here before the host sees it. The bytes stay in
+/// the file's buffer, with the mark taken off the front of it.
+fn unseal(mut file: Vec<u8>) -> Option<Vec<u8>> {
     let (head, blob) = file.split_at_checked(12)?;
     let sum = u64::from_le_bytes(head[4..12].try_into().ok()?);
-    (&head[..4] == MAGIC && sum == checksum(blob)).then(|| blob.to_vec())
+    if &head[..4] != MAGIC || sum != checksum(blob) {
+        return None;
+    }
+    file.drain(..12);
+    Some(file)
 }
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
@@ -348,7 +354,8 @@ thread_local! {
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`); the early list alone if
+/// that is all that changed.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -364,42 +371,60 @@ pub(crate) fn save(now: bool) {
     }
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
+        if l.added == 0 && !l.prebuilt_changed {
+            // Nothing new is in the library, so its file stays as it is, and
+            // with it the pre-build's list that holds for its bytes. A load
+            // reads the early list on its own, not from the library, so a
+            // change of it is written alone: serialising the library holds
+            // this lock against every worker's loads and stores, for a list
+            // of 270 KB at most.
+            if !USED_CHANGED.swap(false, Ordering::Relaxed) {
                 return;
+            }
+            (None, None)
+        } else {
+            // SAFETY: a buffer of the size the library asks for.
+            let bytes = unsafe {
+                let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                l.library.Serialize(&mut bytes).map(|()| bytes)
+            };
+            match bytes {
+                Ok(bytes) => {
+                    l.added = 0;
+                    l.prebuilt_changed = false;
+                    // The early list is written below too, so a change of it
+                    // that was waiting is saved here.
+                    USED_CHANGED.store(false, Ordering::Relaxed);
+                    // Kept beside the bytes it holds for (also when a run adds
+                    // pipelines).
+                    let prebuilt =
+                        (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                    (Some(bytes), prebuilt)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    return;
+                }
             }
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
     let written = crate::make_dir(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &seal(&blob)))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| match &blob {
+            Some(blob) => write_atomically(&dir.join(LIBRARY_FILE), &[&mark(blob), blob]),
+            None => Ok(()),
+        })
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), &[used.join("\n").as_bytes()]))
         .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), &[list.as_bytes()]),
             None => Ok(()),
         });
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            // Zero if only the early list was written.
+            bytes = blob.as_ref().map_or(0, Vec::len),
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -414,10 +439,13 @@ pub(crate) fn save(now: bool) {
     }
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part. Serialised so concurrent worker and
-/// shutdown saves do not race on the same staging file or target rename.
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `parts` one after the other to a temporary file beside `path`, then
+/// renames it over `path`: a reader never sees a part. Serialised so
+/// concurrent worker and shutdown saves do not race on the same staging file
+/// or target rename. Parts, so that a file of a mark and a large blob is
+/// written without joining them in a buffer.
+fn write_atomically(path: &std::path::Path, parts: &[&[u8]]) -> std::io::Result<()> {
+    use std::io::Write;
     use std::sync::atomic::AtomicU64;
     static WRITING: Mutex<()> = Mutex::new(());
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -426,7 +454,9 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp-{}-{n}", std::process::id()));
     let tmp = path.with_file_name(name);
-    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let res = std::fs::File::create(&tmp)
+        .and_then(|mut file| parts.iter().try_for_each(|part| file.write_all(part)))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -467,6 +497,8 @@ impl Used {
 }
 
 static USED: Mutex<Option<Used>> = Mutex::new(None);
+/// Whether a title pipeline was drawn or dispatched with since the early list
+/// was last written.
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
 fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
@@ -542,11 +574,33 @@ mod tests {
     #[test]
     fn sealed_files_round_trip_and_damage_is_refused() {
         let blob = b"library bytes".to_vec();
-        let mut file = seal(&blob);
+        let mut file = [&mark(&blob)[..], &blob].concat();
         assert_eq!(unseal(file.clone()), Some(blob));
         file[20] ^= 1;
         assert_eq!(unseal(file), None);
         assert_eq!(unseal(b"short".to_vec()), None);
+    }
+
+    /// The file is "VPL1", the library's FNV-1a checksum (little endian) and
+    /// the library, as earlier builds wrote it: their files still load.
+    #[test]
+    fn the_sealed_file_format_is_unchanged() {
+        // From the FNV-1a (64 bit) test vectors.
+        assert_eq!(checksum(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(checksum(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(checksum(b"foobar"), 0x8594_4171_f739_67e8);
+        let mut file = b"VPL1".to_vec();
+        file.extend_from_slice(&0x8594_4171_f739_67e8u64.to_le_bytes());
+        file.extend_from_slice(b"foobar");
+        assert_eq!([&mark(b"foobar")[..], b"foobar"].concat(), file);
+        assert_eq!(unseal(file.clone()), Some(b"foobar".to_vec()));
+        // An empty library, and a mark or checksum that is not right.
+        assert_eq!(unseal(mark(b"").to_vec()), Some(Vec::new()));
+        file[0] = b'X';
+        assert_eq!(unseal(file.clone()), None);
+        file[0] = b'V';
+        file[4] ^= 1;
+        assert_eq!(unseal(file), None);
     }
 
     #[test]
@@ -735,7 +789,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let payload = vec![b'a' + t as u8; 4096];
                     for _ in 0..30 {
-                        write_atomically(&target, &payload).unwrap();
+                        write_atomically(&target, &[&payload]).unwrap();
                     }
                 })
             })
@@ -746,5 +800,18 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn write_atomically_writes_its_parts_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("host-pipelines.bin");
+        let blob = vec![7u8; 100_000];
+        write_atomically(&target, &[&mark(&blob), &[], &blob]).unwrap();
+        assert_eq!(unseal(std::fs::read(&target).unwrap()), Some(blob));
+        // Over a file that is there, with no staging file left.
+        write_atomically(&target, &[b"a", b"b"]).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"ab");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
