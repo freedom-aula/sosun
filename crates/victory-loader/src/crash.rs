@@ -51,6 +51,11 @@ static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new()
 /// Read before installing the exception handler.
 static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 
+/// Experimental: step over a title `int3` assert and resume, the way a
+/// debugger continues past one, to see how far init gets. Set by
+/// `VICTORY_SKIP_TITLE_INT3=1`.
+static SKIP_TITLE_INT3: AtomicBool = AtomicBool::new(false);
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -185,6 +190,10 @@ pub fn report_crashes() {
     LOG_FIRST_CHANCE_BREAKPOINTS.store(
         cfg!(feature = "diagnostics")
             && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
+        Ordering::Relaxed,
+    );
+    SKIP_TITLE_INT3.store(
+        std::env::var_os("VICTORY_SKIP_TITLE_INT3").is_some_and(|value| value == "1"),
         Ordering::Relaxed,
     );
     // SAFETY: registers handlers that only read the exception they are
@@ -553,6 +562,12 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if code == EXCEPTION_BREAKPOINT && SKIP_TITLE_INT3.load(Ordering::Relaxed) {
+        // Step over the one-byte `int3` and resume, the way a debugger
+        // continues past an assert. SAFETY: the context record is valid.
+        unsafe { (*(*info).ContextRecord).Rip += 1 };
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
