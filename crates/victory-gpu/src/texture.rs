@@ -370,27 +370,28 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
-/// into host texture `copy`, leaving it readable by shaders.
+/// into host texture `copy`. Returns the barrier that leaves it readable by
+/// shaders, for the caller to record with the others after every copy: one
+/// barrier per texture between the copies kept the GPU from overlapping
+/// them (new shots copy hundreds of textures, run evict6).
+#[must_use]
 pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
     staging: &Staging,
     (buffer, at, subresources): &Upload,
-) {
+) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-    let move_to = |wanted| {
-        if let Some(b) = list.move_texture(copy, wanted) {
-            // SAFETY: an open list; the barrier names a live texture.
-            unsafe { list.list.ResourceBarrier(&[b]) };
-        }
-    };
-    move_to(COPY_DEST);
+    if let Some(b) = list.move_texture(copy, COPY_DEST) {
+        // SAFETY: an open list; the barrier names a live texture.
+        unsafe { list.list.ResourceBarrier(&[b]) };
+    }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
-    move_to(SHADER_RESOURCE);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    list.move_texture(copy, SHADER_RESOURCE)
 }
 
 /// The uploads [`record_upload`] recorded into `resource`'s host texture

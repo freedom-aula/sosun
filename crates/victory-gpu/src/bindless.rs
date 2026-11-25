@@ -260,13 +260,19 @@ pub(crate) fn uploads(
         }
     }
     let mut recorded = false;
+    // The textures copied into stay alive in `work` until recorded.
+    let mut readable = Vec::new();
     for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
         if let Some(upload) = upload {
-            crate::texture::record_upload(list, copy, staging, &upload);
+            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
             #[cfg(feature = "diagnostics")]
             UPLOADED.fetch_add(1, Relaxed);
         }
+    }
+    if !readable.is_empty() {
+        // SAFETY: an open list; the barriers name live textures.
+        unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
