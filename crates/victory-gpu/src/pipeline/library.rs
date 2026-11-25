@@ -122,7 +122,7 @@ fn library() -> Option<&'static Mutex<Library>> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
+            let read = |file| DIR.get().and_then(|d| crate::read_file(&d.join(file)).ok());
             let blob = read(LIBRARY_FILE).and_then(unseal).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
@@ -451,7 +451,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     if used.is_none() {
         let listed = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| crate::read_file(&d.join(EARLY_FILE)).ok().and_then(|b| String::from_utf8(b).ok()))
             .unwrap_or_default();
         let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = before.len(), "title pipelines to start early");
