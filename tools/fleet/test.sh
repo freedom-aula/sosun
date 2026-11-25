@@ -156,5 +156,66 @@ ok "report chip-specific failure" grep -q 'victory_gpu::tests::depth16`: fails o
 ok "report lists every result" grep -q '^| #3 |' <<< "$report"
 eq "empty report" "None found." "$(: | report_markdown | sed -n '/^## Tests/{n;n;p;}')"
 
+# --- worker EXIT cleanup (stub all network, checkout and build operations)
+# A separate shell makes EXIT run after cmd_run's locals have gone out of scope.
+cat > "$tmp/worker-cleanup.sh" <<'EOF'
+case_dir=$1
+setup_status=$2
+validation_status=$3
+set -- help
+. "$0" > /dev/null
+CACHE="$case_dir/cache"
+WORK="$case_dir/work"
+mkdir -p "$WORK/tools/macos"
+printf '#!/bin/sh\nexit %s\n' "$setup_status" > "$WORK/setup.sh"
+chmod +x "$WORK/setup.sh"
+printf '#!/bin/sh\necho "test result: ok. 1 passed; 0 failed; 0 ignored;"\n' > "$WORK/tools/macos/test-wine.sh"
+chmod +x "$WORK/tools/macos/test-wine.sh"
+accepted() { return 0; }
+load_task() { T_COMMIT=0123456789abcdef0123456789abcdef01234567; T_CHIP=m3; }
+require_lease() { return 0; }
+git() { if [ "${3:-}" = rev-parse ]; then echo "$T_COMMIT"; fi; return 0; }
+gh() { echo 'unexpected GitHub call' >&2; exit 99; }
+# Replace the heartbeat subshell itself with sleep, so tests leave no sleep child.
+sleep() { exec /bin/sleep 30; }
+kill() { printf '%s\n' "$1" > "$case_dir/killed-pid"; builtin kill "$@"; }
+cargo() { echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; }
+sysctl() { echo Mac15,11; }
+sw_vers() { echo 15.4; }
+brand() { echo 'Apple M3 Max'; }
+gptk_version() { echo 4.0-beta3; }
+say() {
+    case "$*" in "running setup.sh"*) jobs -p > "$case_dir/heartbeat-pid" ;; esac
+}
+if [ "$validation_status" != 0 ]; then validate_result() { return 1; }; fi
+cmd_run 1
+EOF
+worker_case() {
+    local dir="$tmp/worker-$1" status=0
+    mkdir -p "$dir"
+    bash -c '. "$1" "$2" "$3" "$4"' "$FLEET_DIR/fleet.sh" "$tmp/worker-cleanup.sh" "$dir" "$2" "$3" > "$dir/output" 2>&1 || status=$?
+    eq "worker $1 exit status" "$4" "$status"
+    no "worker $1 has no unbound variable" grep -q 'unbound variable' "$dir/output"
+    ok "worker $1 ran heartbeat cleanup" test -s "$dir/killed-pid"
+    if [ -s "$dir/heartbeat-pid" ]; then
+        local pid
+        pid=$(cat "$dir/heartbeat-pid")
+        no "worker $1 heartbeat stopped" kill -0 "$pid"
+        # Always stop this test's job, including when testing the original bug.
+        kill "$pid" 2> /dev/null || true
+        if [ -s "$dir/killed-pid" ]; then
+            eq "worker $1 cleaned up its own heartbeat" "$pid" "$(cat "$dir/killed-pid")"
+        fi
+    else
+        ok "worker $1 started heartbeat" test -s "$dir/heartbeat-pid"
+    fi
+    if [ -f "$dir/cache/logs/1/result.json" ]; then
+        eq "worker $1 setup result" "$5" "$(jq -r .setup "$dir/cache/logs/1/result.json")"
+    fi
+}
+worker_case success 0 0 0 ok
+worker_case setup-failure 1 0 0 failed
+worker_case invalid-result 0 1 1 unused
+
 echo "fleet tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]
