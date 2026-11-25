@@ -1168,7 +1168,8 @@ pub(crate) mod tests {
     /// (by faults, or reported) is, and every tracker of a page sees it.
     /// A tracked range that starts in reserved memory and runs into plain
     /// committed memory (the host's, as the process heap was in #50) never
-    /// makes that memory read-only; it stays changed instead.
+    /// makes that memory read-only; it is left out of the tracker instead
+    /// (copied whole at each use, so the tracker is never clean).
     #[test]
     fn plain_committed_memory_is_never_guarded() {
         use windows_sys::Win32::System::Memory::{
@@ -1188,7 +1189,9 @@ pub(crate) mod tests {
         // SAFETY: a valid out pointer of the right size.
         unsafe { VirtualQuery((base + 2 * PAGE) as *const _, &mut info, size_of_val(&info)) };
         assert_eq!(info.Protect, PAGE_READWRITE, "still writable");
-        assert!(t.changed(base / PAGE + 2) && t.changed(base / PAGE + 3), "stays changed");
+        assert!(!t.changed(base / PAGE + 2) && !t.changed(base / PAGE + 3), "not tracked");
+        assert_eq!(t.untracked(base, base + 4 * PAGE), [(base + 2 * PAGE, base + 4 * PAGE)], "copied whole");
+        assert!(!t.clean(), "never clean");
         // SAFETY: writable, so no fault.
         unsafe { ((base + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
         drop(t);
