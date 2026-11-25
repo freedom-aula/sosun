@@ -372,6 +372,8 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     crate::list::ensure_state(list, resource, COPY_DEST);
     copies(list, texture, &staging, &buffer, &subresources, || format!("{resource:?}"));
     list.keep(&buffer);
+    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     true
 }
 

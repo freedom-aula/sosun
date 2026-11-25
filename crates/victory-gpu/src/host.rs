@@ -509,8 +509,37 @@ mod tests {
                 list.set_ours();
             }
             let _ = list.transition(textures[0], 0x40);
-            assert_eq!(copy.last_used() != (0, 0), stamped, "ours: {ours}");
+            assert_eq!(copy.last_used().0 != u64::MAX, stamped, "ours: {ours}");
         }
+    }
+
+    /// Textures the heaps view are brought up to date only if the title used
+    /// them lately: one whose pages changed but that no shader read is not
+    /// uploaded; read in the last pass, it is.
+    #[test]
+    fn heap_textures_unread_lately_are_not_brought_up() {
+        let Some(host) = host() else { return };
+        let address = crate::watch::tests::pool(1) as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut object = std::ptr::null();
+        let null = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(null, address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object), 0);
+        let copy = crate::resource::host_copy(object).expect("a host texture");
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
+        // No submission uploads meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        copy.unstamp();
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        assert_eq!(crate::texture::uploads(object), 0, "not read lately: not brought up");
+        copy.stamp();
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        assert_eq!(crate::texture::uploads(object), 1, "read in the last pass: brought up");
     }
 
     #[test]

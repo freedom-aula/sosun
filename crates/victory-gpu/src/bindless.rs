@@ -239,6 +239,17 @@ pub(crate) fn uploads(
             let Some(texture) = crate::resource::made_copy(r as This) else {
                 continue;
             };
+            // Only what shaders read lately (the eviction pass's stamps):
+            // the heaps view thousands of textures a frame never reads, and
+            // bringing each up whenever its pages change re-uploaded about
+            // 4 GB in 30-46 world frames (runs evict2, noevict1).
+            // shortcut: a texture read again after a gap is brought up after
+            // the submission that read it, which can see bytes one refresh
+            // old (a slot the title rewrites is made fresh anyway); upload on
+            // the mark itself if that shows.
+            if !texture.used_recently() {
+                continue;
+            }
             if crate::texture::upload_changed(list, r as This, &texture.texture) {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;

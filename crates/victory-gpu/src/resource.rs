@@ -878,7 +878,15 @@ impl HostTexture {
     /// Forgets its uses (tests: a stamp is then seen to happen).
     #[cfg(test)]
     pub(crate) fn unstamp(&self) {
-        self.stamp_at(0, 0);
+        self.stamp_at(NEVER, 0);
+    }
+
+    /// Whether the title used it in this presented frame or the last one
+    /// (made then, named by a list of its own, or read through the heap as
+    /// the last pass found).
+    pub(crate) fn used_recently(&self) -> bool {
+        let frame = self.last[0].load(std::sync::atomic::Ordering::Relaxed);
+        frame != NEVER && frame.saturating_add(1) >= crate::queue::presented()
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -1469,6 +1477,9 @@ pub(crate) const IDLE_MS: u64 = 120_000;
 /// card's budget does.
 #[cfg(windows)]
 pub(crate) const IDLE_FRAMES: u64 = 300;
+/// A use stamp's frame for "never" (tests).
+#[cfg(windows)]
+const NEVER: u64 = u64::MAX;
 /// Past this share of the card's memory budget, host textures fed from
 /// title memory are given up least recently used first, until the card's
 /// use is back under [`BUDGET_LOW`].
