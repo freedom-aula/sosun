@@ -628,9 +628,9 @@ fn writes_through_views_mark_their_pages() {
 
 /// Reads of texture views the program takes from the resource heap itself
 /// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
-/// at heap byte offset 32 (index 1) sets exactly bit [`super::VIEW_READS`] +
-/// 1. The same read through a table marks nothing (a table read makes its
-/// slot on the host).
+/// at heap byte offset 32 (index 1) sets exactly the bit one past
+/// [`super::VIEW_READS`]. The same read through a table marks nothing (a
+/// table read makes its slot on the host).
 #[test]
 fn heap_direct_texture_reads_mark_their_heap_index() {
     let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
