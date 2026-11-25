@@ -695,11 +695,14 @@ impl HostHeap {
             }
             return None;
         }
+        // The record is read under the slot lock: of two threads making the
+        // slot (a heap sync and the title writing a view), the later one
+        // reads what the title wrote last.
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
