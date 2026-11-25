@@ -132,22 +132,27 @@ pub(crate) fn recycle() {
 }
 
 /// A free staging buffer of `size` bytes, or a new one.
+/// Sizes are taken in powers of two (at least 64 KiB), so a buffer serves
+/// textures of other sizes too: a new shot's textures came in new sizes and
+/// made buffers 10 % of the submitting thread (run evict5).
 fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = match b.free.iter().position(|e| e.0 == size) {
-        Some(i) => {
-            let e = b.free.remove(i)?;
-            b.free_bytes -= size;
-            e
-        }
+    let class = size.max(1 << 16).next_power_of_two();
+    let taken = {
+        let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = b.free.iter().position(|e| e.0 == class);
+        i.and_then(|i| b.free.remove(i)).inspect(|_| b.free_bytes -= class)
+    };
+    // Made without the pool's lock (refreshes run on several threads).
+    let e = match taken {
+        Some(e) => e,
         None => {
-            let (buffer, data) = host()?.upload_buffer(size)?;
+            let (buffer, data) = host()?.upload_buffer(class)?;
             crate::host::name(&buffer, || "texture staging".into());
-            (size, buffer, data as usize)
+            (class, buffer, data as usize)
         }
     };
     let made = (e.1.clone(), e.2 as *mut u8);
-    b.used.push(e);
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
     Some(made)
 }
 
@@ -353,29 +358,6 @@ pub(crate) fn copied(resource: This) -> u64 {
     staging.map_or(0, |s| s.copied.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// For textures shaders reach through the heap itself, at submission
-/// (`crate::bindless::uploads`): brings the staging buffer up to date and
-/// records its copy into `list` only if the memory changed since (or was
-/// never uploaded). True if it recorded; the texture is then in the copy
-/// destination state.
-pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
-    if is_host_written(resource) {
-        return false;
-    }
-    let Some(staging) = staging(resource, texture) else {
-        return false;
-    };
-    let Some((buffer, subresources)) = staging.refresh() else {
-        return false;
-    };
-    const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    copies(list, texture, &staging, &buffer, &subresources, || format!("{resource:?}"));
-    list.keep(&buffer);
-    staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    true
-}
 
 /// Records the copy of `subresources` of `buffer` (laid out as `staging`
 /// says) into `texture` (in the copy destination state); `name` names it
@@ -441,7 +423,54 @@ fn copies(
     }
 }
 
+/// What a refresh gives: a staging buffer and the subresources detiled
+/// into it.
+pub(crate) type Upload = (ID3D12Resource, Vec<u32>);
+
+/// [`Staging::refresh`] of each of `work`, those whose memory may have
+/// changed on several threads at once (reading title memory and detiling
+/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
+pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    // Most find nothing changed (their trackers' clean bits say so): those
+    // are not handed to threads.
+    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    // A quarter of the CPUs at most, four at most: the title's own threads
+    // need the rest.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(changed.len());
+    if threads < 2 {
+        for &i in &changed {
+            out[i] = work[i].0.refresh();
+        }
+        return out;
+    }
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, Relaxed);
+                    let Some(&i) = changed.get(k) else { break };
+                    *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[i].0.refresh();
+                }
+            });
+        }
+    });
+    for (k, r) in results.into_iter().enumerate() {
+        out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
+    }
+    out
+}
+
 impl Staging {
+    /// Whether its memory may have changed since it was last detiled (an
+    /// untracked texture always may).
+    pub(crate) fn maybe_changed(&self) -> bool {
+        self.tracked.as_ref().is_none_or(|t| !t.clean())
+    }
+
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).
@@ -637,7 +666,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {

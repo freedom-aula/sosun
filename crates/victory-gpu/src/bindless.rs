@@ -200,7 +200,6 @@ pub(crate) fn uploads(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
     crate::texture::recycle();
     match &guard.0 {
@@ -214,22 +213,21 @@ pub(crate) fn uploads(
         }
     }
     let list = guard.0.as_ref()?;
-    let mut recorded = false;
+    // What to bring up: the textures lists read through tables, and those
+    // the heaps view that shaders read lately. Collected under the heaps'
+    // locks and brought up without them, several at a time: reading title
+    // memory, detiling and making staging buffers took half the submitting
+    // thread in a new shot, and title threads setting views waited on the
+    // lock meanwhile (run evict5).
+    let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
     let mut staged = std::collections::HashSet::new();
     for (staging, copy) in textures {
-        if staged.insert(Arc::as_ptr(staging))
-            && let Some(upload) = staging.refresh()
-        {
-            crate::texture::record_upload(list, copy, staging, &upload);
-            recorded = true;
-            #[cfg(feature = "diagnostics")]
-            UPLOADED.fetch_add(1, Relaxed);
+        if staged.insert(Arc::as_ptr(staging)) {
+            work.push((staging.clone(), copy.clone()));
         }
     }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
-        // Held while uploading: the title releasing a texture (and its
-        // memory) waits in `forget`.
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
             if !done.insert(r) {
@@ -250,12 +248,24 @@ pub(crate) fn uploads(
             if !texture.used_recently() {
                 continue;
             }
-            if crate::texture::upload_changed(list, r as This, &texture.texture) {
-                crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
-                recorded = true;
-                #[cfg(feature = "diagnostics")]
-                UPLOADED.fetch_add(1, Relaxed);
+            // Its contents are the host's since a host copy wrote it.
+            if texture.host_written.load(Relaxed) {
+                continue;
             }
+            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                && staged.insert(Arc::as_ptr(&staging))
+            {
+                work.push((staging, texture));
+            }
+        }
+    }
+    let mut recorded = false;
+    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+        if let Some(upload) = upload {
+            crate::texture::record_upload(list, copy, staging, &upload);
+            recorded = true;
+            #[cfg(feature = "diagnostics")]
+            UPLOADED.fetch_add(1, Relaxed);
         }
     }
     list.close();

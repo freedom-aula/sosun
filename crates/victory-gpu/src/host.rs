@@ -542,6 +542,42 @@ mod tests {
         assert_eq!(crate::texture::uploads(object), 1, "read in the last pass: brought up");
     }
 
+    /// Heap textures brought up in one submission are refreshed side by
+    /// side, each into its own staging and its own upload.
+    #[test]
+    fn heap_textures_brought_up_together_each_get_their_upload() {
+        let Some(host) = host() else { return };
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let pool = crate::watch::tests::pool(6);
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        let objects: Vec<crate::object::This> = (0..6u32)
+            .map(|k| {
+                // RGBA8 128x128 (one page each), linear, each its own bytes.
+                let address = (pool + k as usize * crate::watch::PAGE) as u64;
+                // SAFETY: the texture's own page of the pool.
+                unsafe { std::ptr::write_bytes(address as *mut u8, 0x10 * k as u8, crate::watch::PAGE) };
+                let words: [u32; 14] = [3, 0, 0, 0, 128, 0, 128, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+                let mut object = std::ptr::null();
+                assert_eq!(crate::resource::create_at_address(std::ptr::null(), address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object), 0);
+                crate::resource::host_copy(object).expect("a host texture").stamp();
+                let mut desc = [0u32; 10];
+                desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+                viewed.set(k, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
+                object
+            })
+            .collect();
+        // No submission uploads meanwhile.
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        for &object in &objects {
+            assert_eq!(crate::texture::uploads(object), 1, "each brought up once");
+        }
+        let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
+        for &object in &objects {
+            assert_eq!(crate::texture::uploads(object), 1, "unchanged: not again");
+        }
+    }
+
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
