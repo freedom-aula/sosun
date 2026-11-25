@@ -319,18 +319,48 @@ fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
 }
 
 /// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
-/// (counted from 0) when that plane was found, else the first.
+/// (counted from 0) when that plane was found, else the plane whose first
+/// resource has the most pixels (#15: on Series S plane 0 is a 1920x1080
+/// overlay and plane 1 the 3840x2160 picture). Ties keep the earlier plane.
 #[cfg(windows)]
-fn shown_plane(found: usize) -> usize {
-    static PLANE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn shown_plane(found: &[Vec<This>]) -> usize {
+    static PLANE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let want = *PLANE.get_or_init(|| {
-        std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok())
     });
-    if want < found { want } else { 0 }
+    let areas: Vec<u64> = found
+        .iter()
+        .map(|plane| {
+            plane.first().and_then(|&r| crate::resource::host_resource(r)).map_or(0, |t| {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                d.Width * u64::from(d.Height)
+            })
+        })
+        .collect();
+    pick_plane(want, &areas)
 }
 
-/// Shows the first resource of one plane in our window (the first plane
-/// unless `VICTORY_PRESENT_PLANE` picks another).
+/// The plane to show given an override and each plane's first resource
+/// area (0 when unknown): the override when in range, else the largest.
+#[cfg(any(windows, test))]
+fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
+    if let Some(w) = want
+        && w < areas.len()
+    {
+        return w;
+    }
+    let mut best = 0;
+    for (i, &a) in areas.iter().enumerate() {
+        if a > areas.get(best).copied().unwrap_or(0) {
+            best = i;
+        }
+    }
+    best
+}
+
+/// Shows the first resource of one plane in our window (the largest
+/// plane unless `VICTORY_PRESENT_PLANE` picks another).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -379,7 +409,7 @@ extern "system" fn present(
     #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
-    let shown = shown_plane(found.len());
+    let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
     #[cfg(windows)]
@@ -573,6 +603,21 @@ mod tests {
     /// place them), each listing one of our textures, are both found; a
     /// list naming something else is not taken for a plane.
     #[cfg(windows)]
+    #[test]
+    fn the_largest_plane_is_shown_unless_one_is_named() {
+        // Series S: a 1080p overlay, then the 4K picture.
+        let series_s = [1920 * 1080, 3840 * 2160];
+        assert_eq!(pick_plane(None, &series_s), 1);
+        assert_eq!(pick_plane(Some(0), &series_s), 0);
+        // An override past the planes found falls back to the largest.
+        assert_eq!(pick_plane(Some(5), &series_s), 1);
+        // Series X: one plane. Ties and unknown sizes keep the first.
+        assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
+        assert_eq!(pick_plane(None, &[0, 0]), 0);
+        assert_eq!(pick_plane(None, &[100, 100]), 0);
+        assert_eq!(pick_plane(None, &[]), 0);
+    }
+
     #[test]
     fn planes_after_the_first_are_found_by_their_stride() {
         let texture = || {
