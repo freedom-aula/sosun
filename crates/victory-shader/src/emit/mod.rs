@@ -81,7 +81,8 @@
 //!   loads and per-lane rows), so tables are never copied per draw.
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
-//!   corner `v0 + v2 - v1`, as the console's hardware does.
+//!   corner opposite the right angle ([`right_angle`]), as the console's
+//!   hardware does.
 //! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
@@ -206,7 +207,7 @@ mod flow_tests;
 pub mod host;
 mod lower;
 mod rect;
-pub use rect::rectangle_gs;
+pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
