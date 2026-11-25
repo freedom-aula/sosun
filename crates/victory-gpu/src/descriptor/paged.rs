@@ -35,14 +35,23 @@ impl<T> Paged<T> {
     }
 
     /// What slot `index` holds; none for an empty slot, a page not made, or
-    /// a slot past the end. Only diagnostics read slots back.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// a slot past the end.
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
         self.pages
             .get(index / PAGE)?
             .as_ref()?
             .get(index % PAGE)?
             .as_ref()
+    }
+
+    /// The slots that hold something, in order, with their indices: the
+    /// pages made are walked, the others skipped.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.pages.iter().enumerate().flat_map(|(p, page)| {
+            page.iter()
+                .flat_map(|slots| slots.iter().enumerate())
+                .filter_map(move |(i, slot)| slot.as_ref().map(|t| (p * PAGE + i, t)))
+        })
     }
 
     /// Slot `index`, to write; none past the end. Its page is made only if
