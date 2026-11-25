@@ -7594,6 +7594,25 @@ impl<'a> Lower<'a> {
         all
     }
 
+    /// Whether every lane enters IR block `b` along the edge the console's
+    /// wave takes, so that an SGPR joined there holds what that edge
+    /// brought: every branch into it is uniform (SCC values). The wave runs
+    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
+    /// per-lane exit) is where lanes would take edges the wave did not, and
+    /// the console compiler's if/else always skips into its join that way.
+    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
+    /// edge into its header; the others take the wave's.
+    fn uniform_join(&self, b: usize) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
+            LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
+                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            _ => true,
+        })
+    }
+
     /// Whether no lane goes from IR block `q` to `b`.
     fn never_taken(&self, q: usize, b: usize) -> bool {
         !self.x.st.bools.meet(&self.lane_edge(q, b))
@@ -9887,6 +9906,17 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A lane mask joined with data at a join every lane
+                    // enters along one edge: the register holds the mask's
+                    // number there (console lanes, so exact).
+                    _ if read
+                        && !bit
+                        && self.mask_data == MaskData::Console
+                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
+                        && self.uniform_join(b) =>
+                    {
+                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
+                    }
                     (Some(Val::Missing(why)), _) if read => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -9910,11 +9940,17 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
+                // Data joined with masks where the wave takes one edge (the BVH
+                // walks pop masks from memory): with console lanes the lane's
+                // own bit of the number, as `Atom::Opaque`.
+                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
+                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
+                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -10651,6 +10687,38 @@ mod tests {
         };
         let direct = [&words[..2], &words[9..]].concat();
         assert_eq!(refusal(&words), refusal(&direct));
+    }
+
+    #[test]
+    fn a_mask_joined_with_data_needs_a_uniform_join() {
+        // s6: lanes below 24, then shifted (data) on each back edge; read
+        // after the loop. Lanes leaving the loop at different iterations
+        // (per lane) see different numbers than the console's register:
+        // refused. The uniform loop is `synthetic_tests::
+        // a_mask_joined_with_data_at_a_uniform_loop_is_its_number`.
+        let mut words = [
+            0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+            0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0x9006_8406, // header: s_lshr_b32 s6, s6, 4
+            0x8007_8107, // s_add_u32 s7, s7, 1
+            0x7D88_0007, // v_cmp_gt_u32 vcc_lo, s7, v0
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFB, // s_cbranch_execnz header
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 1 << 7) else {
+            panic!("a per-lane loop's mask join translated");
+        };
+        assert!(what.contains("lane mask"), "{what}");
+        // Leaving on a uniform condition instead: the mask's number.
+        words[5] = 0xBF0A_8207; // s_cmp_lt_u32 s7, 2
+        words[6] = 0xBF80_0000; // s_nop 0
+        words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
+        lowers(&words, 1 << 7).expect("a uniform loop's mask join");
     }
 
     #[test]

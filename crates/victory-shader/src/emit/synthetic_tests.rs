@@ -359,6 +359,85 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
     }
 }
 
+/// A lane mask joined with data at a uniform loop's header, as the title's
+/// wave-uniform BVH walks push lane masks to memory and pop them
+/// (`shadowmask:CS_TraceShadowRays_Checkerboard`): the register holds the
+/// mask on entry and a number from the back edge, read both as a number and
+/// as a mask.
+#[test]
+fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
+    // s6 = lanes below 24, shifted right by 4 and passed through a VGPR in
+    // each of two iterations; v4 takes each lane's bit of it on every pass.
+    let shader = build(&[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+        0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xD501_0004,
+        0x0019_0280, // header: v_cndmask_b32 v4, 0, 1, s6
+        0x9006_8406, // s_lshr_b32 s6, s6, 4
+        0x7E0A_0206, // v_mov_b32 v5, s6
+        0x7E0C_0505, // v_readfirstlane_b32 s6, v5
+        0x8007_8107, // s_add_u32 s7, s7, 1
+        0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+        0xBF85_FFF8, // s_cbranch_scc1 header
+        0x7E06_0206, // v_mov_b32 v3, s6
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xE070_1080,
+        0x800A_0410, // buffer_store_dword v4, v16, s[40:43], 0 offen offset:128
+        0xBF81_0000, // s_endpgm
+    ])
+    .expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(64),
+    ];
+    let mut want = vec![0x00FF_FFFF >> 8; 32];
+    want.extend((0..32).map(|lane| u32::from(lane < 20)));
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp, "{label}: no pipeline for a wave of 32");
+            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+    }
+}
+
 #[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler
