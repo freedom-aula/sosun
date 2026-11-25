@@ -17,18 +17,20 @@ Codex or Cursor:
 Read https://raw.githubusercontent.com/pragyaangaur/VIctory-macOS/main/docs/fleet-join.md and follow it to help test VIctory on my Mac. Ask me before installing or posting anything.
 ```
 
-The agent explains what it will install and post, and waits for your yes.
-There are three steps it cannot do for you:
+The agent asks you one question. It explains what it will install, what it
+will post under your GitHub account, and the fleet rules, and asks whether you
+accept all of it. After your yes it does the setup. You only have to:
 
-1. Download Apple's Game Porting Toolkit (README, step 2).
-2. Sign in to the GitHub CLI with `gh auth login`.
-3. Read [fleet-legal.md](fleet-legal.md) and run `tools/fleet/fleet.sh accept` in Terminal.
+1. Sign in to Apple and click Download when the agent opens the Game Porting Toolkit page. Apple's licence has to be accepted by you.
+2. Sign in to GitHub in your browser, if the GitHub CLI isn't signed in already.
+3. Install Homebrew yourself if it's missing, because its installer needs your password.
 
 ## Join by hand
 
 ```bash
 tools/fleet/fleet.sh doctor      # what is missing
-tools/fleet/fleet.sh accept      # read and accept the rules
+tools/fleet/fleet.sh accept      # read and accept the rules (type "I agree")
+tools/fleet/fleet.sh gptk        # open Apple's page and wait for the toolkit download
 tools/fleet/fleet.sh next        # open tasks for your chip
 tools/fleet/fleet.sh claim N
 tools/fleet/fleet.sh run N       # setup.sh, cargo test, then the Wine tests

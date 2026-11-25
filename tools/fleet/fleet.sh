@@ -27,7 +27,10 @@ usage() {
 Usage: tools/fleet/fleet.sh <command>
 
   doctor            check this Mac is ready (run first)
-  accept            read and accept docs/fleet-legal.md (a person runs this in Terminal)
+  rules             print the fleet rules (an agent shows them to the person)
+  accept --confirmed  record that the person said yes to the rules (or run
+                    plain "accept" in Terminal to read and type "I agree")
+  gptk              open Apple's download page and wait for the Game Porting Toolkit
   next              list open tasks for this Mac's chip
   claim N           take task N (posts /claim)
   run N             run both test suites for task N (long; posts /beat while running)
@@ -41,7 +44,8 @@ me() { gh api user --jq .login; }
 brand() { sysctl -n machdep.cpu.brand_string 2> /dev/null || true; }
 my_chip() { chip_family_of "$(brand)"; }
 legal_hash() { shasum -a 256 "$LEGAL" | cut -d ' ' -f 1; }
-accepted() { [ -f "$CACHE/accepted-legal" ] && [ "$(cat "$CACHE/accepted-legal")" = "$(legal_hash)" ]; }
+accepted() { [ -f "$CACHE/accepted-legal" ] && [ "$(cut -d ' ' -f 1 "$CACHE/accepted-legal")" = "$(legal_hash)" ]; }
+GPTK_URL="https://developer.apple.com/download/all/?q=game%20porting%20toolkit"
 gptk_dmg() { find "$HOME/Downloads" -maxdepth 1 -name 'Game_Porting_Toolkit*.dmg' 2> /dev/null | sort | tail -n 1; }
 
 gptk_version() {
@@ -93,22 +97,63 @@ cmd_doctor() {
         free=$(df -g "$HOME" | awk 'NR == 2 { print $4 }')
         check "$MIN_FREE_GB GB free for the first setup" "$(t test "${free:-0}" -ge $MIN_FREE_GB)" "only ${free:-?} GB free"
         check "Game Porting Toolkit in Downloads" "$(t test -n "$(gptk_dmg)")" \
-            "the person downloads it from Apple (README step 2) and accepts Apple's terms themselves"
+            "run tools/fleet/fleet.sh gptk; the person signs in to Apple, accepts Apple's terms and clicks Download"
     fi
-    check "fleet terms accepted" "$(t accepted)" "the person reads docs/fleet-legal.md and runs, in Terminal: tools/fleet/fleet.sh accept"
+    check "fleet terms accepted" "$(t accepted)" "show the person tools/fleet/fleet.sh rules; after their yes, run: tools/fleet/fleet.sh accept --confirmed"
     if [ "$ok" = 1 ]; then say "this Mac is ready"; else die "fix the FAIL lines above first"; fi
 }
 
-cmd_accept() {
-    [ -t 0 ] && [ -t 1 ] || die "a person runs this in Terminal, not an agent: tools/fleet/fleet.sh accept"
+cmd_rules() {
     sed -n '/^## The rules/,/^## /p' "$LEGAL" | sed '$d'
-    printf '\nFull text: %s\nType "I agree" to accept the fleet rules: ' "$LEGAL"
-    local answer
-    read -r answer
-    [ "$answer" = "I agree" ] || die "not accepted"
+    printf 'Full text: %s\n' "https://github.com/$REPO/blob/main/docs/fleet-legal.md"
+}
+
+# The person accepts once. Either they type "I agree" in Terminal, or their
+# agent shows them the rules (cmd_rules), gets an explicit yes in the chat and
+# runs "accept --confirmed". The record notes which route was used.
+cmd_accept() {
+    local how
+    if [ "${1:-}" = --confirmed ]; then
+        how=chat
+    elif [ -t 0 ] && [ -t 1 ]; then
+        cmd_rules
+        printf '\nType "I agree" to accept the fleet rules: '
+        local answer
+        read -r answer
+        [ "$answer" = "I agree" ] || die "not accepted"
+        how=terminal
+    else
+        die "show the person the rules (tools/fleet/fleet.sh rules); only after their explicit yes, run: tools/fleet/fleet.sh accept --confirmed"
+    fi
     mkdir -p "$CACHE"
-    legal_hash > "$CACHE/accepted-legal"
-    say "accepted"
+    printf '%s %s %s\n' "$(legal_hash)" "$how" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CACHE/accepted-legal"
+    say "fleet rules accepted ($how)"
+}
+
+# Opens Apple's download page and waits for the .dmg to finish downloading.
+# Apple requires the person to sign in and accept its licence themselves.
+cmd_gptk() {
+    local dmg size last="" _
+    if [ -x "$WINE_BIN" ] || [ -n "$(gptk_dmg)" ]; then
+        say "the Game Porting Toolkit is already here"
+        return
+    fi
+    open "$GPTK_URL"
+    say "opened Apple's download page. Sign in with any Apple account, accept Apple's terms,"
+    say "and click Download on the newest Game Porting Toolkit. Leave the .dmg in Downloads; don't open it."
+    say "waiting up to 30 minutes for the download to finish..."
+    for _ in $(seq 1 360); do
+        sleep 5
+        dmg=$(gptk_dmg)
+        [ -n "$dmg" ] || continue
+        size=$(stat -f %z "$dmg" 2> /dev/null || echo 0)
+        if [ "$size" -gt 0 ] && [ "$size" = "$last" ]; then
+            say "found $(basename "$dmg") ($((size / 1048576)) MB)"
+            return
+        fi
+        last=$size
+    done
+    die "no Game Porting Toolkit download after 30 minutes; run tools/fleet/fleet.sh gptk again when ready"
 }
 
 cmd_next() {
@@ -231,7 +276,9 @@ cmd_status() {
 
 case "${1:-help}" in
     doctor) cmd_doctor ;;
-    accept) cmd_accept ;;
+    rules) cmd_rules ;;
+    accept) cmd_accept "${2:-}" ;;
+    gptk) cmd_gptk ;;
     next) cmd_next ;;
     claim) cmd_claim "${2:-}" ;;
     run) cmd_run "${2:-}" ;;
