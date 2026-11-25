@@ -407,7 +407,24 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                let a = start + at;
+                if host == old {
+                } else if self
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|t| !t.changed(a / PAGE) && t.untracked(a, a + n).is_empty())
+                {
+                    // The title has not written the page since the copy took
+                    // it: title memory holds the bytes from before, and the
+                    // copy's are what goes back, title memory unread (a
+                    // wineserver round trip).
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareUnread, 1);
+                    let _writing = crate::watch::writing(a, n);
+                    crate::host::write_mapped(a as *mut u8, host.as_ptr(), n);
+                    written += n;
+                    synced.push(a / PAGE);
+                } else if crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;

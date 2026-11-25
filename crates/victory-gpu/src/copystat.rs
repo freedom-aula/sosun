@@ -112,8 +112,10 @@ pub(crate) enum C {
     /// written back without reading title memory first.
     MarkedSame,
     MarkedUnread,
+    /// Copying back compared pieces: written without reading title memory.
+    CompareUnread,
 }
-const COUNTERS: usize = 64;
+const COUNTERS: usize = 65;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -243,7 +245,7 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared ({:.0} unchanged by digest, {:.0} written unread), {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB ({:.0} pieces written unread) in {:.1} ms; marked pages: {:.0} compared ({:.0} unchanged by digest, {:.0} written unread), {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -302,6 +304,7 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncSlots as usize],
         ms(c[C::MirrorWaitUs as usize]),
         mb(c[C::CompareBytes as usize]),
+        c[C::CompareUnread as usize],
         ms(c[C::CompareUs as usize]),
         c[C::MarkedPages as usize],
         c[C::MarkedSame as usize],
