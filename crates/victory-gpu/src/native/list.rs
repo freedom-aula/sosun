@@ -101,6 +101,8 @@ pub struct Binding {
     pub static_samplers: Vec<[u32; 10]>,
     /// Minimum descriptor-table entries needed per `RootType::Table` root slot: `(slot, count)`.
     pub table_entries: Vec<(u8, usize)>,
+    /// The pipeline's name (its shaders' hashes), for diagnostics.
+    pub name: Rc<str>,
 }
 
 /// A root view's kind.
@@ -144,6 +146,7 @@ impl Binding {
                 .iter()
                 .map(|&(slot, count)| (slot, count as usize))
                 .collect(),
+            name: "".into(),
         }
     }
 
