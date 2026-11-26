@@ -227,6 +227,17 @@ pub fn last_error_slot() -> *mut u32 {
     unsafe { current().add(OFF_LAST_ERROR).cast() }
 }
 
+/// Zeroes TLS slot `index` (of the 64 `TlsAlloc` hands out) in every live thread, as `TlsFree`
+/// does on Windows: a slot handed out again reads 0 everywhere.
+pub fn clear_tls_slot(index: usize) {
+    assert!(index < TLS_SLOT_COUNT);
+    for thread in LIVE.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let slot = (thread.teb + OFF_TLS_SLOTS + index * 8) as *const AtomicUsize;
+        // SAFETY: inside a TEB that stays alive while it is in `LIVE`, which is locked.
+        unsafe { (*slot).store(0, Ordering::Relaxed) };
+    }
+}
+
 /// The 64 slots `TlsAlloc` hands out, for the calling thread.
 pub fn tls_slots() -> *mut usize {
     // SAFETY: inside the TEB block.

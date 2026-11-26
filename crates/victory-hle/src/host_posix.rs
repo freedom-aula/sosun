@@ -46,6 +46,7 @@ const MAXIMUM_WAIT_OBJECTS: u32 = 64;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_ADDRESS: u32 = 487;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
@@ -241,7 +242,8 @@ pub extern "system" fn VirtualAlloc(
     let page = mem::page_size();
     let len = size.next_multiple_of(page);
     let at = address as usize;
-    let result = if kind & MEM_RESERVE != 0 {
+    // A commit with no address reserves too, as on Windows.
+    let result = if kind & MEM_RESERVE != 0 || at == 0 {
         let len = size.next_multiple_of(GRANULARITY);
         let at = (at != 0).then_some(at & !(GRANULARITY - 1));
         reserve_granular(at, len).and_then(|p| {
@@ -306,14 +308,29 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
         // SAFETY: a region this shim made.
         unsafe { mem::release(address.cast(), len) }.is_ok()
     } else if kind & MEM_DECOMMIT != 0 {
+        let at = address as usize;
+        // Size 0 is the rest of the region (all of it from its base), as on Windows; a range
+        // outside our regions is the host's, never decommitted.
+        let Some((base, len)) = region_at(at) else {
+            set_error(ERROR_INVALID_ADDRESS);
+            return 0;
+        };
+        let page = mem::page_size();
+        let start = at & !(page - 1);
+        let end = match size {
+            0 => base + len,
+            _ => at.saturating_add(size).next_multiple_of(page),
+        };
+        if region_of(start, end - start).is_err() {
+            set_error(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
         if tracing_owners() {
-            let at = address as usize;
-            let owner_at = region_at(at).map_or(0, |(base, _)| base);
-            let range = region_held("decommitted range", (at, size), owner_at);
+            let range = region_held("decommitted range", (start, end - start), base);
             xmem_physical::freeing("VirtualFree(MEM_DECOMMIT) over views", &range);
         }
         // Physical-page views there stay, zeroed.
-        xmem_physical::decommit(address as usize, size.next_multiple_of(mem::page_size()))
+        xmem_physical::decommit(start, end - start)
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -375,6 +392,8 @@ pub extern "system" fn TlsFree(index: u32) -> i32 {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // Zeroed before the slot can be handed out again.
+    teb::clear_tls_slot(index as usize);
     TLS_USED.fetch_and(!(1 << index), Ordering::AcqRel);
     1
 }
@@ -732,11 +751,20 @@ pub extern "system" fn CreateThread(
             // Before anything of the title's runs: park if suspended.
             move || {
                 lock(&me.state).port = Some(native::threadctl::ThreadPort::current());
-                // A suspension that came in before the thread was up.
-                if lock(&me.state).suspend_count > 0 {
+                // A suspension that came in before the thread was up. The count is read and
+                // `running` set under one lock: a `SuspendThread` in between saw the thread not
+                // running, did not stop it, and it then ran suspended.
+                loop {
+                    let mut state = lock(&me.state);
+                    if state.suspend_count == 0 {
+                        state.running = true;
+                        break;
+                    }
+                    // Set again by the `ResumeThread` that brings the count to 0.
+                    me.gate.reset();
+                    drop(state);
                     me.gate.wait(None);
                 }
-                lock(&me.state).running = true;
             },
             move |code| {
                 if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
@@ -1101,6 +1129,28 @@ mod clock_tests {
 mod memory_tests {
     use super::*;
 
+    /// A TLS slot freed and handed out again reads 0 in every thread, not what it held before.
+    #[test]
+    fn a_reused_tls_slot_reads_zero_in_every_thread() {
+        let slot = TlsAlloc();
+        assert_ne!(slot, TLS_OUT_OF_INDEXES);
+        let (set, go) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<u32>());
+        let (set_tx, go_rx) = (set.0, go.1);
+        let other = std::thread::spawn(move || {
+            assert_eq!(TlsSetValue(slot, 5 as *mut c_void), 1);
+            set_tx.send(()).unwrap();
+            TlsGetValue(go_rx.recv().unwrap()) as usize
+        });
+        set.1.recv().unwrap();
+        assert_eq!(TlsSetValue(slot, 6 as *mut c_void), 1);
+        assert_eq!(TlsFree(slot), 1);
+        let again = TlsAlloc();
+        assert_ne!(again, TLS_OUT_OF_INDEXES);
+        go.0.send(again).unwrap();
+        assert_eq!((TlsGetValue(again) as usize, other.join().unwrap()), (0, 0));
+        assert_eq!(TlsFree(again), 1);
+    }
+
     #[test]
     fn reservations_start_on_64_kib_and_take_whole_granules() {
         let mut bases = Vec::new();
@@ -1136,6 +1186,16 @@ mod memory_tests {
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
         }
+    }
+
+    /// `VirtualAlloc(NULL, n, MEM_COMMIT)` reserves as well, as on Windows.
+    #[test]
+    fn a_commit_without_an_address_reserves() {
+        let p = VirtualAlloc(std::ptr::null_mut(), 100, MEM_COMMIT, 0x04);
+        assert!(!p.is_null());
+        // SAFETY: committed read-write.
+        unsafe { p.cast::<u8>().write(1) };
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
     }
 
     /// `VirtualFree(MEM_DECOMMIT)` keeps the bytes of a physical page another address still
@@ -1186,6 +1246,31 @@ mod memory_tests {
         assert_eq!(XMemFreePhysicalPages(1, page.as_ptr()), 1);
     }
 
+    /// `VirtualFree(MEM_DECOMMIT)` with size 0 decommits the whole region from its base, and an
+    /// address outside our regions is refused (`ERROR_INVALID_ADDRESS`), not decommitted.
+    #[test]
+    fn decommit_takes_the_whole_region_and_only_ours() {
+        let size = 2 * GRANULARITY;
+        let p = VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, 0x04);
+        assert!(!p.is_null());
+        assert_eq!(VirtualFree(p, 0, MEM_DECOMMIT), 1);
+        let last = p as usize + size - 1;
+        assert_eq!(mem::query(last).map(|r| r.protect), Some(Protect::NO_ACCESS));
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+
+        let host = reserve_granular(None, GRANULARITY).expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::commit(host, GRANULARITY, Protect::READ_WRITE) }.expect("committed");
+        // SAFETY: committed read-write above.
+        unsafe { host.write(3) };
+        assert_eq!(VirtualFree(host.cast(), GRANULARITY, MEM_DECOMMIT), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_ADDRESS);
+        // SAFETY: still committed read-write.
+        assert_eq!(unsafe { host.read() }, 3, "the host's memory is left alone");
+        // SAFETY: the reservation made above.
+        unsafe { mem::release(host, GRANULARITY) }.expect("released");
+    }
+
     /// `VICTORY_TRACE_OWNERS`: views left in a range `VirtualFree(MEM_DECOMMIT)` gives back, and
     /// a mapping outside every region, are each named with the pool they show.
     #[test]
@@ -1219,13 +1304,50 @@ mod memory_tests {
         assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         assert_ne!(pool_shown_at(r as usize), Some(pool));
         assert_eq!(TRIPS.with(|t| t.borrow().len()), 1, "only the decommit");
-        // Address space no region holds.
-        let q = reserve_granular(None, GRANULARITY).expect("reserved");
+        // Free address space no region holds: found high up, where other tests' reservations
+        // do not land between the release and the mapping.
+        // SAFETY: fresh address space, given back at once; only mapped over below.
+        let q = unsafe {
+            mem::reserve_in(0x5000_0000_0000, 0x5fff_ffff_ffff, GRANULARITY, GRANULARITY)
+        }
+        .expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::release(q, GRANULARITY) }.expect("released");
         assert_eq!(XMemMapPhysicalPages(q.cast(), 1, pages.as_ptr()), q.cast());
         assert_eq!(trips(OUTSIDE), [(pool, 0)]);
         assert_eq!(XMemMapPhysicalPages(q.cast(), 1, std::ptr::null()), q.cast());
-        // SAFETY: the reservation just made, no longer mapped.
+        // SAFETY: the address mapped just above, no longer a view.
         unsafe { mem::release(q, GRANULARITY) }.expect("released");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Physical pages are mapped over a region of ours, a view of ours or free address space,
+    /// never over memory the host has there: on macOS the mapping replaced it silently.
+    #[test]
+    fn physical_pages_are_not_mapped_over_host_memory() {
+        use crate::modules::xmem::{
+            XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages,
+            XMemMapPhysicalPagesScatter, map_alias,
+        };
+        let (mut n, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        // Host memory no region holds, with bytes in it.
+        let host = reserve_granular(None, 2 * GRANULARITY).expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::commit(host, 2 * GRANULARITY, Protect::READ_WRITE) }.expect("committed");
+        // SAFETY: committed read-write above.
+        unsafe { host.write(9) };
+        assert!(XMemMapPhysicalPages(host.cast(), 2, pages.as_ptr()).is_null());
+        let addresses = [host.cast::<c_void>(), host.wrapping_add(GRANULARITY).cast()];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, pages.as_ptr()), 0);
+        let r = VirtualAlloc(std::ptr::null_mut(), GRANULARITY, MEM_RESERVE, 0x01);
+        assert_eq!(XMemMapPhysicalPages(r, 1, pages.as_ptr()), r);
+        assert!(!map_alias(host as u64, r as u64, GRANULARITY as u64));
+        // SAFETY: still the host's, read-write.
+        assert_eq!(unsafe { host.read() }, 9, "the host's bytes are left alone");
+        // SAFETY: the reservation made above, never mapped over.
+        unsafe { mem::release(host, 2 * GRANULARITY) }.expect("released");
+        assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

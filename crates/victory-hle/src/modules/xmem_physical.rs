@@ -538,6 +538,41 @@ fn check_region(base: usize, len: usize, slice: &Slice) {
     let _ = (base, len, slice);
 }
 
+/// Whether title pages may be mapped over `[base, base + len)`: a range in one region
+/// `VirtualAlloc` or `XMemVirtualAlloc` made, or whose pages are each a view of ours or free.
+/// macOS maps with `VM_FLAGS_OVERWRITE`, so anything else there (the host's heap, a library, a
+/// thread's stack) would be replaced without a word; such a mapping is refused, logged once.
+fn may_map(physical: &Physical, base: usize, len: usize) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if crate::host_posix::region_of(base, len).is_ok() {
+            return true;
+        }
+        let ours = |at: usize| {
+            view_at(physical, at).is_some()
+                || mem::next_region(at).is_none_or(|r| r.base >= at + PAGE)
+        };
+        if (base..base.saturating_add(len)).step_by(PAGE).all(ours) {
+            return true;
+        }
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                "refused to map physical pages over memory that is not the title's (logged once)"
+            );
+        }
+        false
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    {
+        // Windows maps only into a placeholder, and fails anywhere else.
+        let _ = (physical, base, len);
+        true
+    }
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -869,6 +904,9 @@ pub extern "system" fn XMemMapPhysicalPages(
         }) {
             return address;
         }
+        if !may_map(&physical, base, n * PAGE) {
+            return std::ptr::null_mut();
+        }
     }
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
@@ -1002,6 +1040,9 @@ fn map_fresh_scatter(addresses: &[*mut c_void], pages: &[usize]) -> Option<(usiz
     {
         return None;
     }
+    if !may_map(&physical, base, run * PAGE) {
+        return Some((run, false));
+    }
     let first = first.clone();
     let slice_at = |k| Slice {
         pool: first.pool.clone(),
@@ -1035,6 +1076,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         })
     {
         return true;
+    }
+    if from != 0 && !may_map(&physical, to, len) {
+        return false;
     }
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
@@ -1280,28 +1324,21 @@ mod tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    /// A reservation of `n` 64 KiB pages, as titles make them for mapping.
+    /// A reservation of `n` 64 KiB pages, as titles make them for mapping (a region of ours, so
+    /// physical pages may be mapped there).
     fn reserve(n: usize) -> *mut c_void {
+        use super::super::xmem::{PAGES_64K, XMemVirtualAlloc};
         #[cfg(windows)]
-        {
-            use super::super::xmem::{PAGES_64K, XMemVirtualAlloc};
-            use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE};
-            XMemVirtualAlloc(
-                std::ptr::null_mut(),
-                n * PAGE,
-                MEM_RESERVE | PAGES_64K,
-                0,
-                PAGE_READWRITE,
-            )
-        }
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_READWRITE};
         #[cfg(not(windows))]
-        {
-            // Leaked; one 64 KiB page more, to start on a 64 KiB boundary
-            // (macOS reservations are 16 KiB granular).
-            // SAFETY: fresh address space.
-            let p = unsafe { mem::reserve(None, (n + 1) * PAGE) }.expect("reserved");
-            p.wrapping_add(p.align_offset(PAGE)).cast()
-        }
+        use super::super::xmem_posix::{MEM_RESERVE, PAGE_READWRITE};
+        XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        )
     }
 
     /// Whether a page is mapped (a placeholder, or a reservation, is not).

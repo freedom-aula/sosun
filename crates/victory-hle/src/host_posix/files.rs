@@ -164,6 +164,8 @@ pub(crate) fn win32_error(e: &io::Error, path: &Path) -> u32 {
 pub(crate) struct FileObject {
     file: File,
     position: AtomicU64,
+    /// Opened for `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write goes to the end.
+    append: bool,
 }
 
 /// The host's metadata of the open file `handle`.
@@ -193,6 +195,8 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
     let all = access & GENERIC_ALL != 0;
     let read = all || access & (GENERIC_READ | FILE_READ_DATA) != 0;
     let write = all || access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+    let append =
+        !all && access & (GENERIC_WRITE | FILE_WRITE_DATA) == 0 && access & FILE_APPEND_DATA != 0;
     let existed = path.exists();
     let mut options = OpenOptions::new();
     options.read(read || !write).write(write);
@@ -230,6 +234,7 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
             new_handle(Object::File(Arc::new(FileObject {
                 file,
                 position: AtomicU64::new(0),
+                append,
             })))
         }
         Err(e) => {
@@ -361,15 +366,26 @@ pub extern "system" fn WriteFile(
         unsafe { std::slice::from_raw_parts(buffer, len as usize) }
     };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
-    let at = ov
-        .as_ref()
-        .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
+    let at = if f.append {
+        // Append-only access writes at the end whatever the offset, as Windows does.
+        match f.file.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => {
+                set_error(ERROR_ACCESS_DENIED);
+                return 0;
+            }
+        }
+    } else {
+        ov.as_ref()
+            .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset)
+    };
     if f.file.write_all_at(data, at).is_err() {
         set_error(ERROR_ACCESS_DENIED);
         return 0;
     }
     match &ov {
         Some(ov) => ov.complete(data.len()),
+        None if f.append => f.position.store(at + data.len() as u64, Ordering::Relaxed),
         None => {
             f.position.fetch_add(data.len() as u64, Ordering::Relaxed);
         }
@@ -862,6 +878,32 @@ mod tests {
         assert!(m("a?c", "abc"));
         assert!(!m("a?c", "ac"));
         assert!(!m("*.bin", "a.txt"));
+    }
+
+    /// `FILE_APPEND_DATA` alone writes at the end of the file, whatever the file pointer says.
+    #[test]
+    fn append_only_access_writes_at_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("log.txt"), b"abc").unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let path = wide(&format!("{letter}:\\log.txt"));
+        let open = |access| {
+            let null = std::ptr::null_mut();
+            CreateFileW(path.as_ptr(), access, 0, null, OPEN_EXISTING, 0, null)
+        };
+        let h = open(FILE_APPEND_DATA);
+        assert_ne!(h, invalid_handle());
+        let mut count = 0u32;
+        let null = std::ptr::null_mut();
+        assert_eq!(WriteFile(h, b"de".as_ptr(), 2, &mut count, null), 1);
+        assert_eq!(WriteFile(h, b"f".as_ptr(), 1, &mut count, null), 1);
+        assert_eq!(super::super::CloseHandle(h), 1);
+        assert_eq!(std::fs::read(dir.path().join("log.txt")).unwrap(), b"abcdef");
+        // Write access as well: at the file pointer, as before.
+        let h = open(FILE_WRITE_DATA | FILE_APPEND_DATA);
+        assert_eq!(WriteFile(h, b"X".as_ptr(), 1, &mut count, null), 1);
+        assert_eq!(super::super::CloseHandle(h), 1);
+        assert_eq!(std::fs::read(dir.path().join("log.txt")).unwrap(), b"Xbcdef");
     }
 
     #[test]
