@@ -320,7 +320,7 @@ pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str)
 }
 
 extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
-    if hr < 0 || trace_level() == 2 || (!info.name.is_empty() && trace_imports()) {
+    if if info.name.is_empty() { hr < 0 || trace_level() == 2 } else { trace_imports() } {
         tracing::warn!(
             area = info.area,
             name = info.name,
