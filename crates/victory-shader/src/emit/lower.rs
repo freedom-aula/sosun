@@ -117,8 +117,12 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    // Compute programs hold masks the structurisation cannot see into
+    // (built from scalars, shifted) only with the console's lanes: asked
+    // for when the first try finds one used.
+    let mut console = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, console).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -128,6 +132,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                     });
                 }
             }
+            Err(Stop::Fail(ShaderError::Unsupported {
+                what: "an opaque lane mask" | "a constant lane mask",
+                ..
+            })) if !console && parts.native.stage == HwStage::Cs => console = true,
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -303,6 +311,9 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: Map<Value, (V, V)>,
+    /// SCC written by a scalar operation on masks, by value: the dwords of
+    /// the mask result it says is not zero.
+    mask_scc: Map<Value, (Value, Option<Value>)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -569,7 +580,7 @@ fn smem_dwords(name: &str) -> Option<u32> {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, console: bool) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -591,7 +602,7 @@ impl<'a> Lower<'a> {
             .iter()
             .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
-        let mut console_lanes = false;
+        let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
@@ -600,38 +611,40 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+            console_lanes = console
+                || insts().any(|i| {
+                    let n = i.name();
+                    n.starts_with("ds_swizzle")
+                        || n.contains("permute")
+                        || n.starts_with("v_mbcnt")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || reads_mask_as_data(x.st, i)
                 })
-            };
+                || {
+                    // Masks held as numbers or constant lane sets: the lane
+                    // tests its own bit by its console lane.
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let mut all: Vec<Bool> =
+                        x.st.guards
+                            .iter()
+                            .flatten()
+                            .flatten()
+                            .copied()
+                            .chain(whens)
+                            .collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                    })
+                };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let lanes = cs.threads.iter().product::<u32>();
             let one_wave = lanes <= wave;
@@ -783,6 +796,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: Map::default(),
+            mask_scc: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -1745,6 +1759,19 @@ impl<'a> Lower<'a> {
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
         }
+        if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
+            // SCC of a mask operation read as data: some lane in the result.
+            let c = self.cur;
+            let mut word = self.i32_of(lo)?;
+            if let Some(hi) = hi {
+                let h = self.i32_of(hi)?;
+                word = self.s.m.bin(c, Bin::Or, word, h);
+            }
+            let z = self.s.m.i32(0);
+            let any = Val::Bit(self.s.m.cmp(c, pred::NE, word, z));
+            self.vals.insert(v, any);
+            return Ok(any);
+        }
         if let Some(Val::Missing(w)) = found {
             return Err(w);
         }
@@ -1998,7 +2025,10 @@ impl<'a> Lower<'a> {
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
             .ok_or(ELSEWHERE)?;
-        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+        // (EXEC written besides the destination: a saveexec's new mask.)
+        if inst.write(Reg::S(*code)) != Some(lo)
+            || *code != EXEC && inst.write(Reg::S(EXEC)).is_some()
+        {
             return Err(ELSEWHERE);
         }
         let at = if b == self.cur_ir {
@@ -2027,6 +2057,31 @@ impl<'a> Lower<'a> {
             };
             Ok(l.s.m.i32(x))
         };
+        if matches!(op, "lshl" | "lshr") {
+            // The shift count is the low 6 (5) bits of a plain number.
+            let n = word(self, 1, 0)?;
+            let a = word(self, 0, 0)?;
+            let i64t = self.s.m.int(64);
+            let k32 = self.s.m.int_const(i64t, 32);
+            let kmask = self.s.m.i32(if wave64 { 63 } else { 31 });
+            let n = self.s.m.bin(at, Bin::And, n, kmask);
+            let f = if op == "lshl" { Bin::Shl } else { Bin::LShr };
+            if !wave64 {
+                return Ok((self.s.m.bin(at, f, a, n), self.s.m.i32(0)));
+            }
+            self.s.flags |= flags::INT64;
+            let b = word(self, 0, 1)?;
+            let a = self.s.m.cast(at, Cast::ZExt, a, i64t);
+            let b = self.s.m.cast(at, Cast::ZExt, b, i64t);
+            let b = self.s.m.bin(at, Bin::Shl, b, k32);
+            let x = self.s.m.bin(at, Bin::Or, a, b);
+            let n = self.s.m.cast(at, Cast::ZExt, n, i64t);
+            let r = self.s.m.bin(at, f, x, n);
+            let rl = self.s.m.cast(at, Cast::Trunc, r, self.s.t.i32);
+            let rh = self.s.m.bin(at, Bin::LShr, r, k32);
+            let rh = self.s.m.cast(at, Cast::Trunc, rh, self.s.t.i32);
+            return Ok((rl, rh));
+        }
         let mut out = [self.s.m.i32(0); 2];
         for h in 0..1 + u8::from(wave64) {
             let a = word(self, 0, h)?;
@@ -3559,6 +3614,16 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let (Some(scc), true) = (scc, self.mask_data == MaskData::Console) {
+                // The result is EXEC when written, else the destination.
+                let pair = |l: u8| {
+                    let hi = inst.write(Reg::S(l + 1)).filter(|_| self.x.native.wave64);
+                    inst.write(Reg::S(l)).map(|lo| (lo, hi))
+                };
+                if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
+                    self.mask_scc.insert(scc, r);
+                }
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -3713,9 +3778,60 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
+                "s_bcnt0_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let na = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+                    let nb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+                    let ones = self.s.m.bin(c, Bin::Add, na, nb);
+                    let k64 = self.s.m.i32(64);
+                    let r = self.s.m.bin(c, Bin::Sub, k64, ones);
+                    self.set(lo, Val::I32(r));
+                    let z = self.s.m.i32(0);
+                    let s = self.s.m.cmp(c, pred::NE, r, z);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_flbit_i32_b64" => {
+                    // Leading zeros; -1 for none (DXIL's first bit high).
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let fa = self.s.m.select(c, none, fa, fa32);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, fa);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ra = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[a]);
+                    let rb = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
+                "s_ff1_i32_b64" | "s_ff0_i32_b64" => {
+                    // The lowest set (clear) bit; -1 for none (as DXIL's first bit low).
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_ff0_i32_b64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s
@@ -3896,6 +4012,16 @@ impl<'a> Lower<'a> {
                 // the signed form), -1 for none: DXIL's first-bit-high.
                 let a = src32(self, 0)?;
                 let op = if name == "s_flbit_i32_b32" { 33 } else { 34 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_ff0_i32_b32" | "s_bcnt0_i32_b32" => {
+                let mut a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                a = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
