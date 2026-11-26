@@ -34,8 +34,8 @@ pub mod threadctl;
 pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
 pub use bridge::{
-    bridged_copy_of, bridged_table, call_win64, declare_direct, declare_win64, expose_object, host_callbacks,
-    is_bridged, is_title_code,
+    bridged_copy_of, bridged_table, call_win64, declare_direct, declare_win64, exit_title_thread,
+    expose_object, host_callbacks, is_bridged, is_title_code,
 };
 #[cfg(target_arch = "x86_64")]
 pub use run::{

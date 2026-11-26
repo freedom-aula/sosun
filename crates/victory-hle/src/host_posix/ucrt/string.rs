@@ -1250,6 +1250,17 @@ pub extern "system" fn _lfind(
 
 // locale: "C" only
 
+static LOCALE_LOCK: std::sync::LazyLock<crate::host_posix::system::MutexObject> =
+    std::sync::LazyLock::new(crate::host_posix::system::MutexObject::new);
+
+pub extern "system" fn _lock_locales() {
+    LOCALE_LOCK.acquire(None);
+}
+
+pub extern "system" fn _unlock_locales() {
+    LOCALE_LOCK.release();
+}
+
 pub extern "system" fn setlocale(_category: i32, locale: *const c_char) -> *const u8 {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let name = *C.get_or_init(|| leak_cstr(b"C") as usize) as *const u8;
@@ -1344,7 +1355,9 @@ exports!(pub(super) fn lookup;
     towupper, towlower, iswalpha, iswupper, iswlower, iswdigit, iswxdigit, iswspace, iswpunct,
     iswcntrl, iswalnum, iswgraph, iswprint, iswblank, iswascii, iswctype, qsort, qsort_s,
     bsearch, bsearch_s, srand, rand, rand_s, _lfind, setlocale, _wsetlocale, localeconv,
-    _configthreadlocale, _get_current_locale, _create_locale, _free_locale;
+    _configthreadlocale, _get_current_locale, _create_locale, _free_locale,
+    _lock_locales, _unlock_locales;
+    "__strncnt" => strnlen,
     // `_l` variants take the locale last, which is ignored.
     "_stricmp_l" => _stricmp, "_strnicmp_l" => _strnicmp, "_strlwr_l" => _strlwr,
     "_strupr_l" => _strupr, "_wcsicmp_l" => _wcsicmp, "_wcsnicmp_l" => _wcsnicmp,
@@ -1556,6 +1569,40 @@ mod tests {
             unsafe { super::super::wide(*lc.add(11).cast::<*const u16>()) },
             [u16::from(b'.')]
         );
+    }
+
+    #[test]
+    fn lock_and_unlock_locales_are_recursive_and_process_wide() {
+        let available_elsewhere = || {
+            std::thread::spawn(|| {
+                let acquired = LOCALE_LOCK.acquire(Some(std::time::Duration::ZERO));
+                if acquired {
+                    _unlock_locales();
+                }
+                acquired
+            })
+            .join()
+            .unwrap()
+        };
+        _lock_locales();
+        _lock_locales();
+        let held_twice = !available_elsewhere();
+        _unlock_locales();
+        let held_once = !available_elsewhere();
+        _unlock_locales();
+        assert!(held_twice && held_once && available_elsewhere());
+    }
+
+    #[test]
+    fn strncnt_stops_at_nul_or_the_bound() {
+        let address = lookup("__strncnt").unwrap();
+        // SAFETY: the registered symbol has this signature.
+        let count: extern "system" fn(*const u8, usize) -> usize =
+            unsafe { std::mem::transmute(address) };
+        assert_eq!(count(b"abc\0xyz".as_ptr(), 7), 3);
+        assert_eq!(count(b"abc".as_ptr(), 3), 3);
+        assert_eq!(count(b"abc".as_ptr(), 2), 2);
+        assert_eq!(count(std::ptr::null(), 0), 0);
     }
 
     #[test]

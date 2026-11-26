@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use super::runtime::bad_param;
 use super::stdio::win_errno;
 use super::{
-    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, leak_cstr, set_errno, units,
+    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, leak_cstr, set_errno, units,
 };
 use crate::host_posix::files;
 
@@ -311,6 +311,36 @@ pub extern "system" fn _getcwd(buf: *mut u8, max: i32) -> *mut u8 {
     } else {
         buf
     }
+}
+
+pub extern "system" fn _wgetcwd(mut buf: *mut u16, max: i32) -> *mut u16 {
+    if !buf.is_null() && max <= 0 {
+        bad_param(EINVAL);
+        return std::ptr::null_mut();
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            set_errno(win_errno(&e));
+            return std::ptr::null_mut();
+        }
+    };
+    let path: Vec<u16> = cwd.to_string_lossy().encode_utf16().chain([0]).collect();
+    let max = max.max(0) as usize;
+    if buf.is_null() {
+        buf = heap::malloc(path.len().max(max) * size_of::<u16>()).cast();
+        if buf.is_null() {
+            return buf;
+        }
+    } else if path.len() > max {
+        // SAFETY: `max` is positive and the caller supplied the buffer.
+        unsafe { buf.write(0) };
+        set_errno(ERANGE);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller or malloc supplied enough space for the path and NUL.
+    unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), buf, path.len()) };
+    buf
 }
 
 /// An absolute path: a drive or rooted path stays, others go under the working folder.
@@ -765,7 +795,7 @@ pub extern "system" fn _findclose(handle: isize) -> i32 {
 exports!(pub(super) fn lookup;
     _stat64, _stat64i32, _wstat64, _wstat64i32, _access, _waccess, _access_s, _waccess_s, _mkdir,
     _wmkdir, _rmdir, _wrmdir, _chdir, _wchdir, remove, _wremove, rename, _wrename, _chmod,
-    _wchmod, _fstat64, _fstat64i32, _getcwd, _fullpath, _splitpath, _wsplitpath, _splitpath_s,
+    _wchmod, _fstat64, _fstat64i32, _getcwd, _wgetcwd, _fullpath, _splitpath, _wsplitpath, _splitpath_s,
     _wsplitpath_s, _makepath, _wmakepath, _makepath_s, _wmakepath_s, _findfirst64i32,
     _findfirst64, _wfindfirst64i32, _wfindfirst64, _findnext64i32, _findnext64,
     _wfindnext64i32, _wfindnext64, _findclose;
@@ -774,6 +804,29 @@ exports!(pub(super) fn lookup;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wgetcwd_uses_the_guest_path_and_a_freeable_buffer() {
+        let mut narrow = [0u8; 4096];
+        assert_eq!(_getcwd(narrow.as_mut_ptr(), 4096), narrow.as_mut_ptr());
+        let expected: Vec<u16> = text(&narrow).encode_utf16().collect();
+        let mut wide = vec![0xFFFF; expected.len() + 1];
+        let capacity = wide.len() as i32;
+        assert_eq!(_wgetcwd(wide.as_mut_ptr(), capacity), wide.as_mut_ptr());
+        assert_eq!(wide[..wide.len() - 1], expected);
+        assert_eq!(wide[wide.len() - 1], 0);
+        assert!(_wgetcwd(wide.as_mut_ptr(), capacity - 1).is_null());
+        assert_eq!(super::super::errno(), ERANGE);
+        assert!(_wgetcwd(wide.as_mut_ptr(), 0).is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+        for max in [0, 1, capacity + 8] {
+            let allocated = _wgetcwd(std::ptr::null_mut(), max);
+            assert!(!allocated.is_null());
+            assert_eq!(unsafe { super::super::wide(allocated) }, expected);
+            assert!(heap::_msize(allocated.cast()) >= max as usize * size_of::<u16>());
+            heap::free(allocated.cast());
+        }
+    }
 
     fn c(s: &str) -> Vec<u8> {
         s.bytes().chain([0]).collect()

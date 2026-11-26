@@ -896,7 +896,7 @@ pub(crate) struct MutexObject {
 }
 
 impl MutexObject {
-    fn new() -> MutexObject {
+    pub(super) fn new() -> MutexObject {
         MutexObject {
             free: Semaphore::new(1, 1).expect("semaphore"),
             owner: AtomicU32::new(0),
