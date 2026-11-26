@@ -13015,25 +13015,59 @@ impl<'a> Lower<'a> {
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
+            // The high dword's join, in a wave64 program.
+            let high = self
+                .pair_high(phi.value)
+                .and_then(|h| self.phi_at.get(&h))
+                .map(|&(hb, hi)| &p.blocks[hb].phis[hi]);
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
+                // Each way out names what the mask is joined with, so a refusal log says which
+                // is missing.
+                const HOST_LANES: Why =
+                    "a lane-mask join of an untracked mask: data, on the host's lanes";
+                const DIVERGENT: Why =
+                    "a lane-mask join of an untracked mask: data, at a join of several edges";
+                const HIGH: Why =
+                    "a lane-mask join of an untracked mask: data whose high dword is not known";
+                const MISSING: Why =
+                    "a lane-mask join of an untracked mask: a value the translation could not make";
+                const BIT: Why = "a lane-mask join of an untracked mask: an SCC or lane bit";
+                const NONE: Why = "a lane-mask join of an untracked mask: no value on that edge";
                 // Data joined with masks where the wave takes one edge (the BVH
                 // walks pop masks from memory): with console lanes the lane's
-                // own bit of the number, as `Atom::Opaque`.
-                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
+                // own bit of the number, as `Atom::Opaque`: of the low dword for
+                // lanes below 32, of the high one above (a mask pair's lane `i`
+                // is its bit `i`).
+                let number = self.console_lanes && self.uniform_join(b);
                 let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
                     (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+                    (None, Some(&Val::I32(word))) if number => {
+                        let hi = if self.x.native.wave64 {
+                            match high.and_then(|h| self.vals.get(&h.args[n])) {
+                                Some(&Val::I32(hi)) => Some(hi),
+                                _ => return Err(unsupported(offset, HIGH)),
+                            }
+                        } else {
+                            None
+                        };
+                        self.lane_bit(qb, word, hi)
+                    }
                     (None, _)
                         if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) =>
                     {
                         self.s.m.bool(false)
                     }
-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
+                    (None, Some(Val::I32(_))) if !self.console_lanes => {
+                        return Err(unsupported(offset, HOST_LANES));
+                    }
+                    (None, Some(Val::I32(_))) => return Err(unsupported(offset, DIVERGENT)),
+                    (None, Some(Val::Missing(_))) => return Err(unsupported(offset, MISSING)),
+                    (None, Some(Val::Bit(_))) => return Err(unsupported(offset, BIT)),
+                    (None, None) => return Err(unsupported(offset, NONE)),
                 };
                 incoming.push((x, qb));
             }
