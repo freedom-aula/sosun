@@ -339,8 +339,17 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 unwind::image_base_of(c.rip as usize),
             ) {
                 for rva in list.split(',').filter_map(|v| usize::from_str_radix(v.trim(), 16).ok()) {
-                    let v = ((base + rva) as *const u64).read_unaligned();
-                    tracing::warn!("peek image+{rva:#x} = {v:#x}");
+                    // Beyond the image: an absolute address.
+                    let at = if rva > 0x1000_0000 { rva } else { base + rva };
+                    let v = (at as *const u64).read_unaligned();
+                    tracing::warn!("peek {at:#x} = {v:#x}");
+                }
+                // The qwords rcx points at, when it looks like a pointer.
+                if (0x10000..0x7fff_ffff_0000).contains(&c.gpr[1]) {
+                    let words: Vec<u64> = (0..8)
+                        .map(|i| ((c.gpr[1] + 8 * i) as *const u64).read_unaligned())
+                        .collect();
+                    tracing::warn!("[rcx] {words:x?}");
                 }
                 // A call chain by the unwind tables (return addresses, as
                 // offsets into the faulting image).

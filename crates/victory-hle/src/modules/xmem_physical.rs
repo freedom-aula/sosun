@@ -324,6 +324,28 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
     1
 }
 
+/// Backs the reserved `[base, base + len)` (a multiple of the page size) with
+/// a pool of its own, as committed `XMemVirtualAlloc` memory is on the
+/// console: physical pages the GPU reaches, here through the pool table.
+/// macOS: the GPU backend resolves title addresses by pool only.
+#[cfg(not(windows))]
+pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
+    let Ok(pool) = Pool::new(len) else {
+        return false;
+    };
+    let slice = Slice {
+        pool: Arc::new(pool),
+        index: 0,
+    };
+    map(&mut physical(), base, len, slice)
+}
+
+/// Gives back what [`back_with_pool`] mapped, before the range is released.
+#[cfg(not(windows))]
+pub(super) fn release_pool_backing(base: usize, len: usize) {
+    unmap(&mut physical(), base, len);
+}
+
 /// Consecutive slices of one pool, committed and writable: through the
 /// pool's own mapping of all of it, or a view of their own if the host would
 /// not map all of it.

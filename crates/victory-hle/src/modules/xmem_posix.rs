@@ -49,6 +49,7 @@ pub(super) fn release_reservation(base: usize) {
     };
     #[cfg(target_arch = "x86_64")]
     crate::host_posix::forget_region(base);
+    super::xmem_physical::release_pool_backing(base, len);
     // SAFETY: a reservation we made and no longer track.
     if let Err(error) = unsafe { mem::release(base as *mut u8, len) } {
         tracing::warn!(base, len, %error, "releasing an xmem reservation failed");
@@ -121,8 +122,14 @@ pub extern "system" fn XMemVirtualAlloc(
         };
         reserved.and_then(|p| {
             if commit {
+                // Pool-backed where it can be, so the GPU reaches it.
                 // SAFETY: the reservation just made.
-                if let Err(e) = unsafe { mem::commit(p, len, prot) } {
+                if super::xmem_physical::back_with_pool(p as usize, len) {
+                    if prot != Protect::READ_WRITE {
+                        // SAFETY: as above.
+                        unsafe { mem::protect(p, len, prot) }?;
+                    }
+                } else if let Err(e) = unsafe { mem::commit(p, len, prot) } {
                     // SAFETY: as above.
                     unsafe { mem::release(p, len) }?;
                     return Err(e);
