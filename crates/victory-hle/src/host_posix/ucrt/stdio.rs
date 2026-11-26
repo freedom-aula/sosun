@@ -984,6 +984,10 @@ pub extern "system" fn _read(fd: i32, buf: *mut u8, count: u32) -> i32 {
         return err(EBADF);
     };
     let mut s = lock(&s);
+    if !s.readable {
+        // Not open for reading: -1, not the 0 of an end of file.
+        return err(EBADF);
+    }
     let mut n = 0;
     while n < count as usize {
         match s.get() {
@@ -1718,6 +1722,33 @@ mod tests {
         assert_eq!(_fileno(f), -1);
         assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn reading_a_write_only_descriptor_fails_with_ebadf() {
+        // Microsoft documents `_read` on a descriptor not open for reading as -1 with EBADF;
+        // 0 would tell the title it is at the end of the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let fd = _open(
+            cstr(path.to_str().unwrap()).as_ptr(),
+            O_WRONLY | O_BINARY,
+            0,
+        );
+        assert!(fd >= 3);
+        let mut b = [0xEEu8; 4];
+        set_errno(0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(b, [0xEE; 4]);
+        // An empty read of a readable descriptor is still 0.
+        assert_eq!(_close(fd), 0);
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 0), 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 3);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 0);
+        assert_eq!(_close(fd), 0);
     }
 
     #[test]
