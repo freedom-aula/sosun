@@ -383,11 +383,9 @@ unsafe impl Send for Hub {}
 // SAFETY: as above.
 unsafe impl Sync for Hub {}
 
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
 /// Microseconds, the clock of every timestamp we hand out.
-fn now() -> u64 {
-    START.elapsed().as_micros() as u64
+pub(crate) fn now() -> u64 {
+    victory_gpu::clock::ticks(1_000_000)
 }
 
 impl Hub {
