@@ -117,6 +117,7 @@ impl<'a> Scene<'a> {
             topology: Topology::Triangles,
             state: DrawState::default(),
             root: self.root(z),
+            fragment_root: None,
             heaps: Heaps {
                 resource: Some(&self.res),
                 sampler: Some(&self.smp),
