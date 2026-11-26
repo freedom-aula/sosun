@@ -485,19 +485,115 @@ pub(crate) extern "system" fn create_compute(
 /// not known yet (`(desc, iid, out)`, the pipeline state's IID; title+0x2477578 and +0x24800d5).
 /// shortcut: the description is not read; the pipeline has no shaders, so draws with it are
 /// dropped.
-pub(crate) extern "system" fn create_unread(
+pub(crate) extern "system" fn create_unread_1c8(
     _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    create_unread_at(0x1c8, desc, iid, out)
+}
+
+/// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
+/// 0x60-byte record, the pieces an `FSPX` part is made of (observed at run time, as the console
+/// runtime takes them): pointer and size of the pipeline registers (kind 0, 0x1c bytes), of the
+/// hash (kind 1, 0x14), of the GFX10 code (kind 6) and of the metadata (kind 7); more fields
+/// follow that are not read.
+pub(crate) extern "system" fn create_compute_pieces(
+    _: This,
+    desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if desc.is_null() {
+        return E_INVALIDARG;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the title passes a description of this layout.
+        if let Some(container) = unsafe { compute_container(desc.add(8)) } {
+            return hand_out(
+                vec![shader("compute", &container)],
+                #[cfg(windows)]
+                None,
+                None,
+                iid,
+                out,
+            );
+        }
+    }
+    create_unread_at(0x218, desc, iid, out)
+}
+
+/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]).
+///
+/// # Safety
+/// `record` points at four (pointer, size) pairs.
+#[cfg(target_os = "macos")]
+unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
+    const KINDS: [u32; 4] = [0, 1, 6, 7];
+    let mut part = vec![0u8; 0x10 + 16 * KINDS.len()];
+    for (i, kind) in KINDS.into_iter().enumerate() {
+        // SAFETY: as the caller says.
+        let (ptr, size) = unsafe {
+            (
+                record.add(16 * i).cast::<usize>().read_unaligned(),
+                record.add(16 * i + 8).cast::<usize>().read_unaligned(),
+            )
+        };
+        if ptr == 0 || size == 0 || size > 1 << 22 {
+            return None;
+        }
+        let at = part.len().next_multiple_of(16);
+        part.resize(at, 0);
+        let entry: Vec<u8> = [kind, at as u32, size as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        part[0x10 + 16 * i..0x20 + 16 * i].copy_from_slice(&entry);
+        // SAFETY: the title's piece of `size` bytes.
+        part.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) });
+    }
+    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, KINDS.len() as u32, part.len() as u32]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    part[..16].copy_from_slice(&header);
+    Some(victory_shader::dxbc::build(&[(victory_shader::FourCC::ACCC, &part)]))
+}
+
+/// Debugging (`VICTORY_DUMP_DESC=1`): the first descriptions of each slot, with the bytes behind
+/// every (pointer, length) pair in them, to stderr.
+fn dump_description(slot: usize, desc: *const u8) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    let n = COUNTS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed);
+    if n >= 50 {
+        return;
+    }
+    // SAFETY: a debugging read of the title's description and of what it points at.
+    unsafe {
+        let words: Vec<u64> = (0..128).map(|i| desc.cast::<u64>().add(i).read_unaligned()).collect();
+        eprintln!("DESC {slot:#x} #{n}");
+        for (i, w) in words.chunks(4).enumerate() {
+            eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
+        }
+        for i in 0..127 {
+            let (p, len) = (words[i], words[i + 1]);
+            if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
+                let bytes = std::slice::from_raw_parts(p as *const u8, (len as usize).min(48));
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("  BLOB +{:#x} ptr={p:#x} len={len:#x} {hex}", i * 8);
+            }
+        }
+    }
+}
+
+fn create_unread_at(
+    slot: usize,
     _desc: *const u8,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     if std::env::var_os("VICTORY_DUMP_DESC").is_some() && !_desc.is_null() {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
-            // SAFETY: a debugging read of the title's description.
-            let words: Vec<u64> = (0..32).map(|i| unsafe { _desc.cast::<u64>().add(i).read_unaligned() }).collect();
-            tracing::warn!("pipeline description {words:x?}");
-        }
+        dump_description(slot, _desc);
     }
     hand_out(
         Vec::new(),
