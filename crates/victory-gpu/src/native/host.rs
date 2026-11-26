@@ -88,6 +88,13 @@ fn heaps<B: GraphicsBackend>(h: &HeapPair<B>) -> Heaps<'_, B> {
     }
 }
 
+/// The title's record in descriptor slot `handle` (tag, view index, generation).
+fn record_at(handle: u64) -> [u8; 12] {
+    let mut r = [0u8; 12];
+    super::safe_read(handle as *const u8, &mut r);
+    r
+}
+
 impl<B: GraphicsBackend> NativeHost<B> {
     pub fn new(backend: B) -> Self {
         Self::with_memory(backend, Arc::new(PoolTable::default()))
@@ -199,6 +206,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count,
             pairs: Default::default(),
             table: Default::default(),
+            mirrored: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -288,7 +296,37 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
             }
         }
+        heap.mirrored.borrow_mut().insert(index, record_at(handle));
         Ok(true)
+    }
+
+    /// Entries of each bound table checked at submission (shortcut: a shader that reads a table
+    /// past this many entries can still find a stale entry there; take the count from the
+    /// shader's metadata if one does).
+    const TABLE_CHECK: usize = 16;
+
+    /// Mirrors again the first entries of each table `root` binds whose title record changed since
+    /// they were last mirrored. The title copies records into its shader-visible heaps with plain
+    /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
+    /// so their host entries stayed empty and the shaders read zeros.
+    fn remirror_tables(&self, root: &[Option<Root<B>>]) {
+        for r in root {
+            let Some(Root::Table(h, at)) = r else { continue };
+            for index in *at..(*at + Self::TABLE_CHECK).min(h.count) {
+                let handle = h.start + index as u64 * Self::step(h.kind);
+                let record = record_at(handle);
+                if h.mirrored.borrow().get(&index) == Some(&record) {
+                    continue;
+                }
+                // shortcut: views of resources the host has not realized yet are not made here
+                // (`glue::mirror` does that for device writes); such an entry stays as it was.
+                if let Err(e) = self.mirror(handle) {
+                    tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
+                }
+                // Tried once per record, whatever the result.
+                h.mirrored.borrow_mut().insert(index, record);
+            }
+        }
     }
 
     /// The arguments of a translated title shader: its user-data block, then its root views.
@@ -483,6 +521,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count: 0,
             pairs: Default::default(),
             table: Default::default(),
+            mirrored: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -705,6 +744,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
+                self.remirror_tables(root);
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
@@ -728,6 +768,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
+                self.remirror_tables(root);
                 self.trace_content(root, vertex, call, binding.as_deref());
                 match binding {
                     Some(b) => {

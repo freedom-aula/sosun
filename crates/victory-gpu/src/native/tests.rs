@@ -193,6 +193,49 @@ fn descriptor_table_buffers_decode_into_metal_heap() {
     drop(slots);
 }
 
+/// A title copies view records between heap slots with plain stores (no device call): the
+/// submission mirrors a bound table's entries whose record changed.
+#[test]
+fn table_records_copied_by_the_title_are_mirrored_at_submission() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..64u32).collect::<Vec<_>>());
+    let mut slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1); // raw buffer view of 64 elements
+        d[10] = pool.va(at) as u32;
+        d[11] = (pool.va(at) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    // Made in slots 4 and 5 (mirrored there), then copied by the title to 0 and 1.
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start + 4 * 32);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 5 * 32);
+    assert!(h.mirror(start + 4 * 32).unwrap() && h.mirror(start + 5 * 32).unwrap());
+    slots.copy_within(4 * 8..6 * 8, 0);
+
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[3, 1]);
+    l.set_compute_root_table(1, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    let q = h.backend.create_queue().unwrap();
+    let done = h.backend.create_fence(0).unwrap();
+    h.execute(&q, &[&l], &[], &[(&done, 1)]).unwrap();
+    assert!(h.backend.wait(&done, 1, 10_000));
+    assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    drop(slots);
+}
+
 type Vertex = [f32; 8];
 
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
