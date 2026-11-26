@@ -1,7 +1,7 @@
 //! Descriptor heaps, textures, samplers and render passes: the second slice of the seam (`backend`
 //! has queues, fences and compute). Platform neutral, no Metal types.
 
-use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs};
+use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs, RootLayout};
 
 /// Which descriptor heap type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,8 +204,61 @@ pub enum VertexFormat {
     Float3,
     Float4,
     Uint,
-    Unorm8x4,
+    Uint2,
+    Uint3,
+    Uint4,
+    Sint,
+    Sint2,
+    Sint3,
+    Sint4,
+    Half,
+    Half2,
+    Half4,
+    Unorm16,
+    Unorm16x2,
+    Unorm16x4,
+    Snorm16,
+    Snorm16x2,
+    Snorm16x4,
+    Uint16,
+    Uint16x2,
+    Uint16x4,
+    Sint16,
+    Sint16x2,
+    Sint16x4,
     Unorm8,
+    Unorm8x2,
+    Unorm8x4,
+    Snorm8,
+    Snorm8x2,
+    Snorm8x4,
+    Uint8,
+    Uint8x2,
+    Uint8x4,
+    Sint8,
+    Sint8x2,
+    Sint8x4,
+    Unorm1010102,
+    Snorm1010102,
+    FloatRG11B10,
+}
+
+impl VertexFormat {
+    /// Size of one element in bytes.
+    pub fn byte_size(self) -> usize {
+        use VertexFormat::*;
+        match self {
+            Unorm8 | Snorm8 | Uint8 | Sint8 => 1,
+            Half | Unorm16 | Snorm16 | Uint16 | Sint16 | Unorm8x2 | Snorm8x2 | Uint8x2
+            | Sint8x2 => 2,
+            Float | Uint | Sint | Half2 | Unorm16x2 | Snorm16x2 | Uint16x2 | Sint16x2
+            | Unorm8x4 | Snorm8x4 | Uint8x4 | Sint8x4 | Unorm1010102 | Snorm1010102
+            | FloatRG11B10 => 4,
+            Float2 | Uint2 | Sint2 | Half4 | Unorm16x4 | Snorm16x4 | Uint16x4 | Sint16x4 => 8,
+            Float3 | Uint3 | Sint3 => 12,
+            Float4 | Uint4 | Sint4 => 16,
+        }
+    }
 }
 
 /// One input element (`D3D12_INPUT_ELEMENT_DESC`), in the order of the vertex shader's input signature.
@@ -355,6 +408,9 @@ pub enum Topology {
 pub struct RenderPipelineDesc<'a> {
     pub vs: &'a [u8],
     pub ps: Option<&'a [u8]>,
+    /// Explicit root layouts when the converter needs the host's argument contract.
+    pub vs_layout: Option<&'a RootLayout>,
+    pub ps_layout: Option<&'a RootLayout>,
     pub attributes: &'a [VertexAttr],
     pub streams: &'a [VertexStream],
     pub color: &'a [Format],

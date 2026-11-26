@@ -7,10 +7,10 @@
 //!
 //! Title memory at addresses the shader computes is found through the page table of
 //! `victory_shader`'s "Title memory", which `super::addr` fills with views of the pools
-//! themselves (the pool-offset contract; compute shaders so far). What a translated shader needs
+//! themselves (the pool-offset contract). What a translated shader needs
 //! from the host that this one does not give yet, and is refused for: buffer views read from the
-//! heap by index, the write marks and view addresses of the shadow-copy design, and, in a graphics
-//! pipeline, the page table. See docs/metal-backend.md.
+//! heap by index, the write marks and view addresses of the shadow-copy design, and the page
+//! table for graphics pipelines outside the guessed path. See docs/metal-backend.md.
 
 use super::list::{Binding, ComputePso};
 use super::state::{self, Graphics};
@@ -39,8 +39,15 @@ pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
 }
 
+/// A guessed vertex shader's container translated for rectangle lists or not, writing the
+/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
+        .map_err(|e| e.to_string())
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute shaders).
+/// give the page table (compute and guessed graphics shaders).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory_writes {
         return Some("marks the pages it writes (translated without zero_copy_memory)");
@@ -58,9 +65,9 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
 }
 
 /// Why a vertex shader and pixel shader cannot be a pipeline of the host, if they cannot.
-fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
+fn refusal(vs: &HostShader, ps: Option<&HostShader>, memory: bool) -> Option<&'static str> {
     for s in [Some(vs), ps].into_iter().flatten() {
-        if let Some(why) = unsupported(s, false) {
+        if let Some(why) = unsupported(s, memory) {
             return Some(why);
         }
     }
@@ -181,7 +188,7 @@ impl<B: PresentBackend> Title<B> {
         graphics: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        if let Some(why) = refusal(vs, ps) {
+        if let Some(why) = refusal(vs, ps, graphics.is_guessed()) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -233,9 +240,17 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let color_state = g.color_state();
+        let vs_binding = Binding::of(vs);
+        let ps_binding = ps
+            .map(Binding::of)
+            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+        let vs_layout = vs_binding.memory.then_some(&vs_binding).and_then(Binding::layout);
+        let ps_layout = ps_binding.as_ref().filter(|b| b.memory).and_then(Binding::layout);
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),
+            vs_layout: vs_layout.as_ref(),
+            ps_layout: ps_layout.as_ref(),
             attributes: &attributes,
             streams: &streams,
             color: &color,
@@ -250,8 +265,8 @@ impl<B: PresentBackend> Title<B> {
             Ok(p) => {
                 self.shaders.pipelines += 1;
                 Pipe::Render(p, Some(Rc::new(Binding {
-                    ps: ps.map(Binding::of).filter(|b| b.dwords > 0 || !b.views.is_empty()).map(Rc::new),
-                    ..Binding::of(vs)
+                    ps: ps_binding.map(Rc::new),
+                    ..vs_binding
                 })))
             }
             Err(e) => {

@@ -21,6 +21,7 @@
 //! Both directions switch GS to an explicit base rather than toggling, so
 //! they nest freely: title, host, title again, and so on.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,7 +231,7 @@ core::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
-    // victory_call_win64(f: rdi, args: rsi, nargs: rdx, teb: rcx) -> rax
+    // victory_call_win64(f: rdi, args: rsi, nargs: rdx, teb: rcx, exit_frame: r8) -> rax
     ".p2align 4",
     ".globl _victory_call_win64",
     "_victory_call_win64:",
@@ -242,6 +243,10 @@ core::arch::global_asm!(
     "push r14",
     "push r15",
     "sub rsp, 8",
+    "test r8, r8",
+    "jz 5f",
+    "mov [r8], rbp",
+    "5:",
     "mov r12, rdi",
     "mov r13, rsi",
     "mov r14, rdx",
@@ -277,6 +282,14 @@ core::arch::global_asm!(
     "mov eax, {set_gs}",
     "syscall",
     "mov rax, r12",
+    "jmp 6f",
+    // Return directly from the thread's outer bridge call. GS is already
+    // the host's because _endthreadex entered through a host stub.
+    ".globl _victory_exit_title_thread",
+    "_victory_exit_title_thread:",
+    "mov rbp, rdi",
+    "mov eax, esi",
+    "6:",
     "lea rsp, [rbp - 40]",
     "pop r15",
     "pop r14",
@@ -431,7 +444,14 @@ fn trace_level() -> u8 {
 unsafe extern "C" {
     fn victory_bridge_to_host();
     fn victory_bridge_win64();
-    fn victory_call_win64(f: usize, args: *const u64, nargs: usize, teb: *mut u8) -> u64;
+    fn victory_call_win64(
+        f: usize,
+        args: *const u64,
+        nargs: usize,
+        teb: *mut u8,
+        exit_frame: *mut usize,
+    ) -> u64;
+    fn victory_exit_title_thread(frame: usize, code: u32) -> !;
 }
 
 /// Most arguments [`call_win64`] and the System V bridge pass.
@@ -451,7 +471,58 @@ pub unsafe fn call_win64(f: usize, args: &[u64]) -> u64 {
     let mut padded = [0u64; MAX_ARGS];
     padded[..args.len()].copy_from_slice(args);
     // SAFETY: forwarded from the caller; `padded` holds at least 4 words.
-    unsafe { victory_call_win64(f, padded.as_ptr(), args.len(), teb::current()) }
+    unsafe {
+        victory_call_win64(
+            f,
+            padded.as_ptr(),
+            args.len(),
+            teb::current(),
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+thread_local! {
+    static THREAD_EXIT_FRAME: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Calls a thread entry point, which can return or exit through
+/// [`exit_title_thread`]. Nested `call_win64` calls leave this frame in place.
+///
+/// # Safety
+/// As for [`call_win64`], with one argument and no active thread entry frame.
+pub(super) unsafe fn call_thread_entry(f: usize, param: usize) -> u32 {
+    THREAD_EXIT_FRAME.with(|frame| {
+        debug_assert_eq!(frame.get(), 0);
+        let args = [param as u64, 0, 0, 0];
+        // SAFETY: forwarded from the caller; assembly records the frame for this call.
+        let code =
+            unsafe { victory_call_win64(f, args.as_ptr(), 1, teb::current(), frame.as_ptr()) };
+        frame.set(0);
+        code as u32
+    })
+}
+
+/// Returns from the active thread entry point with `code`, leaving the
+/// loader to run its thread-detach notifications and finish the thread.
+///
+/// # Safety
+/// Must be called from a guest thread entry via a host stub with host GS.
+/// This abandons the intervening guest and host callback frames.
+pub unsafe fn exit_title_thread(code: u32) -> ! {
+    let frame = THREAD_EXIT_FRAME.get();
+    if frame == 0 {
+        tracing::error!("thread exit outside a title thread entry point");
+        std::process::abort();
+    }
+    // SAFETY: this thread owns the TEB and the live bridge frame.
+    unsafe {
+        teb::current()
+            .add(teb::OFF_IN_HOST)
+            .cast::<usize>()
+            .write(0);
+        victory_exit_title_thread(frame, code);
+    }
 }
 
 /// Host functions written `extern "win64"` (arguments in the Windows ABI,

@@ -2,9 +2,6 @@
 //! and exit code call. Initializer tables and `atexit` handlers are title
 //! functions (called through the bridge); `argv` and the environment come
 //! from the host process unless the run path sets them ([`set_command_line`]).
-//!
-//! `_endthread(ex)` is not served: ending a title thread from inside its
-//! own frames needs an exit primitive in the loader's thread spawn.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -390,6 +387,11 @@ pub extern "system" fn _beginthreadex(
         set_errno(super::EACCES);
     }
     h as usize
+}
+
+pub extern "system" fn _endthreadex(code: u32) -> ! {
+    // SAFETY: called through the host stub from a title thread entry point.
+    unsafe { victory_loader::native::exit_title_thread(code) }
 }
 
 /// `_beginthread` returns `(uintptr_t)-1` on failure.
@@ -825,7 +827,7 @@ exports!(pub(super) fn lookup;
     _crt_at_quick_exit, _onexit, _register_thread_local_exe_atexit_callback, _set_app_type,
     _cexit, _c_exit, exit, _exit, quick_exit, abort, terminate, _set_abort_behavior,
     _set_error_mode, _set_purecall_handler, _set_printf_count_output, _get_printf_count_output,
-    _seh_filter_exe, _seh_filter_dll, _getpid, _wassert, signal, raise, _beginthreadex,
+    _seh_filter_exe, _seh_filter_dll, _getpid, _wassert, signal, raise, _beginthreadex, _endthreadex,
     _beginthread, __p___argc, __p___argv, __p___wargv, __p__acmdln, __p__wcmdln, __p__pgmptr,
     __p__wpgmptr, _get_pgmptr, _get_wpgmptr, _configure_narrow_argv, _configure_wide_argv,
     _get_narrow_winmain_command_line, _get_wide_winmain_command_line, __p__fmode, __p__commode,
@@ -845,6 +847,43 @@ extern "system" fn _onexit_atexit(f: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endthreadex_exits_the_guest_thread_with_its_code() {
+        use crate::host_posix::{
+            CloseHandle, GetExitCodeThread, WAIT_OBJECT_0, WaitForSingleObject, ucrt,
+        };
+
+        #[unsafe(naked)]
+        extern "win64" fn start(_end: usize) -> u32 {
+            core::arch::naked_asm!(
+                "sub rsp, 40",
+                "mov rax, rcx",
+                "mov ecx, 0xFEDCBA98",
+                "call rax",
+                "xor eax, eax",
+                "add rsp, 40",
+                "ret",
+            );
+        }
+
+        let export = ucrt::lookup("api-ms-win-crt-runtime-l1-1-0.dll", "_endthreadex").unwrap();
+        let stub = victory_loader::native::host_callbacks(&[(export, false)]).unwrap()[0];
+        let handle = _beginthreadex(
+            std::ptr::null(),
+            0,
+            start as *const () as usize,
+            stub as *mut c_void,
+            0,
+            std::ptr::null_mut(),
+        ) as *mut c_void;
+        assert!(!handle.is_null());
+        assert_eq!(WaitForSingleObject(handle, 5000), WAIT_OBJECT_0);
+        let mut code = 0;
+        assert_eq!(GetExitCodeThread(handle, &mut code), 1);
+        assert_eq!(code, 0xFEDC_BA98);
+        assert_eq!(CloseHandle(handle), 1);
+    }
 
     #[test]
     fn the_invalid_parameter_handler_is_swapped_and_errno_set() {

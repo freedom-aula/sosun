@@ -62,6 +62,12 @@ pub enum Source {
         bits: u32,
         words: [u32; 2],
     },
+    /// A guessed pixel shader's buffer descriptor over a computed title address.
+    BuiltMemory {
+        control: u32,
+        /// Whether dword 1 may enable swizzling.
+        swizzled: bool,
+    },
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
@@ -163,7 +169,18 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    track_graphics(p, layout, stage, lanes, false)
+}
+
+pub(crate) fn track_graphics(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    computed_buffers: bool,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, layout, stage, lanes)?;
+    t.computed_buffers = computed_buffers && stage == HwStage::Ps;
     let mut out = Resources {
         params: p
             .inputs
@@ -320,6 +337,7 @@ struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
     stage: HwStage,
+    computed_buffers: bool,
     /// Defining instruction per value (phis and inputs have none).
     defs: Vec<Option<Site>>,
     /// Block and index of each phi value.
@@ -427,6 +445,7 @@ impl<'a> Tracer<'a> {
             p,
             layout,
             stage,
+            computed_buffers: false,
             defs,
             phis,
             inputs,
@@ -667,11 +686,21 @@ impl<'a> Tracer<'a> {
         };
         if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
             return match self.param_value(v) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
+                Some((p, 0))
+                    if matches!(
+                        self.layout[p].root,
+                        RootType::Table
+                            | RootType::Descriptor
+                            | RootType::ResourceHeap
+                            | RootType::SamplerHeap
+                    ) =>
+                {
+                    Sum {
+                        base: Some(v),
+                        offset: 0,
+                        dynamic: None,
+                    }
+                }
                 _ => dynamic,
             };
         }
@@ -681,6 +710,37 @@ impl<'a> Tracer<'a> {
                 offset: 0,
                 dynamic: None,
             };
+        }
+        if let Some((_, [_, unshifted])) = self.sop2(
+            v,
+            &[
+                "s_lshl1_add_u32",
+                "s_lshl2_add_u32",
+                "s_lshl3_add_u32",
+                "s_lshl4_add_u32",
+            ],
+        ) {
+            let y = self.sum(unshifted);
+            // Only for heap/table bases, where lowering reads the SMEM/flat base register
+            // directly rather than adding `Address::dynamic` on top of the root address.
+            if y.dynamic.is_none()
+                && y.base
+                    .and_then(|b| self.param_value(b))
+                    .is_some_and(|(p, d)| {
+                        d == 0
+                            && matches!(
+                                self.layout[p].root,
+                                RootType::ResourceHeap | RootType::SamplerHeap | RootType::Table
+                            )
+                    })
+            {
+                return Sum {
+                    base: y.base,
+                    offset: y.offset,
+                    dynamic: Some(v),
+                };
+            }
+            return dynamic;
         }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
@@ -1123,7 +1183,10 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
-        if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
+        if let [lo, hi, w2, Term::Const(w3)] = *words
+            && (self.computed_buffers || matches!(w2, Term::Const(_)))
+        {
+            let descriptor_hi = hi;
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
                 && let Some((x, more)) = self.set_bits(v)
@@ -1139,11 +1202,15 @@ impl<'a> Tracer<'a> {
                     dynamic: None,
                 },
             )?;
-            return Ok(Source::Built {
-                address,
-                bits,
-                words: [w2, w3],
-            });
+            if self.computed_buffers && address.param == MEMORY {
+                return Ok(Source::BuiltMemory {
+                    control: w3,
+                    swizzled: self.possible_bits(descriptor_hi, 8) >> 30 != 0,
+                });
+            }
+            if let Term::Const(w2) = w2 {
+                return Ok(Source::Built { address, bits, words: [w2, w3] });
+            }
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -1154,6 +1221,39 @@ impl<'a> Tracer<'a> {
         } else {
             "a descriptor neither loaded nor built"
         })
+    }
+
+    /// Bits that may be set in a built buffer descriptor's high dword.
+    // shortcut: prove bounds through short scalar ALU chains, extend the analysis if
+    // a buffer descriptor's swizzle bits are cleared through other instructions.
+    fn possible_bits(&self, term: Term, depth: u8) -> u32 {
+        let v = match term {
+            Term::Const(bits) => return bits,
+            Term::Value(v) => v,
+        };
+        if depth == 0 {
+            return u32::MAX;
+        }
+        let Some((inst, [a, b])) = self.sop2(
+            v,
+            &["s_and_b32", "s_or_b32", "s_lshl_b32", "s_add_u32", "s_addc_u32"],
+        ) else {
+            return u32::MAX;
+        };
+        let bits = |t| self.possible_bits(t, depth - 1);
+        match inst.name() {
+            "s_and_b32" => bits(a) & bits(b),
+            "s_or_b32" => bits(a) | bits(b),
+            "s_lshl_b32" => match b {
+                Term::Const(shift) => bits(a) << (shift & 31),
+                _ => u32::MAX,
+            },
+            // A carry can set every bit below the most significant possible bit.
+            _ => {
+                let max = bits(a).saturating_add(bits(b)).saturating_add(u32::from(inst.name() == "s_addc_u32"));
+                u32::MAX.checked_shr(max.leading_zeros()).unwrap_or(0)
+            }
+        }
     }
 
     /// Words that phis of one block join, traced per predecessor (words
@@ -2053,7 +2153,344 @@ enum Moved {
     Value(Value),
 }
 
+/// Undeclared root parameters inferred from descriptor loads in a guessed graphics program
+/// ([`crate::emit::graphics`]).
+pub(crate) struct InferredRoots {
+    /// Entry SGPRs used as 32-bit descriptor heap bases (`hi == 0`), as `ResourceHeap` or
+    /// `SamplerHeap`.
+    pub heaps: Vec<(u8, RootType)>,
+    /// For a vertex shader: an even entry SGPR pair used as a 64-bit vertex buffer descriptor
+    /// table (`s_load_dwordx4` feeding only indexed `buffer_load`/`tbuffer_load`).
+    pub vertex_table: Option<u8>,
+}
+
+/// Infers undeclared SM 6.6 heap base SGPRs (`ResourceHeap` / `SamplerHeap`, 32-bit with `hi == 0`)
+/// and (for vertex shaders) an undeclared 64-bit vertex buffer table SGPR pair from `p`'s
+/// descriptor loads. Only called by [`crate::emit::graphics`] for guessed pipelines; genuinely
+/// unknown SGPR addresses (non-descriptor loads or 64-bit pointers) are left uninferred.
+pub(crate) fn infer_roots(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+) -> Result<InferredRoots, ShaderError> {
+    let t = Tracer::new(p, layout, stage, None)?;
+    // Per descriptor load site: (used_as_resource, used_as_sampler, only_indexed_buffer).
+    let mut loads: std::collections::BTreeMap<Site, (bool, bool, bool)> =
+        std::collections::BTreeMap::new();
+    let mut record = |inst: &Inst, op: &Operand, role: Role, indexed_buf: bool| {
+        let Operand::Scalar { code, dwords } = *op else {
+            return;
+        };
+        let words: Vec<Term> = (0..dwords)
+            .filter_map(|k| inst.read(Reg::S(code + k)).map(|v| t.origin(v)))
+            .collect();
+        let mut sites = Vec::new();
+        t.collect_descriptor_loads(&words, &mut Vec::new(), &mut sites);
+        for site in sites {
+            let entry = loads.entry(site).or_insert((false, false, true));
+            match role {
+                Role::Resource => entry.0 = true,
+                Role::Sampler => entry.1 = true,
+            }
+            entry.2 &= indexed_buf;
+        }
+    };
+    for block in &p.blocks {
+        for inst in &block.insts {
+            match &inst.fields {
+                Fields::Image { rsrc, sampler, .. } if !inst.name().starts_with("image_bvh") => {
+                    record(inst, rsrc, Role::Resource, false);
+                    if let Some(s) = sampler {
+                        record(inst, s, Role::Sampler, false);
+                    }
+                }
+                Fields::Buffer { rsrc, idxen, .. } if !inst.name().ends_with("_inv") => {
+                    record(inst, rsrc, Role::Resource, *idxen);
+                }
+                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
+                    record(inst, base, Role::Resource, false);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Per undeclared entry SGPR: (seen_as_resource_heap, seen_as_sampler_heap).
+    let mut heap_roles: std::collections::BTreeMap<u8, (bool, bool)> =
+        std::collections::BTreeMap::new();
+    let mut vt_candidates: Vec<u8> = Vec::new();
+    for (site, (res, smp, only_idx_buf)) in loads {
+        let inst = t.inst(site);
+        match &inst.fields {
+            Fields::Smem {
+                base: Operand::Scalar { code, .. },
+                offset,
+                soffset,
+                ..
+            } if inst.name().starts_with("s_load_dword") => {
+                let (Some(lo), Some(hi)) = (
+                    inst.read(Reg::S(*code)).map(|v| t.origin(v)),
+                    inst.read(Reg::S(code + 1)).map(|v| t.origin(v)),
+                ) else {
+                    continue;
+                };
+                if t.high_half(hi, None) {
+                    if let Some(n) = t.undeclared_entry_sgpr(lo) {
+                        let e = heap_roles.entry(n).or_default();
+                        e.0 |= res;
+                        e.1 |= smp;
+                    }
+                } else if stage == HwStage::Vs
+                    && inst.name() == "s_load_dwordx4"
+                    && res
+                    && !smp
+                    && only_idx_buf
+                    && *offset >= 0
+                    && *offset % 16 == 0
+                    && matches!(t.term(inst, soffset), Some(Term::Const(0)))
+                    && let (Some(n), Term::Value(hv)) = (t.undeclared_entry_sgpr(lo), hi)
+                    && n % 2 == 0
+                    && n < 105
+                    && t.inputs[hv.0 as usize] == Some(Reg::S(n + 1))
+                    && t.param_of(Reg::S(n + 1)).is_none()
+                    && !vt_candidates.contains(&n)
+                {
+                    vt_candidates.push(n);
+                }
+            }
+            Fields::Flat {
+                addr: Some(Operand::Vector { reg, .. }),
+                saddr,
+                ..
+            } if inst.name().starts_with("global_load_dword") => {
+                let pair = match saddr {
+                    Some(Operand::Scalar { code, .. }) if *code != NULL => inst
+                        .read(Reg::S(*code))
+                        .map(|v| t.origin(v))
+                        .zip(inst.read(Reg::S(code + 1)).map(|v| t.origin(v))),
+                    _ => inst
+                        .read(Reg::V(*reg))
+                        .map(|v| t.vorigin(v))
+                        .zip(inst.read(Reg::V(reg + 1)).map(|v| t.vorigin(v))),
+                };
+                if let Some((lo, hi)) = pair
+                    && t.high_half(hi, None)
+                    && let Some(n) = t.undeclared_entry_sgpr(lo)
+                {
+                    let e = heap_roles.entry(n).or_default();
+                    e.0 |= res;
+                    e.1 |= smp;
+                }
+            }
+            _ => {}
+        }
+    }
+    let heaps: Vec<(u8, RootType)> = heap_roles
+        .into_iter()
+        .filter_map(|(n, (res, smp))| match (res, smp) {
+            (true, false) => Some((n, RootType::ResourceHeap)),
+            (false, true) => Some((n, RootType::SamplerHeap)),
+            _ => None,
+        })
+        .collect();
+    let vertex_table = match vt_candidates.as_slice() {
+        &[n] if !heaps.iter().any(|&(h, _)| h == n || h == n + 1) => Some(n),
+        _ => None,
+    };
+    Ok(InferredRoots {
+        heaps,
+        vertex_table,
+    })
+}
+
+/// Whether shifting a guessed vertex layout explains an otherwise unbound address. The alternate
+/// layout must agree with existing root-address uses and cannot move a live-in away from an
+/// existing root unless the code identifies that pair as the vertex fetch table.
+pub(crate) fn vertex_roots_match_rebased(
+    p: &Program,
+    absolute: &[RootParam],
+    relative: &[RootParam],
+) -> Result<bool, ShaderError> {
+    let old = Tracer::new(p, absolute, HwStage::Vs, None)?;
+    let new = Tracer::new(p, relative, HwStage::Vs, None)?;
+    if p.inputs.iter().any(|&(reg, _)| old.param_of(reg).is_some()) {
+        let vt = infer_roots(p, relative, HwStage::Vs)?.vertex_table;
+        if p.inputs.iter().any(|&(reg, _)| {
+            old.param_of(reg) != new.param_of(reg)
+                && old.param_of(reg).is_some()
+                && !vt.is_some_and(|n| reg == Reg::S(n) || reg == Reg::S(n + 1))
+        }) {
+            return Ok(false);
+        }
+    }
+    let mut found = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            let address = |t: &Tracer<'_>| match &inst.fields {
+                Fields::Smem { base, offset, soffset, .. } if inst.name().starts_with("s_load_") => {
+                    t.smem_address(inst, base, *offset, soffset).map(Some)
+                }
+                Fields::Flat { addr, saddr, offset, .. } if inst.name().starts_with("global_") => {
+                    t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset).map(Some)
+                }
+                Fields::Smem { base: rsrc, .. } | Fields::Buffer { rsrc, .. }
+                    if inst.name().starts_with("s_buffer_")
+                        || inst.name().starts_with("buffer_load_")
+                        || inst.name().starts_with("tbuffer_load_") =>
+                {
+                    t.descriptor(inst, rsrc, b).map(|src| match src {
+                        Source::Built { address, .. } => Some(address),
+                        _ => None,
+                    })
+                }
+                _ => Ok(None),
+            };
+            match (address(&old), address(&new)) {
+                (Ok(Some(a)), after) if a.param < absolute.len() && after != Ok(Some(a)) => {
+                    return Ok(false);
+                }
+                (Err("an address in an SGPR that is no root parameter"), Ok(Some(a)))
+                    if relative.get(a.param).is_some_and(|r|
+                        matches!(r.root, RootType::Table | RootType::Descriptor)) =>
+                {
+                    found = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(found)
+}
+
 impl Tracer<'_> {
+    /// Collects `s_load_dword*` and `global_load_dword*` sites feeding descriptor `words`.
+    fn collect_descriptor_loads(
+        &self,
+        words: &[Term],
+        seen: &mut Vec<Value>,
+        out: &mut Vec<Site>,
+    ) {
+        for &w in words {
+            let Term::Value(v) = w else { continue };
+            if seen.contains(&v) || seen.len() >= 256 {
+                continue;
+            }
+            seen.push(v);
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                let args: Vec<Term> = self.p.blocks[b].phis[i]
+                    .args
+                    .iter()
+                    .map(|&a| self.origin(a))
+                    .collect();
+                self.collect_descriptor_loads(&args, seen, out);
+            } else if let Some((_, a, b)) = self.picked(v) {
+                self.collect_descriptor_loads(&[a, b], seen, out);
+            } else if let Some(lane_v) = self.first_lane_source(v) {
+                let lt = self.lane_term(Term::Value(lane_v));
+                self.collect_lane_descriptor_loads(lt, seen, out);
+            } else if let Some(site) = self.defs[v.0 as usize] {
+                let name = self.inst(site).name();
+                if (name.starts_with("s_load_dword") || name.starts_with("global_load_dword"))
+                    && !out.contains(&site)
+                {
+                    out.push(site);
+                }
+            }
+        }
+    }
+
+    /// Follows per-lane descriptor values (VGPRs from `global_load_dword*`, `v_cndmask_b32`, phis).
+    fn collect_lane_descriptor_loads(
+        &self,
+        t: Term,
+        seen: &mut Vec<Value>,
+        out: &mut Vec<Site>,
+    ) {
+        let Term::Value(v) = self.lane_term(t) else {
+            return;
+        };
+        if seen.contains(&v) || seen.len() >= 256 {
+            return;
+        }
+        seen.push(v);
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            for &a in &self.p.blocks[b].phis[i].args {
+                self.collect_lane_descriptor_loads(Term::Value(a), seen, out);
+            }
+        } else if let Some((_, a, b)) = self.lane_picked(v) {
+            self.collect_lane_descriptor_loads(a, seen, out);
+            self.collect_lane_descriptor_loads(b, seen, out);
+        } else if let Some(site) = self.defs[v.0 as usize] {
+            let name = self.inst(site).name();
+            if (name.starts_with("s_load_dword") || name.starts_with("global_load_dword"))
+                && !out.contains(&site)
+            {
+                out.push(site);
+            }
+        }
+    }
+
+    /// If `t` is an additive expression containing exactly one undeclared entry SGPR (`< 106`,
+    /// not in `layout`) and no declared address base or PC, returns that SGPR's code.
+    fn undeclared_entry_sgpr(&self, t: Term) -> Option<u8> {
+        let mut found: Option<u8> = None;
+        let mut stack = vec![t];
+        let mut seen = Vec::new();
+        while let Some(cur) = stack.pop() {
+            let Term::Value(v) = cur else { continue };
+            if seen.contains(&v) || seen.len() >= 64 {
+                continue;
+            }
+            seen.push(v);
+            if self.inputs[v.0 as usize].is_some() || self.spilled.contains_key(&v) {
+                match self.param_value(v) {
+                    Some((p, 0))
+                        if matches!(
+                            self.layout[p].root,
+                            RootType::Table
+                                | RootType::Descriptor
+                                | RootType::ResourceHeap
+                                | RootType::SamplerHeap
+                        ) =>
+                    {
+                        return None;
+                    }
+                    Some(_) => continue,
+                    None => {
+                        let Some(Reg::S(n)) = self.inputs[v.0 as usize] else {
+                            continue;
+                        };
+                        if n >= 106 || found.is_some() {
+                            return None;
+                        }
+                        found = Some(n);
+                    }
+                }
+                continue;
+            }
+            if self.getpc(v).is_some() {
+                return None;
+            }
+            if let Some((_, [a, b])) = self.sop2(v, &["s_add_u32", "s_add_i32"]) {
+                stack.extend([a, b]);
+            } else if let Some((_, [_, unshifted])) = self.sop2(
+                v,
+                &[
+                    "s_lshl1_add_u32",
+                    "s_lshl2_add_u32",
+                    "s_lshl3_add_u32",
+                    "s_lshl4_add_u32",
+                ],
+            ) {
+                stack.push(unshifted);
+            } else if let Some([a, b]) = self.vadd(v) {
+                stack.extend([a, b]);
+            } else if let Some(lane) = self.first_lane_source(v) {
+                stack.push(self.vorigin(lane));
+            }
+        }
+        found
+    }
+
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
@@ -3633,5 +4070,109 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn root_constant_added_to_heap_base_is_dynamic_offset_not_second_base() {
+        // s10 = ResourceHeap, s9 = Constants (dword 0): s_add_u32 s12, s10, s9 must trace to
+        // ResourceHeap with dynamic offset s9 (not fail or collapse to MEMORY).
+        let r = track_words(
+            &[
+                0x800C_090A, // s_add_u32 s12, s10, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0406,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+                0xE030_2000,
+                0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Vs,
+        );
+        let const_v = r.params.iter().find(|p| p.1 == 0).unwrap().0;
+        assert_eq!(r.scalar[0].1.param, 1);
+        assert_eq!(r.scalar[0].1.dynamic, Some(const_v));
+
+        // Same when s9 (Constants) is passed directly as SMEM soffset.
+        let r2 = track_words(
+            &[
+                0xBE8C_030A, // s_mov_b32 s12, s10
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF40C_0406,
+                0x1200_0000, // s_load_dwordx8 s[16:23], s[12:13], s9
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 1)],
+            HwStage::Vs,
+        );
+        let const_v2 = r2.params.iter().find(|p| p.1 == 0).unwrap().0;
+        assert_eq!(r2.scalar[0].1.param, 1);
+        assert_eq!(r2.scalar[0].1.dynamic, Some(const_v2));
+
+        // s_lshl4_add_u32 s12, s9, s11 (s9 * 16 + s11 SamplerHeap): traces to SamplerHeap.
+        let r3 = track_words(
+            &[
+                0x988C_0B09, // s_lshl4_add_u32 s12, s9, s11
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0606,
+                0xFA00_0000, // s_load_dwordx4 s[24:27], s[12:13], 0x0
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(SamplerHeap, 11, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r3.scalar[0].1.param, 1);
+        assert!(r3.scalar[0].1.dynamic.is_some());
+
+        // On a RootType::Descriptor (not a heap/table), s_lshl4_add_u32 must NOT set `dynamic`
+        // to the sum (which would double-add the descriptor base); it stays MEMORY.
+        let r4 = track_words(
+            &[
+                0x988E_0A09, // s_lshl4_add_u32 s14, s9, s10
+                0xBE8F_030B, // s_mov_b32 s15, s11
+                0xF408_0607,
+                0xFA00_0000, // s_load_dwordx4 s[24:27], s[14:15], 0x0
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(Descriptor, 10, 2)],
+            HwStage::Ps,
+        );
+        assert_eq!(r4.scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn infer_roots_finds_heaps_and_rejects_unknown_scalar_loads() {
+        // s10 loads an image descriptor (hi=0, ResourceHeap) with dynamic offset s9 (Constants);
+        // s11 loads a sampler descriptor (hi=0, SamplerHeap).
+        let code: Vec<u8> = [
+            0xBE8C_030A, // s_mov_b32 s12, s10
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF40C_0406,
+            0x1200_0000, // s_load_dwordx8 s[16:23], s[12:13], s9
+            0xBE8E_030B, // s_mov_b32 s14, s11
+            0xBE8F_0380, // s_mov_b32 s15, 0
+            0xF408_0607,
+            0xFA00_0010, // s_load_dwordx4 s[24:27], s[14:15], 0x10
+            0xF09C_0F08,
+            0x00C4_0400, // image_sample_lz v[4:7], v[0:1], s[16:23], s[24:27] dmask:0xf dim:2D
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let inf = infer_roots(&p, &[param(Constants, 9, 1)], HwStage::Vs).unwrap();
+        assert_eq!(inf.heaps, [(10, ResourceHeap), (11, SamplerHeap)]);
+        assert_eq!(inf.vertex_table, None);
+
+        // Non-descriptor load from unknown s[6:7] produces no inferred heap or vertex table.
+        let unknown: Vec<u8> = [0xF400_0203u32, 0xFA00_0000, S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p2 = crate::ir::build(&unknown, true, 256).unwrap();
+        let inf2 = infer_roots(&p2, &[], HwStage::Vs).unwrap();
+        assert!(inf2.heaps.is_empty());
+        assert_eq!(inf2.vertex_table, None);
     }
 }

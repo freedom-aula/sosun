@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use victory_platform::thread::{self, Thread};
 
-use super::bridge::call_win64;
+use super::bridge::{call_thread_entry, call_win64};
 use super::image::NativeImage;
 use super::teb;
 use crate::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH};
@@ -173,7 +173,7 @@ pub unsafe fn spawn_title_thread_with(
         on_start();
         notify_threads(DLL_THREAD_ATTACH);
         // SAFETY: forwarded from the caller.
-        let code = unsafe { call_win64(start, &[param as u64]) } as u32;
+        let code = unsafe { call_thread_entry(start, param) };
         notify_threads(DLL_THREAD_DETACH);
         on_exit(code);
         code
@@ -234,7 +234,7 @@ pub unsafe fn run_entry_with(
             }
             register_thread_callbacks(image);
             attach(image, DLL_PROCESS_ATTACH);
-            let code = call_win64(entry, &[0]) as u32;
+            let code = call_thread_entry(entry, 0);
             attach(image, DLL_PROCESS_DETACH);
             for dll in dlls.iter().rev() {
                 attach_dll(&dll.image, DLL_PROCESS_DETACH, 1);

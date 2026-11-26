@@ -67,7 +67,8 @@ pub fn format(dxgi: u32) -> Option<Format> {
         10 => Format::Rgba16Float,
         41 => Format::R32Float,
         40 => Format::D32Float,
-        20 | 45 => Format::D32FloatS8,
+        // D32_FLOAT_S8X24_UINT (19), its shader views (20) and the console's variant (45).
+        19 | 20 | 45 => Format::D32FloatS8,
         71 => Format::Bc1,
         74 => Format::Bc2,
         77 => Format::Bc3,

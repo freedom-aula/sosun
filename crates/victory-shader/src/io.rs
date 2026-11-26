@@ -209,6 +209,14 @@ pub struct Io {
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+    raise_graphics(p, native, false)
+}
+
+pub(crate) fn raise_graphics(
+    p: &Program,
+    native: &NativeProgram,
+    guessed: bool,
+) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
@@ -311,20 +319,28 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
-            // A guessed graphics description's vertex shader (`emit::graphics`): s0/s1 are the
-            // vertex buffer table, and the base vertex and instance after them read 0.
-            StageIo::Vs { .. }
-                if native.layout.iter().any(|p| p.slot == crate::emit::graphics::VERTEX_TABLE) =>
-            {
-                Some(2)
-            }
+            // A guessed graphics description's vertex shader (`emit::graphics`): the vertex
+            // buffer table sits in two SGPRs (usually s0/s1), and the base vertex and instance
+            // after them read 0.
+            StageIo::Vs { .. } => native
+                .layout
+                .iter()
+                .find(|p| p.slot == crate::emit::graphics::VERTEX_TABLE)
+                .map(|p| p.user_data.saturating_add(2)),
             StageIo::Ps { .. } => {
                 let user = native
                     .layout
                     .iter()
                     .map(|r| u32::from(r.user_data) + r.sgprs)
-                    .max();
-                Some(user.unwrap_or(0).clamp(8, 104) as u8 + 2)
+                    .max()
+                    .unwrap_or(0);
+                // Anchor to the primitive-mask SGPR when the code loads one exclusively into M0
+                // for interpolation (handles guessed PS whose user data is < 8 or has gaps),
+                // otherwise fall back to the 8-SGPR ABI floor.
+                let base = ps_prim_mask(p, user, guessed)
+                    .map(u32::from)
+                    .unwrap_or_else(|| user.clamp(8, 104));
+                Some(base.min(104) as u8 + 2)
             }
             _ => None,
         },
@@ -451,6 +467,262 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         }
     }
     Ok(io)
+}
+
+/// Finds a unique live-in SGPR `s<pm>` (`user <= pm <= 104`) that is used solely to feed `m0`
+/// for pixel interpolation (`v_interp_*`), following scalar copies, `v_writelane`/`v_readlane`
+/// spills, and phis.
+fn ps_prim_mask(p: &Program, user: u32, guessed: bool) -> Option<u8> {
+    let mut found = None;
+    for &(reg, init_v) in &p.inputs {
+        let Reg::S(pm) = reg else { continue };
+        if pm > 104 || u32::from(pm) < user {
+            continue;
+        }
+        if is_prim_mask_only(p, init_v, guessed) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(pm);
+        }
+    }
+    found
+}
+
+/// Whether `init_v` (a live-in SGPR) flows only through copies / `v_writelane`+`v_readlane`
+/// spills into `m0`, and every consumer of those `m0` values is `v_interp_*` (or the benign
+/// `MSG_ORDERED_PS_DONE` sendmsg, which ignores `m0` in hardware).
+// shortcut: guessed shaders may also mask or shift the value on the way to M0, extend the
+// recognised scalar operations if a new compiler pattern still uses the value only for M0.
+pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bool {
+    use std::collections::HashSet;
+    let m0 = crate::ir::M0;
+    let mut scalar_vals = HashSet::from([init_v]);
+    let mut scalar_q = vec![init_v];
+    let mut spilled: HashSet<(Value, u32)> = HashSet::new();
+    let mut spill_q: Vec<(Value, u32)> = Vec::new();
+    let mut m0_vals: HashSet<Value> = HashSet::new();
+    let mut m0_q: Vec<Value> = Vec::new();
+
+    while !scalar_q.is_empty() || !spill_q.is_empty() {
+        while let Some(v) = scalar_q.pop() {
+            for block in &p.blocks {
+                for phi in &block.phis {
+                    if !phi.args.contains(&v) {
+                        continue;
+                    }
+                    match phi.reg {
+                        Reg::S(d) if d < 106 => {
+                            if scalar_vals.insert(phi.value) {
+                                scalar_q.push(phi.value);
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                for inst in &block.insts {
+                    if !inst.reads.iter().any(|r| r.1 == v) {
+                        continue;
+                    }
+                    match (inst.name(), &inst.fields) {
+                        (
+                            name,
+                            Fields::Sop {
+                                dst: Some(Operand::Scalar { code: d, .. }),
+                                src,
+                                ..
+                            },
+                        ) if (name == "s_mov_b32"
+                            && matches!(src.first(), Some(&Operand::Scalar { code: s, .. }) if inst.read(Reg::S(s)) == Some(v)))
+                            || (guessed && matches!(name, "s_and_b32" | "s_or_b32" | "s_lshl_b32" | "s_lshr_b32")) =>
+                        {
+                            // The mask bits have no host use, including through SCC.
+                            if let Some(scc) = inst.write(Reg::Scc)
+                                && p.blocks.iter().any(|b| {
+                                    b.phis.iter().any(|phi| phi.args.contains(&scc))
+                                        || b.insts.iter().any(|inst| inst.read(Reg::Scc) == Some(scc))
+                                })
+                            {
+                                return false;
+                            }
+                            let Some(dv) = inst.write(Reg::S(*d)) else {
+                                return false;
+                            };
+                            if *d == m0 {
+                                if m0_vals.insert(dv) {
+                                    m0_q.push(dv);
+                                }
+                            } else if *d < 106 {
+                                if scalar_vals.insert(dv) {
+                                    scalar_q.push(dv);
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                        ("v_writelane_b32", Fields::Valu(f))
+                            if matches!(
+                                (f.dst, f.src.as_slice()),
+                                (
+                                    Some(Operand::Vector { .. }),
+                                    [Operand::Scalar { code: s, .. }, _]
+                                ) if inst.read(Reg::S(*s)) == Some(v)
+                            ) =>
+                        {
+                            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                                return false;
+                            };
+                            let Some(lane) = crate::resource::lane_of(f.src[1]) else {
+                                return false;
+                            };
+                            let Some(vv) = inst.write(Reg::V(reg)) else {
+                                return false;
+                            };
+                            if spilled.insert((vv, lane)) {
+                                spill_q.push((vv, lane));
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+
+        while let Some((vv, lane)) = spill_q.pop() {
+            for block in &p.blocks {
+                for phi in &block.phis {
+                    if !phi.args.contains(&vv) {
+                        continue;
+                    }
+                    match phi.reg {
+                        Reg::V(_) => {
+                            if spilled.insert((phi.value, lane)) {
+                                spill_q.push((phi.value, lane));
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                for inst in &block.insts {
+                    if !inst.reads.iter().any(|r| r.1 == vv) {
+                        continue;
+                    }
+                    match (inst.name(), &inst.fields) {
+                        ("v_readlane_b32", Fields::Valu(f))
+                            if matches!(
+                                (f.dst, f.src.as_slice()),
+                                (
+                                    Some(Operand::Scalar { .. }),
+                                    [Operand::Vector { reg, .. }, _]
+                                ) if inst.read(Reg::V(*reg)) == Some(vv)
+                            ) =>
+                        {
+                            let Some(read_lane) = crate::resource::lane_of(f.src[1]) else {
+                                return false;
+                            };
+                            if read_lane == lane {
+                                let Some(Operand::Scalar { code: d, .. }) = f.dst else {
+                                    return false;
+                                };
+                                let Some(dv) = inst.write(Reg::S(d)) else {
+                                    return false;
+                                };
+                                if d == m0 {
+                                    if m0_vals.insert(dv) {
+                                        m0_q.push(dv);
+                                    }
+                                } else if d < 106 {
+                                    if scalar_vals.insert(dv) {
+                                        scalar_q.push(dv);
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                        ("v_writelane_b32", Fields::Valu(f))
+                            if matches!(f.dst, Some(Operand::Vector { reg, .. }) if inst.read(Reg::V(reg)) == Some(vv)) =>
+                        {
+                            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                                return false;
+                            };
+                            let Some(write_lane) = f.src.get(1).and_then(|o| crate::resource::lane_of(*o)) else {
+                                return false;
+                            };
+                            if write_lane != lane {
+                                let Some(nv) = inst.write(Reg::V(reg)) else {
+                                    return false;
+                                };
+                                if spilled.insert((nv, lane)) {
+                                    spill_q.push((nv, lane));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Allow a full overwrite of the spill VGPR where `vv` is only read
+                            // as the IR's implicit old-value tie.
+                            let tie_only = inst
+                                .reads
+                                .iter()
+                                .filter(|r| r.1 == vv)
+                                .all(|(r, _)| inst.write(*r).is_some())
+                                && !match &inst.fields {
+                                    Fields::Valu(f) => f.src.iter().any(|s| {
+                                        matches!(*s, Operand::Vector { reg, dwords }
+                                            if (0..dwords).any(|k| inst.read(Reg::V(reg + k)) == Some(vv)))
+                                    }),
+                                    _ => true,
+                                };
+                            if !tie_only {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if m0_vals.is_empty() {
+        return false;
+    }
+    while let Some(mv) = m0_q.pop() {
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if phi.args.contains(&mv) {
+                    if phi.reg == Reg::S(m0) {
+                        if m0_vals.insert(phi.value) {
+                            m0_q.push(phi.value);
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    let mut saw_interp = false;
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if !inst.reads.iter().any(|r| m0_vals.contains(&r.1)) {
+                continue;
+            }
+            if matches!(inst.fields, Fields::Vintrp { .. }) || inst.name().starts_with("v_interp_")
+            {
+                saw_interp = true;
+            } else if matches!(
+                inst.fields,
+                Fields::Sopp { imm }
+                    if matches!(inst.name(), "s_sendmsg" | "s_sendmsghalt") && imm & 0xF == 7
+            ) {
+                // `MSG_ORDERED_PS_DONE` ignores `m0` in hardware (`ir.rs` adds `m0` read for all
+                // `s_sendmsg`).
+            } else {
+                return false;
+            }
+        }
+    }
+    saw_interp
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -798,6 +1070,51 @@ mod tests {
                 (2, Input::Position(0)),
                 (3, Input::Position(1)),
             ]
+        );
+    }
+
+    #[test]
+    fn pixel_initialized_sgprs_anchors_to_prim_mask() {
+        // Direct s0 -> m0 -> v_interp: anchors initialized_sgprs to 0 + 2 = 2 (below 8 ABI floor).
+        let direct = program(&[
+            0xBEFC_0300, // s_mov_b32 m0, s0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&direct, &pixel(vec![TEXCOORD], 2)).unwrap().initialized_sgprs,
+            Some(2)
+        );
+
+        // Spilled s4 -> v5 lane 2 -> s12 -> m0 -> v_interp + MSG_ORDERED_PS_DONE: anchors to 4 + 2 = 6.
+        let spilled = program(&[
+            0xD761_0005,
+            0x0001_0404, // v_writelane_b32 v5, s4, 2
+            0xD761_0005,
+            0x0001_0609, // v_writelane_b32 v5, s9, 3
+            0xD760_000C,
+            0x0001_0505, // v_readlane_b32 s12, v5, 2
+            0xBEFC_030C, // s_mov_b32 m0, s12
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&spilled, &pixel(vec![TEXCOORD], 2)).unwrap().initialized_sgprs,
+            Some(6)
+        );
+
+        // s4 moved to m0 for v_movrels_b32 (not v_interp): must NOT anchor, keeps 8 + 2 = 10.
+        let movrel = program(&[
+            0xBEFC_0304, // s_mov_b32 m0, s4
+            0x7E04_8700, // v_movrels_b32 v2, v0
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&movrel, &pixel(vec![], 0)).unwrap().initialized_sgprs,
+            Some(10)
         );
     }
 }

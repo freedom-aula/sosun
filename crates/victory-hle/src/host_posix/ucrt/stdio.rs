@@ -144,10 +144,15 @@ impl Stream {
     }
 
     fn unget(&mut self, b: u8) {
-        if self.rpos > 0 && self.rbuf[self.rpos - 1] == b {
-            self.rpos -= 1;
+        self.unget_bytes(&[b]);
+    }
+
+    fn unget_bytes(&mut self, bytes: &[u8]) {
+        if self.rbuf[..self.rpos].ends_with(bytes) {
+            self.rpos -= bytes.len();
         } else {
-            self.rbuf.insert(self.rpos, b);
+            self.rbuf
+                .splice(self.rpos..self.rpos, bytes.iter().copied());
         }
         self.eof = false;
     }
@@ -695,6 +700,19 @@ pub extern "system" fn fputwc(c: u16, file: *mut c_void) -> u32 {
         } else {
             WEOF
         }
+    })
+}
+
+pub extern "system" fn ungetwc(c: u16, file: *mut c_void) -> u16 {
+    with(file, WEOF as u16, |s| {
+        if !s.readable || u32::from(c) == WEOF {
+            return WEOF as u16;
+        }
+        let Some(ch) = char::from_u32(u32::from(c)) else {
+            return WEOF as u16;
+        };
+        s.unget_bytes(ch.encode_utf8(&mut [0; 4]).as_bytes());
+        c
     })
 }
 
@@ -1498,7 +1516,7 @@ pub extern "system" fn __stdio_common_vfwscanf(
 
 exports!(pub(super) fn lookup;
     fopen, _wfopen, fopen_s, _wfopen_s, _fdopen, fclose, _fcloseall, fflush, _flushall, fread,
-    fwrite, fgetc, fputc, ungetc, fgets, fputs, puts, getchar, putchar, fputwc, fgetwc, fputws,
+    fwrite, fgetc, fputc, ungetc, fgets, fputs, puts, getchar, putchar, fputwc, fgetwc, ungetwc, fputws,
     feof, ferror, clearerr, _fseeki64, fseek, _ftelli64, ftell, rewind, fgetpos, fsetpos,
     setvbuf, setbuf, _fileno, __acrt_iob_func, _lock_file, _unlock_file,
     _get_stream_buffer_pointers, tmpfile, _open, _wopen, _sopen_s, _wsopen_s, _close, _read,
@@ -1543,6 +1561,35 @@ mod tests {
 
     fn open(path: &std::path::Path, mode: &str) -> *mut c_void {
         fopen(cstr(path.to_str().unwrap()).as_ptr(), cstr(mode).as_ptr())
+    }
+
+    #[test]
+    fn ungetwc_pushes_utf16_units_through_the_stream_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.txt");
+        std::fs::write(&path, "éx").unwrap();
+        let f = open(&path, "r");
+        assert_eq!(fgetwc(f), u32::from('é'));
+        assert_eq!(ungetwc('©' as u16, f), '©' as u16);
+        assert_eq!(fgetwc(f), u32::from('©'));
+        assert_eq!(fgetwc(f), u32::from('x'));
+        assert_eq!(fgetwc(f), WEOF);
+        assert_eq!(feof(f), 1);
+        assert_eq!(ungetwc(WEOF as u16, f), WEOF as u16);
+        assert_eq!(feof(f), 1);
+        assert_eq!(ungetwc('雪' as u16, f), '雪' as u16);
+        assert_eq!(feof(f), 0);
+        assert_eq!(fgetwc(f), u32::from('雪'));
+        assert_eq!(ungetwc('q' as u16, f), 'q' as u16);
+        rewind(f);
+        assert_eq!(fgetwc(f), u32::from('é'));
+        assert_eq!(fclose(f), 0);
+
+        let f = open(&path, "w");
+        assert_eq!(ungetwc('q' as u16, f), WEOF as u16);
+        assert_eq!(fclose(f), 0);
+        assert_eq!(ungetwc('q' as u16, std::ptr::null_mut()), WEOF as u16);
+        assert_eq!(errno(), EINVAL);
     }
 
     #[test]

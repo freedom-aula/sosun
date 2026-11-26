@@ -223,6 +223,8 @@ mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(test)]
+mod gfx_refusal_tests;
+#[cfg(test)]
 mod mask_tests;
 #[cfg(all(test, windows))]
 mod memory_tests;
@@ -341,6 +343,9 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Pixel inputs split off an input the code reads two ways: (original, new) `TEXCOORD`
+    /// indices. The vertex shader must write the new one with the original's values.
+    pub splits: Vec<(u32, u32)>,
 }
 
 impl HostShader {
@@ -422,6 +427,12 @@ pub struct Options {
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
     /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being v1 + v2 - v0.
     pub rect_list: bool,
+    /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
+    /// n, undefined values) because its pixel shader reads them.
+    pub extra_params: u32,
+    /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
+    /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
+    pub copy_params: [u8; 32],
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -452,8 +463,12 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let guessed = graphics::is_guessed(&c);
+    let computed_buffers = guessed && options.zero_copy_memory;
+    let res = resource::track_graphics(
+        &p, &native.layout, native.stage, st.as_ref().ok(), computed_buffers,
+    )?;
+    let io = io::raise_graphics(&p, &native, guessed)?;
     let st = st?;
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
@@ -489,6 +504,27 @@ pub fn emit_with(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if !pixel && options.extra_params != 0 {
+        let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+                continue;
+            }
+            outputs.push(container::SigElement {
+                name: "TEXCOORD".into(),
+                index: n,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+            row += 1;
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -552,15 +588,19 @@ pub fn emit_with(
         wave32_host: options.wave32_host,
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
+        copy_params: options.copy_params,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let guessed = graphics::is_guessed(c);
+    let l = match lower::lower_graphics(&parts(st, res), guessed) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            let res = resource::track_graphics(
+                p, &native.layout, native.stage, Some(&st), guessed && options.zero_copy_memory,
+            )?;
+            lower::lower_graphics(&parts(&st, &res), guessed)?
         }
         l => l?,
     };
@@ -590,6 +630,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        splits: l.splits,
     })
 }
 
@@ -686,6 +727,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -701,6 +743,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1109,6 +1152,7 @@ mod tests {
             }
         };
         let ps = super::HostShader {
+            splits: Vec::new(),
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1126,6 +1170,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                splits: Vec::new(),
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -1282,6 +1327,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let _ = &ms;
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())

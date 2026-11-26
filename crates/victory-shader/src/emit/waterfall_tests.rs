@@ -75,6 +75,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })
     .expect("lower");
@@ -82,6 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
+        splits: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

@@ -173,6 +173,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         // The D3D12 host copies title memory: it needs the pages marked.
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
+        extra_params: 0,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
@@ -311,6 +313,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        // Pixel-input splits belong to the native host's guessed graphics path only.
+        splits: _,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -424,6 +428,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_uavs = r.list()?;
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
+        splits: Vec::new(),
         stage,
         dxil,
         user_data,
@@ -447,6 +452,7 @@ mod tests {
 
     fn shader() -> HostShader {
         HostShader {
+            splits: Vec::new(),
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
