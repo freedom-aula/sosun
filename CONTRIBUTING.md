@@ -8,7 +8,13 @@ Thanks for helping. The goal: GTA VI running natively on an Apple Silicon Mac, f
 
 ## Set up
 
-Follow the [Quick start](README.md#quick-start). Then make sure the tests pass before you change anything:
+Follow the [Quick start](README.md#quick-start). The native probe tests build a small Windows program, and the clippy gate checks a Windows target, so also install the cross tools and that target:
+
+```bash
+brew install llvm lld mingw-w64 && rustup target add --toolchain 1.98.1 x86_64-pc-windows-gnullvm
+```
+
+Then make sure the tests pass before you change anything:
 
 ```bash
 rustup run 1.98.1 cargo test --target x86_64-apple-darwin -p victory-hle -p victory-loader -p victory
