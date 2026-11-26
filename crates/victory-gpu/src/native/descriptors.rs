@@ -20,6 +20,7 @@ pub enum Decoded {
         size: u32,
     },
     /// A texture SRV or UAV of a registered resource: the first mip and count of its view.
+    /// A count of `u32::MAX` includes every remaining mip; the backend clips it to the texture.
     Image {
         resource: usize,
         mips: Option<(u32, u32)>,
@@ -161,7 +162,7 @@ pub(crate) fn decode(
                 mips: if *unordered {
                     Some((d[2], 1))
                 } else {
-                    Some((d[4], if d[5] == u32::MAX { 0 } else { d[5] }))
+                    Some((d[4], d[5]))
                 },
                 format: format(d[0]),
             })
@@ -176,7 +177,7 @@ pub(crate) fn decode(
         }
         View::Shader(r, Some(d)) if d[1] == TEXTURE_2D => Some(Decoded::Image {
             resource: *r,
-            mips: Some((d[4], if d[5] == u32::MAX { 0 } else { d[5] })),
+            mips: Some((d[4], d[5])),
             format: format(d[0]),
         }),
         View::Unordered(r, _, Some(d)) if d[1] == TEXTURE_2D => Some(Decoded::Image {
@@ -290,6 +291,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn texture_srvs_keep_all_remaining_mips_from_the_first_requested() {
+        let mut srv = [0; 10];
+        (srv[0], srv[1], srv[4], srv[5]) = (28, TEXTURE_2D, 2, u32::MAX);
+        let mut placed = [0; 16];
+        placed[..srv.len()].copy_from_slice(&srv);
+        let mut resource = [0; 14];
+        resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+
+        for view in [View::Shader(7, Some(srv)), View::Placed(false, resource, placed)] {
+            let Some(Decoded::Image { mips, .. }) = decode(&view, &|_| None) else {
+                panic!("expected a texture view");
+            };
+            assert_eq!(mips, Some((2, u32::MAX)));
+        }
+    }
 
     #[test]
     fn buffer_views_decode_to_raw_ranges() {

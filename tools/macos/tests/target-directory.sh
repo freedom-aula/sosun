@@ -73,6 +73,17 @@ reject_launch() {
 }
 
 test_default() { launch "$default"; }
+test_same_second_logs() {
+  printf '#!/bin/bash\necho 20260101-120000\n' > "$bin_dir/date"
+  chmod +x "$bin_dir/date"
+  launch "$default"
+  local first=("$repo"/runs/*/victory.log)
+  echo 'first run marker' >> "${first[0]}"
+  launch "$default"
+  local logs=("$repo"/runs/*/victory.log)
+  [[ ${#logs[@]} == 2 ]] || fail "two runs in the same second shared a log"
+  grep -Fxq 'first run marker' "${first[0]}" || fail "first log was overwritten"
+}
 test_global() { configure "$CARGO_HOME" "$shared"; launch "$shared"; }
 test_home_global() { configure "$CARGO_HOME" "$shared"; unset CARGO_HOME; launch "$shared"; }
 test_global_without_default() {
@@ -222,7 +233,7 @@ test_launch_without_cargo() {
 
 # Optional names allow the central regression to be checked against old scripts.
 if [[ $# == 0 ]]; then
-  set -- default global home_global global_without_default environment \
+  set -- default same_second_logs global home_global global_without_default environment \
     build_environment relative_environment project missing not_executable invalid_config \
     bad_metadata setup setup_metadata_failure setup_build_failure \
     setup_rustup_in_cargo_home setup_rustup_in_homebrew setup_without_rustup \

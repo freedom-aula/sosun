@@ -69,7 +69,14 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
         }
         match Metal::new() {
             Ok(metal) => {
-                tracing::info!("native host: Metal");
+                let console = crate::console::current();
+                let (gpu_optimal, standard) = console.title_memory();
+                tracing::info!(
+                    console = console.name(),
+                    title_memory_mib = (gpu_optimal + standard) / (1 << 20),
+                    recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    "native host: Metal"
+                );
                 *guard = Some(Shared(Title::new(metal, pools().clone())));
                 start_timer();
             }
@@ -108,6 +115,27 @@ fn refresh(t: &mut MetalTitle) {
             if !stuck.is_empty() {
                 *last = Some(std::time::Instant::now());
                 tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+                // What a held queue or a fence waits for may be owed by a command buffer the GPU
+                // lost (out of memory): those are paid from the CPU so the title goes on.
+                let lost = victory_metal::gfx::recover_lost();
+                if lost > 0 {
+                    tracing::warn!("recovered {lost} command buffers the GPU never reported on");
+                }
+                // Nothing is submitted while every queue is held, so the per-submission report
+                // of command buffers the GPU has not finished would stay silent.
+                if env_set!("VICTORY_TRACE_GPU_FAILS") {
+                    let flying = victory_metal::gfx::report_in_flight();
+                    let order: Vec<String> = t
+                        .backend_queues()
+                        .map(|(k, q)| (k, q.order_state()))
+                        .filter(|(_, (done, made))| done != made)
+                        .map(|(k, (done, made))| format!("queue {k:#x} at {done} of {made}"))
+                        .collect();
+                    tracing::warn!(
+                        "command buffers in flight while work is held: {flying}; order events behind: {order:?}; commands dropped at unmapped memory so far: {}",
+                        t.host.unmapped()
+                    );
+                }
             }
         }
     }
@@ -135,6 +163,9 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -535,7 +566,7 @@ pub(crate) fn pipeline_released(pipeline: This) {
 
 pub(crate) fn resource_released(res: This) {
     with_title(|t| {
-        t.host.forget_resource(res as usize);
+        t.host.release_resource(res as usize);
         t.texture_released(res as usize);
     });
 }
@@ -548,23 +579,24 @@ pub(crate) fn texture_created(res: This) {
     }
 }
 
-/// `OMSetRenderTargets`: the host textures of the views' resources.
+/// `OMSetRenderTargets`: the host textures of the views' resources, in the views' formats.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let keys: Vec<Option<usize>> = color
+        let views: Vec<Option<(usize, u32)>> = color
             .iter()
-            .map(|&h| crate::descriptor::rtv_record(h).map(|r| r.resource as usize))
+            .map(|&h| crate::descriptor::rtv_record(h).map(|r| (r.resource as usize, r.format())))
             .collect();
+        let keys: Vec<Option<usize>> = views.iter().map(|v| v.map(|(k, _)| k)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
         l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
-        let made: Option<Vec<_>> = keys
+        let made: Option<Vec<_>> = views
             .iter()
-            .map(|slot| slot.and_then(|k| t.texture_of(k)))
+            .map(|slot| slot.and_then(|(k, named)| t.target_of(k, named)))
             .collect();
-        let Some(color) = made else {
+        let Some(made) = made else {
             l.targets_ready = false;
             l.targets = TargetFormats::default();
             l.target_keys.clear();
@@ -574,9 +606,10 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         };
         l.targets_ready = true;
         l.targets = TargetFormats {
-            color: keys.iter().flatten().filter_map(|&k| t.format_of(k)).collect(),
+            color: made.iter().map(|(_, format)| *format).collect(),
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
+        let color: Vec<_> = made.into_iter().map(|(texture, _)| texture).collect();
         // Debugging: no depth attachment at all.
         let drop_depth = env_set!("VICTORY_DEBUG_NO_DEPTH_ATTACH");
         if drop_depth {
@@ -589,7 +622,9 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
 /// `ClearRenderTargetView`. shortcut: the whole target, whatever rectangles the title passes.
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
-        if let Some(tex) = crate::descriptor::rtv_record(handle).and_then(|r| t.texture_of(r.resource as usize)) {
+        if let Some((tex, _)) = crate::descriptor::rtv_record(handle)
+            .and_then(|r| t.target_of(r.resource as usize, r.format()))
+        {
             if let Some(r) = crate::descriptor::rtv_record(handle) {
                 trace_bump(r.resource as usize, 1);
             }
@@ -815,8 +850,8 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
-    let r = with_title(|t| t.host.backend.residency_counts()).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, "native draws so far");
+    let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
     super::descriptor_trace::log(frame);
 }
 
@@ -1374,13 +1409,16 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if env_set!("VICTORY_TRACE_WRITES") {
         let inside = pools().resolve(address, bytes as u64).is_some();
-        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}, list {this:p}");
     }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 
 /// A wait for a memory value, recorded at the current position of the list.
 pub(crate) fn wait_value(this: This, w: Wait) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("list wait at {:#x} cmp {} ref {:#x}, list {this:p}", w.address, w.comparison, w.reference);
+    }
     with_list(this, |_, l| l.wait(w));
 }
 

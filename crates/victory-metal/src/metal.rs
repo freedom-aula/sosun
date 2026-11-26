@@ -170,6 +170,14 @@ fn residency_mode(asked: Option<&str>, supported: bool, memory: u64) -> (bool, b
     }
 }
 
+impl Queue {
+    /// The value the queue's order event has reached and the number of command buffers encoded
+    /// with it: equal when every one of them has finished (0 and 0 when the host does not order).
+    pub fn order_state(&self) -> (u64, u64) {
+        (self.2.signaledValue(), self.3.get())
+    }
+}
+
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
@@ -257,6 +265,12 @@ impl Metal {
         self.residency_sets = sets_supported(&self.dev);
         self.pool_sets = false;
         self
+    }
+
+    /// Metal's own estimate of how much GPU memory this device can keep
+    /// resident at once, in bytes (`recommendedMaxWorkingSetSize`).
+    pub fn recommended_working_set(&self) -> u64 {
+        self.dev.recommendedMaxWorkingSetSize()
     }
 
     /// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
@@ -638,5 +652,11 @@ mod tests {
         drop(q);
         // Shader conversion returns an Err instead of panicking.
         assert!(m.create_compute_pipeline(AFFINE).is_err());
+    }
+
+    #[test]
+    fn recommended_working_set_is_nonzero_on_real_hardware() {
+        let m = Metal::new().expect("Metal device available on macOS");
+        assert!(m.recommended_working_set() > 0);
     }
 }

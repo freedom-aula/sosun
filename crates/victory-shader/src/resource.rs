@@ -140,6 +140,10 @@ pub struct Resources {
     /// ([`MEMORY`]).
     pub memory_inputs: Vec<u8>,
     pub waterfall: Waterfall,
+    /// Buffer accesses through a loaded descriptor whose stride the program cleared
+    /// (`Tracer::stride_cleared`): the index adds nothing to the address (index × stride, RDNA2
+    /// ISA 8.1.5).
+    pub unstrided: Vec<Site>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -254,7 +258,10 @@ pub(crate) fn track_graphics(
                 // descriptor. Lowering one is a no-op on the host, so there
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    descriptor(rsrc, Role::Resource)?;
+                    if t.stride_cleared(inst, rsrc).is_some() {
+                        out.unstrided.push(site);
+                    }
                 }
                 Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
@@ -1180,6 +1187,9 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
+        if let Some(loaded) = self.stride_cleared(inst, op) {
+            words = loaded;
+        }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
@@ -1313,7 +1323,49 @@ impl<'a> Tracer<'a> {
                 Some(_) => Change::Computed,
             },
         };
+        if let (Change::Masked, Term::Value(v)) = (kind, *word)
+            && let Some(inst) = self.def(v)
+        {
+            return self.masked_why(k, inst, v);
+        }
         changed_why(k, kind)
+    }
+
+    /// The refusal of dword `k` masked or merged by `inst` (writing `v`): the operation and its
+    /// constant operands, the half of a 64-bit one that `v` is, so a log tells the exact form.
+    fn masked_why(&self, k: usize, inst: &Inst, v: Value) -> &'static str {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return changed_why(k, Change::Masked);
+        };
+        // Which dword of a 64-bit result `v` is.
+        let half = match (dst, inst.writes.iter().find(|w| w.1 == v)) {
+            (Some(Operand::Scalar { code, .. }), Some(&(Reg::S(r), _))) => r.wrapping_sub(*code),
+            _ => 0,
+        };
+        let constants: Vec<String> = src
+            .iter()
+            .filter_map(|op| match *op {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    match self.origin(inst.read(Reg::S(code + half))?) {
+                        Term::Const(c) => Some(format!("{c:#x}")),
+                        Term::Value(_) => None,
+                    }
+                }
+                _ => match self.term(inst, op)? {
+                    Term::Const(c) => Some(format!("{c:#x}")),
+                    Term::Value(_) => None,
+                },
+            })
+            .collect();
+        let with = if constants.is_empty() {
+            "computed values".to_string()
+        } else {
+            constants.join(" and ")
+        };
+        interned(format!(
+            "a descriptor changed after loading: dword {k} masked or merged ({} with {with})",
+            inst.name()
+        ))
     }
 
     /// Bits that may be set in a built buffer descriptor's high dword.
@@ -1646,6 +1698,44 @@ impl<'a> Tracer<'a> {
             return None;
         };
         (x == d1).then_some([w0, d1, d2, d3])
+    }
+
+    /// The loaded words of a buffer descriptor whose dword 1 is the load's ANDed with a constant
+    /// that clears the whole stride and nothing else (bits 16-29 cleared; the base address bits
+    /// 0-15 and the swizzle bits 30-31 kept), for a buffer access that is not typed. With
+    /// stride 0 the address is base + offsets (the index times the stride adds nothing, RDNA2
+    /// ISA 8.1.5), which the loaded view's raw access gives once the index is dropped
+    /// (`Resources::unstrided`).
+    // Guess: the bounds stay the host view's size. That is the console's when the title's V#
+    // checks raw bounds in bytes (OOB_SELECT 3, no swizzle: offset + payload > num_records, in
+    // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range,
+    // and select 1 would check the dropped index against num_records.
+    fn stride_cleared(&self, inst: &Inst, op: &Operand) -> Option<Vec<Term>> {
+        let Fields::Buffer { format: None, .. } = inst.fields else {
+            return None;
+        };
+        if inst.name().contains("format") {
+            return None;
+        }
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return None;
+        };
+        let mut words = (0..4)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>()?;
+        let Term::Value(w1) = words[1] else {
+            return None;
+        };
+        const STRIDE: u32 = 0x3FFF_0000;
+        let loaded = match self.sop2(w1, &["s_and_b32"])?.1 {
+            // The whole stride cleared (a part could leave a stride, and the index would count),
+            // nothing else.
+            [x, Term::Const(c)] | [Term::Const(c), x] if c & STRIDE == 0 && !c & !STRIDE == 0 => x,
+            _ => return None,
+        };
+        words[1] = loaded;
+        self.loaded(&words)?;
+        Some(words)
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -2238,6 +2328,22 @@ impl<'a> Tracer<'a> {
             first: first as u8,
         })
     }
+}
+
+/// `text` as a refusal reason, which is `&'static str` throughout the tracer: each distinct text
+/// is kept once for the program's life.
+// shortcut: formatted reasons are leaked, one per distinct text (a handful per title); give
+// refusals an owned reason if that ever grows.
+fn interned(text: String) -> &'static str {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&s) = seen.get(text.as_str()) {
+        return s;
+    }
+    let s: &'static str = Box::leak(text.into_boxed_str());
+    seen.insert(s);
+    s
 }
 
 /// What a dword of a descriptor that is no load's is instead (see `Tracer::changed`).
@@ -3051,6 +3157,17 @@ pub(crate) mod tests {
             run(&[0x8008_9008, 0x8209_8009]), // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
             "a descriptor changed after loading: dword 0 added to (s_add, s_sub...)"
         );
+        // A mask or merge names the operation and its constant operands, if any.
+        assert_eq!(
+            run(&[0x8709_FF09, 0x3FFF_FFFF]), // s_and_b32 s9, s9, 0x3fffffff
+            "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 with \
+             0x3fffffff)"
+        );
+        assert_eq!(
+            run(&[0x8809_0409]), // s_or_b32 s9, s9, s4 (a program input)
+            "a descriptor changed after loading: dword 1 masked or merged (s_or_b32 with \
+             computed values)"
+        );
     }
 
     /// The FidelityFX upscaler's byte accesses make a loaded buffer
@@ -3093,8 +3210,8 @@ pub(crate) mod tests {
             run(0xC000_FFFE).unwrap_err(),
             ShaderError::Unsupported {
                 offset: 0x3c,
-                what: "a descriptor changed after loading: dword 1 masked or merged (s_and, s_or, \
-                       s_bfi...)"
+                what: "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 \
+                       with 0xc000fffe)"
             }
         );
     }

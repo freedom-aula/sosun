@@ -23,6 +23,56 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    pub images: std::cell::RefCell<Shown>,
+}
+
+/// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those
+/// may be stale: an entry counts only while `of` still names the texture).
+#[derive(Default)]
+pub struct Shown {
+    of: std::collections::HashMap<usize, usize>,
+    entries: std::collections::HashMap<usize, Vec<usize>>,
+    /// The entries cleared when a texture was released, by its object's address.
+    gone: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+impl<B: GraphicsBackend> NativeHeap<B> {
+    /// Entry `index` now shows title texture `resource` (`None`: a buffer or a sampler).
+    pub fn shows(&self, index: usize, resource: Option<usize>) {
+        let Shown { of, entries, .. } = &mut *self.images.borrow_mut();
+        match resource {
+            Some(r) => {
+                if of.insert(index, r) != Some(r) {
+                    entries.entry(r).or_default().push(index);
+                }
+            }
+            None => {
+                of.remove(&index);
+            }
+        }
+    }
+
+    /// The entries that show title texture `resource`, which they stop showing.
+    pub fn take_entries(&self, resource: usize) -> Vec<usize> {
+        let Shown { of, entries, gone } = &mut *self.images.borrow_mut();
+        let mut listed = entries.remove(&resource).unwrap_or_default();
+        listed.retain(|i| of.get(i) == Some(&resource));
+        listed.sort_unstable();
+        listed.dedup();
+        listed.iter().for_each(|i| {
+            of.remove(i);
+        });
+        if !listed.is_empty() {
+            gone.insert(resource, listed.clone());
+        }
+        listed
+    }
+
+    /// The entries [`Self::take_entries`] took when the texture last at `resource` was released,
+    /// once: the title has made a texture at that address again.
+    pub fn take_gone(&self, resource: usize) -> Vec<usize> {
+        self.images.borrow_mut().gone.remove(&resource).unwrap_or_default()
+    }
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):

@@ -41,10 +41,28 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Heap entries cleared because the texture they showed was released.
+    cleared: std::cell::Cell<u64>,
     /// Commands dropped because the host could not prepare them for another reason.
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+    /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
+    /// taken by [`Self::take_written`].
+    written: RefCell<Option<std::collections::HashSet<usize>>>,
+}
+
+/// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
+/// list (or this queue's next segment) may wait for with no other way to go on.
+fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
+    // Once per page: a title writes the same unmapped words every frame.
+    static PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if let Cmd::Fill { dst, len, value } = c {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pages.len() < 50 && pages.insert(dst >> 12) {
+            tracing::warn!("native host drops a value write: byte {value:#x} x{len} at {dst:#x}: {why}");
+        }
+    }
 }
 
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
@@ -134,8 +152,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
+            written: Default::default(),
         }
     }
 
@@ -247,6 +267,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
+        // The entries cleared when the texture last at this address was released are checked
+        // again: the record the title writes for the new one may equal the old one's.
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_gone(key) {
+                heap.mirrored.borrow_mut().remove(&index);
+            }
+        }
     }
 
     /// A shader-visible heap over the title's descriptor memory at `start` (zeroed memory the title
@@ -278,6 +305,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -313,6 +341,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);
+    }
+
+    /// The title released texture `key` for good (its object's last reference, or the pool it was
+    /// placed in): besides [`Self::forget_resource`], the heap entries that show it are cleared.
+    /// Left as they were, they kept the host texture alive and resident until the title happened
+    /// to write another view there, so the memory the GPU holds wired grew with play time.
+    /// A cleared entry is written again when the title writes another record there, or makes a
+    /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
+    /// name the next object at this address, of a format the view cannot be made over.
+    pub fn release_resource(&self, key: usize) {
+        let texture = matches!(self.resources.borrow_mut().remove(&key), Some(Res::Texture(_)));
+        if !texture {
+            return;
+        }
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_entries(key) {
+                self.backend.clear_entry(&heap.heap, index);
+                self.cleared.set(self.cleared.get() + 1);
+            }
+        }
+    }
+
+    /// Heap entries cleared so far because the texture they showed was released.
+    pub fn cleared(&self) -> u64 {
+        self.cleared.get()
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -370,6 +423,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                heap.shows(index, None);
             }
             Decoded::Image {
                 resource,
@@ -395,10 +449,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.shows(index, None);
             }
         }
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
@@ -408,6 +464,49 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Minimum entries of each bound table checked at submission when a shader has no
     /// metadata for that table (or declares fewer entries).
     const TABLE_CHECK: usize = 16;
+
+    /// Turns the collection of GPU-written texture keys on or off.
+    pub(super) fn collect_written(&self, on: bool) {
+        *self.written.borrow_mut() = on.then(Default::default);
+    }
+
+    pub(super) fn collecting_written(&self) -> bool {
+        self.written.borrow().is_some()
+    }
+
+    /// The keys collected since the last call.
+    pub(super) fn take_written(&self) -> Vec<usize> {
+        self.written.borrow_mut().as_mut().map_or_else(Vec::new, |w| w.drain().collect())
+    }
+
+    /// Notes the textures the tables `root` binds hold unordered access views of: what a dispatch
+    /// may write. More than it does write (the shader may not use every entry).
+    ///
+    /// shortcut: a shader that indexes the descriptor heap itself, and pixel shader writes, are
+    /// not seen; add them when a title texture needs it.
+    fn note_written(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        let mut written = self.written.borrow_mut();
+        let Some(written) = written.as_mut() else { return };
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
+            for index in *at..end {
+                match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
+                    Some(crate::descriptor::View::Unordered(r, ..)) => {
+                        written.insert(r);
+                    }
+                    Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
+                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                        written.insert(super::textures::placed_key(address, &res));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
@@ -648,6 +747,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -935,6 +1035,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
                 self.remirror_tables(root, pso.binding.as_ref());
+                self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;
@@ -1090,6 +1191,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
                 // Anything else the host cannot give one command (arguments that are not what the
@@ -1102,6 +1204,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
             }

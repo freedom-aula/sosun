@@ -4,6 +4,8 @@
 
 use super::Pool;
 use crate::native::glue::{self, with_list, with_title};
+use crate::native::list::NativeList;
+use crate::native::title::Title;
 use crate::native::memory::{PoolInfo, PoolObserver};
 use crate::object::{This, slot};
 use victory_backend::resources::*;
@@ -361,6 +363,78 @@ fn a_render_target_is_cleared_through_the_titles_view() {
     assert!(out.chunks(4).all(|p| p == [0, 255, 0, 255]), "{:?}", &out[..8]);
 }
 
+/// A render target view names the format its writes are stored in. Through a plain view of an
+/// sRGB texture a value is stored as it is (a movie's picture, which is display values already);
+/// through an sRGB view of a plain texture it is encoded.
+#[test]
+fn a_render_target_view_stores_in_the_format_it_names() {
+    let Some(pool) = pool(9120, 16) else { return };
+    // The texture's format, the view's (0: none described), and the byte half grey is stored as.
+    for (i, (own, named, stored)) in [(29, 28, 128), (28, 29, 188), (29, 0, 188), (28, 28, 128)]
+        .into_iter()
+        .enumerate()
+    {
+        let at = i * 0x10000;
+        let rt = crate::resource::test_texture_at(
+            pool.va(at),
+            (16, 16),
+            1,
+            own,
+            Swizzle::SW_64KB_R_X.0,
+            1,
+        );
+        let heap = crate::descriptor::test_heap(false, 4);
+        let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+        // A 2D view of mip 0.
+        let desc = [named, 4, 0, 0, 0, 0];
+        let desc = if named == 0 {
+            std::ptr::null()
+        } else {
+            &raw const desc
+        };
+        crate::descriptor::create_rtv(std::ptr::null(), rt, desc, handle);
+        let list = crate::list::test_list(false, std::ptr::null());
+        let (q, f) = (crate::queue::test_queue(false), {
+            let mut f = std::ptr::null();
+            crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+            f
+        });
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+            list,
+            1,
+            &handle,
+            0,
+            std::ptr::null(),
+        );
+        let color = [0.5f32, 0.5, 0.5, 1.0];
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const u8)>(list, 0x1a0)(
+            list,
+            handle,
+            &color,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+        slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+        assert_eq!(
+            slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(
+                f,
+                1,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        let out = read_mip(rt as usize, 0, 16, 16);
+        assert!(
+            out.chunks(4)
+                .all(|p| p[0].abs_diff(stored) <= 1 && p[3] == 255),
+            "texture {own} view {named}: {:?}",
+            &out[..4]
+        );
+    }
+}
+
 /// A layout the host cannot address (`SW_4KB_R_X`, which has no equations) is counted and left empty, not
 /// an error that stops the submission.
 #[test]
@@ -516,4 +590,89 @@ fn a_target_the_host_cannot_make_does_not_shift_the_ones_after_it() {
     let bound = with_list(list, |_, l| l.targets.color.len()).unwrap();
     assert_eq!(bound, 1, "a makeable target binds again after a refused pass");
     drop(slots);
+}
+
+/// A compute dispatch writes a tiled title texture through a UAV; once its fence value shows, the
+/// title's own memory holds the texels, in the texture's layout (the ocean maps' path, #46).
+#[test]
+fn a_texture_compute_writes_is_copied_back_into_title_memory() {
+    // Skips without the Shader Converter.
+    if super::host().is_none() {
+        return;
+    }
+    let dxil = include_bytes!("../../../victory-metal/tests/fixtures/tex_fill.dxil");
+    const W: u32 = 64;
+    // A title host of its own: no timer thread, and a pool no other test shares.
+    let mut t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((64 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9131, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    let pool = Pool { mem };
+    t.set_texture_back(true);
+    for (n, swizzle) in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D_X].into_iter().enumerate() {
+        // Flags 4: unordered access. DXGI 28: RGBA8.
+        let res = crate::resource::test_texture_at(pool.va(0), (u64::from(W), W), 1, 28, swizzle.0, 4);
+        let info = crate::resource::texture_info(res).unwrap();
+        let key = res as usize;
+        pool.write(0, &vec![0u8; info.size]);
+        // The title's descriptor memory: one UAV (format, 2D, mip 0).
+        let slots = vec![0u32; 8 * 8];
+        let handle = slots.as_ptr() as u64;
+        let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(std::ptr::null(), res, std::ptr::null(), &uav, handle);
+        let (queue, fence) = (1 + n, 11 + n);
+        t.texture_created(key, info.clone());
+        assert!(t.realize(key), "{swizzle:?}");
+        let heap = t.host.heap(HeapKind::Resource, handle, 8).unwrap();
+        let pso = t.host.compute_pipeline(dxil, [8, 8, 1]).unwrap();
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(W / 8, W / 8, 1).unwrap();
+        t.ensure_queue(queue).unwrap();
+        t.submit(queue, vec![(l, vec![])]);
+        t.signal_queue(queue, fence, 0, 1);
+        let start = std::time::Instant::now();
+        while !t.try_wait(fence, 0, 1) {
+            assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The value shows, so the memory is there already.
+        let mut out = vec![0u8; info.size];
+        assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+        let linear: Vec<u8> = (0..W)
+            .flat_map(|y| (0..W).flat_map(move |x| [x as u8, y as u8, 64, 255]))
+            .collect();
+        let mut want = vec![0u8; info.size];
+        info.layout
+            .tile(&mut want, 0, 0, &linear, W as usize * 4, linear.len())
+            .unwrap();
+        assert!(out == want, "{swizzle:?}: title memory is not the retiled texels");
+        // Our own write is not mistaken for the title's: nothing is uploaded again.
+        let uploads = t.uploads_of(key);
+        t.sync_textures();
+        assert_eq!(t.uploads_of(key), uploads, "{swizzle:?}");
+        // The title writes the memory while the same work runs: its bytes stay.
+        let mut l = NativeList::default();
+        let heap = t.host.heap_at(handle).unwrap().0;
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(W / 8, W / 8, 1).unwrap();
+        t.submit(queue, vec![(l, vec![])]);
+        t.signal_queue(queue, fence, 0, 2);
+        pool.write(0, &vec![0x5Au8; info.size]);
+        let start = std::time::Instant::now();
+        while !t.try_wait(fence, 0, 2) {
+            assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+        assert!(out.iter().all(|&b| b == 0x5A), "{swizzle:?}: the title's own write was overwritten");
+        t.host.drop_heap(handle);
+        t.host.forget_resource(key);
+        t.texture_released(key);
+    }
 }

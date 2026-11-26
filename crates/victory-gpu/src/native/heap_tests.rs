@@ -176,3 +176,28 @@ fn a_mesh_shader_loads_a_texture_by_heap_index() {
     let pixels = draw(&mut t, &heap, &ms, &ps, |l| l.dispatch_mesh(1, 1, 1).unwrap());
     assert!(pixels.iter().all(|p| *p == [255, 128, 128, 255]), "{pixels:?}");
 }
+
+/// A texture the title releases leaves the heap: the entries showing it are cleared, where they
+/// used to keep the host texture alive and resident until the title wrote another view there.
+/// Entries of other textures stay, and a texture only forgotten (another description placed at
+/// its address) keeps its entries.
+#[test]
+fn a_released_texture_leaves_the_heap() {
+    let Some(t) = title() else { return };
+    let heap = Heap::new(&t);
+    let (red, green) = (0x4EA9_0000, 0x4EA9_0001);
+    t.host.forget_resource(red);
+    assert_eq!(t.host.cleared(), 0, "forgetting a texture leaves its entries");
+    t.host.register_texture(red, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
+    t.host.release_resource(green);
+    assert_eq!(t.host.cleared(), 1);
+    assert!(!t.host.knows(green) && t.host.knows(red));
+    assert!(heap.heap.mirrored.borrow().contains_key(&1), "its old record is not mirrored again");
+    assert!(heap.heap.take_entries(green).is_empty() && heap.heap.take_entries(red) == [0]);
+    // Released again, or a buffer: nothing to clear.
+    t.host.release_resource(green);
+    assert_eq!(t.host.cleared(), 1);
+    // A texture at the released one's address: the entry is checked again, the other is not.
+    t.host.register_texture(green, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
+    assert!(!heap.heap.mirrored.borrow().contains_key(&1) && heap.heap.mirrored.borrow().contains_key(&0));
+}

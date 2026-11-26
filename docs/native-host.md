@@ -42,7 +42,7 @@ Setup prerequisites and its build are stubbed; no game or SDK files are needed.
 | The rest of `xmem` (`XMemVirtualAlloc`, `XMemVirtualQuery`, `XMemAlloc` and the hooks, working-set statistics, transfers), `modules::xmem_posix` | Done on macOS, on `mem::reserve_in` / `next_region` / `footprint`; served from the registry. Hooks are found by reading the mapped title's export table |
 | DirectStorage (`modules::dstorage`) | Done on macOS: the scheduler and completion rules are unchanged; file reads are `pread` on its worker threads, destinations go through `write_physical` and `page_window`. Paths go through `host_posix::files::translate`, so virtual drives (`G:`, `T:`) work |
 | Files: `CreateFile`, `ReadFile`, `WriteFile`, `SetFilePointer(Ex)`, `GetFileSize(Ex)`, `FindFirstFile`, attributes, virtual drives | Done (`host_posix/files.rs`) |
-| Title-shipped DLLs (`native::dll`): msvcp140, vcruntime140, Bink, libHttpClient, ... | Done: mapped beside the exe in dependency order (a DLL is wanted unless our runtime serves its name, so the C++ runtime comes from the title's folder), relocated, own static TLS, bound through the same resolver (hle, then `host_posix`, then the other title DLLs' exports, forwarders followed), `.pdata` added to the exception dispatcher, `DllMain` and TLS callbacks run in dependency order on the main title thread before the exe's own, `DLL_THREAD_ATTACH/DETACH` delivered (`DisableThreadLibraryCalls` honoured), `LoadLibrary`/`GetModuleHandle`/`GetProcAddress`/`GetModuleFileName` see them, late `LoadLibrary` maps, binds and starts a DLL on the calling thread. `--list-imports` binds them too and runs none of their code |
+| Title-shipped DLLs (`native::dll`): msvcp140, vcruntime140, Bink, libHttpClient, ... | Done: mapped beside the exe in dependency order (a DLL is wanted unless our runtime serves its name, so the C++ runtime comes from the title's folder), relocated, own static TLS, bound through the same resolver (hle, then `host_posix`, then the other title DLLs' exports, forwarders followed), `.pdata` added to the exception dispatcher, `DllMain` and TLS callbacks run in dependency order on the main title thread before the exe's own, `DLL_THREAD_ATTACH/DETACH` delivered (`DisableThreadLibraryCalls` honoured), `LoadLibrary`/`GetModuleHandle`/`GetProcAddress`/`GetModuleFileName` see them, late `LoadLibrary` maps, binds and starts a DLL on the calling thread. `--list-imports` binds them too and runs none of their code. A title DLL that stubbed imports come from but that is not in the folder is named on a `missing dll` line, with a warning to point victory at the whole game folder; `MicrosoftGame.config` is found whatever its case, and a warning says when it is absent (the title ID is then 00000000). Both explained tester report #104 |
 | kernel32 and friends beyond the first slice (`host_posix/system.rs`) | Time and time zones, strings and locales, system information, mutexes, waitable timers, the thread pool, FLS, SLists, `InitOnce`, registry/ETW/COM/crypt32/bcrypt/user32 message stubs, `Get`/`SetEnvironmentVariable` over the process environment (names ignore case; the C runtime's `getenv` reads the same one, where Windows' CRT keeps a copy). The C runtime (`api-ms-win-crt-*`) is separate |
 | `GetModuleHandle`/`LoadLibrary`/`GetProcAddress` on system DLLs (`kernel32.dll`, `api-ms-win-core-*`, `ucrtbase.dll`, ...) | Done (`host_posix/fake_dll.rs`): one stable handle per normalised name, a 64 KiB read-only region holding a minimal PE header (no sections, no exports) so header reads do not crash; `GetProcAddress` (name or ordinal) resolves through the binder's resolver and returns a cached bridge stub (`bridge::stub_for`), NULL with `ERROR_PROC_NOT_FOUND` otherwise; `GetModuleFileName` gives `C:\Windows\System32\<name>`; `FreeLibrary` succeeds |
 | Universal C runtime (`api-ms-win-crt-*`, `ucrtbase.dll`) | Done (`host_posix/ucrt.rs`): about 700 exports, see below |
@@ -50,6 +50,7 @@ Setup prerequisites and its build are stubbed; no game or SDK files are needed.
 | WinHTTP (`host_posix/winhttp.rs`) | Done, offline: handles, options, timeouts, headers, status callbacks (`HANDLE_CLOSING` is delivered on close), `WinHttpCrackUrl`; `WinHttpSendRequest` fails with `ERROR_WINHTTP_CANNOT_CONNECT` and the calls that need a sent request fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Nothing leaves the machine |
 | Media Foundation (`host_posix/mf.rs`) | `MFStartup`/`MFShutdown`/`MFGetSystemTime` work; `MFCreateAttributes`, `MFCreateMediaType`, `MFCreateSourceResolver` and the source readers fail with `MF_E_UNSUPPORTED_BYTESTREAM_TYPE` and a null object, so a title skips its video paths. No COM objects; AVFoundation is the way to a real reader |
 | Audio decoder (`xapu.dll`, `modules::apu`) | Done on macOS: the same module as on Windows, its result event is a `host_posix` event handle |
+| Spatial audio (`host_posix/wasapi/spatial.rs`, over `wasapi.rs`) | `ISpatialAudioClient` on the default render device: the title's objects are mixed to stereo in 10 ms passes into the queue the CoreAudio `AudioQueue` plays. The title's event is set by a clock of the stream's own (`Shared::tick`): a period apart, half a period apart while fewer than three periods are queued, and not at all while five are. The device does not set it: CoreAudio takes frames in cycles of its own (512 frames at 48 kHz on the Mac measured), so it asks for 10 ms buffers 10.7 ms apart with two back to back every 160 ms, and one event for those two left a period of silence. Panning is by azimuth only. |
 | XAudio2 (`host_posix/xaudio2.rs`, `mixer.rs`, `coreaudio.rs`) | `XAudio2Create` (ordinal 1) returns a bridged `extern "win64"` `IXAudio2`. PCM and float source voices support buffer queues, loops, volume, channel volumes, output matrices and frequency ratios. The float mixer runs roughly 10 ms passes on the CoreAudio `AudioQueue` thread or the silent clock. Each pass calls registered engine start callbacks in order, source voice start callbacks with the byte shortfall, then voice and engine end callbacks after mixing. `StopEngine` pauses passes and `StartEngine` resumes them. Buffer, loop and stream notices still use the callback worker. A runtime queue enqueue failure raises `OnCriticalError`. `OnVoiceError` awaits a decoder that can fail during mixing. Effects, filters, full submix mixing and ADPCM/XMA/xWMA sources remain future work. |
 | Graphics objects and window on macOS | Done (`victory-gpu` native host on Metal, see `docs/metal-backend.md`): every object `D3D12XboxCreateDevice` and its methods hand out passes `object::answer`, which gives it a bridged method table (`object::set_bridge`, set by `apps/victory/src/native_run.rs` from `victory_loader::native`; the table's length sits just before its first slot, `ClearDepthStencilView` is `extern "win64"` for its float). Slots nobody wrote log once and answer `E_NOTIMPL`. The runtime's physical-memory observer forwards to `native::pool_observer()`, fence events to `posix::set_event`. `victory run --execute` opens an `NSWindow` (1920x1080, "VIctory") over the host's `CAMetalLayer` on the main thread (`apps/victory/src/window.rs`, AppKit through `objc2::msg_send!`, a hand-driven event loop) while the title runs on its own threads; closing it exits the process. `--headless` presents into an offscreen layer instead |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
@@ -275,6 +276,10 @@ The probe must be built with `-fasynchronous-unwind-tables -fexceptions -Xclang 
 
 Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread (a call from title code outside a dispatch returns); C++ handlers (`__CxxFrameHandler`) are not provided; unwinding stops at host frames (a host function that calls back into title code is not crossed); no stack-overflow handling; `SetThreadContext` is not done.
 
+**`DebugBreak`** is `RaiseException(EXCEPTION_BREAKPOINT, 0, 0, NULL)` for its caller (`_victory_DebugBreak`, a tail call into `_victory_RaiseException`), so a vectored handler or `__except` takes it and, with none, it is unhandled as on Windows; it is not a no-op. Guess: Windows runs an `int3` inside `DbgBreakPoint`, so its record names that address and has one parameter (0); here the address is the caller's return address, the record has none, and a handler that continues resumes after the call.
+
+**`FormatMessageW`** (`host_posix/system.rs`) does the part Microsoft Learn documents that a library uses: `FROM_SYSTEM` (an `HRESULT` of a Win32 error too), `FROM_STRING` with `%1`..`%99` inserts (`!s!`, `!ls!`, `!ws!`, `!d!`, `!i!`, `!u!`, `!x!`, `!X!`) and the escapes `%0`, `%n`, `%t`, `%%`, `%.`, `%!`, `% `, `IGNORE_INSERTS`, `ARGUMENT_ARRAY` or a `va_list`, `ALLOCATE_BUFFER` (leaked, as `FormatMessageA`'s: `LocalFree` keeps nothing to free) and `MAX_WIDTH_MASK`, which drops the system text's closing line break. Other sources (`FROM_HMODULE`), flags, `printf` forms or a null string argument fail with `ERROR_INVALID_PARAMETER`. System texts are Windows' English ones for a few common errors. Guesses: an id with no text gives `Error 0x%08X` where Windows fails with `ERROR_MR_MID_NOT_FOUND`, since a title logging it is better served by the number; a width other than 0 or `0xFF` does not wrap lines. `_ldsign` is `_dsign` (`long double` is `double` on this ABI): nonzero (`0x8000`) when the sign bit is set, as Microsoft Learn's floating-point primitives promise.
+
 **Threads.** `spawn_title_thread_with` sends `DLL_THREAD_ATTACH` before and `DLL_THREAD_DETACH` after the start routine to every image registered with `register_thread_callbacks` (`run_entry` registers the main image). `CREATE_SUSPENDED` holds the thread at a gate (the thread reads its suspension count and marks itself running under one lock, so a `SuspendThread` while it starts either parks it at the gate or finds it running); once running, `SuspendThread` is `thread_suspend` on the Mach port, retried briefly until the thread is in title code (so it holds no host lock), and `GetThreadContext` is `thread_get_state` (x86 state under Rosetta works). Waits on several objects use one epoch counter that every signal bumps (it wakes sleepers only while a thread is in such a wait, so a signal with none makes no system call); wait-all takes under a lock and gives back what it took if it cannot take all. Critical sections, SRW locks and condition variables live in the title's own structures over `wait_on_address`. Not done: mutexes (`CreateMutexW`), waitable timers, APCs, `SetThreadContext`, thread priorities.
 
 **Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Overlapped reads complete before returning. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
@@ -311,7 +316,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 - A function with a `float` or `double` argument is `extern "win64"` and declared to the bridge (`declare_win64`) when looked up; everything else is `extern "system"`. `lldiv` returns through the hidden pointer Windows passes in `rcx`.
 - Callbacks (`qsort`, `bsearch`, `_initterm`, `_execute_onexit_table`, `signal`/`raise`, the invalid-parameter handler) are title functions called with `call_win64`. `qsort` is a merge sort over a copy, so an inconsistent comparator cannot panic the host.
 - `strtod`, `strtof`, their wide forms and `scanf`'s floats set `ERANGE` for an underflow to zero (nonzero digits read as 0, such as `1e-400`) as for an overflow, as Microsoft documents; zero digits and subnormals do not.
-- `FILE*` is a leaked 16-byte block the title never reads; behind it is a stream shared with the descriptor `_fileno` returns, over `files::translate` paths (so `G:\` works). Reads are buffered, writes are not. Text mode drops `\r` before `\n` on reads and writes `\n` unchanged.
+- `FILE*` is a leaked 16-byte block the title never reads; behind it is a stream shared with the descriptor `_fileno` returns, over `files::translate` paths (so `G:\` works). Reads are buffered, writes are not. Text mode drops `\r` before `\n` on reads and writes `\n` unchanged. `_filelength`, `_tell`, `_eof` and their 64-bit forms return -1 with `EBADF` for a descriptor that is not open, as Microsoft documents. `_read` of a descriptor not open for reading returns -1 with `EBADF`, as Microsoft documents, not the 0 of an end of file. A failed seek leaves the position alone and sets `errno` as Microsoft documents for `_lseek`: `EBADF` for a bad descriptor, `EINVAL` for a bad origin or a position before the start of the file (`fseek` too).
 - `errno` is per thread (`_errno()`), with the Windows numbers (`EDOM` 33, `ERANGE` 34, `STRUNCATE` 80). The math functions set `EDOM` for a NaN from numbers and `ERANGE` for an infinity from finite ones. `remquo` stores the sign of `x / y` and the low three bits of the quotient's magnitude (taken from `|x| mod 8|y|`, so they hold for huge quotients too). The checked `float` wrappers (the `unary!`/`binary!` forms such as `expf`, `powf` and `fdimf`), `ldexpf`, `scalbnf`, `scalblnf` and `nextafterf` check the result after rounding it to a float, so a float overflow sets `ERANGE`; `fdim`, `ldexp`, `scalbn`, `scalbln`, `_scalb`, `nextafter` and `nexttoward` set it on overflow too. Underflow (a result rounded to zero or a subnormal) leaves `errno` alone, for all of them.
 - `rand` is the CRT's linear generator, per thread, seed 1: `srand(1)` gives 41, 18467, 6334 as on Windows.
 - `argv`, `argc`, the command line and the environment come from the host process, or from `victory_hle::posix::set_command_line` (call it before the title's start-up code runs).
@@ -330,8 +335,28 @@ constant", "comes from another load or place in it", "masked or merged (s_and, s
 "chosen by a select or a join", "is a program input" or "computed otherwise". Nothing new is
 lowered: the next tester log tells which forms to lower (a V# base address moved by an offset in
 dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
+One form is lowered: a buffer descriptor loaded whole except dword 1, which is the loaded dword 1
+ANDed with a constant that clears the whole stride and nothing else (bits 16-29 cleared; the base
+address bits 0-15 and the swizzle bits 30-31 kept; a partial clear may leave a stride, so it stays
+refused), as in a real run's `s_and_b32` with 0xc000ffff, for a buffer access that
+is not typed (`Tracer::stride_cleared`). With stride 0 the address is the base plus the offsets,
+index × stride adding nothing (RDNA2 ISA 8.1.5): the access reads the loaded view raw and drops its
+index (`Resources::unstrided`). Guess: the bounds stay the host view's size, which is the console's
+when the title's V# checks raw bounds in bytes (OOB_SELECT 3 without swizzle: offset + payload >
+num_records, in bytes with stride 0, ISA tables 33 and 35); OOB_SELECT 0 would put every access out
+of range, and OOB_SELECT 1 would check the index against num_records on the console, a check the
+dropped index no longer makes here. Typed accesses and other masks stay refused.
+`addr_tests::a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu` (`victory-gpu`)
+reads a structured view (16-byte elements) by index and offset on Metal: each lane gets dword
+`lane`, not `lane × 4 + lane`.
 `pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
 path: the container made from the title's pieces, the host's options.
+A mask or merge by a scalar ALU instruction names it and its constant operands (for a 64-bit one,
+the half the dword is), for example "dword 1 masked or merged (s_and_b32 with 0x3fffffff)", or
+"with computed values" when none is constant: a real run's 78 refusals at dword 1 (base address
+bits 47:32, stride, swizzle in a buffer V#, RDNA2 ISA 8.1.5) need the exact form. These texts are
+made at run time; refusals are `&'static str`, so each distinct one is kept for the program's life
+(`resource::interned`).
 
 ## Known limits of this slice
 
@@ -425,7 +450,8 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels copied out after it is drawn (`victory_metal::present`); a frame whose pixels are mostly pure green (zero YCbCr planes, a movie frame sampled blank) is counted. Once a second stderr gets `present pacing t=<s> presents=<n> longest_ms=<gap> green=<n> partly_green=<n> green_total=<n>`: presents in that second, the longest gap between two, and green frames. Costs one small blit a frame.
 - `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
 - `VICTORY_PROFILE=<secs>`: times every title-to-host call (imports and the methods of bridged objects: count, total and longest, by `rdtsc` in the bridge) and logs the 40 with the longest total every that many seconds. Time inside a call includes waiting for the host's locks and any title code it calls back, so methods that are long everywhere (all of `0x118`, `0x428`, `0xc0` at about 150 ms) point at a lock someone else holds (here the native host's `TITLE` lock, held by `sync_textures`).
-- `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines).
+- `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory.
+- `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
 - `VICTORY_TRACE_DISPATCH_FLAGS=1`: logs the first `DispatchX` with each flags value (`DispatchX: the first dispatch with these flags`, with its counts and the bits the host does not know: it knows 0x20 and 0x8000, see "`DispatchX` with thread counts"), and the first `ExecuteIndirect` of a type-105 dispatch, whose counts run as group counts.
 - `VICTORY_TRACE_IMPORTS=1`: the same for every import bound to a host function (name and DLL), whatever the result. Slow (millions of lines in a title's startup).
 - `VICTORY_KEYS=<seconds>:<key>,...`: on macOS, scripted input next to the live keyboard (below; the two are OR-ed): each key is held for 0.2 s that long after `GameInputCreate`, and drives the stand-in pad (`Enter` is A, `Esc` is B, `Tab` is Menu; letters, digits, `Tab`, `Back` and the arrows as in the README). **Live keys (windowed run):** `window.rs` takes key-down and key-up events (macOS key codes, not characters; Cmd shortcuts are left to AppKit) and calls `gameinput::set_live_key` with the Windows virtual key; the macOS `Source::keys` returns them with the scripted ones, so the stand-in pad (`FALLBACK_BUTTONS`, shared with Windows) sees both. Held while down, released on key-up or when the window loses key status. Enter or Space is A, Esc or Backspace B, X, Y, arrows the D-pad, W/A/S/D the left stick (I/J/K/L the right, F/H the stick clicks), Tab Menu, V View, Q/E the shoulders, Z/C the triggers. **Controllers (windowed run):** while the window has key status, each loop turn `window.rs` reads one `GCController`: `GCController.current` (the one used last) when it has an `extendedGamepad`, otherwise the first connected one that has. The Xbox layout comes from the extended gamepad's elements, so a DualShock 4 (`GCDualShockGamepad`) and a DualSense (`GCDualSenseGamepad`) are read like an Xbox pad: Cross/Circle/Square/Triangle are A/B/X/Y, Options (`buttonMenu`) is Menu, Share (`buttonOptions`) is View. Those two profiles also have `touchpadButton` (found with `respondsToSelector:`), and its click is View too: our choice, as PlayStation titles use the touchpad for back and map. The PS button (`buttonHome`) is not mapped: GameInput has no Guide bit for titles, and macOS keeps it for its own overlay. `gameinput::set_live_pad` OR-s the result with the keyboard's stand-in pad. Each change of controller is logged once at info level (`controller: drives the pad`, with `vendor`, `category` such as `DualShock 4`, and `touchpad`). The window tests read a software gamepad (`+[GCController controllerWithExtendedGamepad]`, whose elements take `setValue:`), so the read path is checked without hardware. A headless run needs it to get past the title's engagement screen (below); `VICTORY_KEYS=$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)` presses Enter every 2 s.
@@ -587,7 +613,7 @@ Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which tit
 * **Views of memory in no pool.** A buffer view whose address the pool table cannot resolve now writes the null view (size 0) into its host heap entry, and `mirror` still returns the error; it used to leave the entry as it was, so a descriptor the title reused for such a buffer kept showing the buffer it named before, and shaders read and wrote that memory, possibly given to something else since (a cause of writes landing elsewhere, issue #15). The entry is not marked mirrored by `mirror`. Image and sampler views the host cannot make still leave the entry as it was: a buffer is not something to put in a texture or sampler entry.
 * Ruled out on the way: the pool view of the constant buffer equals the title's bytes (no aliasing problem for the low, sub-4 GiB linear allocator), no mirror errors for it, the table's heap is the heap bound, residency (`VICTORY_METAL_RESIDENCY_SETS=1` changes nothing there).
 
-Residency itself: what a descriptor heap names is resident through the heap's own `MTLResidencySet` (the heap buffer plus each allocation its entries name, added when first named and removed when the last entry naming it is overwritten), given to every command buffer that uses the heap, so residency follows the frame. Before, every allocation was named to every encoder with `useResource`: the world's heap names about 37,000 allocations, the kernel took about 155 ms per drawing render pass for that list whatever the pass's shaders, and a world frame with 35 such passes in one submission took over 5 s with the GPU idle (0.07 fps on an M5 Pro; 0.47 with the sets). The sets are the default only on a Mac with 32 GiB or more (a guess: the world's heap set holds 17 to 18 GB and no smaller Mac has run it); a smaller Mac keeps the per-encoder naming unless `VICTORY_METAL_RESIDENCY_SETS=heap` asks for the sets, and the choice is logged once at start-up. `VICTORY_METAL_RESIDENCY_SETS=0` gives the per-encoder naming back on any Mac. `VICTORY_METAL_RESIDENCY_SETS=1` also keeps the title's pool buffers in a set on every queue, which holds all of title memory (about 6.7 GB on a Series S profile) resident for the whole process and on an 18 GB Mac ended in `kIOGPUCommandBufferCallbackErrorTimeout` after the world load; by default the encoders name the pool buffers they use. The frame line logs the heap set's size (`heap_set_mb`). Not checked on a 16 or 18 GB Mac. Details in `docs/metal-backend.md`, "Residency (what a heap needs)".
+Residency itself: what a descriptor heap names is resident through the heap's own `MTLResidencySet` (the heap buffer plus each allocation its entries name, added when first named and removed when the last entry naming it is overwritten), given to every command buffer that uses the heap, so residency follows the frame. Before, every allocation was named to every encoder with `useResource`: the world's heap names about 37,000 allocations, the kernel took about 155 ms per drawing render pass for that list whatever the pass's shaders, and a world frame with 35 such passes in one submission took over 5 s with the GPU idle (0.07 fps on an M5 Pro; 0.47 with the sets). The sets are the default only on a Mac with 32 GiB or more (a guess: the world's heap set holds 17 to 18 GB and no smaller Mac has run it); a smaller Mac keeps the per-encoder naming unless `VICTORY_METAL_RESIDENCY_SETS=heap` asks for the sets, and the choice is logged once at start-up. `VICTORY_METAL_RESIDENCY_SETS=0` gives the per-encoder naming back on any Mac. `VICTORY_METAL_RESIDENCY_SETS=1` also keeps the title's pool buffers in a set on every queue, which holds all of title memory (about 6.7 GB on a Series S profile) resident for the whole process and on an 18 GB Mac ended in `kIOGPUCommandBufferCallbackErrorTimeout` after the world load; by default the encoders name the pool buffers they use. A texture the title releases for good (its object's last reference, or the pool it was placed in) has its heap entries cleared (`NativeHost::release_resource`, counted as `heap_cleared` on the frame line): left alone they kept the host texture alive and resident until the title happened to write another view there. A cleared entry reads as one never written. It is written again when the title writes another record there, or makes a texture at the released object's address again (`register_texture`: the record is then checked against the new texture, as the title's record for it may equal the old one's). The old record alone is not mirrored again: in a run it named the next object at that address, an RGBA8 texture under a stale R8 view, and Metal asserts on such a view (the backend now refuses a view format Metal cannot cast the texture to, `gfx::castable`). A texture only replaced by another description at its address keeps its entries (the title may still read them; that release is a guess). The frame line logs the heap set's size (`heap_set_mb`). Not checked on a 16 or 18 GB Mac. Details in `docs/metal-backend.md`, "Residency (what a heap needs)".
 * With both, a normal run (no debug switch) draws the content target: a dark (32, 32, 44) background and the white button prompts "ACCOUNT PICKER (Y)  SCREEN NARRATION (OFF) (X)  PLAYER (A)" at the bottom right, placed and scaled by the real matrix (the "logo" under `VICTORY_DEBUG_VS_POS=1` was these glyphs at 1/32768 scale). With static samplers in the layout the presented buffer shows the same frames (scratchpad `presented-finish-setup.png`).
 * Texture formats added for the menus: DXGI 2 (`R32G32B32A32_FLOAT`), 56 (`R16_UNORM`), 61 (`R8_UNORM`) and 65 (`A8_UNORM`, a 2048x2048 UI atlas). Views of them had no host texture before. With them, runs reach the legal-notices menu (about 90 s with `VICTORY_KEYS`). Still open: the body font's x-height-only letters (a c e m n o r s u v w x z) draw as filled boxes, while letters with ascenders or descenders are right. The title never calls `ClearDepthStencilView`, and stencil-only clears would be dropped anyway (`glue::clear_dsv` acts on flag 1 only), so stencil-then-cover text was the first suspect; ruled out since: no pipeline enables stencil (`VICTORY_TRACE_PIPES=1` logs each guessed pipeline's depth, stencil and blend state), and the atlas reaches the host (below). The cause was the blend state (below).
 * Debug runs: the content draws start about 5 s before the boot-wait breakpoint, so dump every second (`VICTORY_DUMP_TARGETS=<dir>,30,1` with `VICTORY_TRACE_TARGETS=1`, which the dumps need) and check that the target was drawn before the last dump. `VICTORY_DEBUG_PS=in<N>` reads the original input row, which a split input may have moved: a black result does not mean the vertex shader wrote 0.
@@ -685,6 +711,12 @@ slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend 
 the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
 count are not read; a view of part of an array shows all of it.
 
+A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
+`MostDetailedMip` onward. The native decoder preserves that count for ordinary and placed
+views so Metal clamps it to the remaining levels. Previously the decoder returned zero and
+the host bound the whole texture, so a shader reading level 0 saw the base mip even when
+the view started farther down the chain.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers
@@ -703,6 +735,32 @@ times. Draws and dispatches of the failed buffer are lost, and its copies are no
 have partly run, and its source may have changed since). Guess: the console has no equivalent of a
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
 policy, not console behaviour.
+
+#### A command buffer the GPU never reports on is paid too
+
+Observed, with memory running out (two games in the world at once on a 48 GB Mac: 41 GB wired, 5%
+free; one game alone wires about 22.5 GB in either residency mode): after 30 to 60 world frames one
+game stops for good with no crash. Metal fails some command buffers of the graphics queue with
+`kIOGPUCommandBufferCallbackErrorTimeout` 5 and 10 s after they were committed, and never calls the
+completed handler of others committed before them: in one run #11485, #11486, #11489 and #11490
+failed while #11483, #11484, #11487 and #11488 were neither completed nor failed for the remaining
+minute. The unreported ones' value writes never land (one held the fills of three barrier words),
+so every title queue stays held on its barrier word, no fence moves, and the title spins in `Sleep`
+with no graphics call at all. The queue's order event is not what is stuck (it had reached every
+value encoded). The same error is what an 18 GB Mac got with the pool's set on the queues.
+
+Now: every submission is listed until Metal reports on it (`gfx::Flight`). While work stays held
+(`refresh`, at most every 5 s) `gfx::recover_lost` pays what the lost ones owe, as for a failed
+command buffer: a command buffer is lost when one committed after it on the same queue failed 5 s
+ago or more, or when it has gone unreported for 30 s. It logs an error the first time and a
+warning with the count each time. Guess: such a command buffer never runs. If one does, its draws
+land late and its signals and writes repeat what was paid. Lost draws are missing from the
+picture; the title goes on, and recovers when memory is there again.
+
+Two runs with `VICTORY_METAL_RESIDENCY_SETS=0` under the same pressure (40.5 GB wired, 6% free,
+four minutes, 21 world frames each) had no failed command buffer. That is fewer frames than the
+set-mode runs reached before stalling (31 and 54), so it does not show that per-encoder naming
+survives pressure better.
 
 #### A pass refused mid-encoding ends its encoder
 
@@ -785,6 +843,21 @@ still record commands for depth-only, stencil-only and combined flags. Array/unk
 and default views of multisampled resources are also rejected; explicit and default
 single-layer 1D views still record full mip-0 clears. Rectangle and subresource clear support remains unimplemented.
 
+#### GPU-written textures copied back into title memory (`VICTORY_TEXTURE_BACK=1`)
+
+Host textures are Metal's own allocations in Apple's layout, so what a compute pass writes never shows in the title's bytes, and a title that reads such a texture on the CPU (the ocean's height and displacement maps, [#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)) gets the old contents. Off unless `VICTORY_TEXTURE_BACK=1`:
+
+* **Which textures.** At each dispatch, the textures named by unordered access views in the descriptor tables it binds (`NativeHost::note_written`): more than the shader writes, which costs time but changes nothing (the read-back equals what is there). Of those, textures with the unordered access flag, not render or depth targets, with at most 4 MiB of title memory. The limit is a guess until a world run shows what is written; each texture is logged once, copied or too large, with format, size and layout.
+* **When.** Each piece of title work also signals a fence of the host's own, in the same command buffer; the title's signals go in later ones. The copy happens once that fence is reached, before the title is shown any fence value (`Title::completed`, `Title::fence_value`: read the values, then copy back, so the work a value covers is already in memory). No page protection and no read faults: the native host has none, and Rosetta cannot resume some faults (`watch.rs`). Guess: the title waits on a fence, or reads a frame late; a title polling a label the GPU writes into memory, or another queue that waits on such a label and then signals a fence, could get there before the copy.
+* **Layout.** The reverse of the upload: `read_texture` per mip and array slice (a 3D mip is read with all its depth), `Layout::tile` into the current title bytes (the same address walk as `detile`, so every layout the upload handles, including the XOR modes; padding between subresources stays), then written through the pool's own mapping. B4G4R4A4 (115) is rotated back by 4 bits. Layouts `detile` refuses never had a host copy to read.
+* **The title's own writes win.** If the memory no longer holds what the host texture was filled from (or last copied back as), nothing is written and the next submission uploads the title's bytes. The hash of the bytes written back is recorded as the last upload, so the scanner's sighting of them uploads nothing.
+* **Not seen:** UAVs a shader reaches by indexing the descriptor heap itself, pixel shader UAV writes, and GPU copies into textures.
+* **Cost.** CPU read, retile and two hashes per written texture per submission, under the title lock. A compute retile on the GPU is the next step if a profile shows it.
+
+Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D texture in `LINEAR`, `SW_4KB_S` and `SW_64KB_D_X`. A second test sends tiled bytes up into a host texture and back down for 1D, 2D with 5 and 9 mips, a 2D array with mips, and 3D with and without mips (element sizes 1, 4 and 8, the same three modes plus `SW_64KB_S`): every mip, array slice and depth slice comes back where it was. It shows nothing is dropped, not that the console's layout equations are right (both directions use them). Not tested: a dispatch writing those shapes.
+
+A world run on an M5 Pro (Series S, windowed, reported on [#151](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/151)) named 22 textures as copied back (15 2D, 4 3D, 3 1D; the largest 256x256x16, 4 MiB), none too large, with no frame rate change beyond run-to-run noise up to the first world frame. The run then crashed (image+0x55e56f8, also without the switch), so whether boats float is still unknown. That count may be low: a texture skipped on its first completion was not logged then (fixed since).
+
 #### Texture formats the host lacked
 
 The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
@@ -811,9 +884,11 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 91 | B8G8R8A8_UNORM_SRGB | 1024x512, sampled (named once a windowed run reached the world load) | BGRA8Unorm_sRGB |
 | 95, 96 | BC6H_UF16, BC6H_SF16 | 96: 512x512 (tester log #123) | BC6H_RGBUfloat, BC6H_RGBFloat. Metal's `RGBFloat` is the signed one: 95 used to map to it, so unsigned BC6H textures decoded with the wrong sign (test: `victory-metal` `sample_bc6h_unsigned_and_signed`) |
 
-Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
+Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and uploads need the conversion, as does the copy-back of GPU-written textures (above). Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
 
 A render target view whose host texture cannot be made keeps its attachment slot: `glue::targets` binds nothing for that pass and refuses the draws that follow, instead of moving the later targets into earlier slots.
+
+A render target view's format says how its writes are stored, so a view that names the other format of its texture's sRGB pair (R8G8B8A8 or B8G8R8A8, UNORM against UNORM_SRGB) is drawn and cleared through a host view of the texture in that format (`Title::target_of`). The title draws its boot movie through a plain view (28) of an sRGB texture (29): drawn into the texture itself, the picture was encoded a second time and shown too bright. The view's other fields (mip, slice) are still not read.
 
 ## Whole-wave sections the simulation does not follow
 
@@ -829,8 +904,18 @@ models every step, "a value that is no reduction or prefix". The first step not 
 hint, not proof: the value refused may not depend on it. `pipeline::pieces_tests::
 the_host_refuses_a_whole_wave_section_naming_its_step` (`victory-gpu`) checks the refusal on the
 native host's own path: the container made from the title's pieces, the host's options. The
-story-load log of issue #110 (Series S) has three compute programs refused with the old message;
-nothing is lowered yet.
+story-load log of issue #110 (Series S) has three compute programs refused with the old message.
+The simulator now follows a constant loaded by `s_mov_b32` inside the section. For example, a
+signed minimum can use `INT_MAX` from an SGPR as its inactive-lane identity. Whether the three
+logged programs use this pattern is unknown.
+
+A section of `v_mul_f32` steps is now followed: it is the product of the lanes
+(`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
+host waves of a console wave multiply their results (`split_wave_tests::
+a_whole_wave_product_multiplies_both_halves` runs it on Metal). As with the other float
+reductions, the host multiplies in its own order, so the last bits may differ from the console's.
+Prefix products and integer products (`v_mul_lo_u32`) are still refused. Whether any title shader
+needs a product is not known: no run log names the operation.
 
 ## Groups whose lanes are not a multiple of 64 (wave32 host)
 
@@ -913,3 +998,66 @@ native Metal host serves no view addresses or formats to shaders, and would have
 (`victory-gpu`) checks the refusal on the native host's own path: the container made from the
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
+
+## The device's own memory ceiling, logged at native host startup (issue #8)
+
+16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),
+even with `--console series-s` (#12) and per-encoder residency (#76, which cut real usage from
+12+ GB to about 9.4 GB on an 18 GB Mac). Nobody has set a real threshold for when that is a problem
+on a given Mac, because nobody has the numbers from a run that hits it on current `main` yet.
+
+Rather than guess a threshold (an earlier version of this change tried a 90%-of-recommendation
+warning; worked out against this M2 Pro 16 GB's own real numbers it was silent exactly on the
+Series S default #12 steers 16 GB Macs to — `Metal` here reports `recommendedMaxWorkingSet: 12,124
+MiB`, and Series S's 7,776 MiB budget is 64% of that even before any host overhead, so a fixed
+10% margin never fires where it matters), `native::glue::with_title`
+(`crates/victory-gpu/src/native/glue.rs`), the one place the native Metal device is made (lazily,
+on first GPU use), now always logs `MTLDevice.recommendedMaxWorkingSetSize`
+(`Metal::recommended_working_set`, `crates/victory-metal/src/metal.rs`) alongside the console
+name and its declared `title_memory` (GPU-optimal plus standard), in the existing "native host:
+Metal" line. No switch is needed: it is a log line, not a behaviour change ("dropped work is
+logged loudly", above). Every tester's log now carries the numbers needed to work out a real
+threshold, or to see the host's own overhead (texture copies, heaps) once compared against a
+run's actual peak Metal memory.
+
+Tests: `victory_metal::metal::tests::recommended_working_set_is_nonzero_on_real_hardware` (the
+real device on whatever Mac runs the test suite; on this M2 Pro it reported 12,124 MiB).
+
+## Reverb and convolution DSP (`chad.dll`), a CPU fallback (`VICTORY_GUESS_DSP=1`)
+
+The title's audio DSP coprocessor convolves blocks of float samples with an impulse response
+(`crates/victory-hle/src/modules/dsp.rs`). `XDspActivate`'s `StreamDesc::ir` holds that response,
+but in the hardware's own partitioned frequency-domain layout, which is not documented anywhere
+we have found, so it is not read. Issue #17: outputs were always zeroed, so reverb and
+convolution effects played back silent (dry sound, which does not go through this path, was
+unaffected).
+
+Guess, marked in code (`synthetic_ir`, `convolve_merged`), off by default behind
+`VICTORY_GUESS_DSP=1` since it is unverified against a real run (without the variable, behaviour
+is unchanged: silence, as before): a convolution stream (`StreamDesc::kind == CONVOLUTION`) gets a
+fixed, deterministic ~100 ms (4,800 tap at 48 kHz) synthetic decaying-noise impulse, unrelated to
+the title's own response, convolved with the input per channel and scaled by the command's
+`gains`. `gains` is itself a second guess: it is read as one gain per output channel, as likely to
+actually be `[dry, wet]`, in which case a mono stream's second element is never read.
+
+The tail is carried across blocks (`Stream::history`, the last `ir.len() - 1` frames of input,
+fed back in as the start of the next block) rather than reset at every boundary, so a continuous
+input does not click at the block rate. This is still a CPU-fallback coloration, not the title's
+actual reverb: a real room's decay is 300 ms or more, well past what a per-sample scalar
+convolution can do without an FFT-based engine. `Stream::scratch` is reused every call instead of
+allocating, and the title's input is always copied into it before any write to the output buffer,
+in case the two happen to alias.
+
+`VICTORY_TRACE_DSP=1` logs the leading floats of a convolution stream's own `StreamDesc::ir` at
+activation (`trace_ir`). It exists to let a future run with the real game settle what format that
+data is actually in (time-domain samples, in which case `ir_floats` for a given `ir_seconds` would
+land near `ir_seconds * 48000`, or something else) and replace this guess with the real thing.
+
+Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
+`convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
+hand-computed values), `a_block_split_matches_one_convolution_over_the_whole_signal` (splitting one
+signal into two blocks and carrying history gives the same result as convolving it in one go — the
+property that stops the tail from clicking at block boundaries), and
+`convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
+`VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
+input).

@@ -941,6 +941,53 @@ fn lds_instructions_addressed_by_m0_translate() {
     );
 }
 
+/// A loaded buffer descriptor whose stride the program clears (`s_and_b32` of dword 1 with
+/// 0xc000ffff, a title's form) is the loaded view read raw, the index adding nothing (RDNA2 ISA
+/// 8.1.5): its dword loads translate, by index or by offset. A mask that clears only part of the
+/// stride (which may then not be 0), one that also clears base address bits, and a typed load stay
+/// refused.
+#[test]
+fn a_descriptor_with_its_stride_cleared_reads_the_loaded_view_raw() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |mask: u32, load: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x870D_FF0D,
+            mask, // s_and_b32 s13, s13, mask
+            load,
+            0x8003_0100, // buffer_load_* v1, v0, s[12:15], 0 (idxen or offen)
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // A raw UAV at table dword 0, the buffer read at dword 8.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+    };
+    let (idxen, offen, typed) = (0xE030_2000, 0xE030_1000, 0xE000_2000);
+    program(0xC000_FFFF, idxen).unwrap();
+    program(0xC000_FFFF, offen).unwrap();
+    let refused = |r: Result<_, ShaderError>| match r {
+        Err(ShaderError::Unsupported { what, .. }) => what,
+        Ok(_) => panic!("translated"),
+        Err(e) => panic!("{e}"),
+    };
+    // A stride of 16 (bit 20) survives 0xc03fffff: the index would still count.
+    let part = refused(program(0xC03F_FFFF, idxen));
+    assert!(part.contains("dword 1 masked or merged"), "{part}");
+    let base = refused(program(0xC000_FFFE, idxen));
+    assert!(base.contains("dword 1 masked or merged"), "{base}");
+    let format = refused(program(0xC000_FFFF, typed));
+    assert!(format.contains("dword 1 masked or merged"), "{format}");
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [
@@ -2238,6 +2285,70 @@ fn compute_root_constants_reach_the_user_data() {
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
+/// Reduce the active lanes with signed min. Each inactive lane contributes INT_MAX,
+/// supplied either directly to v_cndmask or through an SGPR in the whole-wave section.
+#[test]
+fn a_whole_wave_minimum_accepts_a_scalar_literal_identity() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let minimum = |setup: &[u32], identity: u32| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7D82_0085, // v_cmp_lt_u32 vcc_lo, 5, v0
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        ];
+        code.extend_from_slice(setup);
+        code.extend([0xD501_0001, 0x000A_0000 | identity]); // v_cndmask_b32 v1, identity, v0, s2
+        if identity == 255 {
+            code.push(i32::MAX as u32);
+        }
+        // Each row of 16 reduces in four butterflies.
+        for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+            code.extend([0x2202_02FA, 0xFF00_0001 | ctrl << 8]); // v_min_i32_dpp v1, v1, v1
+        }
+        code.extend([
+            0xD778_0002,
+            0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+            0x2202_0501, // v_min_i32 v1, v1, v2
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        let container = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+        translate_with(&container, Options::default())
+    };
+    let direct = minimum(&[], 255).expect("literal identity");
+    let moved = minimum(&[0xBE86_03FF, 0x7FFF_FFFF], 6).expect("s_mov_b32 s6, INT_MAX");
+    assert_eq!(moved.dxil, direct.dxil);
+
+    let exec_off = [
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBE86_03FF, 0x7FFF_FFFF, // s_mov_b32 s6, INT_MAX
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+    ];
+    let moved = minimum(&exec_off, 6).expect("scalar move with EXEC off");
+    assert_eq!(moved.dxil, direct.dxil);
+
+    // Overwriting INT_MAX with -1 no longer supplies the signed-min identity.
+    let wrong = minimum(&[0xBE86_03FF, 0x7FFF_FFFF, 0xBE86_03C1], 6);
+    assert!(matches!(
+        wrong,
+        Err(ShaderError::Unsupported { what: super::wave::NO_SHAPE, .. })
+    ));
+    // A scalar register read is not a literal.
+    let dynamic = minimum(&[0xBE86_0302], 6); // s_mov_b32 s6, s2 (saved EXEC)
+    assert!(matches!(dynamic, Err(ShaderError::Unsupported { what, .. })
+        if what.ends_with("a scalar ALU result")));
+}
+
 /// A value a whole-wave section leaves without a shape is refused naming the
 /// first step the simulation does not model, or, when it models every step,
 /// saying the value is no reduction or prefix.
@@ -2265,7 +2376,7 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
     };
     let prefix = "a whole-wave section step the simulation does not follow: ";
     for (step, why) in [
-        (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+        (&[0x0802_0100][..], "a VALU operation it does not model"), // v_sub_f32 v1, v0, v0
         // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
         (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
     ] {
@@ -2323,5 +2434,41 @@ fn a_cross_lane_operation_outside_compute_says_which_and_where() {
             err.contains(&format!("a cross-lane operation outside compute: {want}")),
             "{err}"
         );
+    }
+}
+
+/// A `v_mul_f32` butterfly over the wave, as `WaveActiveProduct` expands, is
+/// the product of the lanes: it lowers like the sum and min/max sections.
+#[test]
+fn whole_wave_float_products_lower() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001,
+        0x000A_00F2, // v_cndmask_b32_e64 v1, 1.0, v0, s2
+        0x1002_02FA,
+        0xFF00_B101, // v_mul_f32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x1002_02FA,
+        0xFF00_4E01, // v_mul_f32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x1002_02FA,
+        0xFF01_4101, // v_mul_f32_dpp v1, v1, v1 row_half_mirror
+        0x1002_02FA,
+        0xFF01_4001, // v_mul_f32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    let container = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+    if let Err(e) = translate_with(&container, Options::default()) {
+        panic!("{e}");
     }
 }

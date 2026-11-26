@@ -1563,7 +1563,7 @@ mod pieces_tests {
         };
         let prefix = "a whole-wave section step the simulation does not follow: ";
         for (step, why) in [
-            (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+            (&[0x0802_0100][..], "a VALU operation it does not model"), // v_sub_f32 v1, v0, v0
             // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
             (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
         ] {

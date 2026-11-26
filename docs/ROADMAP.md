@@ -26,20 +26,21 @@ Two problems stop it, in this order:
 ## 2. Frame rate and memory in the world
 
 - In the world, fps falls from about 15 to about 7 over 4 minutes. Something grows every frame; host texture copies are the main suspect (one tester counted 26,000 by frame 4096). Being investigated on `fix/fps-decay`.
-- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies is proposed in #110. Series S is the default on 16 GB Macs.
+- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies is proposed in #110. Series S is the default on 16 GB Macs. The native host now logs Metal's own recommended working set size alongside the title's declared budget at startup, so a tester's log carries the numbers needed to set a real threshold.
 - The game rewrites about 40,000 descriptor records a frame with plain stores. Patching its store sites instead of remirroring is being measured ([#43](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/43); `VICTORY_TRACE_DESCRIPTORS=sites`).
-- Textures the GPU writes and the CPU reads back (the water simulation) are not copied back yet ([#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)).
+- Textures the GPU writes and the CPU reads back (the water simulation) are copied back behind `VICTORY_TEXTURE_BACK=1`, off by default ([#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)). A world run on an M5 Pro names 22 textures at no measurable cost, then crashes before boats can be seen. Needed: a run past that crash.
 
 ## 3. Shader translation gaps ([#4](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/4))
 
 Refused shaders drop their draws and dispatches. Unique refused shaders in the story load fell from 526 to about 150 on 27 November, and more fixes have landed since. Refusals now name their exact cause. The largest groups left:
-- an image store of some channels;
 - a descriptor loaded from title memory at an address in a root constant (bindless; needs the host to map the address to a heap index);
 - a lane-mask join of an untracked mask;
 - cross-lane operations and LDS shared between the two host waves of a console wave, inside real per-lane branches (needs if-conversion so both host waves always arrive);
 - a whole-wave section step the simulation does not follow.
 
 Fixed on 27 November: compute root constants, sized from the root signature's `Num32BitValues` (#114); `v_pk_fmac_f16` constants; wave64 lane-mask joins; `s_absdiff_i32`; signed BC6H; ExecuteIndirect with a count buffer. A batch on `fix/shader-refusals-2` also covers samplers built from constant bit masks, the thread-group info SGPR, and LDS behind uniform branches; it is being merged.
+
+Since then: image stores of some channels (#94) and whole-wave float products (`WaveActiveProduct`, `v_mul_f32`).
 
 Translated shaders, pipelines and refusals are cached on disk between runs.
 
@@ -51,7 +52,7 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 
 ## 5. Everything after that
 
-- Reverb: the audio DSP's convolution is not emulated, so reverb returns are silent ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)).
+- Reverb: the audio DSP's convolution has a synthetic CPU fallback behind `VICTORY_GUESS_DSP=1` (a fixed decaying-noise tail, not the title's own impulse response); default behaviour is unchanged (silence) until a real run judges whether it sounds right ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)). The hardware's impulse-response layout is still undocumented; `VICTORY_TRACE_DSP=1` logs the title's own `ir` data to help settle it.
 - The Brightness logo draws as half a rectangle ([#16](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/16)).
 - Mesh-shader pipelines: indirect mesh dispatches still drop.
 - Culling, depth, stencil and write mask in guessed pipelines are still partly guessed.

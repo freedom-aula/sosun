@@ -45,6 +45,7 @@ IMPORT int TlsSetValue(u32, ptr);
 IMPORT ptr AddVectoredExceptionHandler(u32, ptr);
 IMPORT u32 RemoveVectoredExceptionHandler(ptr);
 IMPORT void RaiseException(u32, u32, u32, const u64 *);
+IMPORT void DebugBreak(void);
 
 /* Threads and synchronisation. */
 IMPORT u32 SuspendThread(ptr);
@@ -291,8 +292,10 @@ enum {
     E_UNHANDLED_SKIPPED = 1u << 12,
     E_AFTER = 1u << 13,
     E_ORDER = 1u << 14,
+    E_BREAK = 1u << 15,
+    E_BREAK_CONTINUE = 1u << 16,
 };
-#define EXC_ALL 0x7FFFu
+#define EXC_ALL 0x1FFFFu
 
 static volatile int *volatile null_pointer = (volatile int *)8;
 static volatile int zero;
@@ -449,6 +452,27 @@ u32 probe_seh(ptr unused)
         RemoveVectoredExceptionHandler(handle);
         VirtualFree(veh_page, 0, 0x8000);
     }
+    /* DebugBreak raises EXCEPTION_BREAKPOINT, which __except takes... */
+    caught = 0;
+    seen_code = 0;
+    __try {
+        DebugBreak();
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught && seen_code == 0x80000003)
+        ok |= E_BREAK;
+    /* ...and a filter that continues returns from it. */
+    after = 0;
+    __try {
+        DebugBreak();
+        after = 1;
+    } __except (continue_filter((struct exception_pointers *)_exception_info())) {
+        after = 2;
+    }
+    if (after == 1)
+        ok |= E_BREAK_CONTINUE;
+
     /* Everything above left the thread able to carry on. */
     if (read_gs(0x30) == teb_at_start)
         ok |= E_AFTER;
