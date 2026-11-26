@@ -299,8 +299,11 @@ fn sleep_condition(
     loop {
         // A wake between the load and the wait changes the word, and the
         // wait returns at once. A spurious return leaves the word alone:
-        // only a changed word is a wake, so the wait goes on until the time
-        // is up (wait_on_address's callers re-check, as here).
+        // with a deadline, only a changed word is a wake, so the wait goes
+        // on until the time is up (wait_on_address's callers re-check, as
+        // here). Without a deadline any return is taken as a wake, which is
+        // legal for a condition variable: the caller re-checks its own
+        // predicate.
         let left = match deadline {
             None => None,
             Some(d) => match d.checked_duration_since(Instant::now()) {
@@ -321,6 +324,10 @@ fn sleep_condition(
             reacquire();
             return 1;
         }
+        // The word did not change, a spurious return. wait_on_address also
+        // returns at once on EFAULT-type errors, so back off instead of
+        // spinning until the deadline.
+        std::thread::sleep(Duration::from_micros(100));
     }
 }
 
