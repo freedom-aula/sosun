@@ -8,7 +8,10 @@ use super::container::SigElement;
 use super::lower::{self, Lowered, Parts};
 use super::{Options, graphics, translate_with};
 use crate::dxbc::{Container, FourCC};
-use crate::native::{HwStage, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
+    UsedResource,
+};
 use crate::{ShaderError, io, ir, resource, structure};
 
 fn bytes_of(words: &[u32]) -> Vec<u8> {
@@ -1406,6 +1409,151 @@ fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
             .contains("a vertex fetch format the host's vertex layout lacks"),
         "untyped buffer_load_format: got `{err}`"
     );
+}
+
+// =========================================================================
+// Compute: "a typed buffer store of some channels or at an offset"
+// =========================================================================
+
+/// A wave32 compute program whose table in user data 0 holds a typed buffer
+/// UAV: each lane stores registers from v1 on (copies of its lane number) to
+/// element `lane` with the typed store `store` (two words).
+fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    typed_store_cs_after(&[], store)
+}
+
+/// [`typed_store_cs`] with the words `setup` run just before the store.
+fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0x7E04_0300, // v_mov_b32 v2, v0
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    words.extend_from_slice(setup);
+    words.extend([store[0], store[1], 0xBF81_0000]); // then s_endpgm
+    let table = RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![table],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 3 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    })
+}
+
+/// Typed stores of one, two or three channels write the whole element (0 in
+/// the channels they do not name: `stride_tests` runs one), so they lower as
+/// the four-channel store does.
+#[test]
+fn typed_buffer_stores_of_some_channels_lower() {
+    let stores: &[(u32, &str)] = &[
+        (0xE010_2000, "buffer_store_format_x v1, v0, s[8:11], 0 idxen"),
+        (0xE014_2000, "buffer_store_format_xy v[1:2], v0, s[8:11], 0 idxen"),
+        (0xE018_2000, "buffer_store_format_xyz v[1:3], v0, s[8:11], 0 idxen"),
+        (0xE01C_2000, "buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen"),
+        (0xE210_2000, "buffer_store_format_d16_x v1, v0, s[8:11], 0 idxen"),
+        (0xE214_2000, "buffer_store_format_d16_xy v1, v0, s[8:11], 0 idxen"),
+        (0xE218_2000, "buffer_store_format_d16_xyz v[1:2], v0, s[8:11], 0 idxen"),
+        (0xE21C_2000, "buffer_store_format_d16_xyzw v[1:2], v0, s[8:11], 0 idxen"),
+    ];
+    for &(w0, asm) in stores {
+        let l = typed_store_cs([w0, 0x8002_0100]).unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+}
+
+/// A typed view has no bytes inside an element to address: a typed store at
+/// an offset stays refused.
+#[test]
+fn typed_buffer_stores_at_an_offset_remain_refused() {
+    let stores: &[([u32; 2], &str)] = &[
+        ([0xE010_2004, 0x8002_0100], "buffer_store_format_x v1, v0, s[8:11], 0 idxen offset:4"),
+        ([0xE010_3000, 0x8002_0102], "buffer_store_format_x v1, v[2:3], s[8:11], 0 idxen offen"),
+        ([0xE01C_2004, 0x8002_0100], "buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen offset:4"),
+    ];
+    for &(store, asm) in stores {
+        let err = typed_store_cs(store).err().unwrap_or_else(|| panic!("{asm}: expected refusal"));
+        assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
+    }
+}
+
+/// A scalar offset register that provably holds 0 (a move of the constant) is
+/// no offset: the store lowers, whatever its channel count.
+#[test]
+fn typed_buffer_stores_at_a_zero_sgpr_offset_lower() {
+    let stores: &[(u32, &str)] = &[
+        (0xE01C_2000, "buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen"),
+        (0xE010_2000, "buffer_store_format_x v1, v0, s[8:11], s2 idxen"),
+    ];
+    for &(w0, asm) in stores {
+        // s_mov_b32 s2, 0
+        let l = typed_store_cs_after(&[0xBE82_0380], [w0, 0x0202_0100])
+            .unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+}
+
+/// A scalar offset register holding another constant, or a value that is not
+/// known, is an offset: refused, not dropped.
+#[test]
+fn typed_buffer_stores_at_a_nonzero_or_unknown_sgpr_offset_remain_refused() {
+    let setups: &[(u32, &str)] = &[
+        (0xBE82_0384, "s_mov_b32 s2, 4"),
+        (0xBE82_0300, "s_mov_b32 s2, s0"),
+    ];
+    for &(setup, asm) in setups {
+        // buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen
+        let err = typed_store_cs_after(&[setup], [0xE01C_2000, 0x0202_0100])
+            .err()
+            .unwrap_or_else(|| panic!("{asm}: expected refusal"));
+        assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
+    }
 }
 
 // =========================================================================

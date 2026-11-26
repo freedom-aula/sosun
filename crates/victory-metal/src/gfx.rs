@@ -99,6 +99,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         Format::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+        Format::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::D32Float => MTLPixelFormat::Depth32Float,
