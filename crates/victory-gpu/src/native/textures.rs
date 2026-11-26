@@ -202,6 +202,19 @@ pub struct Tracked<B: ResourceBackend> {
     /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
     /// them; once left to the scanner, their first frames showed green for a second or two).
     blank: bool,
+    /// Its view in the other format of its sRGB pair, once a render target view named it.
+    twin: Option<Rc<B::Texture>>,
+}
+
+/// The other format of an sRGB pair.
+fn srgb_twin(f: Format) -> Option<Format> {
+    Some(match f {
+        Format::Rgba8Unorm => Format::Rgba8UnormSrgb,
+        Format::Rgba8UnormSrgb => Format::Rgba8Unorm,
+        Format::Bgra8Unorm => Format::Bgra8UnormSrgb,
+        Format::Bgra8UnormSrgb => Format::Bgra8Unorm,
+        _ => return None,
+    })
 }
 
 /// Submissions a texture whose memory changed stays hot without a further change.
@@ -442,6 +455,7 @@ impl<B: PresentBackend> Title<B> {
                 sampled_sees_writes: false,
                 skipped: 0,
                 blank: false,
+                twin: None,
             },
         );
         true
@@ -456,6 +470,35 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
         self.textures.get(&key).map(|t| t.texture.clone())
+    }
+
+    /// What a render target view of title texture `key` in DXGI format `named` (0: the texture's
+    /// own) draws into, and its format: the host texture, or its view in the other format of
+    /// its sRGB pair when the view names that one. The view's format says how writes are stored:
+    /// a picture written through a plain view of an sRGB texture is display values already (a
+    /// movie), and drawn into the texture itself it was encoded again and shown too bright.
+    pub fn target_of(&mut self, key: usize, named: u32) -> Option<(Rc<B::Texture>, Format)> {
+        self.realize(key);
+        let t = self.textures.get_mut(&key)?;
+        let own = t.info.desc()?.format;
+        let Some(twin) = format(named).filter(|&f| srgb_twin(own) == Some(f)) else {
+            return Some((t.texture.clone(), own));
+        };
+        if t.twin.is_none() {
+            let view = ViewDesc {
+                format: twin,
+                mips: (0, usize::MAX),
+                slices: (0, usize::MAX),
+            };
+            match self.host.backend.create_texture_view(&t.texture, &view) {
+                Ok(v) => t.twin = Some(Rc::new(v)),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?own, view = ?twin, "no host view for a render target view: drawn in the texture's format");
+                    return Some((t.texture.clone(), own));
+                }
+            }
+        }
+        t.twin.clone().map(|v| (v, twin))
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.

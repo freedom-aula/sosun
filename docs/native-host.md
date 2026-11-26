@@ -802,6 +802,8 @@ Integer render targets never blend (Metal refuses a pipeline that blends one), w
 
 A render target view whose host texture cannot be made keeps its attachment slot: `glue::targets` binds nothing for that pass and refuses the draws that follow, instead of moving the later targets into earlier slots.
 
+A render target view's format says how its writes are stored, so a view that names the other format of its texture's sRGB pair (R8G8B8A8 or B8G8R8A8, UNORM against UNORM_SRGB) is drawn and cleared through a host view of the texture in that format (`Title::target_of`). The title draws its boot movie through a plain view (28) of an sRGB texture (29): drawn into the texture itself, the picture was encoded a second time and shown too bright. The view's other fields (mip, slice) are still not read.
+
 ## Whole-wave sections the simulation does not follow
 
 A whole-wave section (`emit::wave`, decision 0003) is simulated on the console's lanes, and a
