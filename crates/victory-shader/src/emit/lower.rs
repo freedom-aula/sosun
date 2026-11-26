@@ -341,6 +341,9 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// Generic pixel inputs interpolated with more than one mode:
+    /// `(original input id, mode)` -> split `SigElement` id on its own row.
+    split_inputs: Map<(usize, u8), usize>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -821,6 +824,7 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            split_inputs: Map::default(),
         }
     }
 
@@ -1570,7 +1574,10 @@ impl<'a> Lower<'a> {
                     // moves to M0 for its interpolation (spilled and reloaded
                     // on the way); the host interpolates by itself, so the
                     // value goes unread.
-                    None if self.s.pixel && self.x.io.initialized_sgprs == Some(n + 2) => {
+                    None if self.s.pixel
+                        && (self.x.io.initialized_sgprs == Some(n + 2)
+                            || self.is_interp_m0_only(v)) =>
+                    {
                         Val::I32(self.s.m.i32(0))
                     }
                     // The ordered section's collision id, and (`operand`) the
@@ -1594,6 +1601,177 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether a pixel-shader live-in SGPR `start` flows exclusively (through
+    /// scalar copies, phis, and constant-lane VGPR spills) into `M0` for
+    /// `v_interp_*` instructions and nowhere else (e.g. `PRIM_MASK` in a
+    /// guessed pixel shader whose SGPR slot is not `initialized_sgprs - 2`).
+    fn is_interp_m0_only(&self, start: Value) -> bool {
+        let mut work = vec![(start, None::<u32>)];
+        let mut seen = HashSet::new();
+        seen.insert((start, None));
+        let mut used_by_interp = false;
+        while let Some((val, spilled)) = work.pop() {
+            for block in &self.x.p.blocks {
+                for phi in &block.phis {
+                    if phi.args.contains(&val) && seen.insert((phi.value, spilled)) {
+                        work.push((phi.value, spilled));
+                    }
+                }
+                for inst in &block.insts {
+                    let mut reads = inst.reads.iter().filter(|&&(_, v)| v == val).peekable();
+                    if reads.peek().is_none() {
+                        continue;
+                    }
+                    let name = inst.name();
+                    for &(reg, _) in reads {
+                        match spilled {
+                            Some(lane) => match (&inst.fields, name) {
+                                (Fields::Valu(v), "v_writelane_b32") => {
+                                    // `val` must be the old dst VGPR, not src0.
+                                    let is_src0 = matches!(
+                                        v.src.first(),
+                                        Some(&Operand::Scalar { code, .. })
+                                            if reg == Reg::S(code)
+                                    );
+                                    let Some(other) =
+                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                                    else {
+                                        return false;
+                                    };
+                                    if is_src0 {
+                                        return false;
+                                    }
+                                    if other != lane {
+                                        let Some(Operand::Vector { reg: d, .. }) = v.dst else {
+                                            return false;
+                                        };
+                                        let Some(w) = inst.write(Reg::V(d)) else {
+                                            return false;
+                                        };
+                                        if seen.insert((w, Some(lane))) {
+                                            work.push((w, Some(lane)));
+                                        }
+                                    }
+                                }
+                                (Fields::Valu(v), "v_readlane_b32") => {
+                                    let Some(rlane) =
+                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                                    else {
+                                        return false;
+                                    };
+                                    if rlane == lane {
+                                        let Some(Operand::Scalar { code, .. }) = v.dst else {
+                                            return false;
+                                        };
+                                        let Some(w) = inst.write(Reg::S(code)) else {
+                                            return false;
+                                        };
+                                        if seen.insert((w, None)) {
+                                            work.push((w, None));
+                                        }
+                                    }
+                                }
+                                _ => return false,
+                            },
+                            None if reg == Reg::S(crate::ir::M0) => {
+                                if name.starts_with("v_interp_")
+                                    || matches!(inst.fields, Fields::Vintrp { .. })
+                                {
+                                    used_by_interp = true;
+                                } else if matches!(name, "s_sendmsg" | "s_sendmsghalt")
+                                    && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == 7)
+                                {
+                                    // `MSG_ORDERED_PS_DONE` ignores M0 in hardware, though
+                                    // `ir::build` records an implicit M0 read on all `s_sendmsg`.
+                                } else if name == "s_mov_b32"
+                                    && let Fields::Sop {
+                                        dst: Some(Operand::Scalar { code, .. }),
+                                        ..
+                                    } = &inst.fields
+                                    && let Some(w) = inst.write(Reg::S(*code))
+                                {
+                                    if seen.insert((w, None)) {
+                                        work.push((w, None));
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                            None => match (&inst.fields, name) {
+                                (
+                                    Fields::Sop {
+                                        dst: Some(Operand::Scalar { code, .. }),
+                                        ..
+                                    },
+                                    "s_mov_b32",
+                                ) => {
+                                    let Some(w) = inst.write(Reg::S(*code)) else {
+                                        return false;
+                                    };
+                                    if seen.insert((w, None)) {
+                                        work.push((w, None));
+                                    }
+                                }
+                                (
+                                    Fields::Sop {
+                                        dst: Some(Operand::Scalar { code: dcode, .. }),
+                                        src,
+                                        ..
+                                    },
+                                    "s_mov_b64",
+                                ) => {
+                                    let Some(&Operand::Scalar { code: scode, .. }) = src.first()
+                                    else {
+                                        return false;
+                                    };
+                                    let half = if reg == Reg::S(scode) {
+                                        0
+                                    } else if reg == Reg::S(scode + 1) {
+                                        1
+                                    } else {
+                                        return false;
+                                    };
+                                    let Some(w) = inst.write(Reg::S(dcode + half)) else {
+                                        return false;
+                                    };
+                                    if seen.insert((w, None)) {
+                                        work.push((w, None));
+                                    }
+                                }
+                                (Fields::Valu(v), "v_writelane_b32") => {
+                                    let is_src0 = matches!(
+                                        v.src.first(),
+                                        Some(&Operand::Scalar { code, .. })
+                                            if reg == Reg::S(code)
+                                    );
+                                    let Some(lane) =
+                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                                    else {
+                                        return false;
+                                    };
+                                    let Some(Operand::Vector { reg: d, .. }) = v.dst else {
+                                        return false;
+                                    };
+                                    if !is_src0 {
+                                        return false;
+                                    }
+                                    let Some(w) = inst.write(Reg::V(d)) else {
+                                        return false;
+                                    };
+                                    if seen.insert((w, Some(lane))) {
+                                        work.push((w, Some(lane)));
+                                    }
+                                }
+                                _ => return false,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        used_by_interp
+    }
+
     fn input(&mut self, input: Input) -> Val {
         let (kind, col) = match input {
             Input::VertexId => (1, 0),
@@ -1610,6 +1788,32 @@ impl<'a> Lower<'a> {
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
+            Input::Ancillary => {
+                let Some(e) = self.s.inputs.iter_mut().find(|e| e.kind == 12) else {
+                    return Val::Missing("a pixel system input the signature lacks");
+                };
+                e.usage |= 1;
+                // shortcut: only sample index bits 8..11 of the pixel ancillary
+                // input are populated (face/prim-mask/slice bits stay zero);
+                // upgrade if a pixel shader reads non-sample ancillary bits.
+                let entry = self.s.entry;
+                let idx =
+                    self.s
+                        .op(entry, "sampleIndex.i32", Attr::ReadNone, self.s.t.i32, 90, &[]);
+                let k8 = self.s.m.i32(8);
+                return Val::I32(self.s.m.bin(entry, Bin::Shl, idx, k8));
+            }
+            Input::SampleCoverage => {
+                let Some(e) = self.s.inputs.iter_mut().find(|e| e.kind == 14) else {
+                    return Val::Missing("a pixel system input the signature lacks");
+                };
+                e.usage |= 1;
+                let entry = self.s.entry;
+                return Val::I32(
+                    self.s
+                        .op(entry, "coverage.i32", Attr::ReadNone, self.s.t.i32, 91, &[]),
+                );
+            }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
@@ -1769,14 +1973,27 @@ impl<'a> Lower<'a> {
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
-            let c = self.cur;
-            let mut word = self.i32_of(lo)?;
-            if let Some(hi) = hi {
-                let h = self.i32_of(hi)?;
-                word = self.s.m.bin(c, Bin::Or, word, h);
-            }
-            let z = self.s.m.i32(0);
-            let any = Val::Bit(self.s.m.cmp(c, pred::NE, word, z));
+            // Emit in the defining block so caching in `vals` dominates all uses,
+            // and allow reading the mask dwords even when the consumer does not
+            // itself set `mask_ok` (e.g. `s_cselect`, `s_addc`).
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let was_ok = self.mask_ok;
+            self.mask_ok = true;
+            let res = (|| -> Result<V, Why> {
+                let mut word = self.i32_of(lo)?;
+                if let Some(hi) = hi {
+                    let h = self.i32_of(hi)?;
+                    word = self.s.m.bin(at, Bin::Or, word, h);
+                }
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, word, z))
+            })();
+            self.mask_ok = was_ok;
+            let any = Val::Bit(res?);
             self.vals.insert(v, any);
             return Ok(any);
         }
@@ -1996,10 +2213,12 @@ impl<'a> Lower<'a> {
     /// Both dwords of a mask holding lanes that do not reach the block
     /// writing it (a complement, a copy made where EXEC is not known), so
     /// no ballot there gives it: with console lanes, the scalar operation
-    /// that writes it applied to its operands' numbers, as the console does.
+    /// that writes it applied to its operands' numbers, as the console does;
+    /// with host lanes (`MaskData::Host`), only wave-size-safe bitwise ops
+    /// and selects on host ballots.
     fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
         const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
-        if self.mask_data != MaskData::Console {
+        if self.mask_data == MaskData::None {
             return Err(ELSEWHERE);
         }
         let p = self.x.p;
@@ -2039,106 +2258,134 @@ impl<'a> Lower<'a> {
         {
             return Err(ELSEWHERE);
         }
+        if matches!(op, "lshl" | "lshr") && self.mask_data != MaskData::Console {
+            return Err(ELSEWHERE);
+        }
         let at = if b == self.cur_ir {
             self.cur
         } else {
             self.tail[b].ok_or("a lane mask written after its use")?
         };
-        // Dword `h` of source `k` (inline constants sign-extend).
-        let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
-            let x = match src.get(k) {
-                Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                    let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
-                    return l.i32_of(v);
-                }
-                Some(&Operand::Const(c)) => {
-                    let x = crate::resource::inline(c).ok_or(ELSEWHERE)?;
-                    match h {
-                        0 => x,
-                        _ if (x as i32) < 0 => u32::MAX,
-                        _ => 0,
+        let was_ok = self.mask_ok;
+        self.mask_ok = true;
+        let result = (|| -> Result<(V, V), Why> {
+            // Dword `h` of source `k` (inline constants sign-extend).
+            let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
+                let x = match src.get(k) {
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
+                        return l.i32_of(v);
                     }
-                }
-                Some(&Operand::Literal(x)) if h == 0 => x,
-                Some(Operand::Literal(_)) => 0,
-                _ => return Err(ELSEWHERE),
-            };
-            Ok(l.s.m.i32(x))
-        };
-        if matches!(op, "lshl" | "lshr") {
-            // The shift count is the low 6 (5) bits of a plain number.
-            let n = word(self, 1, 0)?;
-            let a = word(self, 0, 0)?;
-            let i64t = self.s.m.int(64);
-            let k32 = self.s.m.int_const(i64t, 32);
-            let kmask = self.s.m.i32(if wave64 { 63 } else { 31 });
-            let n = self.s.m.bin(at, Bin::And, n, kmask);
-            let f = if op == "lshl" { Bin::Shl } else { Bin::LShr };
-            if !wave64 {
-                return Ok((self.s.m.bin(at, f, a, n), self.s.m.i32(0)));
-            }
-            self.s.flags |= flags::INT64;
-            let b = word(self, 0, 1)?;
-            let a = self.s.m.cast(at, Cast::ZExt, a, i64t);
-            let b = self.s.m.cast(at, Cast::ZExt, b, i64t);
-            let b = self.s.m.bin(at, Bin::Shl, b, k32);
-            let x = self.s.m.bin(at, Bin::Or, a, b);
-            let n = self.s.m.cast(at, Cast::ZExt, n, i64t);
-            let r = self.s.m.bin(at, f, x, n);
-            let rl = self.s.m.cast(at, Cast::Trunc, r, self.s.t.i32);
-            let rh = self.s.m.bin(at, Bin::LShr, r, k32);
-            let rh = self.s.m.cast(at, Cast::Trunc, rh, self.s.t.i32);
-            return Ok((rl, rh));
-        }
-        let mut out = [self.s.m.i32(0); 2];
-        for h in 0..1 + u8::from(wave64) {
-            let a = word(self, 0, h)?;
-            let ones = self.s.m.i32(u32::MAX);
-            out[usize::from(h)] = match op {
-                "mov" => a,
-                "not" => self.s.m.bin(at, Bin::Xor, a, ones),
-                "cselect" => {
-                    let c = word(self, 1, h)?;
-                    let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
-                    let cond = match self.get(scc)? {
-                        Val::Bit(x) => x,
-                        Val::I32(x) => {
-                            let z = self.s.m.i32(0);
-                            self.s.m.cmp(at, pred::NE, x, z)
+                    Some(&Operand::Const(c)) => {
+                        let x = crate::resource::inline(c).ok_or(ELSEWHERE)?;
+                        match h {
+                            0 => x,
+                            _ if (x as i32) < 0 => u32::MAX,
+                            _ => 0,
                         }
-                        Val::Missing(w) => return Err(w),
-                    };
-                    self.s.m.select(at, cond, a, c)
-                }
-                _ => {
-                    let c = word(self, 1, h)?;
-                    // (operation, complement of src1, complement of the result)
-                    let (f, not_c, not_r) = match op {
-                        "and" => (Bin::And, false, false),
-                        "or" => (Bin::Or, false, false),
-                        "xor" => (Bin::Xor, false, false),
-                        "andn2" => (Bin::And, true, false),
-                        "orn2" => (Bin::Or, true, false),
-                        "nand" => (Bin::And, false, true),
-                        "nor" => (Bin::Or, false, true),
-                        "xnor" => (Bin::Xor, false, true),
-                        _ => return Err(ELSEWHERE),
-                    };
-                    let c = if not_c {
-                        self.s.m.bin(at, Bin::Xor, c, ones)
-                    } else {
-                        c
-                    };
-                    let r = self.s.m.bin(at, f, a, c);
-                    if not_r {
-                        self.s.m.bin(at, Bin::Xor, r, ones)
-                    } else {
-                        r
                     }
-                }
+                    Some(&Operand::Literal(x)) if h == 0 => x,
+                    Some(Operand::Literal(_)) => 0,
+                    _ => return Err(ELSEWHERE),
+                };
+                Ok(l.s.m.i32(x))
             };
-        }
-        Ok((out[0], out[1]))
+            if matches!(op, "lshl" | "lshr") {
+                // The shift count is the low 6 (5) bits of a plain number.
+                let n = word(self, 1, 0)?;
+                let a = word(self, 0, 0)?;
+                let i64t = self.s.m.int(64);
+                let k32 = self.s.m.int_const(i64t, 32);
+                let kmask = self.s.m.i32(if wave64 { 63 } else { 31 });
+                let n = self.s.m.bin(at, Bin::And, n, kmask);
+                let f = if op == "lshl" { Bin::Shl } else { Bin::LShr };
+                if !wave64 {
+                    return Ok((self.s.m.bin(at, f, a, n), self.s.m.i32(0)));
+                }
+                self.s.flags |= flags::INT64;
+                let b = word(self, 0, 1)?;
+                let a = self.s.m.cast(at, Cast::ZExt, a, i64t);
+                let b = self.s.m.cast(at, Cast::ZExt, b, i64t);
+                let b = self.s.m.bin(at, Bin::Shl, b, k32);
+                let x = self.s.m.bin(at, Bin::Or, a, b);
+                let n = self.s.m.cast(at, Cast::ZExt, n, i64t);
+                let r = self.s.m.bin(at, f, x, n);
+                let rl = self.s.m.cast(at, Cast::Trunc, r, self.s.t.i32);
+                let rh = self.s.m.bin(at, Bin::LShr, r, k32);
+                let rh = self.s.m.cast(at, Cast::Trunc, rh, self.s.t.i32);
+                return Ok((rl, rh));
+            }
+            let mut out = [self.s.m.i32(0); 2];
+            for h in 0..1 + u8::from(wave64) {
+                let a = word(self, 0, h)?;
+                let ones = self.s.m.i32(u32::MAX);
+                out[usize::from(h)] = match op {
+                    "mov" => a,
+                    "not" => self.s.m.bin(at, Bin::Xor, a, ones),
+                    "cselect" | "cmov" => {
+                        let c = if op == "cmov" {
+                            let old = inst.read(Reg::S(*code + h)).ok_or(ELSEWHERE)?;
+                            self.i32_of(old)?
+                        } else {
+                            word(self, 1, h)?
+                        };
+                        let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                        let cond = match self.get(scc)? {
+                            Val::Bit(x) => x,
+                            Val::I32(x) => {
+                                let z = self.s.m.i32(0);
+                                self.s.m.cmp(at, pred::NE, x, z)
+                            }
+                            Val::Missing(w) => return Err(w),
+                        };
+                        self.s.m.select(at, cond, a, c)
+                    }
+                    _ => {
+                        let c = word(self, 1, h)?;
+                        // (operation, complement of src1, complement of the result)
+                        let (f, not_c, not_r) = match op {
+                            "and" => (Bin::And, false, false),
+                            "or" => (Bin::Or, false, false),
+                            "xor" => (Bin::Xor, false, false),
+                            "andn2" => (Bin::And, true, false),
+                            "orn2" => (Bin::Or, true, false),
+                            "nand" => (Bin::And, false, true),
+                            "nor" => (Bin::Or, false, true),
+                            "xnor" => (Bin::Xor, false, true),
+                            _ => return Err(ELSEWHERE),
+                        };
+                        let c = if not_c {
+                            self.s.m.bin(at, Bin::Xor, c, ones)
+                        } else {
+                            c
+                        };
+                        let r = self.s.m.bin(at, f, a, c);
+                        if not_r {
+                            self.s.m.bin(at, Bin::Xor, r, ones)
+                        } else {
+                            r
+                        }
+                    }
+                };
+            }
+            if self.mask_data == MaskData::Host
+                && wave64
+                && matches!(op, "not" | "orn2" | "nand" | "nor" | "xnor")
+            {
+                // On a 32-lane host wave, complementing sets bits 32..63 that
+                // belong to no lane; clear the high dword when wave size <= 32.
+                self.s.flags |= flags::WAVE_OPS;
+                let lanes = self
+                    .s
+                    .op(at, "waveGetLaneCount", Attr::ReadNone, self.s.t.i32, 112, &[]);
+                let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+                let wide = self.s.m.cmp(at, pred::IUGT, lanes, k32);
+                out[1] = self.s.m.select(at, wide, out[1], z);
+            }
+            Ok((out[0], out[1]))
+        })();
+        self.mask_ok = was_ok;
+        result
     }
 
     // ---- operands ----
@@ -2708,10 +2955,38 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(word).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
+            // In pixel and vertex programs (`MaskData::Host`), allow opaque
+            // masks whose value is host-wave-size independent (e.g.
+            // `1 << s_ff1(mask)`, `mask & -mask`, `mask & (mask - 1)`,
+            // `s_bitset0(mask, s_ff1(mask))`, uniform all-0/all-1 masks).
+            Atom::Opaque(v) if self.mask_data == MaskData::Host => {
+                let hi_val = self.pair_high(v);
+                if !self.is_host_wave_mask(v, hi_val, &mut Set::default()) {
+                    return Err("an opaque lane mask");
+                }
+                let lo = self.get(v)?;
+                let hi = hi_val.map(|h| self.get(h)).transpose()?;
+                let word = |w: Val| match w {
+                    Val::I32(x) => Ok(x),
+                    _ => Err("an opaque lane mask"),
+                };
+                let lo = word(lo)?;
+                let hi = hi.map(word).transpose()?;
+                let hi = if self.x.wave32_host { None } else { hi };
+                Ok(self.lane_bit(at, lo, hi))
+            }
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
+            }
+            // Quad-periodic constants (same 4-bit pattern in every quad, e.g.
+            // `0x5555_5555_5555_5555`) mean the same on any host wave size.
+            Atom::Constant(k)
+                if self.mask_data == MaskData::Host && self.is_quad_periodic(k) =>
+            {
+                let lo = self.s.m.i32(k as u32);
+                Ok(self.lane_bit(at, lo, None))
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
@@ -2795,7 +3070,674 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        let hreg = pick(reg)?;
+        if let Some(hi) = inst.write(hreg) {
+            return Some(hi);
+        }
+        // Split 64-bit add/sub pair: `s_sub_u32` + `s_subb_u32` (or `s_add_u32`
+        // + `s_addc_u32`) sharing SCC into adjacent SGPRs.
+        if let Some(scc) = inst.write(Reg::Scc)
+            && matches!(inst.name(), "s_sub_u32" | "s_add_u32")
+            && let Some(hi) = p.blocks[b].insts.iter().find_map(|u| {
+                (matches!(u.name(), "s_subb_u32" | "s_addc_u32")
+                    && u.read(Reg::Scc) == Some(scc))
+                .then(|| u.write(hreg))
+                .flatten()
+            })
+        {
+            return Some(hi);
+        }
+        // Fallback: a 2-dword scalar operand reading `lo` alongside `reg + 1`.
+        let mut found = None;
+        for block in &p.blocks {
+            for u in &block.insts {
+                let ops: &[Operand] = match &u.fields {
+                    Fields::Sop { src, .. } => src,
+                    Fields::Valu(v) => &v.src,
+                    _ => continue,
+                };
+                for op in ops {
+                    if let Operand::Scalar { code, dwords: 2 } = *op
+                        && u.read(Reg::S(code)) == Some(lo)
+                        && let Some(h) = u.read(Reg::S(code + 1))
+                    {
+                        match found {
+                            None => found = Some(h),
+                            Some(prev) if prev == h => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether a constant lane mask repeats identically in every 4-lane quad.
+    fn is_quad_periodic(&self, k: u64) -> bool {
+        let lo = k as u32;
+        let hi = (k >> 32) as u32;
+        lo.rotate_left(4) == lo && (!self.x.native.wave64 || lo == hi)
+    }
+
+    /// Whether `op` is provably a 0/1 scalar flag (so `0 - op` is all-0/all-1).
+    fn is_scalar_flag(&self, inst: &Inst, op: Operand, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        match op {
+            Operand::Const(253) => true, // src_scc
+            _ if matches!(scalar_constant(op), Some(0 | 1)) => true,
+            Operand::Scalar { code, .. } if code != NULL => {
+                let Some(v) = inst.read(Reg::S(code)) else {
+                    return false;
+                };
+                let Some(def) = self.def_inst(v) else {
+                    return false;
+                };
+                let Fields::Sop { src, .. } = &def.fields else {
+                    return false;
+                };
+                match def.name() {
+                    "s_mov_b32" => src
+                        .first()
+                        .is_some_and(|&s| self.is_scalar_flag(def, s, depth - 1)),
+                    "s_and_b32" => src
+                        .iter()
+                        .any(|&s| scalar_constant(s) == Some(1)),
+                    "s_lshr_b32" => src.get(1).and_then(|&s| scalar_constant(s)) == Some(31),
+                    "s_bfe_u32" => src
+                        .get(1)
+                        .and_then(|&s| scalar_constant(s))
+                        .is_some_and(|imm| (imm >> 16 & 0x7F) == 1),
+                    "s_cselect_b32" => {
+                        src.len() == 2
+                            && src
+                                .iter()
+                                .all(|&s| self.is_scalar_flag(def, s, depth - 1))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether 32-bit scalar `v` is provably uniform all-0 or all-1.
+    fn is_uniform_bitmask32(&self, v: Value, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(def) = self.def_inst(v) else {
+            return false;
+        };
+        let Fields::Sop { dst, src, imm } = &def.fields else {
+            return false;
+        };
+        let op_ok = |op: Operand| -> bool {
+            if matches!(scalar_constant(op), Some(0 | u32::MAX)) {
+                return true;
+            }
+            match op {
+                Operand::Scalar { code, .. } if code != NULL => def
+                    .read(Reg::S(code))
+                    .is_some_and(|x| self.is_uniform_bitmask32(x, depth - 1)),
+                _ => false,
+            }
+        };
+        match def.name() {
+            "s_mov_b32" | "s_not_b32" => src.first().is_some_and(|&s| op_ok(s)),
+            "s_movk_i32" => matches!(imm.map(|x| i32::from(x as i16) as u32), Some(0 | u32::MAX)),
+            "s_cselect_b32" => src.len() == 2 && src.iter().all(|&s| op_ok(s)),
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                let src_ok = if def.name() == "s_cmovk_i32" {
+                    matches!(imm.map(|x| i32::from(x as i16) as u32), Some(0 | u32::MAX))
+                } else {
+                    src.first().is_some_and(|&s| op_ok(s))
+                };
+                let old_ok = dst.is_some_and(op_ok);
+                src_ok && old_ok
+            }
+            "s_ashr_i32" => src.get(1).and_then(|&s| scalar_constant(s)) == Some(31),
+            "s_sub_i32" | "s_sub_u32" => {
+                src.first().and_then(|&s| scalar_constant(s)) == Some(0)
+                    && src
+                        .get(1)
+                        .is_some_and(|&s| self.is_scalar_flag(def, s, depth - 1))
+            }
+            "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
+            | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
+                src.len() == 2 && src.iter().all(|&s| op_ok(s))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether scalar `v` is a host-wave lane index (`s_ff1` or `W - 1 - s_flbit`
+    /// of a host-wave mask).
+    fn is_host_lane_index(&self, v: Value, visited: &mut Set<Value>) -> bool {
+        if !visited.insert(v) {
+            return false;
+        }
+        let Some(def) = self.def_inst(v) else {
+            return false;
+        };
+        let Fields::Sop { dst, src, .. } = &def.fields else {
+            return false;
+        };
+        let wave64 = self.x.native.wave64;
+        let mask_arg = |op: Operand, wide: bool, visited: &mut Set<Value>| -> bool {
+            let Operand::Scalar { code, .. } = op else {
+                return false;
+            };
+            if code == NULL {
+                return false;
+            }
+            let Some(lo) = def.read(Reg::S(code)) else {
+                return false;
+            };
+            let hi = if wide {
+                match def.read(Reg::S(code + 1)) {
+                    Some(h) => Some(h),
+                    None => return false,
+                }
+            } else {
+                None
+            };
+            self.is_host_wave_mask(lo, hi, visited)
+        };
+        let flbit_of = |op: Operand, visited: &mut Set<Value>| -> bool {
+            let Operand::Scalar { code, .. } = op else {
+                return false;
+            };
+            let Some(u) = def.read(Reg::S(code)) else {
+                return false;
+            };
+            let Some(fdef) = self.def_inst(u) else {
+                return false;
+            };
+            let Fields::Sop { src: fsrc, .. } = &fdef.fields else {
+                return false;
+            };
+            let want = if wave64 {
+                "s_flbit_i32_b64"
+            } else {
+                "s_flbit_i32_b32"
+            };
+            if fdef.name() != want {
+                return false;
+            }
+            let Some(&Operand::Scalar { code: mc, .. }) = fsrc.first() else {
+                return false;
+            };
+            if mc == NULL {
+                return false;
+            }
+            let Some(lo) = fdef.read(Reg::S(mc)) else {
+                return false;
+            };
+            let hi = if wave64 {
+                match fdef.read(Reg::S(mc + 1)) {
+                    Some(h) => Some(h),
+                    None => return false,
+                }
+            } else {
+                None
+            };
+            self.is_host_wave_mask(lo, hi, visited)
+        };
+        match def.name() {
+            "s_ff1_i32_b64" if wave64 => {
+                src.first().is_some_and(|&s| mask_arg(s, true, visited))
+            }
+            "s_ff1_i32_b32" if !wave64 => {
+                src.first().is_some_and(|&s| mask_arg(s, false, visited))
+            }
+            "s_sub_i32" | "s_sub_u32" | "s_xor_b32" => {
+                let top = if wave64 { 63 } else { 31 };
+                (src.first().and_then(|&s| scalar_constant(s)) == Some(top)
+                    && src.get(1).is_some_and(|&s| flbit_of(s, visited)))
+                    || (def.name() == "s_xor_b32"
+                        && src.get(1).and_then(|&s| scalar_constant(s)) == Some(top)
+                        && src.first().is_some_and(|&s| flbit_of(s, visited)))
+            }
+            "s_mov_b32" => src.first().is_some_and(|&s| {
+                matches!(s, Operand::Scalar { code, .. } if code != NULL
+                    && def.read(Reg::S(code)).is_some_and(|x| self.is_host_lane_index(x, visited)))
+            }),
+            "s_cselect_b32" => {
+                src.len() == 2
+                    && src.iter().all(|&s| {
+                        matches!(s, Operand::Scalar { code, .. } if code != NULL
+                            && def.read(Reg::S(code)).is_some_and(|x| self.is_host_lane_index(x, visited)))
+                    })
+            }
+            "s_cmov_b32" => {
+                let s0 = src.first().is_some_and(|&s| {
+                    matches!(s, Operand::Scalar { code, .. } if code != NULL
+                        && def.read(Reg::S(code)).is_some_and(|x| self.is_host_lane_index(x, visited)))
+                });
+                let old = dst.is_some_and(|d| {
+                    matches!(d, Operand::Scalar { code, .. } if code != NULL
+                        && def.read(Reg::S(code)).is_some_and(|x| self.is_host_lane_index(x, visited)))
+                });
+                s0 && old
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `(lo, hi)` is a host-wave-safe lane mask in `MaskData::Host`
+    /// (produces the right per-lane boolean via `lane_bit` on both 32-lane and
+    /// 64-lane host waves, without depending on console-wave64 lane layout).
+    fn is_host_wave_mask(&self, lo: Value, hi: Option<Value>, visited: &mut Set<Value>) -> bool {
+        let wave64 = self.x.native.wave64;
+        if wave64 && hi.is_none() {
+            return false;
+        }
+        if !visited.insert(lo) {
+            return true;
+        }
+        if self.x.st.masks.contains_key(&lo) {
+            return !wave64 || hi.is_some_and(|h| self.x.st.highs.get(&h) == Some(&lo));
+        }
+        if let Some(&(b, i)) = self.phi_at.get(&lo) {
+            let lo_phi = &self.x.p.blocks[b].phis[i];
+            let hi_phi = if wave64 {
+                let h = hi.expect("checked");
+                let &(hb, hj) = match self.phi_at.get(&h) {
+                    Some(x) if x.0 == b => x,
+                    _ => return false,
+                };
+                Some(&self.x.p.blocks[hb].phis[hj])
+            } else {
+                None
+            };
+            let mut non_cycle = false;
+            for (k, &alo) in lo_phi.args.iter().enumerate() {
+                let ahi = hi_phi.map(|hp| hp.args[k]);
+                if !visited.contains(&alo) {
+                    non_cycle = true;
+                }
+                if !self.is_host_wave_mask(alo, ahi, visited) {
+                    return false;
+                }
+            }
+            return non_cycle;
+        }
+        let Some(lo_inst) = self.def_inst(lo) else {
+            return false;
+        };
+        let hi_inst = hi.and_then(|h| self.def_inst(h));
+        let same_inst = match (hi, hi_inst) {
+            (None, _) => !wave64,
+            (Some(_), Some(hi_i)) => std::ptr::eq(lo_inst, hi_i),
+            (Some(_), None) => false,
+        };
+        let op_mask = |inst: &Inst, op: Operand, visited: &mut Set<Value>| -> bool {
+            if let Some(k) = scalar_constant(op) {
+                if k == 0 || k == u32::MAX {
+                    return true;
+                }
+                return !wave64 && k.rotate_left(4) == k;
+            }
+            let Operand::Scalar { code, .. } = op else {
+                return false;
+            };
+            if code == NULL {
+                return true;
+            }
+            let Some(alo) = inst.read(Reg::S(code)) else {
+                return false;
+            };
+            let ahi = if wave64 {
+                match inst.read(Reg::S(code + 1)) {
+                    Some(h) => Some(h),
+                    None => return false,
+                }
+            } else {
+                None
+            };
+            self.is_host_wave_mask(alo, ahi, visited)
+        };
+        if same_inst {
+            let Fields::Sop { dst, src, imm } = &lo_inst.fields else {
+                return false;
+            };
+            let name = lo_inst.name();
+            let width = if wave64 { "_b64" } else { "_b32" };
+            if name == (if wave64 { "s_lshl_b64" } else { "s_lshl_b32" }) {
+                let s0 = src.first().copied();
+                let s1 = src.get(1).copied();
+                // `1 << lane_index` (WaveIsFirstLane idiom).
+                if s0.and_then(scalar_constant) == Some(1)
+                    && let Some(Operand::Scalar { code, .. }) = s1
+                    && code != NULL
+                    && let Some(lv) = lo_inst.read(Reg::S(code))
+                {
+                    return self.is_host_lane_index(lv, &mut Set::default());
+                }
+                // No-op shift by 0 of a host-wave mask.
+                if s1.and_then(scalar_constant) == Some(0)
+                    && let Some(s0) = s0
+                {
+                    return op_mask(lo_inst, s0, visited);
+                }
+                return false;
+            }
+            if name == (if wave64 { "s_bitset0_b64" } else { "s_bitset0_b32" })
+                || name == (if wave64 { "s_bitset1_b64" } else { "s_bitset1_b32" })
+            {
+                let Some(d) = *dst else { return false };
+                let Some(&Operand::Scalar { code, .. }) = src.first() else {
+                    return false;
+                };
+                if code == NULL {
+                    return false;
+                }
+                let Some(lv) = lo_inst.read(Reg::S(code)) else {
+                    return false;
+                };
+                return op_mask(lo_inst, d, visited)
+                    && self.is_host_lane_index(lv, &mut Set::default());
+            }
+            if name == (if wave64 { "s_ashr_i64" } else { "s_ashr_i32" }) {
+                let want = if wave64 { 63 } else { 31 };
+                return src.get(1).and_then(|&s| scalar_constant(s)) == Some(want);
+            }
+            if !wave64 {
+                match name {
+                    "s_movk_i32" => {
+                        return matches!(
+                            imm.map(|x| i32::from(x as i16) as u32),
+                            Some(0 | u32::MAX)
+                        );
+                    }
+                    "s_cmovk_i32" => {
+                        return matches!(
+                            imm.map(|x| i32::from(x as i16) as u32),
+                            Some(0 | u32::MAX)
+                        ) && dst.is_some_and(|d| op_mask(lo_inst, d, visited));
+                    }
+                    "s_sub_u32" | "s_sub_i32" => {
+                        // `0 - mask`, `0 - flag`, or `mask - 1`.
+                        let s0 = src.first().copied();
+                        let s1 = src.get(1).copied();
+                        if s0.and_then(scalar_constant) == Some(0)
+                            && let Some(s1) = s1
+                        {
+                            return op_mask(lo_inst, s1, visited)
+                                || self.is_scalar_flag(lo_inst, s1, 8);
+                        }
+                        if s1.and_then(scalar_constant) == Some(1)
+                            && let Some(s0) = s0
+                        {
+                            return op_mask(lo_inst, s0, visited);
+                        }
+                        return false;
+                    }
+                    "s_add_u32" | "s_add_i32" => {
+                        // `mask + (-1)`.
+                        let s0 = src.first().copied();
+                        let s1 = src.get(1).copied();
+                        if s1.and_then(scalar_constant) == Some(u32::MAX)
+                            && let Some(s0) = s0
+                        {
+                            return op_mask(lo_inst, s0, visited);
+                        }
+                        if s0.and_then(scalar_constant) == Some(u32::MAX)
+                            && let Some(s1) = s1
+                        {
+                            return op_mask(lo_inst, s1, visited);
+                        }
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            let Some(op) = name
+                .strip_prefix("s_")
+                .and_then(|n| n.strip_suffix(width))
+            else {
+                return false;
+            };
+            return match op {
+                "mov" | "not" => src.first().is_some_and(|&s| op_mask(lo_inst, s, visited)),
+                "cselect" | "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" => {
+                    src.len() == 2 && src.iter().all(|&s| op_mask(lo_inst, s, visited))
+                }
+                "cmov" => {
+                    src.first().is_some_and(|&s| op_mask(lo_inst, s, visited))
+                        && dst.is_some_and(|d| op_mask(lo_inst, d, visited))
+                }
+                _ => false,
+            };
+        }
+        // Wave64 pair written by two separate 32-bit scalar instructions.
+        let Some(hi_inst) = hi_inst else {
+            return false;
+        };
+        let (
+            Fields::Sop {
+                src: lsrc,
+                ..
+            },
+            Fields::Sop {
+                src: hsrc,
+                ..
+            },
+        ) = (&lo_inst.fields, &hi_inst.fields)
+        else {
+            return false;
+        };
+        let (lname, hname) = (lo_inst.name(), hi_inst.name());
+        let read_s = |inst: &Inst, op: Operand| -> Option<Value> {
+            match op {
+                Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+                _ => None,
+            }
+        };
+        let shared_scc = lo_inst
+            .write(Reg::Scc)
+            .is_some_and(|s| hi_inst.read(Reg::Scc) == Some(s));
+        // 64-bit `-mask`: `s_sub_u32 0, m_lo` + `s_subb_u32 0, m_hi`.
+        if shared_scc && lname == "s_sub_u32" && hname == "s_subb_u32" {
+            let l0 = lsrc.first().and_then(|&s| scalar_constant(s));
+            let h0 = hsrc.first().and_then(|&s| scalar_constant(s));
+            let l1 = lsrc.get(1).copied();
+            let h1 = hsrc.get(1).copied();
+            if l0 == Some(0)
+                && h0 == Some(0)
+                && let (Some(l1), Some(h1)) = (l1, h1)
+            {
+                if let (Some(mlo), Some(mhi)) = (read_s(lo_inst, l1), read_s(hi_inst, h1)) {
+                    return self.is_host_wave_mask(mlo, Some(mhi), visited);
+                }
+                // Uniform 64-bit `0 - flag` (`s_sub_u32 0, flag; s_subb_u32 0, 0`).
+                if scalar_constant(h1) == Some(0) && self.is_scalar_flag(lo_inst, l1, 8) {
+                    return true;
+                }
+            }
+            // 64-bit `mask - 1`: `s_sub_u32 m_lo, 1` + `s_subb_u32 m_hi, 0`.
+            if l1.and_then(scalar_constant) == Some(1)
+                && h1.and_then(scalar_constant) == Some(0)
+                && let (Some(mlo), Some(mhi)) = (
+                    lsrc.first().and_then(|&s| read_s(lo_inst, s)),
+                    hsrc.first().and_then(|&s| read_s(hi_inst, s)),
+                )
+            {
+                return self.is_host_wave_mask(mlo, Some(mhi), visited);
+            }
+        }
+        // 64-bit `mask + (-1)`: `s_add_u32 m_lo, -1` + `s_addc_u32 m_hi, -1`.
+        if shared_scc && lname == "s_add_u32" && hname == "s_addc_u32" {
+            let pick = |inst: &Inst, ops: &[Operand]| -> Option<Value> {
+                let (s0, s1) = (*ops.first()?, *ops.get(1)?);
+                if scalar_constant(s1) == Some(u32::MAX) {
+                    read_s(inst, s0)
+                } else if scalar_constant(s0) == Some(u32::MAX) {
+                    read_s(inst, s1)
+                } else {
+                    None
+                }
+            };
+            if let (Some(mlo), Some(mhi)) = (pick(lo_inst, lsrc), pick(hi_inst, hsrc)) {
+                return self.is_host_wave_mask(mlo, Some(mhi), visited);
+            }
+        }
+        // Uniform all-0/all-1 replicated into both dwords: `hi = s_mov_b32 lo`
+        // (or vice versa), or matching `s_cselect_b32` on the same SCC.
+        if hname == "s_mov_b32"
+            && hsrc.first().and_then(|&s| read_s(hi_inst, s)) == Some(lo)
+            && self.is_uniform_bitmask32(lo, 8)
+        {
+            return true;
+        }
+        if lname == "s_mov_b32"
+            && let Some(h) = hi
+            && lsrc.first().and_then(|&s| read_s(lo_inst, s)) == Some(h)
+            && self.is_uniform_bitmask32(h, 8)
+        {
+            return true;
+        }
+        if lname == "s_cselect_b32"
+            && hname == "s_cselect_b32"
+            && lo_inst.read(Reg::Scc).is_some()
+            && lo_inst.read(Reg::Scc) == hi_inst.read(Reg::Scc)
+            && lsrc.len() == 2
+            && hsrc.len() == 2
+        {
+            let pair_ok = |a: Operand, b: Operand| -> bool {
+                match (scalar_constant(a), scalar_constant(b)) {
+                    (Some(x), Some(y)) => x == y && matches!(x, 0 | u32::MAX),
+                    _ => false,
+                }
+            };
+            if pair_ok(lsrc[0], hsrc[0]) && pair_ok(lsrc[1], hsrc[1]) {
+                return true;
+            }
+        }
+        // Split 32-bit identical bitwise/move ops on matching halves of host masks.
+        if lname == hname {
+            let pair_arg = |k: usize, visited: &mut Set<Value>| -> bool {
+                let (Some(&la), Some(&ha)) = (lsrc.get(k), hsrc.get(k)) else {
+                    return false;
+                };
+                if let (Some(lc), Some(hc)) = (scalar_constant(la), scalar_constant(ha)) {
+                    return lc == hc && lc.rotate_left(4) == lc;
+                }
+                let (Some(lv), Some(hv)) = (read_s(lo_inst, la), read_s(hi_inst, ha)) else {
+                    return false;
+                };
+                self.is_host_wave_mask(lv, Some(hv), visited)
+            };
+            match lname {
+                "s_mov_b32" | "s_not_b32" => return pair_arg(0, visited),
+                "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
+                | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
+                    return pair_arg(0, visited) && pair_arg(1, visited);
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether `inst` may read lane masks as data in `MaskData::Host`.
+    fn host_mask_ok(&self, inst: &Inst) -> bool {
+        let name = inst.name();
+        if name.starts_with("s_bcnt1_i32_")
+            || name.starts_with("s_ff1_i32_")
+            || name.starts_with("s_flbit_i32_b")
+            || name.starts_with("v_mbcnt_")
+            || matches!(
+                name,
+                "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+            )
+        {
+            return true;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let is_mask_op = |op: Operand| -> bool {
+            let Operand::Scalar { code, .. } = op else {
+                return false;
+            };
+            code != NULL
+                && inst.read(Reg::S(code)).is_some_and(|v| {
+                    self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)
+                })
+        };
+        match name {
+            "s_bitset0_b32" | "s_bitset0_b64" | "s_bitset1_b32" | "s_bitset1_b64" => {
+                // Only when toggling a host-wave lane index (e.g. `s_ff1`).
+                matches!(src.first(), Some(&Operand::Scalar { code, .. }) if code != NULL
+                    && inst.read(Reg::S(code)).is_some_and(|v| self.is_host_lane_index(v, &mut Set::default())))
+            }
+            "s_sub_u32" | "s_sub_i32" => {
+                let s0 = src.first().copied();
+                let s1 = src.get(1).copied();
+                (s0.and_then(scalar_constant) == Some(0) && s1.is_some_and(is_mask_op))
+                    || (s1.and_then(scalar_constant) == Some(1) && s0.is_some_and(is_mask_op))
+            }
+            "s_subb_u32" => {
+                let s0 = src.first().copied();
+                let s1 = src.get(1).copied();
+                (s0.and_then(scalar_constant) == Some(0) && s1.is_some_and(is_mask_op))
+                    || (s1.and_then(scalar_constant) == Some(0) && s0.is_some_and(is_mask_op))
+            }
+            "s_add_u32" | "s_add_i32" | "s_addc_u32" => {
+                let s0 = src.first().copied();
+                let s1 = src.get(1).copied();
+                (s1.and_then(scalar_constant) == Some(u32::MAX) && s0.is_some_and(is_mask_op))
+                    || (s0.and_then(scalar_constant) == Some(u32::MAX)
+                        && s1.is_some_and(is_mask_op))
+            }
+            // Split 32-bit bitwise ops on a wave64 mask (e.g. `mask & -mask`).
+            "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" => {
+                self.x.native.wave64
+                    && src.len() == 2
+                    && src.iter().any(|&s| is_mask_op(s))
+                    && src.iter().all(|&s| {
+                        is_mask_op(s)
+                            || matches!(s, Operand::Scalar { code, .. } if code != NULL
+                                && inst.read(Reg::S(code)).is_some_and(|v| {
+                                    self.def_inst(v).is_some_and(|d| {
+                                        matches!(
+                                            d.name(),
+                                            "s_sub_u32" | "s_subb_u32" | "s_add_u32" | "s_addc_u32"
+                                        )
+                                    })
+                                }))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a phi `v` (either dword in wave64) belongs to a host-wave mask.
+    fn is_host_wave_mask_phi(&self, v: Value) -> bool {
+        if !self.x.native.wave64 {
+            return self.is_host_wave_mask(v, None, &mut Set::default());
+        }
+        if let Some(hi) = self.pair_high(v)
+            && self.is_host_wave_mask(v, Some(hi), &mut Set::default())
+        {
+            return true;
+        }
+        if let Some(&(b, i)) = self.phi_at.get(&v)
+            && let Reg::S(c) = self.x.p.blocks[b].phis[i].reg
+            && c > 0
+            && let Some(lo) = self.x.p.blocks[b]
+                .phis
+                .iter()
+                .find(|q| q.reg == Reg::S(c - 1))
+                .map(|q| q.value)
+        {
+            return self.is_host_wave_mask(lo, Some(v), &mut Set::default());
+        }
+        false
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -3555,15 +4497,7 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
-            MaskData::Host => {
-                name.starts_with("s_bcnt1_i32_")
-                    || name.starts_with("s_ff1_i32_")
-                    || name.starts_with("v_mbcnt_")
-                    || matches!(
-                        name,
-                        "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
-                    )
-            }
+            MaskData::Host => self.host_mask_ok(inst),
             MaskData::None => name == "s_bcnt1_i32_b64",
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
@@ -3607,7 +4541,7 @@ impl<'a> Lower<'a> {
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
-        v.is_some_and(|v| self.x.st.masks.contains_key(&v))
+        v.is_some_and(|v| self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
     }
 
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
@@ -3621,12 +4555,19 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
-            if let (Some(scc), true) = (scc, self.mask_data == MaskData::Console) {
+        if inst.write(Reg::S(EXEC)).is_some()
+            || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
+            || self.is_mask(lo)
+        {
+            if let (Some(scc), true) = (scc, self.mask_data != MaskData::None) {
                 // The result is EXEC when written, else the destination.
                 let pair = |l: u8| {
+                    let lo = inst.write(Reg::S(l))?;
+                    if !self.x.st.masks.contains_key(&lo) {
+                        return None;
+                    }
                     let hi = inst.write(Reg::S(l + 1)).filter(|_| self.x.native.wave64);
-                    inst.write(Reg::S(l)).map(|lo| (lo, hi))
+                    Some((lo, hi))
                 };
                 if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
                     self.mask_scc.insert(scc, r);
@@ -3946,6 +4887,58 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_cmov_b64" => {
+                    let Some(code) = dst_code else {
+                        return Err("a missing operand");
+                    };
+                    let cond = self.scc_in(inst)?;
+                    for (h, v) in [(0, lo), (1, hi)] {
+                        let a = half(self, 0, h)?;
+                        let old =
+                            self.i32_of(inst.read(Reg::S(code + h)).ok_or("an unread operand")?)?;
+                        let r = self.s.m.select(c, cond, a, old);
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let Some(code) = dst_code else {
+                        return Err("a missing operand");
+                    };
+                    let old_lo = self.i32_of(inst.read(Reg::S(code)).ok_or("an unread operand")?)?;
+                    let old_hi =
+                        self.i32_of(inst.read(Reg::S(code + 1)).ok_or("an unread operand")?)?;
+                    let bit = src32(self, 0)?;
+                    let (k31, k32, one, z) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let idx = self.s.m.bin(c, Bin::And, bit, k31);
+                    let mask = self.s.m.bin(c, Bin::Shl, one, idx);
+                    let hi_bit = self.s.m.bin(c, Bin::And, bit, k32);
+                    let upper = self.s.m.cmp(c, pred::NE, hi_bit, z);
+                    let lo_mask = self.s.m.select(c, upper, z, mask);
+                    let hi_mask = self.s.m.select(c, upper, mask, z);
+                    let (rlo, rhi) = if name == "s_bitset1_b64" {
+                        (
+                            self.s.m.bin(c, Bin::Or, old_lo, lo_mask),
+                            self.s.m.bin(c, Bin::Or, old_hi, hi_mask),
+                        )
+                    } else {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let nlo = self.s.m.bin(c, Bin::Xor, lo_mask, ones);
+                        let nhi = self.s.m.bin(c, Bin::Xor, hi_mask, ones);
+                        (
+                            self.s.m.bin(c, Bin::And, old_lo, nlo),
+                            self.s.m.bin(c, Bin::And, old_hi, nhi),
+                        )
+                    };
+                    self.set(lo, Val::I32(rlo));
+                    self.set(hi, Val::I32(rhi));
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -3962,6 +4955,16 @@ impl<'a> Lower<'a> {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
+            }
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                let cond = self.scc_in(inst)?;
+                let a = if name == "s_cmovk_i32" {
+                    sext16(self)
+                } else {
+                    src32(self, 0)?
+                };
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                (self.s.m.select(c, cond, a, old), None)
             }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
@@ -4142,6 +5145,8 @@ impl<'a> Lower<'a> {
                     "s_mov_b32"
                         | "s_movk_i32"
                         | "s_cselect_b32"
+                        | "s_cmov_b32"
+                        | "s_cmovk_i32"
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
@@ -8323,14 +9328,58 @@ impl<'a> Lower<'a> {
         };
         // A channel of an input element, interpolated as `mode` says.
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let (id, col) = l
+            let (orig_id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
-            let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
-            }
-            e.interp = mode;
+            let id = if l.s.inputs[orig_id].interp != mode && l.s.inputs[orig_id].usage != 0 {
+                if l.s.inputs[orig_id].kind != 0 {
+                    return Err("one input interpolated two ways");
+                }
+                // shortcut: a generic input interpolated two ways is split onto
+                // a fresh row and unused semantic index so DXIL keeps one
+                // interpolation mode per row; the vertex shader only exports
+                // the original semantic index unless extended to duplicate it.
+                if let Some(&split_id) = l.split_inputs.get(&(orig_id, mode)) {
+                    split_id
+                } else {
+                    let orig = l.s.inputs[orig_id].clone();
+                    let next_index = l
+                        .s
+                        .inputs
+                        .iter()
+                        .filter(|x| x.name == orig.name)
+                        .map(|x| x.index + 1)
+                        .max()
+                        .unwrap_or(0);
+                    let free_row = l
+                        .s
+                        .inputs
+                        .iter()
+                        .filter_map(|x| x.row)
+                        .map(|r| r + 1)
+                        .max()
+                        .unwrap_or(0);
+                    l.s.inputs.push(SigElement {
+                        name: orig.name,
+                        index: next_index,
+                        kind: orig.kind,
+                        comp: orig.comp,
+                        interp: mode,
+                        row: Some(free_row),
+                        col: orig.col,
+                        cols: orig.cols,
+                        usage: 0,
+                        // Clear `half` so `packed_half` keeps its original slot layout.
+                        half: false,
+                    });
+                    let split_id = l.s.inputs.len() - 1;
+                    l.split_inputs.insert((orig_id, mode), split_id);
+                    split_id
+                }
+            } else {
+                l.s.inputs[orig_id].interp = mode;
+                orig_id
+            };
             match l.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
@@ -9669,13 +10718,44 @@ impl<'a> Lower<'a> {
         if !by_index || offset >= 0x1000 {
             return Err("a vertex fetch that is not indexed or has a large offset");
         }
-        let (kind, comp) = match (typed, format.and_then(buffer_format)) {
-            (false, _) => (if count == 1 { 'U' } else { 'F' }, if count == 1 { 5 } else { 9 }),
-            (true, Some(([8, 8, 8, 8], Numeric::Unorm))) if count == 4 => ('N', 9),
-            (true, Some((w, Numeric::Float))) if w.iter().all(|&b| b == 32) && w.len() == count as usize => ('F', 9),
+        let (kind, comp, channels) = match (typed, format.and_then(buffer_format)) {
+            (false, _) if inst.name() == "buffer_load_ubyte" => ('B', 5, 1),
+            (false, _) if inst.name() == "buffer_load_sbyte" => ('C', 4, 1),
+            (false, _) if inst.name() == "buffer_load_ushort" => ('W', 5, 1),
+            (false, _) if inst.name() == "buffer_load_sshort" => ('K', 4, 1),
+            (false, _) if (1..=4).contains(&count) => (
+                if count == 1 { 'U' } else { 'F' },
+                if count == 1 { 5 } else { 9 },
+                count,
+            ),
+            (true, Some((w, num)))
+                if !inst.name().contains("_format_d16_") && w.len() >= count as usize =>
+            {
+                let (k, c) = match (w, num) {
+                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Float) => {
+                        ('F', 9)
+                    }
+                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Uint) => ('U', 5),
+                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Sint) => ('I', 4),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Float) => ('H', 9),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Unorm) => ('M', 9),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Snorm) => ('S', 9),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Uint) => ('W', 5),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Sint) => ('K', 4),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Unorm) => ('N', 9),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Snorm) => ('Q', 9),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint) => ('B', 5),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint) => ('C', 4),
+                    ([10, 10, 10, 2], Numeric::Unorm) => ('P', 9),
+                    ([10, 10, 10, 2], Numeric::Snorm) => ('T', 9),
+                    ([11, 11, 10], Numeric::Float) => ('G', 9),
+                    _ => return Err("a vertex fetch format the host's vertex layout lacks"),
+                };
+                (k, c, w.len() as u32)
+            }
             _ => return Err("a vertex fetch format the host's vertex layout lacks"),
         };
-        let name = format!("VB{kind}{count}");
+        let name = format!("VB{kind}{channels}");
         let corners = if self.x.rect_list { 3 } else { 1 };
         let mut ids = Vec::new();
         for corner in 0..corners {
@@ -9692,7 +10772,7 @@ impl<'a> Lower<'a> {
                     interp: 0,
                     row: Some(row),
                     col: 0,
-                    cols: count as u8,
+                    cols: channels as u8,
                     usage: 0,
                     half: false,
                 });
@@ -9718,7 +10798,7 @@ impl<'a> Lower<'a> {
                     let n = l.s.m.i32(n);
                     l.s.m.cmp(c, pred::EQ, vid, n)
                 };
-                let ex = if kind == 'U' {
+                let ex = if matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C') {
                     d
                 } else {
                     let (fa, fb, fd) = (self.as_float(a), self.as_float(b), self.as_float(d));
@@ -11254,10 +12334,13 @@ impl<'a> Lower<'a> {
                     }
                     // A lane mask joined with data at a join every lane
                     // enters along one edge: the register holds the mask's
-                    // number there (console lanes, so exact).
+                    // number there (exact with console lanes, or for host-wave
+                    // masks in `MaskData::Host`).
                     _ if read
                         && !bit
-                        && self.mask_data == MaskData::Console
+                        && (self.mask_data == MaskData::Console
+                            || self.mask_data == MaskData::Host
+                                && self.is_host_wave_mask_phi(phi.value))
                         && (self.x.st.masks.contains_key(&arg)
                             || self.x.st.highs.contains_key(&arg))
                         && self.uniform_join(b) =>
