@@ -528,6 +528,26 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        if std::env::var_os("VICTORY_DSTORAGE_LOG").is_some() {
+            let _ = std::thread::Builder::new().name("dstorage log".into()).spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let g = scheduler.lock();
+                    let lanes: Vec<String> = g
+                        .lanes
+                        .iter()
+                        .filter(|(_, l)| l.entries() > 0)
+                        .map(|(id, l)| {
+                            format!(
+                                "lane {id}: unsubmitted {} held {} reads {} statuses {} running {} cap {}",
+                                l.unsubmitted.len(), l.held.len(), l.reads.len(), l.statuses.len(), l.running.len(), l.capacity
+                            )
+                        })
+                        .collect();
+                    tracing::warn!(staged = g.staged, staging = g.staging, ?lanes, "dstorage state");
+                }
+            });
+        }
     });
     Some(scheduler)
 }
@@ -955,6 +975,18 @@ extern "system" fn close(this: QueueRef) {
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
+    if std::env::var_os("VICTORY_TRACE_DSTORAGE_FILES").is_some() {
+        static SEEN: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+        let name = source_name(request).to_owned();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.entry(name.clone()).or_default();
+        e.0 += 1;
+        e.1 += u64::from(request.source_size);
+        if e.0 == 1 || e.0.is_power_of_two() {
+            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
+        }
+    }
+
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
             options = format_args!("{options:#x}"),

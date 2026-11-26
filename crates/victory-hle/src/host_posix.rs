@@ -367,6 +367,30 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 fn new_handle(object: Object) -> *mut c_void {
     let handle = (NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize) << 2;
+    if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+        let kind = match &object {
+            Object::Event(_) => "event",
+            Object::Semaphore(_) => "semaphore",
+            Object::Thread(_) => "thread",
+            _ => "other",
+        };
+        let chain = native::dump::caller_chain();
+        if matches!(object, Object::Semaphore(_)) {
+            lock(&LEDGER).insert(handle, (chain.iter().take(4).copied().collect(), 0, 0));
+            static START: std::sync::Once = std::sync::Once::new();
+            START.call_once(|| {
+                std::thread::spawn(|| loop {
+                    std::thread::sleep(Duration::from_secs(4));
+                    let mut rows: Vec<_> = lock(&LEDGER).iter().map(|(h, v)| (*h, v.clone())).collect();
+                    rows.sort_by_key(|r| r.0);
+                    for (h, (chain, rel, got)) in rows {
+                        tracing::warn!("ledger {h:#x} made at {chain:x?}: released {rel}, taken {got}");
+                    }
+                });
+            });
+        }
+        tracing::warn!("handle {handle:#x} ({kind}) made at image+ {chain:x?}");
+    }
     lock(&HANDLES).insert(handle, object);
     handle as *mut c_void
 }
@@ -419,7 +443,13 @@ pub extern "system" fn CreateSemaphoreW(
     _name: *const u16,
 ) -> *mut c_void {
     match Semaphore::new(initial as u32, max as u32) {
-        Ok(s) => new_handle(Object::Semaphore(Arc::new(s))),
+        Ok(s) => {
+            let h = new_handle(Object::Semaphore(Arc::new(s)));
+            if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                tracing::warn!("semaphore {h:?} initial {initial} max {max}");
+            }
+            h
+        }
         Err(_) => {
             set_error(ERROR_INVALID_PARAMETER);
             std::ptr::null_mut()
@@ -432,11 +462,13 @@ pub extern "system" fn ReleaseSemaphore(
     count: i32,
     previous: *mut i32,
 ) -> i32 {
+    watched(handle as usize, "release", count as u32);
     let semaphore = match lock(&HANDLES).get(&(handle as usize)) {
         Some(Object::Semaphore(s)) => Some(s.clone()),
         _ => None,
     };
     let Some(s) = semaphore else {
+        tracing::warn!("ReleaseSemaphore on {handle:p}: not a semaphore");
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
@@ -450,6 +482,7 @@ pub extern "system" fn ReleaseSemaphore(
             1
         }
         None => {
+            tracing::warn!("ReleaseSemaphore on {handle:p}: past the maximum");
             set_error(ERROR_INVALID_PARAMETER);
             0
         }
@@ -512,10 +545,40 @@ pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 
         set_error(ERROR_INVALID_HANDLE);
         return WAIT_FAILED;
     };
-    if object.wait(timeout) {
+    let got = object.wait(timeout);
+    watched(handle as usize, if got { "wait got it" } else { "wait timed out" }, ms);
+    if got {
         WAIT_OBJECT_0
     } else {
         WAIT_TIMEOUT
+    }
+}
+
+static LEDGER: LazyLock<Mutex<HashMap<usize, (Vec<usize>, u64, u64)>>> = LazyLock::new(Default::default);
+
+static WATCHED: LazyLock<Mutex<std::collections::HashSet<usize>>> = LazyLock::new(Default::default);
+
+/// `VICTORY_WATCH_HANDLE=<hex>`: logs every wait and release on that handle.
+fn watched(handle: usize, what: &str, arg: u32) {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_TRACE_HANDLES").is_some());
+    if !*ON {
+        return;
+    }
+    static WATCH: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_WATCH_HANDLE")
+            .ok()
+            .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    });
+    if let Some(e) = lock(&LEDGER).get_mut(&handle) {
+        match what {
+            "release" => e.1 += 1,
+            "wait got it" | "multi wait got it" => e.2 += 1,
+            _ => {}
+        }
+    }
+    if (handle == *WATCH && handle != 0 || lock(&WATCHED).contains(&handle)) && what != "wait timed out" {
+        tracing::warn!("watch {handle:#x}: {what} ({arg}) at image+ {:x?}", native::dump::caller_chain());
     }
 }
 
@@ -541,7 +604,11 @@ pub extern "system" fn WaitForMultipleObjects(
         return WAIT_FAILED;
     };
     let timeout = (ms != INFINITE).then(|| Duration::from_millis(u64::from(ms)));
-    sync::wait_multiple(&objects, wait_all != 0, timeout)
+    let r = sync::wait_multiple(&objects, wait_all != 0, timeout);
+    if let Some(&h) = handles.get(r as usize) {
+        watched(h as usize, "multi wait got it", count);
+    }
+    r
 }
 
 pub extern "system" fn WaitForMultipleObjectsEx(
@@ -608,6 +675,9 @@ pub extern "system" fn CreateThread(
                 lock(&me.state).running = true;
             },
             move |code| {
+                if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                    tracing::warn!("title thread ends, code {code:#x}");
+                }
                 lock(&finished.state).exit_code = code;
                 finished.done.set();
                 sync::signalled();
