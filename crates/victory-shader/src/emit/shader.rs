@@ -158,6 +158,9 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// Group-shared dwords for exchanges between host waves (`xchg`).
+    pub xchg_dwords: u32,
+    xchg: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -222,6 +225,8 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            xchg_dwords: 0,
+            xchg: None,
             main,
             entry,
         }
@@ -237,6 +242,24 @@ impl Shader {
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g
+    }
+
+    /// The group-shared array host waves of one console wave exchange
+    /// through (`xchg_dwords` dwords).
+    pub fn xchg(&mut self) -> V {
+        if let Some(g) = self.xchg {
+            return g;
+        }
+        let arr = self.m.array(self.xchg_dwords, self.t.i32);
+        let g = self.m.global("xchg", arr, 3);
+        self.xchg = Some(g);
+        g
+    }
+
+    /// Whether [`Self::xchg`] was made.
+    #[cfg(test)]
+    pub fn xchg_used(&self) -> bool {
+        self.xchg.is_some()
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
