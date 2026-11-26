@@ -17,7 +17,7 @@ type Texture = <Metal as ResourceBackend>::Texture;
 /// A mesh-style vertex program as the title's start (lane 0 alone takes the group id, shifted by
 /// 7: groups of 128 lanes), whose lanes 0-2 export the corners of a triangle covering the target
 /// and whose lane 0 exports primitive (0, 1, 2).
-const TRIANGLE: &[u32] = &[
+pub(super) const TRIANGLE: &[u32] = &[
     0xBEFE_0481, // s_mov_b64 exec, 1
     0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
     0xBEFE_04C1, // s_mov_b64 exec, -1

@@ -54,7 +54,9 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders).
+/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
+/// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
+/// stage (`bind_root_render`, `bind_root` in `victory-metal`).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory_writes {
         return Some("marks the pages it writes (translated without zero_copy_memory)");
@@ -64,9 +66,6 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     }
     if shader.view_addresses || shader.view_marks {
         return Some("needs view addresses or write marks");
-    }
-    if shader.heap {
-        return Some("indexes the descriptor heap itself");
     }
     None
 }
@@ -145,7 +144,10 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
-        if let Some(why) = unsupported(shader, true) {
+        // shortcut: compute shaders indexing the heap itself stay refused (graphics ones run);
+        // lift it once a compute value test reads a heap-indexed view.
+        let why = unsupported(shader, true).or(shader.heap.then_some("indexes the descriptor heap itself"));
+        if let Some(why) = why {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
