@@ -164,3 +164,45 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
         assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {i}: {:?}", pixels(&t, &color));
     }
 }
+
+/// 16-bit parameters across guessed stages (`graphics::HALF`): the triangle program exports
+/// param0 as two packed dwords (x: 1.0 high, 0.5 low; y: 0.25 high, 0.75 low), and the pixel
+/// program interpolates each half with `v_interp_p1ll_f16`/`v_interp_p2_f16` (low and `high`)
+/// and writes them to mrt0 as (x.lo, x.hi, y.lo, y.hi). Without a cross-stage convention the
+/// pixel program is refused.
+#[test]
+fn packed_half_parameters_reach_the_pixel_program() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x7E10_02FF, 0x3C00_3800, // v_mov_b32 v8, 0x3c003800 (1.0, 0.5)
+        0x7E12_02FF, 0x3400_3A00, // v_mov_b32 v9, 0x34003a00 (0.25, 0.75)
+        0xF800_0203, 0x0000_0908, // exp param0 v8, v9
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0xD742_0002, 0x0202_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
+        0xD75A_0004, 0x040A_0300, // v_interp_p2_f16 v4, v1, attr0.x high, v2
+        0xD742_0002, 0x0202_0040, // v_interp_p1ll_f16 v2, v0, attr0.y
+        0xD75A_0005, 0x040A_0240, // v_interp_p2_f16 v5, v1, attr0.y, v2
+        0xD742_0002, 0x0202_0140, // v_interp_p1ll_f16 v2, v0, attr0.y high
+        0xD75A_0006, 0x040A_0340, // v_interp_p2_f16 v6, v1, attr0.y high, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0x7E0A_1705, // v_cvt_f32_f16 v5, v5
+        0x7E0C_1706, // v_cvt_f32_f16 v6, v6
+        0xF800_180F, 0x0605_0403, // exp mrt0 v3, v4, v5, v6 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 191, 64]), "{:?}", pixels(&t, &color));
+}

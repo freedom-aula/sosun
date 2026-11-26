@@ -42,6 +42,20 @@ pub(super) fn is_guessed(c: &dxbc::Container<'_>) -> bool {
 /// The root slot a vertex shader's vertex buffer table (s0/s1) is given: no title root parameter.
 pub const VERTEX_TABLE: u8 = 253;
 
+/// Guessed pipelines' cross-stage convention for 16-bit parameters (docs/native-host.md, "16-bit
+/// parameters of guessed pipelines"). Neither guessed stage knows which parameter dwords the
+/// other packs as two f16 halves, so a vertex or mesh program exports every parameter channel
+/// three times: as itself (`TEXCOORD<n>`), and its low and high halves each widened to f32
+/// (`HALF<2n>`, `HALF<2n + 1>`), all interpolated. A pixel program's f16 interpolation of
+/// attribute n reads the half it names from the `HALF` element; its 32-bit reads stay
+/// `TEXCOORD<n>`. Interpolating each half as an f32 is what the console's f16 interpolation of
+/// that half computes, up to the f16 rounding the pixel side applies.
+pub(crate) const HALF: &str = "HALF";
+
+/// Signature rows a guessed vertex or mesh program may export, the halves included: Metal takes
+/// at most 124 scalar inputs to a fragment function (31 rows).
+const MAX_ROWS: u32 = 31;
+
 /// Where the metadata's records start (the header is 0x10 bytes).
 const RECORDS: usize = 0x10;
 
@@ -251,19 +265,37 @@ fn infer(
         .unwrap_or(0);
 
     let (mut params, mut targets) = (Vec::<(u8, u8)>::new(), Vec::<(u8, u8)>::new());
-    let mut attrs: Vec<(u8, u8, bool)> = Vec::new(); // (attribute, channels, flat)
+    let mut attrs: Vec<(u8, u8, bool)> = Vec::new(); // (attribute, 32-bit channels, flat)
+    let mut halves: Vec<(u8, u8, u8)> = Vec::new(); // (attribute, low, high halves' channels)
     let mut depth = false;
     let mut interpolates = false;
     for i in &list {
         let flat = i.name() == Some("v_interp_mov_f32");
+        let f16 = i.name().is_some_and(|n| n.starts_with("v_interp") && n.ends_with("_f16"));
         let mut attr = |a: &Operand| {
-            if let Operand::Attr { index, chan, .. } = *a {
+            if let Operand::Attr { index, chan, high } = *a {
+                let half = f16 || high;
+                let bits = if half { 0 } else { 1 << chan };
                 match attrs.iter_mut().find(|e| e.0 == index) {
                     Some(e) => {
-                        e.1 |= 1 << chan;
+                        e.1 |= bits;
                         e.2 &= flat;
                     }
-                    None => attrs.push((index, 1 << chan, flat)),
+                    None => attrs.push((index, bits, flat)),
+                }
+                if half {
+                    let e = match halves.iter().position(|e| e.0 == index) {
+                        Some(n) => &mut halves[n],
+                        None => {
+                            halves.push((index, 0, 0));
+                            halves.last_mut().expect("pushed")
+                        }
+                    };
+                    if high {
+                        e.2 |= 1 << chan;
+                    } else {
+                        e.1 |= 1 << chan;
+                    }
                 }
                 interpolates |= !flat;
             }
@@ -306,6 +338,16 @@ fn infer(
             .map(|&(n, m)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
             .collect();
         outs.push(element("SV_Position", 0, 3, rows, 0xf));
+        // Each parameter's halves (`HALF`), as many as fit.
+        let mut next = rows + 1;
+        for &(n, m) in &params {
+            if next + 2 > MAX_ROWS {
+                break;
+            }
+            outs.push(element(HALF, 2 * u32::from(n), 0, next, m));
+            outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, m));
+            next += 2;
+        }
         let outputs = params
             .iter()
             .map(|&(n, _)| VsOutput {
@@ -325,8 +367,19 @@ fn infer(
     } else {
         let mut ins: Vec<SigElement> = attrs
             .iter()
+            .filter(|a| a.1 != 0)
             .map(|&(n, m, _)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
             .collect();
+        let mut next_row = attrs.iter().map(|a| u32::from(a.0) + 1).max().unwrap_or(0);
+        halves.sort_unstable();
+        for &(n, lo, hi) in &halves {
+            for (index, m) in [(2 * u32::from(n), lo), (2 * u32::from(n) + 1, hi)] {
+                if m != 0 {
+                    ins.push(element(HALF, index, 0, next_row, m));
+                    next_row += 1;
+                }
+            }
+        }
         let mut outs: Vec<SigElement> = targets
             .iter()
             .map(|&(n, m)| element("SV_Target", u32::from(n), 16, u32::from(n), m))
@@ -375,7 +428,6 @@ fn infer(
                 left -= 1;
             }
         }
-        let mut next_row = attrs.iter().map(|a| u32::from(a.0) + 1).max().unwrap_or(0);
         if addr & (0xF << 8) != 0 {
             ins.push(SigElement {
                 name: "SV_Position".into(),

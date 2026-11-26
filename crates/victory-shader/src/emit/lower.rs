@@ -10142,6 +10142,27 @@ impl<'a> Lower<'a> {
         } else {
             "a 16-bit read of a 32-bit input: an f16 interpolation of an input not marked 16-bit"
         };
+        // A guessed pipeline's half: its own input element (`graphics::HALF`), an f32.
+        let guessed_half = (self.guessed && packing.is_none() && f16)
+            .then(|| {
+                let index = 2 * u32::from(attribute.row) + u32::from(attribute.high);
+                self.s.inputs.iter().find_map(|e| {
+                    (e.name == super::graphics::HALF
+                        && e.index == index
+                        && (e.col..e.col + e.cols).contains(&attribute.channel))
+                    .then_some(e.row)
+                    .flatten()
+                })
+            })
+            .flatten();
+        if let Some(row) = guessed_half {
+            let row = u8::try_from(row).map_err(|_| "an input row")?;
+            let x = channel(self, row, attribute.channel)?;
+            let f = self.as_float(x);
+            let h = self.narrow16(f);
+            let h = self.half_modifiers(inst, h);
+            return self.write_half(inst, h, None);
+        }
         let x = match packing {
             None if f16 || attribute.high => return Err(unmarked),
             None => channel(self, attribute.row, attribute.channel)?,
@@ -12397,6 +12418,24 @@ impl<'a> Lower<'a> {
             };
             if let Some((id, col)) = found {
                 stores.push((id, col, value, None));
+            }
+        }
+        // A guessed pipeline's parameter channels, each also as its two halves widened to f32
+        // (`graphics::HALF`).
+        if let (true, Target::Param { usage, row }) = (self.guessed, e.target)
+            && let Some(r) = param_row(usage, row)
+        {
+            for high in [false, true] {
+                let index = 2 * u32::from(r) + u32::from(high);
+                let Some(id) = outputs.iter().position(|o| o.name == super::graphics::HALF && o.index == index) else {
+                    continue;
+                };
+                let (col, cols) = (outputs[id].col, outputs[id].cols);
+                for ch in col..col + cols {
+                    if let Some(value) = e.values[usize::from(ch)] {
+                        stores.push((id, ch - col, value, Some(high)));
+                    }
+                }
             }
         }
         // A parameter a split pixel input copies (`Options::copy_params`) is written with the
