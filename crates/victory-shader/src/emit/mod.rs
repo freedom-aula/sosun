@@ -235,6 +235,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave32_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -242,9 +244,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED,
-    VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, VIEW_WRITES_BYTES,
+    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^14.
@@ -395,6 +398,13 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// The host's waves are 32 lanes and cannot be asked for 64 (Apple's
+    /// Metal Shader Converter refuses `WaveSize(64)`): compute programs of
+    /// the console's 64-lane waves run as two host waves per console wave,
+    /// the lanes' own and the other half's reached through group-shared
+    /// memory (module notes, "Wave64 on a 32-lane host"). Implies
+    /// [`Self::narrow_waves`]. Off for D3D12.
+    pub wave32_host: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -522,6 +532,7 @@ pub fn emit_with(
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
+        wave32_host: options.wave32_host,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

@@ -557,3 +557,26 @@ the tests stay `cfg(windows)`), `descriptor.rs` (`record` and `increment` are `p
    command buffer, but a title that frees memory the GPU still uses is the title's bug).
 7. The Windows build was only checked with clippy (`--target x86_64-pc-windows-gnullvm`, `-D warnings`)
    and the existing tests, which this change cannot affect (no Wine run).
+
+## Wave64 compute on 32-lane Apple GPUs (`Options::wave32_host`)
+
+The translator can now emit wave64 compute shaders without `WaveSize(64)` (off by default; D3D12 unchanged).
+Choice: keep one thread per console lane and run a console wave as two host waves (flat ids `64n..64n+31`,
+`64n+32..64n+63`); the console lane is the group index modulo 64. What stays inside 32 lanes is native (DPP
+rows, quads, `ds_swizzle`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers,
+`v_readfirstlane` per half). What crosses the halves (ballots read as data, `v_readlane`, `ds_bpermute`, the
+reductions and prefix sums of whole-wave sections) goes through a `xchg` group-shared array (one dword per
+thread) between two group barriers. This was preferred to two lanes per thread because the emitter lowers one
+lane per value. Cost: two barriers and a shared-memory round trip per such operation, 4 bytes per thread of
+group-shared memory, `WaveSize(32)`.
+
+Group barriers need every thread, so these operations are lowered only where each thread runs the block exactly
+once, or (group of one console wave) behind uniform scalar branches outside loops. In EXEC-divergent code or
+per-lane loops the value is left unknown and the program is refused if anything uses it; LDS shared without a
+barrier in divergent code is refused too. 16-bit wave reductions across the halves are refused. Fixing the
+divergent case needs if-conversion of the region so both halves always arrive (not done).
+
+Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lowered containers pass
+`metal-shaderconverter` (no IRError 6). Not measured: the 528 corpus shaders (the cache holds translated DXIL,
+not console shaders; re-translate with the option to count). Not run on the GPU: the compute backend has no
+descriptor heaps or root signatures for translator output yet.
