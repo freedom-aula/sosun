@@ -116,6 +116,7 @@ fn prewarm(shader: &Arc<Shader>) {
     static POOL: OnceLock<Option<std::sync::mpsc::Sender<Arc<Shader>>>> = OnceLock::new();
     static QUEUED: AtomicUsize = AtomicUsize::new(0);
     static DONE: AtomicUsize = AtomicUsize::new(0);
+    static DXIL: AtomicUsize = AtomicUsize::new(0);
     let pool = POOL.get_or_init(|| {
         if std::env::var_os("VICTORY_NO_SHADER_PREWARM").is_some_and(|v| !v.is_empty() && v != "0") {
             return None;
@@ -128,10 +129,11 @@ fn prewarm(shader: &Arc<Shader>) {
                 loop {
                     let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     let Ok(s) = next else { break };
-                    let _ = s.native();
+                    let held = s.native().map_or(0, |h| h.dxil.len());
+                    let dxil_mb = (DXIL.fetch_add(held, Relaxed) + held) >> 20;
                     let n = DONE.fetch_add(1, Relaxed) + 1;
                     if n.is_power_of_two() {
-                        tracing::info!("shaders prewarmed n={n} pending={}", QUEUED.load(Relaxed).saturating_sub(n));
+                        tracing::info!("shaders prewarmed n={n} pending={} dxil_mb={dxil_mb}", QUEUED.load(Relaxed).saturating_sub(n));
                     }
                 }
             });
