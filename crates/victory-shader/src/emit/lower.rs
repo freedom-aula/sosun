@@ -26,6 +26,25 @@ mod halves;
 
 type Why = &'static str;
 
+/// The refusal texts of a cross-lane operation outside compute, in a pixel
+/// and in a vertex program; the shared prefix keeps tallies grouping them.
+macro_rules! outside_compute {
+    ($op:literal) => {
+        [
+            concat!(
+                "a cross-lane operation outside compute: ",
+                $op,
+                " in a pixel program"
+            ),
+            concat!(
+                "a cross-lane operation outside compute: ",
+                $op,
+                " in a vertex program"
+            ),
+        ]
+    };
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -4087,8 +4106,9 @@ impl<'a> Lower<'a> {
 
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
-    /// Pixel lanes match only within a quad.
-    fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
+    /// Pixel lanes match only within a quad. `outside` names the operation
+    /// in a pixel and in a vertex program ([`outside_compute!`]).
+    fn cross_lane(&mut self, quad: bool, outside: [Why; 2]) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
@@ -4096,7 +4116,7 @@ impl<'a> Lower<'a> {
             return Err("a cross-lane operation in a mesh shader");
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
-            return Err("a cross-lane operation outside compute");
+            return Err(outside[usize::from(!self.s.pixel)]);
         }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
@@ -4392,7 +4412,10 @@ impl<'a> Lower<'a> {
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(quad)?;
+                self.cross_lane(
+                    quad,
+                    outside_compute!("ds_swizzle_b32 with a bit-mask pattern"),
+                )?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -4428,7 +4451,7 @@ impl<'a> Lower<'a> {
         if name == "ds_bpermute_b32" {
             // Each lane reads `data` of the lane its address plus the offset
             // names in dwords (modulo the wave); 0 from a lane EXEC leaves out.
-            self.cross_lane(false)?;
+            self.cross_lane(false, outside_compute!("ds_bpermute_b32"))?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -7739,7 +7762,30 @@ impl<'a> Lower<'a> {
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            self.cross_lane(quad)?;
+            // GFX10 DPP16 controls (RDNA2 ISA, DPP_CTRL); quad_perm passes above.
+            let outside = match dpp {
+                Dpp::Lanes { .. } => outside_compute!("DPP8"),
+                Dpp::Row {
+                    ctrl: 0x101..=0x12F,
+                    ..
+                } => {
+                    outside_compute!("DPP row_shl, row_shr or row_ror")
+                }
+                Dpp::Row {
+                    ctrl: 0x140 | 0x141,
+                    ..
+                } => {
+                    outside_compute!("DPP row_mirror or row_half_mirror")
+                }
+                Dpp::Row {
+                    ctrl: 0x150..=0x16F,
+                    ..
+                } => {
+                    outside_compute!("DPP row_share or row_xmask")
+                }
+                Dpp::Row { .. } => outside_compute!("DPP with another row control"),
+            };
+            self.cross_lane(quad, outside)?;
         }
         let c = self.cur;
         let lane = self.lane_index();
@@ -8597,7 +8643,7 @@ impl<'a> Lower<'a> {
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
-                    self.cross_lane(false)?;
+                    self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
                 }
                 let r = if self.mask_data == MaskData::Host {
                     self.read_lane(a, lane)
@@ -8616,7 +8662,7 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                self.cross_lane(false)?;
+                self.cross_lane(false, outside_compute!("v_writelane_b32"))?;
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
@@ -8651,7 +8697,10 @@ impl<'a> Lower<'a> {
                 // the other row in the same 32-lane half (`v_permlanex16`),
                 // using nibble `lane & 15` of `{src2, src1}` as the lane within
                 // that row.
-                self.cross_lane(false)?;
+                self.cross_lane(
+                    false,
+                    outside_compute!("v_permlane16_b32 or v_permlanex16_b32"),
+                )?;
                 self.s.flags |= flags::WAVE_OPS;
                 let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let lane = self.lane_index();
@@ -9806,7 +9855,7 @@ impl<'a> Lower<'a> {
                     }
                     self.s.flags |= flags::WAVE_OPS;
                 } else if self.s.mesh.is_none() {
-                    self.cross_lane(false)?;
+                    self.cross_lane(false, outside_compute!("v_mbcnt of a console lane mask"))?;
                 }
                 let lane = self.lane_index();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
