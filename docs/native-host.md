@@ -944,6 +944,30 @@ native Metal host serves no view addresses or formats to shaders, and would have
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
 
+## The device's own memory ceiling, logged at native host startup (issue #8)
+
+16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),
+even with `--console series-s` (#12) and per-encoder residency (#76, which cut real usage from
+12+ GB to about 9.4 GB on an 18 GB Mac). Nobody has set a real threshold for when that is a problem
+on a given Mac, because nobody has the numbers from a run that hits it on current `main` yet.
+
+Rather than guess a threshold (an earlier version of this change tried a 90%-of-recommendation
+warning; worked out against this M2 Pro 16 GB's own real numbers it was silent exactly on the
+Series S default #12 steers 16 GB Macs to — `Metal` here reports `recommendedMaxWorkingSet: 12,124
+MiB`, and Series S's 7,776 MiB budget is 64% of that even before any host overhead, so a fixed
+10% margin never fires where it matters), `native::glue::with_title`
+(`crates/victory-gpu/src/native/glue.rs`), the one place the native Metal device is made (lazily,
+on first GPU use), now always logs `MTLDevice.recommendedMaxWorkingSetSize`
+(`Metal::recommended_working_set`, `crates/victory-metal/src/metal.rs`) alongside the console
+name and its declared `title_memory` (GPU-optimal plus standard), in the existing "native host:
+Metal" line. No switch is needed: it is a log line, not a behaviour change ("dropped work is
+logged loudly", above). Every tester's log now carries the numbers needed to work out a real
+threshold, or to see the host's own overhead (texture copies, heaps) once compared against a
+run's actual peak Metal memory.
+
+Tests: `victory_metal::metal::tests::recommended_working_set_is_nonzero_on_real_hardware` (the
+real device on whatever Mac runs the test suite; on this M2 Pro it reported 12,124 MiB).
+
 ## Reverb and convolution DSP (`chad.dll`), a CPU fallback (`VICTORY_GUESS_DSP=1`)
 
 The title's audio DSP coprocessor convolves blocks of float samples with an impulse response

@@ -267,6 +267,12 @@ impl Metal {
         self
     }
 
+    /// Metal's own estimate of how much GPU memory this device can keep
+    /// resident at once, in bytes (`recommendedMaxWorkingSetSize`).
+    pub fn recommended_working_set(&self) -> u64 {
+        self.dev.recommendedMaxWorkingSetSize()
+    }
+
     /// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
     /// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
     /// is a dependency.
@@ -646,5 +652,11 @@ mod tests {
         drop(q);
         // Shader conversion returns an Err instead of panicking.
         assert!(m.create_compute_pipeline(AFFINE).is_err());
+    }
+
+    #[test]
+    fn recommended_working_set_is_nonzero_on_real_hardware() {
+        let m = Metal::new().expect("Metal device available on macOS");
+        assert!(m.recommended_working_set() > 0);
     }
 }
