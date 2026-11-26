@@ -1032,7 +1032,9 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
 }
 
 /// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
-fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+/// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
+/// pipeline).
+fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
@@ -1070,8 +1072,16 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
         }
         return None;
     };
+    if pso.mesh_threads().is_some() != mesh {
+        dropped(if mesh { "a mesh dispatch of a vertex pipeline" } else { "a draw of a mesh pipeline" });
+        trace_drop(l);
+        return None;
+    }
     let topology = if rect {
         Some(victory_backend::resources::Topology::TriangleStrip)
+    } else if mesh {
+        // A mesh shader declares its own topology; the list's is unused.
+        Some(victory_backend::resources::Topology::Triangles)
     } else {
         super::state::topology(l.topology)
     };
@@ -1110,7 +1120,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         return;
     }
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l) {
+        if let Some(rect) = graphics(t, l, false) {
             if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
@@ -1144,7 +1154,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l) {
+        if let Some(rect) = graphics(t, l, false) {
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
                 dropped("an indexed rectangle-list draw");
@@ -1166,7 +1176,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
 /// `ExecuteIndirect` of a single-command signature: `max` draws or dispatches, record `i` at title
 /// address `records + i * stride`, each read on the GPU; with a count buffer at title address
 /// `count`, record `i` runs only if `i` is below the count, also read on the GPU (D3D12 runs
-/// min(count, max) records). False when the host cannot run it (mesh dispatches); the caller logs
+/// min(count, max) records). False when the host cannot run it; the caller logs
 /// that. Rectangle lists drop here.
 pub(crate) fn execute_indirect(
     this: This,
@@ -1179,7 +1189,25 @@ pub(crate) fn execute_indirect(
     use crate::signature::Command;
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
     match command {
-        Command::DispatchMesh => false,
+        Command::DispatchMesh => {
+            RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
+            with_list(this, |t, l| {
+                if graphics(t, l, true).is_none() {
+                    return;
+                }
+                for i in 0..max {
+                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
+                        Ok(()) => {
+                            ENCODED.fetch_add(1, Ordering::Relaxed);
+                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                        }
+                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
+                    }
+                }
+                trace_present_draw(t, l);
+            });
+            true
+        }
         Command::Dispatch => {
             with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
                 Pipe::Compute(pso) => {
@@ -1200,7 +1228,7 @@ pub(crate) fn execute_indirect(
         }
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
-            with_list(this, |t, l| match graphics(t, l) {
+            with_list(this, |t, l| match graphics(t, l, false) {
                 // shortcut: a rectangle list's records count vertices of three-corner rectangles;
                 // drawing them needs the counts rewritten on the GPU first.
                 Some(true) => {

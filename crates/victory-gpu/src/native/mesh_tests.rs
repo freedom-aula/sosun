@@ -140,3 +140,27 @@ fn a_mesh_shader_reads_its_root_constants() {
     super::run(&t.host, &[&list]);
     assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
 }
+
+/// `ExecuteIndirect` of `DispatchMesh` with a count buffer: the record (one group) and the count
+/// (1) are read on the GPU, so record 0 colours the target and record 1 of the same count, not
+/// below it, leaves it black.
+#[test]
+fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let pool = super::Pool::new(&t.host, 1);
+    let (records, count) = (0, 64);
+    pool.write(records, &[1u32, 1, 1, 1, 1, 1]);
+    pool.write(count, &[1u32]);
+    for (i, want) in [(0, [255, 128, 128, 255]), (1, [0; 4])] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.dispatch_mesh_indirect(pool.va(records + 12 * i as usize), Some((pool.va(count), i)))
+            .unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {i}: {:?}", pixels(&t, &color));
+    }
+}
