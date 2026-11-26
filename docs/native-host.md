@@ -448,3 +448,20 @@ them as usual.
 * A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn as a plain strip without its fourth corner, and now warns once.
 * `VICTORY_TRACE_RECTS=1` logs the first three rectangle-list draws of each pipeline with the first three vertices as floats.
 * The Brightness logo (half a rectangle, the cut along one diagonal) is a guessed pipeline (`vertex 511484f3`: float3 position, unorm8x4 colour at 12, float2 uv at 16, 24-byte vertices) drawing one rectangle at (+-0.2, +-0.325) with corners top-left, bottom-left, bottom-right, which is the order the rule expects. Its matrices flip y, so the visible half is the strip's first triangle (which holds the computed corner), and the second triangle is lost. Both triangles wind alike, so culling does not explain it; the next suspects are the guessed depth state (less-equal with writes, `VICTORY_DEBUG_NO_DEPTH`) and the pixel shader on the second triangle. Not settled: the game runs needed were stopped.
+
+#### Raster, depth, stencil and write mask from the register image
+
+In all 23,022 images the registers just before the eight `CB_BLEND<n>_CONTROL` sit at the same
+offsets back from them (the field layouts below match the values seen):
+
+| Bytes before the blend block | Register | Seen |
+|---|---|---|
+| 0x30 | `PA_SU_SC_MODE_CNTL` | 0x201a40 no cull (11,341), 0x201a42 cull back (11,621), 0x201a41 cull front (58), 0x201a46 cull back with clockwise front (2) |
+| 0x2c, 0x28 | constant 0x8, 0x1000 | |
+| 0x24 to 0x1c | floats (polygon offset: 0.003, 29.0, 16.0, 1.0) | not used yet |
+| 0x18 | `DB_DEPTH_CONTROL` | 0x7007f0 depth off (6,895), 0x7007e2 test GREATER_EQUAL without writes (4,999), 0x7007e7 GREATER_EQUAL with writes and stencil (3,325), 0x700796 LESS with writes, 0x7007b6 LESS_EQUAL with writes, 0x2002f1 stencil EQUAL only |
+| 0x14 | `DB_STENCIL_CONTROL` | 0 (keep), 0x30030 pass REPLACE, 0x80080 pass increment-wrap |
+| 0x10, 0xc | `DB_STENCILREFMASK`, `_BF` | 0x100ff00 (read mask 0xff, write mask 0), 0x1ffff00 (both 0xff) |
+| 0x4 | `CB_TARGET_MASK` | 0xffffffff, 0 (depth only), 0xf, 0x3ffff |
+
+`Graphics::guess_from` now reads all of these over the guessed defaults: cull (FACE 0 = counter-clockwise front), depth enable, write and function (hardware + 1 = D3D12), stencil enable, read and write masks, front and back ops and functions (the back face's only with BACKFACE_ENABLE), and each target's write mask. Most depth tests are GREATER_EQUAL (reversed Z), where the guess was LESS_EQUAL with writes. The polygon offset floats are not mapped. `VICTORY_GUESS_BLEND_ONLY=1` keeps the earlier blend-only reading, for comparison. A run past setup to the loading screen gave the same presented images, byte for byte, as without this change. The setup screens were not checked: runs now skip them, probably because the profile is saved.
