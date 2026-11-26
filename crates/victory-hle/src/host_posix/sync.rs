@@ -90,7 +90,10 @@ impl Cs {
 
     fn take(&self) {
         let word = self.word();
-        if word.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if word
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             return;
         }
         // 2 means locked with waiters, so unlocking knows to wake one.
@@ -268,7 +271,12 @@ pub extern "system" fn InitializeConditionVariable(cv: *mut c_void) {
     unsafe { cv.cast::<u64>().write(0) };
 }
 
-fn sleep_condition(cv: *mut c_void, ms: u32, release: impl FnOnce(), reacquire: impl FnOnce()) -> i32 {
+fn sleep_condition(
+    cv: *mut c_void,
+    ms: u32,
+    release: impl FnOnce(),
+    reacquire: impl FnOnce(),
+) -> i32 {
     let word = condition(cv);
     let ticket = word.load(Ordering::Acquire);
     release();

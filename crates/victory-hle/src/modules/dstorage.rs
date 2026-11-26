@@ -188,11 +188,16 @@ fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::F
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
-// shortcut: no virtual drives yet (they come with `files.rs` on POSIX); the
-// path is used as the title wrote it with `\` read as `/`.
+/// Goes through the POSIX host's drive table, so virtual drives work too.
 #[cfg(not(windows))]
-fn open_for_reading(_path: *const u16, name: &str) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(name.replace('\\', "/"))
+fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::File> {
+    // SAFETY: the title passes a NUL-terminated path.
+    let wide = unsafe {
+        std::slice::from_raw_parts(path, (0..).take_while(|&i| *path.add(i) != 0).count())
+    };
+    let host = crate::host_posix::files::translate(wide)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    std::fs::File::open(host)
 }
 
 /// `(capacity, name, iid, out)`.

@@ -148,7 +148,10 @@ fn narrow_path(p: *const c_char) -> Option<PathBuf> {
 fn win32_error(e: &io::Error, path: &Path) -> u32 {
     match e.kind() {
         io::ErrorKind::NotFound => {
-            if path.parent().is_some_and(|p| !p.as_os_str().is_empty() && !p.exists()) {
+            if path
+                .parent()
+                .is_some_and(|p| !p.as_os_str().is_empty() && !p.exists())
+            {
                 ERROR_PATH_NOT_FOUND
             } else {
                 ERROR_FILE_NOT_FOUND
@@ -216,11 +219,13 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
     options.custom_flags(0);
     match options.open(&path) {
         Ok(file) => {
-            set_error(if existed && matches!(disposition, CREATE_ALWAYS | OPEN_ALWAYS) {
-                ERROR_ALREADY_EXISTS
-            } else {
-                0
-            });
+            set_error(
+                if existed && matches!(disposition, CREATE_ALWAYS | OPEN_ALWAYS) {
+                    ERROR_ALREADY_EXISTS
+                } else {
+                    0
+                },
+            );
             let _ = flags;
             new_handle(Object::File(Arc::new(FileObject {
                 file,
@@ -295,7 +300,9 @@ pub extern "system" fn ReadFile(
     // SAFETY: the title's buffer of `len` bytes.
     let out = unsafe { std::slice::from_raw_parts_mut(buffer, len as usize) };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
-    let at = ov.as_ref().map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
+    let at = ov
+        .as_ref()
+        .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
     let mut done = 0;
     while done < out.len() {
         match f.file.read_at(&mut out[done..], at + done as u64) {
@@ -335,7 +342,9 @@ pub extern "system" fn WriteFile(
     // SAFETY: the title's buffer of `len` bytes.
     let data = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
-    let at = ov.as_ref().map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
+    let at = ov
+        .as_ref()
+        .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
     if f.file.write_all_at(data, at).is_err() {
         set_error(ERROR_ACCESS_DENIED);
         return 0;
@@ -526,10 +535,18 @@ pub extern "system" fn GetFileAttributesExW(path: *const u16, _level: u32, data:
             // SAFETY: the title's 36-byte structure.
             unsafe {
                 data.cast::<u32>().write_unaligned(attributes_of(&m));
-                data.add(4).cast::<u64>().write_unaligned(filetime(m.created()));
-                data.add(12).cast::<u64>().write_unaligned(filetime(m.accessed()));
-                data.add(20).cast::<u64>().write_unaligned(filetime(m.modified()));
-                data.add(28).cast::<u32>().write_unaligned((m.len() >> 32) as u32);
+                data.add(4)
+                    .cast::<u64>()
+                    .write_unaligned(filetime(m.created()));
+                data.add(12)
+                    .cast::<u64>()
+                    .write_unaligned(filetime(m.accessed()));
+                data.add(20)
+                    .cast::<u64>()
+                    .write_unaligned(filetime(m.modified()));
+                data.add(28)
+                    .cast::<u32>()
+                    .write_unaligned((m.len() >> 32) as u32);
                 data.add(32).cast::<u32>().write_unaligned(m.len() as u32);
             }
             1
@@ -613,10 +630,18 @@ fn fill_find_data(entry: &(String, Option<std::fs::Metadata>), data: *mut u8) {
         std::ptr::write_bytes(data, 0, 592);
         if let Some(m) = meta {
             data.cast::<u32>().write_unaligned(attributes_of(m));
-            data.add(4).cast::<u64>().write_unaligned(filetime(m.created()));
-            data.add(12).cast::<u64>().write_unaligned(filetime(m.accessed()));
-            data.add(20).cast::<u64>().write_unaligned(filetime(m.modified()));
-            data.add(28).cast::<u32>().write_unaligned((m.len() >> 32) as u32);
+            data.add(4)
+                .cast::<u64>()
+                .write_unaligned(filetime(m.created()));
+            data.add(12)
+                .cast::<u64>()
+                .write_unaligned(filetime(m.accessed()));
+            data.add(20)
+                .cast::<u64>()
+                .write_unaligned(filetime(m.modified()));
+            data.add(28)
+                .cast::<u32>()
+                .write_unaligned((m.len() >> 32) as u32);
             data.add(32).cast::<u32>().write_unaligned(m.len() as u32);
         } else {
             data.cast::<u32>().write_unaligned(FILE_ATTRIBUTE_DIRECTORY);
@@ -640,7 +665,11 @@ fn find_first(path: Option<PathBuf>, data: *mut u8) -> *mut c_void {
             return invalid_handle();
         }
     };
-    let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
+    let dir = if dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        dir
+    };
     let pattern: Vec<char> = pattern.chars().collect();
     let read = match std::fs::read_dir(&dir) {
         Ok(read) => read,
@@ -653,17 +682,22 @@ fn find_first(path: Option<PathBuf>, data: *mut u8) -> *mut c_void {
         (".".to_owned(), std::fs::metadata(&dir).ok()),
         ("..".to_owned(), std::fs::metadata(dir.join("..")).ok()),
     ];
-    entries.extend(
-        read.flatten()
-            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().ok())),
-    );
+    entries.extend(read.flatten().map(|e| {
+        (
+            e.file_name().to_string_lossy().into_owned(),
+            e.metadata().ok(),
+        )
+    }));
     entries.retain(|(name, _)| wildcard(&pattern, &name.chars().collect::<Vec<_>>()));
     if entries.is_empty() {
         set_error(ERROR_FILE_NOT_FOUND);
         return invalid_handle();
     }
     fill_find_data(&entries[0], data);
-    new_handle(Object::Find(Arc::new(Mutex::new(Find { entries, next: 1 }))))
+    new_handle(Object::Find(Arc::new(Mutex::new(Find {
+        entries,
+        next: 1,
+    }))))
 }
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut u8) -> *mut c_void {
@@ -755,14 +789,20 @@ mod tests {
         assert_eq!(mount(dir.path()), Some(letter));
         let root = std::path::absolute(dir.path()).unwrap();
         let path = |s: &str| translate(&s.encode_utf16().collect::<Vec<_>>()).unwrap();
-        assert_eq!(path(&format!("{letter}:\\a\\b.txt")), root.join("a").join("b.txt"));
+        assert_eq!(
+            path(&format!("{letter}:\\a\\b.txt")),
+            root.join("a").join("b.txt")
+        );
         assert_eq!(path(&format!("{letter}:/../../x")), root.join("x"));
         assert_eq!(path(&format!("\\\\?\\{letter}:\\")), root);
         assert_eq!(path("/tmp\\x"), PathBuf::from("/tmp/x"));
 
         let mut attributes = [0u8; 36];
         let p = wide(&format!("{letter}:\\save.dat"));
-        assert_ne!(GetFileAttributesExW(p.as_ptr(), 0, attributes.as_mut_ptr()), 0);
+        assert_ne!(
+            GetFileAttributesExW(p.as_ptr(), 0, attributes.as_mut_ptr()),
+            0
+        );
         let size = u32::from_le_bytes(attributes[32..36].try_into().unwrap());
         assert_eq!(size, 100);
     }
@@ -770,7 +810,10 @@ mod tests {
     #[test]
     fn wildcards_match_like_find_first_file() {
         let m = |p: &str, n: &str| {
-            wildcard(&p.chars().collect::<Vec<_>>(), &n.chars().collect::<Vec<_>>())
+            wildcard(
+                &p.chars().collect::<Vec<_>>(),
+                &n.chars().collect::<Vec<_>>(),
+            )
         };
         assert!(m("*", "anything"));
         assert!(m("*.TXT", "a.txt"));

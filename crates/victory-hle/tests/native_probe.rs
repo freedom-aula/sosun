@@ -224,7 +224,10 @@ mod run {
             .collect();
         let result = run_probe("probe_files", wide.as_ptr() as u64);
         assert_all(result, 0x3FF, "probe_files");
-        assert_eq!(std::fs::read(dir.path().join("written.bin")).unwrap(), b"abcd");
+        assert_eq!(
+            std::fs::read(dir.path().join("written.bin")).unwrap(),
+            b"abcd"
+        );
     }
 
     #[test]
