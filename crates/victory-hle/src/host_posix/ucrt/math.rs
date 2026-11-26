@@ -700,9 +700,14 @@ mod tests {
         overflows("powf(10, 50)", || powf(10.0, 50.0));
         overflows("hypotf(3e38, 3e38)", || hypotf(3e38, 3e38));
         overflows("ldexpf(1, 200)", || ldexpf(1.0, 200));
-        set_errno(0);
+        // A finite result, and an infinity from an infinite argument, leave errno as it was.
+        set_errno(7);
         assert_eq!(expf(10.0), 10f32.exp());
-        assert_eq!(errno(), 0);
+        assert_eq!(errno(), 7);
+        assert_eq!(expf(f32::INFINITY), f32::INFINITY);
+        assert_eq!(powf(f32::INFINITY, 2.0), f32::INFINITY);
+        assert_eq!(ldexpf(f32::INFINITY, 1), f32::INFINITY);
+        assert_eq!(errno(), 7);
     }
 
     #[test]
