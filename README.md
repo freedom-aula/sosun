@@ -41,7 +41,7 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
 | Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
 | Boot movie and menus in the window | 🟡 The boot movie plays and the start screen, FINISH SETUP and LEGAL NOTICES show in the window with correct text and blending ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6) fixed); other screens not checked yet |
-| Start screen ("press A") and input | ✅ Passed; the keyboard drives the gamepad in the window (real controllers not yet) |
+| Start screen ("press A") and input | ✅ Passed; the keyboard and Game Controller pads (Xbox, DualShock 4, DualSense) drive the gamepad in the window; DualShock 4 waiting for a hardware test |
 | Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
 | Gameplay | 🔴 Not yet |
@@ -88,7 +88,9 @@ Point it at the folder that holds `game_scarlett_master.exe`. A window opens; af
 | Q, E | left, right shoulder |
 | Z, C | left, right trigger |
 
-Real controllers aren't supported yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
+**Controllers.** An Xbox pad, a PS4 DualShock 4 or a PS5 DualSense connected to the Mac (USB, or Bluetooth through System Settings → Bluetooth; on a DualShock 4 hold Share and PS until the light bar flashes to pair) drives the gamepad while the window is in front. The keyboard still works alongside it. On a PlayStation pad Cross, Circle, Square and Triangle are A, B, X and Y, Options is Menu, and Share or a touchpad click is View. With several controllers connected, the one you used last wins. The run log names the controller it picked (`controller: drives the pad`); if it says none, check that macOS sees the controller in System Settings → Game Controllers.
+
+Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
 **3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 
@@ -98,7 +100,7 @@ Whatever your background, there is something to do:
 
 - **Testers:** run the game on your Mac and file a tester report. No coding needed.
 - **Graphics and Metal:** the still-guessed pipeline state (culling, depth, stencil, write mask), shader refusals, the GPU timeout at about 53 s.
-- **Debugging:** the Metal GPU timeout at about 50 s, and real controllers through the Game Controller framework.
+- **Debugging:** the Metal GPU timeout at about 50 s, and testing real controllers (DualShock 4, DualSense) in the menus.
 - **Compilers:** the arm64 recompiler (jump tables, SSE, exceptions).
 - **Rust and systems:** missing Windows and Xbox system calls, speed, tests.
 

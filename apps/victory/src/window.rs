@@ -6,6 +6,7 @@
 //! crate for it. The loop is `nextEventMatchingMask:` by hand rather than `[NSApp run]`, so the
 //! title finishing is noticed without a delegate class.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // No binding crate links AppKit or GameController, so their classes would not be registered
@@ -239,17 +240,26 @@ unsafe fn key_event(event: *mut AnyObject) -> bool {
     true
 }
 
-/// Polls the first connected `GCController` with an `extendedGamepad` (Xbox,
-/// DualSense, or MFi) and updates `GameInput`. Releases controller state when
-/// no extended gamepad is connected.
-unsafe fn poll_controller() {
-    use victory_hle::modules::gameinput::ControllerSnapshot;
-    // SAFETY: documented GameController framework getters on valid ObjC objects.
+/// The controller `poll_controller` read last (its address, 0 for none), so
+/// that a change of controller is logged once.
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The `GCController` that drives the pad: the one used last
+/// (`GCController.current`) when it has an extended gamepad, otherwise the
+/// first connected one that has. Null when none is connected.
+unsafe fn active_controller() -> *mut AnyObject {
+    // SAFETY: documented GameController class methods and getters.
     unsafe {
+        let current: *mut AnyObject = msg_send![class!(GCController), current];
+        if !current.is_null() {
+            let gp: *mut AnyObject = msg_send![current, extendedGamepad];
+            if !gp.is_null() {
+                return current;
+            }
+        }
         let controllers: *mut AnyObject = msg_send![class!(GCController), controllers];
         if controllers.is_null() {
-            victory_hle::modules::gameinput::release_live_pad();
-            return;
+            return std::ptr::null_mut();
         }
         let count: usize = msg_send![controllers, count];
         for i in 0..count {
@@ -258,67 +268,134 @@ unsafe fn poll_controller() {
                 continue;
             }
             let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
-            if gp.is_null() {
-                continue;
+            if !gp.is_null() {
+                return ctrl;
             }
-            let pressed = |btn: *mut AnyObject| -> bool {
-                !btn.is_null() && {
-                    let b: Bool = msg_send![btn, isPressed];
-                    b.as_bool()
-                }
-            };
-            let trigger = |btn: *mut AnyObject| -> f32 {
-                if btn.is_null() { 0.0 } else { msg_send![btn, value] }
-            };
-            let axis = |dpad: *mut AnyObject| -> (f32, f32) {
-                if dpad.is_null() {
-                    return (0.0, 0.0);
-                }
-                let x_axis: *mut AnyObject = msg_send![dpad, xAxis];
-                let y_axis: *mut AnyObject = msg_send![dpad, yAxis];
-                let x: f32 = if x_axis.is_null() { 0.0 } else { msg_send![x_axis, value] };
-                let y: f32 = if y_axis.is_null() { 0.0 } else { msg_send![y_axis, value] };
-                (x, y)
-            };
-            let dpad: *mut AnyObject = msg_send![gp, dpad];
-            let (up, down, left, right) = if dpad.is_null() {
-                (false, false, false, false)
-            } else {
-                (
-                    pressed(msg_send![dpad, up]),
-                    pressed(msg_send![dpad, down]),
-                    pressed(msg_send![dpad, left]),
-                    pressed(msg_send![dpad, right]),
-                )
-            };
-            let (left_x, left_y) = axis(msg_send![gp, leftThumbstick]);
-            let (right_x, right_y) = axis(msg_send![gp, rightThumbstick]);
-            let snap = ControllerSnapshot {
-                a: pressed(msg_send![gp, buttonA]),
-                b: pressed(msg_send![gp, buttonB]),
-                x: pressed(msg_send![gp, buttonX]),
-                y: pressed(msg_send![gp, buttonY]),
-                up,
-                down,
-                left,
-                right,
-                left_shoulder: pressed(msg_send![gp, leftShoulder]),
-                right_shoulder: pressed(msg_send![gp, rightShoulder]),
-                left_stick: pressed(msg_send![gp, leftThumbstickButton]),
-                right_stick: pressed(msg_send![gp, rightThumbstickButton]),
-                menu: pressed(msg_send![gp, buttonMenu]),
-                view: pressed(msg_send![gp, buttonOptions]),
-                left_trigger: trigger(msg_send![gp, leftTrigger]),
-                right_trigger: trigger(msg_send![gp, rightTrigger]),
-                left_x,
-                left_y,
-                right_x,
-                right_y,
-            };
-            victory_hle::modules::gameinput::set_live_pad(snap);
+        }
+        std::ptr::null_mut()
+    }
+}
+
+/// Whether `gamepad` is a PlayStation profile (`GCDualShockGamepad` or
+/// `GCDualSenseGamepad`), which add a touchpad to the extended gamepad.
+unsafe fn has_touchpad(gamepad: *mut AnyObject) -> bool {
+    // SAFETY: `respondsToSelector:` is valid on every NSObject.
+    let responds: Bool =
+        unsafe { msg_send![gamepad, respondsToSelector: objc2::sel!(touchpadButton)] };
+    responds.as_bool()
+}
+
+/// Reads a `GCExtendedGamepad` (Xbox, DualShock 4, DualSense or MFi) into a
+/// snapshot in the Xbox layout. On a DualShock 4, Cross/Circle/Square/Triangle
+/// are A/B/X/Y, Options is Menu, and Share and the touchpad click are View.
+unsafe fn snapshot_of(gp: *mut AnyObject) -> victory_hle::modules::gameinput::ControllerSnapshot {
+    use victory_hle::modules::gameinput::ControllerSnapshot;
+    // SAFETY: documented GameController getters on a live extended gamepad;
+    // every element is checked for null before use.
+    unsafe {
+        let pressed = |btn: *mut AnyObject| -> bool {
+            !btn.is_null() && {
+                let b: Bool = msg_send![btn, isPressed];
+                b.as_bool()
+            }
+        };
+        let trigger = |btn: *mut AnyObject| -> f32 {
+            if btn.is_null() { 0.0 } else { msg_send![btn, value] }
+        };
+        let axis = |dpad: *mut AnyObject| -> (f32, f32) {
+            if dpad.is_null() {
+                return (0.0, 0.0);
+            }
+            let x_axis: *mut AnyObject = msg_send![dpad, xAxis];
+            let y_axis: *mut AnyObject = msg_send![dpad, yAxis];
+            let x: f32 = if x_axis.is_null() { 0.0 } else { msg_send![x_axis, value] };
+            let y: f32 = if y_axis.is_null() { 0.0 } else { msg_send![y_axis, value] };
+            (x, y)
+        };
+        let dpad: *mut AnyObject = msg_send![gp, dpad];
+        let (up, down, left, right) = if dpad.is_null() {
+            (false, false, false, false)
+        } else {
+            (
+                pressed(msg_send![dpad, up]),
+                pressed(msg_send![dpad, down]),
+                pressed(msg_send![dpad, left]),
+                pressed(msg_send![dpad, right]),
+            )
+        };
+        let (left_x, left_y) = axis(msg_send![gp, leftThumbstick]);
+        let (right_x, right_y) = axis(msg_send![gp, rightThumbstick]);
+        let touchpad = has_touchpad(gp) && pressed(msg_send![gp, touchpadButton]);
+        ControllerSnapshot {
+            a: pressed(msg_send![gp, buttonA]),
+            b: pressed(msg_send![gp, buttonB]),
+            x: pressed(msg_send![gp, buttonX]),
+            y: pressed(msg_send![gp, buttonY]),
+            up,
+            down,
+            left,
+            right,
+            left_shoulder: pressed(msg_send![gp, leftShoulder]),
+            right_shoulder: pressed(msg_send![gp, rightShoulder]),
+            left_stick: pressed(msg_send![gp, leftThumbstickButton]),
+            right_stick: pressed(msg_send![gp, rightThumbstickButton]),
+            menu: pressed(msg_send![gp, buttonMenu]),
+            view: pressed(msg_send![gp, buttonOptions]),
+            touchpad,
+            left_trigger: trigger(msg_send![gp, leftTrigger]),
+            right_trigger: trigger(msg_send![gp, rightTrigger]),
+            left_x,
+            left_y,
+            right_x,
+            right_y,
+        }
+    }
+}
+
+/// `s` (an `NSString`, or null) as text.
+unsafe fn text(s: *mut AnyObject) -> String {
+    if s.is_null() {
+        return "unknown".into();
+    }
+    // SAFETY: the caller passes an NSString.
+    unsafe { (*s.cast::<NSString>()).to_string() }
+}
+
+/// Logs, once per change, which controller now drives the pad, so a tester
+/// can see in the run log that their controller was recognised.
+unsafe fn note_controller(ctrl: *mut AnyObject) {
+    let id = ctrl as usize;
+    if ACTIVE.swap(id, Ordering::Relaxed) == id {
+        return;
+    }
+    if ctrl.is_null() {
+        tracing::info!("controller: none connected, the keyboard drives the pad");
+        return;
+    }
+    // SAFETY: documented GCController getters on a live controller.
+    unsafe {
+        let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
+        let vendor = text(msg_send![ctrl, vendorName]);
+        let category = text(msg_send![ctrl, productCategory]);
+        let touchpad = !gp.is_null() && has_touchpad(gp);
+        tracing::info!(vendor, category, touchpad, "controller: drives the pad");
+    }
+}
+
+/// Polls the active `GCController` (see `active_controller`) and updates
+/// `GameInput`. Releases controller state when no extended gamepad is
+/// connected.
+unsafe fn poll_controller() {
+    // SAFETY: GameController queries on the main thread.
+    unsafe {
+        let ctrl = active_controller();
+        note_controller(ctrl);
+        if ctrl.is_null() {
+            victory_hle::modules::gameinput::release_live_pad();
             return;
         }
-        victory_hle::modules::gameinput::release_live_pad();
+        let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
+        victory_hle::modules::gameinput::set_live_pad(snapshot_of(gp));
     }
 }
 
@@ -470,6 +547,64 @@ mod tests {
             assert!(!unsafe { key_event(other) });
 
             victory_hle::modules::gameinput::release_live_keys();
+        });
+    }
+
+    /// Sets a button of a software gamepad (`controllerWithExtendedGamepad`).
+    unsafe fn press(button: *mut AnyObject, value: f32) {
+        assert!(!button.is_null());
+        // SAFETY: `setValue:` is documented for snapshot controllers' elements.
+        unsafe {
+            let _: () = msg_send![button, setValue: value];
+        }
+    }
+
+    /// Sets a stick or D-pad of a software gamepad.
+    unsafe fn push(pad: *mut AnyObject, x: f32, y: f32) {
+        assert!(!pad.is_null());
+        // SAFETY: as in `press`.
+        unsafe {
+            let _: () = msg_send![pad, setValueForXAxis: x, yAxis: y];
+        }
+    }
+
+    /// Reads a software extended gamepad, made without any hardware, through
+    /// the same path a real Xbox pad or DualShock 4 takes. It has no
+    /// touchpad, so `touchpad` stays up.
+    #[test]
+    fn snapshot_reads_a_software_extended_gamepad() {
+        super::autoreleasepool(|_| {
+            // SAFETY: documented GameController factory and getters; the
+            // controller lives until the pool drains.
+            unsafe {
+                let ctrl: *mut AnyObject =
+                    msg_send![class!(GCController), controllerWithExtendedGamepad];
+                assert!(!ctrl.is_null());
+                let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
+                assert!(!gp.is_null());
+                assert!(!has_touchpad(gp));
+
+                let idle = snapshot_of(gp);
+                assert_eq!(idle, Default::default());
+
+                press(msg_send![gp, buttonA], 1.0);
+                press(msg_send![gp, buttonY], 1.0);
+                press(msg_send![gp, rightShoulder], 1.0);
+                press(msg_send![gp, buttonMenu], 1.0);
+                press(msg_send![gp, leftTrigger], 0.5);
+                push(msg_send![gp, leftThumbstick], -0.25, 0.75);
+                push(msg_send![gp, rightThumbstick], 1.0, -1.0);
+                push(msg_send![gp, dpad], 0.0, 1.0); // up
+
+                let s = snapshot_of(gp);
+                assert!(s.a && s.y && s.right_shoulder && s.menu && s.up);
+                assert!(!s.b && !s.x && !s.left_shoulder && !s.down && !s.left && !s.right);
+                assert!(!s.view && !s.touchpad);
+                assert_eq!(s.left_trigger, 0.5);
+                assert_eq!(s.right_trigger, 0.0);
+                assert_eq!((s.left_x, s.left_y), (-0.25, 0.75));
+                assert_eq!((s.right_x, s.right_y), (1.0, -1.0));
+            }
         });
     }
 

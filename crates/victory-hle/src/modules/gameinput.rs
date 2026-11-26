@@ -617,6 +617,10 @@ pub struct ControllerSnapshot {
     pub right_stick: bool,
     pub menu: bool,
     pub view: bool,
+    /// The touchpad click of a PlayStation pad (DualShock 4, DualSense).
+    /// It drives View too, next to Share (`view`): on PlayStation titles the
+    /// touchpad is the usual back or map button, and Share is awkward to reach.
+    pub touchpad: bool,
     /// Analog triggers, 0.0 to 1.0.
     pub left_trigger: f32,
     pub right_trigger: f32,
@@ -632,7 +636,7 @@ fn pad_from_snapshot(s: ControllerSnapshot) -> PadState {
     let mut buttons = 0u32;
     for (on, bit) in [
         (s.menu, MENU),
-        (s.view, VIEW),
+        (s.view || s.touchpad, VIEW),
         (s.a, A),
         (s.b, B),
         (s.x, X),
@@ -1919,6 +1923,7 @@ mod tests {
             right_stick: true,
             menu: true,
             view: true,
+            touchpad: false,
             left_trigger: 0.35,
             right_trigger: 1.5, // clamped to 1.0
             left_x: -0.6,
@@ -1949,6 +1954,31 @@ mod tests {
                 right_y: 0.0,
             }
         );
+    }
+
+    /// A DualShock 4 (or DualSense) touchpad click is View, as Share is; with
+    /// neither pressed, View stays up.
+    #[cfg(not(windows))]
+    #[test]
+    fn playstation_touchpad_click_is_view() {
+        let touch = ControllerSnapshot {
+            touchpad: true,
+            ..Default::default()
+        };
+        assert_eq!(pad_from_snapshot(touch).buttons, VIEW);
+        let share = ControllerSnapshot {
+            view: true,
+            ..Default::default()
+        };
+        assert_eq!(pad_from_snapshot(share).buttons, VIEW);
+        let both = ControllerSnapshot {
+            view: true,
+            touchpad: true,
+            a: true,
+            ..Default::default()
+        };
+        assert_eq!(pad_from_snapshot(both).buttons, VIEW | A);
+        assert_eq!(pad_from_snapshot(ControllerSnapshot::default()).buttons, 0);
     }
 
     #[cfg(not(windows))]
@@ -2008,6 +2038,10 @@ mod tests {
 
     #[test]
     fn keys_feed_the_keyboard_and_the_stand_in_pad() {
+        // On macOS the stand-in pad also carries the live controller, which
+        // `live_controller_merges_with_keyboard_and_clears_on_release` sets.
+        #[cfg(not(windows))]
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (hub, host) = fake();
         let log = Log::default();
         register(hub, KEYBOARD_KIND, 2, &log);

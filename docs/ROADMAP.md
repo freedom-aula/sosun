@@ -22,7 +22,7 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 **Now:**
 - At about 53 s (about 1,400 frames) a Metal command buffer fails with `kIOGPUCommandBufferCallbackErrorTimeout`. A fence is left one step behind (signal 2836, GPU at 2832) and presents stop. One way to get there is fixed: Metal ends a command buffer whose fence wait lasts about 5 s and drops its signals, so all unsatisfied queue `Wait`s are now held on the CPU until observed backend completion, including waits behind already-committed signals, since those producers can still be delayed or fail asynchronously (docs/native-host.md). Not confirmed as this time-out's cause; recent tester runs (#13, #26) pass 53 s.
-- The keyboard now drives the stand-in pad in the window (Enter/Space = A, Esc = B, arrows = D-pad, WASD = left stick). Real controllers through the Game Controller framework are still a self-contained task.
+- The keyboard now drives the stand-in pad in the window (Enter/Space = A, Esc = B, arrows = D-pad, WASD = left stick). Game Controller framework pads drive it too (Xbox, DualShock 4, DualSense; the one used last wins, and a PlayStation touchpad click is View). The DualShock 4 mapping is tested against a software gamepad only: a tester run with a real one in the menus is still needed.
 
 **Start here:** `crates/victory-gpu/src/native/` and `queue.rs` for the timeout; `crates/victory-hle/src/modules/gameinput.rs` and `apps/victory/src/window.rs` for input.
 
