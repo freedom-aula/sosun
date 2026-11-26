@@ -503,14 +503,17 @@ impl Metal {
             return Ok(None);
         };
         // The converter's layout names the table as a table resource with no register.
-        let offset = self
+        // With no table in the layout there is nothing to fill: the pipeline is still made.
+        let Some(offset) = self
             .msc()?
             .locations(l)
             .map_err(|e| e.to_string())?
             .iter()
             .find(|&&(kind, space, slot, ..)| kind == 0 && space == u32::MAX && slot == u32::MAX)
             .map(|&(.., offset, _)| offset as usize)
-            .ok_or("the converter laid out no static sampler table")?;
+        else {
+            return Ok(None);
+        };
         let table = self
             .dev
             .newBufferWithLength_options(
