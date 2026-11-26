@@ -35,7 +35,7 @@ already assumes ("a resource's GPU address is its CPU address"). On Metal that c
 | `shader_cache.rs` (translated DXIL by content hash) | cache the converted `.metallib` next to it; conversion averages 84 ms (compute), 32 ms (pixel) over the corpus below |
 | `twin.rs` (depth also written by UAV: colour twin) | Metal textures allow `shaderWrite` on depth-format views only through a pixel-format view; likely still needs the twin until checked on real shaders |
 | `query.rs` | `MTLCounterSampleBuffer` / visibility result buffer |
-| `signature.rs` (ExecuteIndirect) | indirect command buffers (`MTLIndirectCommandBuffer`), or compute-generated arguments |
+| `signature.rs` (ExecuteIndirect) | Metal indirect draws and dispatches that read the records in title memory; with a count buffer, a one-thread gate kernel per record first copies the record or zeros (`gfx.rs`, `GATE`) |
 | present | `CAMetalLayer` |
 
 What is not a mapping but a gain: the per-draw "dynamic slots" of the host heap, the per-submission

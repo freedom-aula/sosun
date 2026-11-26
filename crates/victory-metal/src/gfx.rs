@@ -1143,7 +1143,93 @@ impl Metal {
     }
 }
 
+/// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
+/// on the GPU: this one-thread kernel copies the record's `words`, or zeros (no groups, no
+/// vertices or instances), into a buffer of its own, which the indirect command then reads.
+/// Bound at 20 and up, apart from the converter's slots.
+const GATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void gate(device const uint *count [[buffer(20)]],
+                 device const uint *record [[buffer(21)]],
+                 device uint *out [[buffer(22)]],
+                 constant uint2 &at [[buffer(23)]]) {
+    bool run = at.x < count[0];
+    for (uint w = 0; w < at.y; w++) {
+        out[w] = run ? record[w] : 0u;
+    }
+}
+"#;
+
 impl Metal {
+    fn gate_pipeline(&self) -> Result<&ProtocolObject<dyn MTLComputePipelineState>, String> {
+        self.gate
+            .get_or_init(|| {
+                let lib = self
+                    .dev
+                    .newLibraryWithSource_options_error(
+                        &objc2_foundation::NSString::from_str(GATE),
+                        None,
+                    )
+                    .map_err(|e| e.localizedDescription().to_string())?;
+                let f = lib
+                    .newFunctionWithName(&objc2_foundation::NSString::from_str("gate"))
+                    .ok_or("no gate function")?;
+                self.dev
+                    .newComputePipelineStateWithFunction_error(&f)
+                    .map_err(|e| e.localizedDescription().to_string())
+            })
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    /// Encodes the gate of one counted record (`words` long at `record`) into `e`; returns the
+    /// buffer the indirect command reads instead of the record. Tracked by Metal (unlike the
+    /// title's pools), so whatever reads it later in the command buffer waits for the write.
+    /// shortcut: one gate dispatch and one small buffer per record; gate all the records of one
+    /// `ExecuteIndirect` in a single dispatch if a large `MaxCommandCount` shows up in profiles.
+    fn encode_gate(
+        &self,
+        e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        (count, at, index): (&Buffer, *const u8, u32),
+        (record, title): (&Buffer, *const u8),
+        words: u32,
+        set_on_queue: bool,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, String> {
+        let out = self
+            .dev
+            .newBufferWithLength_options(words as usize * 4, MTLResourceOptions::StorageModePrivate)
+            .ok_or("no buffer for a gated indirect record")?;
+        for b in [count, record] {
+            if self.names(b, set_on_queue) {
+                e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+            }
+        }
+        // What the work before wrote (the count, the record) is seen.
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        e.setComputePipelineState(self.gate_pipeline()?);
+        let args = [index, words];
+        // SAFETY: both title ranges lie inside live buffers (the caller resolved them); the bytes
+        // are copied before the call returns.
+        unsafe {
+            e.setBuffer_offset_atIndex(Some(&count.buf), at as usize - count.base as usize, 20);
+            e.setBuffer_offset_atIndex(
+                Some(&record.buf),
+                title as usize - record.base as usize,
+                21,
+            );
+            e.setBuffer_offset_atIndex(Some(&out), 0, 22);
+            e.setBytes_length_atIndex(
+                NonNull::new(args.as_ptr().cast_mut().cast()).unwrap(),
+                8,
+                23,
+            );
+        }
+        e.dispatchThreadgroups_threadsPerThreadgroup(size([1, 1, 1]), size([1, 1, 1]));
+        e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        Ok(out)
+    }
+
     /// Whether encoder `use` calls are needed for `b`: not when the queue has the pool residency set
     /// and the buffer is in it.
     fn names(&self, b: &Buffer, set_on_queue: bool) -> bool {
@@ -1171,6 +1257,12 @@ impl Metal {
             e.waitForFence(f);
         }
         for d in dispatches {
+            let gated = match (d.count, d.indirect) {
+                (Some(count), Some(record)) => {
+                    Some(self.encode_gate(&e, count, record, 3, set_on_queue)?)
+                }
+                _ => None,
+            };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -1187,11 +1279,16 @@ impl Metal {
                     if self.names(b, set_on_queue) {
                         e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
                     }
-                    // SAFETY: the caller resolved three words at `title` inside the live buffer.
+                    let (buf, at) = match &gated {
+                        Some(g) => (&**g, 0),
+                        None => (&*b.buf, title as usize - b.base as usize),
+                    };
+                    // SAFETY: the caller resolved three words at `title` inside the live buffer
+                    // (or the gate wrote them to its own).
                     unsafe {
                         e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            &b.buf,
-                            title as usize - b.base as usize,
+                            buf,
+                            at,
                             size(d.threads_per_group),
                         )
                     };
@@ -1279,6 +1376,38 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
+        // Counted indirect draws are gated first, in a compute pass of their own.
+        let mut gates = Vec::new();
+        if rp
+            .draws
+            .iter()
+            .any(|d| d.count.is_some() && d.indirect.is_some())
+        {
+            let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
+            if let Some((f, started)) = order
+                && started.get()
+            {
+                c.waitForFence(f);
+            }
+            for d in &rp.draws {
+                let words = if matches!(d.call, DrawCall::Indexed { .. }) {
+                    5
+                } else {
+                    4
+                };
+                gates.push(match (d.count, d.indirect) {
+                    (Some(count), Some(record)) => {
+                        Some(self.encode_gate(&c, count, record, words, set_on_queue)?)
+                    }
+                    _ => None,
+                });
+            }
+            if let Some((f, started)) = order {
+                c.updateFence(f);
+                started.set(true);
+            }
+            c.endEncoding();
+        }
         if let Some(dp) = &rp.depth {
             let a = desc.depthAttachment();
             a.setTexture(Some(&dp.texture.tex));
@@ -1329,7 +1458,7 @@ impl Metal {
             .map(|c| &c.texture.tex)
             .or(rp.depth.as_ref().map(|d| &d.texture.tex))
             .map_or((0, 0), |t| (t.width(), t.height()));
-        for d in &rp.draws {
+        for (k, d) in rp.draws.iter().enumerate() {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
@@ -1431,7 +1560,6 @@ impl Metal {
                 // What the converter runtime's indirect `IRRuntimeDraw(Indexed)Primitives` do: the
                 // argument record itself is the shader's draw arguments (D3D12's records are
                 // `IRRuntimeDraw(Indexed)Argument`s and Metal's indirect ones, word for word).
-                let at = title as usize - ab.base as usize;
                 if self.names(ab, set_on_queue) {
                     e.useResource_usage_stages(
                         ProtocolObject::from_ref(&*ab.buf),
@@ -1439,13 +1567,18 @@ impl Metal {
                         MTLRenderStages::Vertex,
                     );
                 }
+                // A counted record is read from its gate's buffer.
+                let (args, at) = match gates.get(k).and_then(Option::as_ref) {
+                    Some(g) => (&**g, 0),
+                    None => (&*ab.buf, title as usize - ab.base as usize),
+                };
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
-                unsafe { e.setVertexBuffer_offset_atIndex(Some(&ab.buf), at, DRAW_ARGUMENTS) };
+                unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
                 match (d.call, d.index_buffer) {
                     (DrawCall::Arrays { .. }, _) => {
                         set_index_type(&e, 0);
                         // SAFETY: as above.
-                        unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, &ab.buf, at) };
+                        unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at) };
                     }
                     (DrawCall::Indexed { wide, .. }, Some((b, title))) => {
                         set_index_type(&e, if wide { 2 } else { 1 });
@@ -1463,7 +1596,7 @@ impl Metal {
                                 if wide { MTLIndexType::UInt32 } else { MTLIndexType::UInt16 },
                                 &b.buf,
                                 title as usize - b.base as usize,
-                                &ab.buf,
+                                args,
                                 at,
                             )
                         };
