@@ -389,15 +389,18 @@ next dispatch follows it) and by every sampling test below.
 
 Resources reached only through a heap entry are **not** resident unless named. Measured: with neither a
 residency set nor `useResource`, every heap test returns wrong data (Apple Silicon does not make an
-unnamed resource work by luck). So a heap carries its own `MTLResidencySet` holding the heap buffer and
+unnamed resource work by luck). A heap can carry its own `MTLResidencySet` holding the heap buffer and
 each resource written into it (`addAllocation` on every `write_*`, `commit` before the next command
-buffer that uses it, then `useResidencySet` on that command buffer). Where `newResidencySetWithDescriptor`
-is missing (macOS before 15) or `VICTORY_METAL_NO_RESIDENCY_SETS` is set, the fallback names every entry
-to every encoder with `useResource` (O(entries) per dispatch: fine for tests, not for a heap of a million
-entries). The heap tests run in both modes (`common::backends()`). Not done: removing a replaced entry's
-old resource from the set (it stays resident until the heap is dropped); a set for the title pools (they
-are named with `useResource` per dispatch through `Dispatch::resources`, a handful of buffers; a
-queue-level `addResidencySet` is the cheaper end state); `useHeap` for `MTLHeap`-placed textures.
+buffer that uses it, then `useResidencySet` on that command buffer), but it is **off by default**:
+a set never forgets an allocation, so with the title's thousands of heap-named textures and buffers it
+held all of title memory (about 6.7 GB here) plus the host's texture copies resident for the whole
+process, and command buffers began to time out (`kIOGPUCommandBufferCallbackErrorTimeout`) after the
+world load. `VICTORY_METAL_RESIDENCY_SETS=1` turns it on; by default every heap entry is named to every
+encoder with `useResource` instead, so residency follows the frame. The heap tests run in both modes
+(`common::backends()`). Not done: removing a replaced entry's old resource from the set (it stays
+resident until the heap is dropped); a set for the title pools (they are named with `useResource` per
+dispatch through `Dispatch::resources`, a handful of buffers; a queue-level `addResidencySet` is the
+cheaper end state); `useHeap` for `MTLHeap`-placed textures.
 
 ### Textures and samplers
 

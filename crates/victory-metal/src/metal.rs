@@ -97,7 +97,13 @@ impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        let residency_sets = std::env::var_os("VICTORY_METAL_NO_RESIDENCY_SETS").is_none()
+        // Residency is per encoder (`useResource`) unless `VICTORY_METAL_RESIDENCY_SETS=1`. A
+        // residency set keeps every allocation it was given resident for as long as the holder
+        // lives, and the title names thousands of textures and buffers in its descriptor heaps, so
+        // the set held all of title memory (about 6.7 GB here) plus the host's texture copies
+        // permanently. That is what preceded `kIOGPUCommandBufferCallbackErrorTimeout` (and, with
+        // the copies, `...OutOfMemory`). Per encoder, residency follows the frame instead.
+        let residency_sets = std::env::var_os("VICTORY_METAL_RESIDENCY_SETS").is_some()
             && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
         Ok(Metal {
             dev,
