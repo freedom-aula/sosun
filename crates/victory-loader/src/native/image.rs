@@ -11,6 +11,8 @@ use victory_pe::layout::{self, dir};
 use victory_pe::{ImageInfo, ImportSymbol};
 use victory_platform::mem::{self, Protect};
 
+use super::seh;
+
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -76,6 +78,13 @@ impl NativeImage {
         };
         image.copy_sections(bytes)?;
         image.relocate(bytes)?;
+        let pdata = layout::data_directory_offset(bytes, dir::EXCEPTION).map(|at| {
+            (
+                layout::read_u32(bytes, at).unwrap_or(0),
+                layout::read_u32(bytes, at + 4).unwrap_or(0),
+            )
+        });
+        seh::unwind::add_image(image.base, image.len, pdata);
         tracing::info!(
             base = format_args!("{:#x}", image.base),
             preferred = format_args!("{preferred:#x}"),
@@ -284,6 +293,7 @@ impl NativeImage {
     /// # Safety
     /// No title code may run or hold pointers into it afterwards.
     pub unsafe fn unmap(self) {
+        seh::unwind::remove_image(self.base);
         // SAFETY: forwarded from the caller.
         unsafe { mem::release(self.base as *mut u8, self.len) }.ok();
     }

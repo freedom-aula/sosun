@@ -17,7 +17,7 @@ done
 # --dynamicbase gives it base relocations; the preferred base is above 4 GiB
 # like a console title's.
 tools/macos/gnullvm-cc.sh -O1 -ffreestanding -fno-builtin -fno-stack-protector \
-    -fno-asynchronous-unwind-tables -fms-extensions -fno-emulated-tls -nostdlib \
+    -fms-extensions -fasynchronous-unwind-tables -fexceptions -Xclang -fasync-exceptions -fno-emulated-tls -nostdlib \
     -Wl,--entry,probe_main -Wl,--subsystem,console -Wl,--dynamicbase \
     -Wl,--image-base,0x140000000 -Wl,--export-all-symbols \
     -L"$WORK" "$SRC/probe.c" -lxgameruntime -lvictory-probe-host -lkernel32 -o "$OUT"

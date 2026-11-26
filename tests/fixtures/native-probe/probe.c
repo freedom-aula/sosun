@@ -11,6 +11,7 @@
  * build.
  */
 typedef unsigned char u8;
+typedef unsigned short u16;
 typedef unsigned int u32;
 typedef unsigned long long u64;
 typedef void *ptr;
@@ -38,6 +39,42 @@ IMPORT ptr CreateThread(ptr, u64, ptr, ptr, u32, u32 *);
 IMPORT u32 TlsAlloc(void);
 IMPORT ptr TlsGetValue(u32);
 IMPORT int TlsSetValue(u32, ptr);
+
+/* Exceptions. */
+IMPORT ptr AddVectoredExceptionHandler(u32, ptr);
+IMPORT u32 RemoveVectoredExceptionHandler(ptr);
+IMPORT void RaiseException(u32, u32, u32, const u64 *);
+
+/* Threads and synchronisation. */
+IMPORT u32 SuspendThread(ptr);
+IMPORT u32 ResumeThread(ptr);
+IMPORT int GetThreadContext(ptr, ptr);
+IMPORT u32 WaitForMultipleObjects(u32, const ptr *, int, u32);
+IMPORT int SwitchToThread(void);
+IMPORT void InitializeCriticalSection(ptr);
+IMPORT void EnterCriticalSection(ptr);
+IMPORT int TryEnterCriticalSection(ptr);
+IMPORT void LeaveCriticalSection(ptr);
+IMPORT void AcquireSRWLockExclusive(ptr);
+IMPORT void AcquireSRWLockShared(ptr);
+IMPORT u8 TryAcquireSRWLockExclusive(ptr);
+IMPORT u8 TryAcquireSRWLockShared(ptr);
+IMPORT void ReleaseSRWLockExclusive(ptr);
+IMPORT void ReleaseSRWLockShared(ptr);
+IMPORT int SleepConditionVariableCS(ptr, ptr, u32);
+IMPORT void WakeConditionVariable(ptr);
+
+/* Files. */
+IMPORT ptr CreateFileW(const u16 *, u32, u32, ptr, u32, u32, ptr);
+IMPORT int ReadFile(ptr, ptr, u32, u32 *, ptr);
+IMPORT int WriteFile(ptr, const void *, u32, u32 *, ptr);
+IMPORT u32 SetFilePointer(ptr, int, int *, u32);
+IMPORT int SetFilePointerEx(ptr, long long, long long *, u32);
+IMPORT u32 GetFileSize(ptr, u32 *);
+IMPORT u32 GetFileAttributesW(const u16 *);
+IMPORT ptr FindFirstFileW(const u16 *, ptr);
+IMPORT int FindNextFileW(ptr, ptr);
+IMPORT int FindClose(ptr);
 
 /* victory-probe-host.dll: provided by the test itself. */
 IMPORT u64 ProbeSum8(u64, u64, u64, u64, u64, u64, u64, u64);
@@ -76,6 +113,7 @@ static u32 *const data_pointer = &data_word;
 static u64 callback_table[2];
 
 static u32 tls_callback_saw_attach;
+static volatile u32 thread_attach_notices, thread_detach_notices;
 
 static u64 read_gs(u32 offset)
 {
@@ -116,6 +154,10 @@ static void tls_callback(ptr module, u32 reason, ptr reserved)
     (void)reserved;
     if (reason == 1)
         tls_callback_saw_attach = 1;
+    else if (reason == 2)
+        thread_attach_notices++;
+    else if (reason == 3)
+        thread_detach_notices++;
 }
 
 unsigned int _tls_index = 0;
@@ -216,4 +258,574 @@ u32 probe_missing(ptr unused)
 {
     (void)unused;
     return (u32)ProbeNotImplemented(42);
+}
+
+/* ---- exceptions ---------------------------------------------------- */
+
+struct exception_record {
+    u32 code, flags;
+    struct exception_record *chain;
+    ptr address;
+    u32 count;
+    u64 info[15];
+};
+struct exception_pointers {
+    struct exception_record *record;
+    ptr context;
+};
+
+enum {
+    E_AV_CAUGHT = 1u << 0,
+    E_AV_DETAILS = 1u << 1,
+    E_GS_IN_FILTER = 1u << 2,
+    E_FINALLY = 1u << 3,
+    E_DEEP = 1u << 4,
+    E_RAISE = 1u << 5,
+    E_RAISE_ARGS = 1u << 6,
+    E_DIVIDE = 1u << 7,
+    E_CONTINUE = 1u << 8,
+    E_VEH_FIXES = 1u << 9,
+    E_VEH_GS = 1u << 10,
+    E_VEH_WRITE = 1u << 11,
+    E_UNHANDLED_SKIPPED = 1u << 12,
+    E_AFTER = 1u << 13,
+    E_ORDER = 1u << 14,
+};
+#define EXC_ALL 0x7FFFu
+
+static volatile int *volatile null_pointer = (volatile int *)8;
+static volatile int zero;
+static volatile u32 seen_code, seen_kind;
+static volatile u64 seen_address, seen_teb;
+static volatile u32 finally_runs, sequence, finally_at, except_at;
+static u64 teb_at_start;
+
+static int record_filter(struct exception_pointers *p)
+{
+    seen_code = p->record->code;
+    seen_kind = (u32)p->record->info[0];
+    seen_address = p->record->info[1];
+    seen_teb = read_gs(0x30);
+    return 1; /* EXCEPTION_EXECUTE_HANDLER */
+}
+
+static int continue_filter(struct exception_pointers *p)
+{
+    (void)p;
+    return -1; /* EXCEPTION_CONTINUE_EXECUTION */
+}
+
+/* Faults several frames below the __try that catches it. */
+static void __attribute__((noinline)) fault_deep(int depth)
+{
+    volatile int local = depth;
+    if (depth > 0)
+        fault_deep(depth - 1);
+    else
+        *null_pointer = local;
+    local = 0;
+}
+
+static void __attribute__((noinline)) fault_with_finally(void)
+{
+    __try {
+        fault_deep(3);
+    } __finally {
+        finally_runs++;
+        finally_at = ++sequence;
+    }
+}
+
+static u8 *veh_page;
+static volatile u32 veh_calls, veh_wrote, veh_gs_ok;
+
+/* A vectored handler (title code): makes the page writable and retries. */
+static int veh(struct exception_pointers *p)
+{
+    veh_calls++;
+    veh_gs_ok = read_gs(0x30) == teb_at_start;
+    if (p->record->code == 0xC0000005 && p->record->info[0] == 1 &&
+        (u8 *)p->record->info[1] >= veh_page && (u8 *)p->record->info[1] < veh_page + 4096) {
+        u32 old;
+        veh_wrote = 1;
+        VirtualProtect(veh_page, 4096, 4, &old);
+        return -1;
+    }
+    return 0; /* EXCEPTION_CONTINUE_SEARCH */
+}
+
+u32 probe_seh(ptr unused)
+{
+    u32 ok = 0;
+    (void)unused;
+    teb_at_start = read_gs(0x30);
+
+    /* An access violation caught by __try/__except, with its details. */
+    int caught = 0;
+    seen_code = 0;
+    __try {
+        *null_pointer = 1;
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught)
+        ok |= E_AV_CAUGHT;
+    if (seen_code == 0xC0000005 && seen_kind == 1 && seen_address == 8)
+        ok |= E_AV_DETAILS;
+    if (seen_teb == teb_at_start && read_gs(0x30) == teb_at_start)
+        ok |= E_GS_IN_FILTER;
+
+    /* A fault three frames down, a __finally in between, then the __except. */
+    finally_runs = 0;
+    caught = 0;
+    __try {
+        fault_with_finally();
+    } __except (1) {
+        caught = 1;
+        except_at = ++sequence;
+    }
+    if (caught && finally_runs == 1)
+        ok |= E_FINALLY;
+    if (caught)
+        ok |= E_DEEP;
+    if (finally_at != 0 && except_at > finally_at)
+        ok |= E_ORDER;
+
+    /* RaiseException with parameters. */
+    caught = 0;
+    seen_code = 0;
+    u64 args[2] = {0x1234, 0x5678};
+    __try {
+        RaiseException(0xE0000001, 0, 2, args);
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught && seen_code == 0xE0000001)
+        ok |= E_RAISE;
+    if (caught && seen_kind == 0x1234 && seen_address == 0x5678)
+        ok |= E_RAISE_ARGS;
+
+    /* An integer divide by zero. */
+    caught = 0;
+    seen_code = 0;
+    __try {
+        zero = 10 / zero;
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught && seen_code == 0xC0000094)
+        ok |= E_DIVIDE;
+
+    /* A filter that continues: RaiseException returns to its caller. */
+    int after = 0;
+    __try {
+        RaiseException(0xE0000002, 0, 0, 0);
+        after = 1;
+    } __except (continue_filter((struct exception_pointers *)_exception_info())) {
+        after = 2;
+    }
+    if (after == 1)
+        ok |= E_CONTINUE;
+
+    /* A vectored handler fixes a read-only page and the store goes on. */
+    veh_page = VirtualAlloc(0, 4096, 0x3000, 2);
+    ptr handle = AddVectoredExceptionHandler(1, (ptr)veh);
+    if (veh_page && handle) {
+        veh_page[16] = 42;
+        if (veh_page[16] == 42 && veh_wrote)
+            ok |= E_VEH_FIXES | E_VEH_WRITE;
+        if (veh_gs_ok)
+            ok |= E_VEH_GS;
+        /* It is passed over for exceptions it declines. */
+        caught = 0;
+        __try {
+            *null_pointer = 1;
+        } __except (1) {
+            caught = 1;
+        }
+        if (caught && veh_calls >= 2)
+            ok |= E_UNHANDLED_SKIPPED;
+        RemoveVectoredExceptionHandler(handle);
+        VirtualFree(veh_page, 0, 0x8000);
+    }
+    /* Everything above left the thread able to carry on. */
+    if (read_gs(0x30) == teb_at_start)
+        ok |= E_AFTER;
+    return ok;
+}
+
+/* ---- threads and synchronisation ------------------------------------ */
+
+enum {
+    T_ATTACH = 1u << 0,
+    T_DETACH = 1u << 1,
+    T_SUSPENDED_START = 1u << 2,
+    T_RESUME_RUNS = 1u << 3,
+    T_COUNTS = 1u << 4,
+    T_STOPS = 1u << 5,
+    T_CONTEXT = 1u << 6,
+    T_CONTINUES = 1u << 7,
+    T_WAIT_ANY = 1u << 8,
+    T_WAIT_ANY_TIMEOUT = 1u << 9,
+    T_WAIT_ALL = 1u << 10,
+    T_WAIT_ALL_KEEPS = 1u << 11,
+    T_CS = 1u << 12,
+    T_CS_TRY = 1u << 13,
+    T_SRW = 1u << 14,
+    T_SRW_TRY = 1u << 15,
+    T_CV = 1u << 16,
+    T_CV_TIMEOUT = 1u << 17,
+    T_SWITCH = 1u << 18,
+};
+
+static volatile u32 ran_flag, spin_stop;
+static volatile u64 spin_count;
+
+static u32 flag_worker(ptr param)
+{
+    ran_flag = 1;
+    if (param)
+        SetEvent(param);
+    return 0;
+}
+
+static u32 __attribute__((noinline)) spin_worker(ptr param)
+{
+    (void)param;
+    while (!spin_stop)
+        spin_count++;
+    return 0;
+}
+
+static u32 __attribute__((noinline)) after_spin_worker(void)
+{
+    return 0;
+}
+
+/* A CONTEXT is 0x4D0 bytes, 16-aligned. */
+static u8 context_buffer[0x4D0] __attribute__((aligned(16)));
+
+u32 probe_threads(ptr unused)
+{
+    u32 ok = 0;
+    (void)unused;
+
+    /* Thread notices reach the TLS callback on the new thread. */
+    u32 a0 = thread_attach_notices, d0 = thread_detach_notices;
+    ptr t = CreateThread(0, 0, (ptr)flag_worker, 0, 0, 0);
+    WaitForSingleObject(t, 5000);
+    CloseHandle(t);
+    if (thread_attach_notices >= a0 + 1)
+        ok |= T_ATTACH;
+    if (thread_detach_notices >= d0 + 1)
+        ok |= T_DETACH;
+
+    /* CREATE_SUSPENDED: nothing runs until ResumeThread. */
+    ran_flag = 0;
+    ptr done = CreateEventW(0, 1, 0, 0);
+    t = CreateThread(0, 0, (ptr)flag_worker, done, 4, 0);
+    Sleep(40);
+    if (!ran_flag)
+        ok |= T_SUSPENDED_START;
+    u32 prev = ResumeThread(t);
+    if (prev == 1 && WaitForSingleObject(done, 5000) == 0 && ran_flag)
+        ok |= T_RESUME_RUNS;
+    WaitForSingleObject(t, 5000);
+    CloseHandle(t);
+
+    /* Suspend counts nest. */
+    ptr t2 = CreateThread(0, 0, (ptr)flag_worker, 0, 4, 0);
+    u32 s1 = SuspendThread(t2), s2 = SuspendThread(t2);
+    u32 r1 = ResumeThread(t2), r2 = ResumeThread(t2), r3 = ResumeThread(t2);
+    if (s1 == 1 && s2 == 2 && r1 == 3 && r2 == 2 && r3 == 1)
+        ok |= T_COUNTS;
+    WaitForSingleObject(t2, 5000);
+    CloseHandle(t2);
+
+    /* Suspend a thread spinning in title code, read its registers. */
+    spin_stop = 0;
+    spin_count = 0;
+    ptr sp = CreateThread(0, 0, (ptr)spin_worker, 0, 0, 0);
+    Sleep(30);
+    SuspendThread(sp);
+    u64 c1 = spin_count;
+    Sleep(30);
+    if (c1 > 0 && spin_count == c1)
+        ok |= T_STOPS;
+    for (u32 i = 0; i < sizeof context_buffer; i++)
+        context_buffer[i] = 0;
+    *(u32 *)(context_buffer + 0x30) = 0x10000B;
+    if (GetThreadContext(sp, context_buffer)) {
+        u64 rip = *(u64 *)(context_buffer + 0xF8), rsp = *(u64 *)(context_buffer + 0x98);
+        if (rip >= (u64)spin_worker && rip < (u64)after_spin_worker && rsp > 0x10000)
+            ok |= T_CONTEXT;
+    }
+    ResumeThread(sp);
+    Sleep(30);
+    if (spin_count > c1)
+        ok |= T_CONTINUES;
+    spin_stop = 1;
+    WaitForSingleObject(sp, 5000);
+    CloseHandle(sp);
+    CloseHandle(done);
+    return ok;
+}
+
+static u8 cs_area[64] __attribute__((aligned(16)));
+static u8 srw_area[16] __attribute__((aligned(16)));
+static u8 cv_area[16] __attribute__((aligned(16)));
+static volatile u32 shared_counter, cv_ready, cv_seen;
+static ptr consumer_done, late_event;
+
+static u32 cs_worker(ptr param)
+{
+    for (int i = 0; i < 20000; i++) {
+        if (param) {
+            EnterCriticalSection(cs_area);
+            shared_counter++;
+            LeaveCriticalSection(cs_area);
+        } else {
+            AcquireSRWLockExclusive(srw_area);
+            shared_counter++;
+            ReleaseSRWLockExclusive(srw_area);
+        }
+    }
+    return 0;
+}
+
+static u32 holder(ptr param)
+{
+    (void)param;
+    EnterCriticalSection(cs_area);
+    SetEvent(late_event);
+    Sleep(80);
+    LeaveCriticalSection(cs_area);
+    return 0;
+}
+
+static u32 try_from_other(ptr param)
+{
+    (void)param;
+    shared_counter = (u32)TryEnterCriticalSection(cs_area);
+    if (shared_counter)
+        LeaveCriticalSection(cs_area);
+    return 0;
+}
+
+static u32 consumer(ptr param)
+{
+    (void)param;
+    EnterCriticalSection(cs_area);
+    while (!cv_ready)
+        SleepConditionVariableCS(cv_area, cs_area, 0xFFFFFFFF);
+    cv_seen = 1;
+    LeaveCriticalSection(cs_area);
+    SetEvent(consumer_done);
+    return 0;
+}
+
+static u32 late_setter(ptr param)
+{
+    Sleep(40);
+    SetEvent(param);
+    return 0;
+}
+
+static u32 delayed_flag(ptr param)
+{
+    (void)param;
+    Sleep(20);
+    ran_flag = 1;
+    return 0;
+}
+
+u32 probe_sync(ptr unused)
+{
+    u32 ok = 0;
+    (void)unused;
+
+    /* WaitForMultipleObjects, any. */
+    ptr e[2] = {CreateEventW(0, 0, 0, 0), CreateEventW(0, 0, 0, 0)};
+    if (WaitForMultipleObjects(2, e, 0, 20) == 0x102)
+        ok |= T_WAIT_ANY_TIMEOUT;
+    SetEvent(e[1]);
+    if (WaitForMultipleObjects(2, e, 0, 1000) == 1 && WaitForSingleObject(e[1], 0) == 0x102)
+        ok |= T_WAIT_ANY;
+
+    /* All: one signalled is not enough, and is not consumed by the try. */
+    SetEvent(e[0]);
+    u32 r = WaitForMultipleObjects(2, e, 1, 30);
+    if (r == 0x102 && WaitForSingleObject(e[0], 0) == 0)
+        ok |= T_WAIT_ALL_KEEPS;
+    SetEvent(e[0]);
+    ptr th = CreateThread(0, 0, (ptr)late_setter, e[1], 0, 0);
+    if (WaitForMultipleObjects(2, e, 1, 5000) == 0)
+        ok |= T_WAIT_ALL;
+    WaitForSingleObject(th, 5000);
+    CloseHandle(th);
+    CloseHandle(e[0]);
+    CloseHandle(e[1]);
+
+    /* Critical sections: mutual exclusion, recursion, TryEnter. */
+    InitializeCriticalSection(cs_area);
+    EnterCriticalSection(cs_area);
+    EnterCriticalSection(cs_area);
+    LeaveCriticalSection(cs_area);
+    LeaveCriticalSection(cs_area);
+    shared_counter = 0;
+    ptr w[2];
+    w[0] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
+    w[1] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
+    WaitForMultipleObjects(2, w, 1, 20000);
+    if (shared_counter == 40000)
+        ok |= T_CS;
+    CloseHandle(w[0]);
+    CloseHandle(w[1]);
+    late_event = CreateEventW(0, 1, 0, 0);
+    ptr h = CreateThread(0, 0, (ptr)holder, 0, 0, 0);
+    WaitForSingleObject(late_event, 5000);
+    ptr tr = CreateThread(0, 0, (ptr)try_from_other, 0, 0, 0);
+    WaitForSingleObject(tr, 5000);
+    CloseHandle(tr);
+    if (shared_counter == 0)
+        ok |= T_CS_TRY;
+    WaitForSingleObject(h, 5000);
+    CloseHandle(h);
+    CloseHandle(late_event);
+
+    /* SRW locks. */
+    shared_counter = 0;
+    w[0] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
+    w[1] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
+    WaitForMultipleObjects(2, w, 1, 20000);
+    if (shared_counter == 40000)
+        ok |= T_SRW;
+    CloseHandle(w[0]);
+    CloseHandle(w[1]);
+    AcquireSRWLockShared(srw_area);
+    u8 shared_again = TryAcquireSRWLockShared(srw_area);
+    u8 exclusive_while_shared = TryAcquireSRWLockExclusive(srw_area);
+    ReleaseSRWLockShared(srw_area);
+    ReleaseSRWLockShared(srw_area);
+    u8 exclusive_after = TryAcquireSRWLockExclusive(srw_area);
+    ReleaseSRWLockExclusive(srw_area);
+    if (shared_again && !exclusive_while_shared && exclusive_after)
+        ok |= T_SRW_TRY;
+
+    /* Condition variable: a consumer sleeps until told. */
+    consumer_done = CreateEventW(0, 1, 0, 0);
+    ptr c = CreateThread(0, 0, (ptr)consumer, 0, 0, 0);
+    Sleep(30);
+    EnterCriticalSection(cs_area);
+    cv_ready = 1;
+    LeaveCriticalSection(cs_area);
+    WakeConditionVariable(cv_area);
+    if (WaitForSingleObject(consumer_done, 5000) == 0 && cv_seen)
+        ok |= T_CV;
+    CloseHandle(c);
+    CloseHandle(consumer_done);
+    EnterCriticalSection(cs_area);
+    SetLastError(0);
+    int slept = SleepConditionVariableCS(cv_area, cs_area, 10);
+    LeaveCriticalSection(cs_area);
+    if (!slept && GetLastError() == 1460)
+        ok |= T_CV_TIMEOUT;
+
+    /* SwitchToThread while another thread gets on. */
+    ran_flag = 0;
+    ptr d = CreateThread(0, 0, (ptr)delayed_flag, 0, 0, 0);
+    u64 t0 = GetTickCount64();
+    while (!ran_flag && GetTickCount64() < t0 + 3000)
+        SwitchToThread();
+    if (ran_flag)
+        ok |= T_SWITCH;
+    WaitForSingleObject(d, 5000);
+    CloseHandle(d);
+    return ok;
+}
+
+/* ---- files ------------------------------------------------------------ */
+
+enum {
+    F_OPEN = 1u << 0,
+    F_SIZE = 1u << 1,
+    F_READ = 1u << 2,
+    F_SEEK = 1u << 3,
+    F_SEEK_END = 1u << 4,
+    F_FIND = 1u << 5,
+    F_FIND_END = 1u << 6,
+    F_WRITE = 1u << 7,
+    F_ATTR = 1u << 8,
+    F_MISSING = 1u << 9,
+};
+
+static u32 wlen(const u16 *s)
+{
+    u32 n = 0;
+    while (s[n])
+        n++;
+    return n;
+}
+
+static void wcopy(u16 *to, const u16 *from, const char *tail)
+{
+    u32 n = wlen(from);
+    for (u32 i = 0; i < n; i++)
+        to[i] = from[i];
+    while (*tail)
+        to[n++] = (u16)*tail++;
+    to[n] = 0;
+}
+
+static u8 find_data[592] __attribute__((aligned(8)));
+
+/* `dir` is a wide path of a folder holding hello.txt ("hello, victory\n"). */
+u32 probe_files(const u16 *dir)
+{
+    u32 ok = 0;
+    u16 path[600];
+    wcopy(path, dir, "/hello.txt");
+    ptr f = CreateFileW(path, 0x80000000u, 1, 0, 3, 0x80, 0);
+    if (f != (ptr)-1)
+        ok |= F_OPEN;
+    if (f != (ptr)-1 && GetFileSize(f, 0) == 15)
+        ok |= F_SIZE;
+    u8 buf[32];
+    u32 n = 0;
+    if (f != (ptr)-1 && ReadFile(f, buf, 5, &n, 0) && n == 5 && buf[0] == 'h' && buf[4] == 'o')
+        ok |= F_READ;
+    if (f != (ptr)-1 && SetFilePointer(f, 7, 0, 0) == 7 && ReadFile(f, buf, 8, &n, 0) && n == 8 &&
+        buf[0] == 'v' && buf[7] == '\n')
+        ok |= F_SEEK;
+    long long end = 0;
+    if (f != (ptr)-1 && SetFilePointerEx(f, 0, &end, 2) && end == 15 &&
+        ReadFile(f, buf, 4, &n, 0) && n == 0)
+        ok |= F_SEEK_END;
+    if (f != (ptr)-1)
+        CloseHandle(f);
+
+    wcopy(path, dir, "/*.txt");
+    ptr find = FindFirstFileW(path, find_data);
+    if (find != (ptr)-1 && *(u16 *)(find_data + 44) == 'h' && *(u32 *)(find_data + 32) == 15)
+        ok |= F_FIND;
+    if (find != (ptr)-1 && !FindNextFileW(find, find_data) && GetLastError() == 18)
+        ok |= F_FIND_END;
+    if (find != (ptr)-1)
+        FindClose(find);
+
+    wcopy(path, dir, "/written.bin");
+    ptr w = CreateFileW(path, 0x40000000u, 0, 0, 2, 0x80, 0);
+    u32 written = 0;
+    if (w != (ptr)-1 && WriteFile(w, "abcd", 4, &written, 0) && written == 4)
+        ok |= F_WRITE;
+    if (w != (ptr)-1)
+        CloseHandle(w);
+
+    if (GetFileAttributesW(dir) & 0x10)
+        ok |= F_ATTR;
+    wcopy(path, dir, "/nothing-here");
+    if (GetFileAttributesW(path) == 0xFFFFFFFFu && GetLastError() == 2 &&
+        CreateFileW(path, 0x80000000u, 1, 0, 3, 0x80, 0) == (ptr)-1 && GetLastError() == 2)
+        ok |= F_MISSING;
+    return ok;
 }

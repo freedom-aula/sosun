@@ -17,14 +17,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use victory_loader::native::{self, teb};
+use victory_loader::native::seh::context::Context;
+use victory_loader::native::{self, seh, teb};
 use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
 
+pub(crate) mod files;
+mod sync;
+
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+const CREATE_SUSPENDED: u32 = 0x4;
+const MAXIMUM_WAIT_OBJECTS: u32 = 64;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -37,6 +43,7 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
 const DEFAULT_STACK: usize = 1 << 20;
+const STILL_ACTIVE: u32 = 259;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -264,11 +271,31 @@ pub extern "system" fn TlsSetValue(index: u32, value: *mut c_void) -> i32 {
 
 // Kernel objects: a handle table over `victory-platform`.
 
-enum Object {
+pub(crate) enum Object {
     Event(Arc<Event>),
     Semaphore(Arc<Semaphore>),
-    /// A title thread: signalled when it ends.
-    Thread(Arc<Event>),
+    Thread(Arc<ThreadObject>),
+    File(Arc<files::FileObject>),
+    Find(Arc<Mutex<files::Find>>),
+}
+
+/// A title thread: its end, its suspension count and its Mach port.
+pub(crate) struct ThreadObject {
+    /// Signalled when the thread has ended.
+    done: Arc<Event>,
+    /// Holds a thread created suspended before its first instruction.
+    gate: Event,
+    state: Mutex<ThreadState>,
+    start: usize,
+    param: usize,
+}
+
+struct ThreadState {
+    suspend_count: u32,
+    /// Past the gate, running title code (Mach suspension applies).
+    running: bool,
+    port: Option<native::threadctl::ThreadPort>,
+    exit_code: u32,
 }
 
 static HANDLES: LazyLock<Mutex<HashMap<usize, Object>>> = LazyLock::new(Default::default);
@@ -308,6 +335,7 @@ pub extern "system" fn SetEvent(handle: *mut c_void) -> i32 {
         return 0;
     };
     e.set();
+    sync::signalled();
     1
 }
 
@@ -350,6 +378,7 @@ pub extern "system" fn ReleaseSemaphore(
     };
     match s.release(count as u32) {
         Some(before) => {
+            sync::signalled();
             if !previous.is_null() {
                 // SAFETY: the title passes a valid pointer or null.
                 unsafe { previous.write(before as i32) };
@@ -363,27 +392,95 @@ pub extern "system" fn ReleaseSemaphore(
     }
 }
 
+/// An object a wait can take: cloned out of the table, so the table is not
+/// locked during a long wait.
+#[derive(Clone)]
+pub(crate) enum Waitable {
+    Event(Arc<Event>),
+    Semaphore(Arc<Semaphore>),
+}
+
+impl Waitable {
+    fn of(handle: *mut c_void) -> Option<Waitable> {
+        match lock(&HANDLES).get(&(handle as usize)) {
+            Some(Object::Event(e)) => Some(Waitable::Event(e.clone())),
+            Some(Object::Thread(t)) => Some(Waitable::Event(t.done.clone())),
+            Some(Object::Semaphore(s)) => Some(Waitable::Semaphore(s.clone())),
+            _ => None,
+        }
+    }
+
+    fn wait(&self, timeout: Option<Duration>) -> bool {
+        match self {
+            Waitable::Event(e) => e.wait(timeout),
+            Waitable::Semaphore(s) => s.wait(timeout),
+        }
+    }
+
+    /// Takes the object if it is signalled now.
+    fn try_take(&self) -> bool {
+        self.wait(Some(Duration::ZERO))
+    }
+
+    /// Undoes a take (a wait-all that could not take every object). A
+    /// manual-reset event was not changed by it, and setting it again is
+    /// a no-op.
+    fn give_back(&self) {
+        match self {
+            Waitable::Event(e) => e.set(),
+            Waitable::Semaphore(s) => {
+                s.release(1);
+            }
+        }
+    }
+}
+
 pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 {
     let timeout = (ms != INFINITE).then(|| Duration::from_millis(u64::from(ms)));
-    // Cloned out, so the table is not locked during a long wait.
-    let object = match lock(&HANDLES).get(&(handle as usize)) {
-        Some(Object::Event(e) | Object::Thread(e)) => Some(Object::Event(e.clone())),
-        Some(Object::Semaphore(s)) => Some(Object::Semaphore(s.clone())),
-        None => None,
+    let Some(object) = Waitable::of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
     };
-    let signalled = match object {
-        Some(Object::Event(e) | Object::Thread(e)) => e.wait(timeout),
-        Some(Object::Semaphore(s)) => s.wait(timeout),
-        None => {
-            set_error(ERROR_INVALID_HANDLE);
-            return WAIT_FAILED;
-        }
-    };
-    if signalled {
+    if object.wait(timeout) {
         WAIT_OBJECT_0
     } else {
         WAIT_TIMEOUT
     }
+}
+
+pub extern "system" fn WaitForSingleObjectEx(handle: *mut c_void, ms: u32, _alertable: i32) -> u32 {
+    WaitForSingleObject(handle, ms)
+}
+
+pub extern "system" fn WaitForMultipleObjects(
+    count: u32,
+    handles: *const *mut c_void,
+    wait_all: i32,
+    ms: u32,
+) -> u32 {
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS || handles.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    // SAFETY: the title passes `count` handles.
+    let handles = unsafe { std::slice::from_raw_parts(handles, count as usize) };
+    let objects: Option<Vec<Waitable>> = handles.iter().map(|&h| Waitable::of(h)).collect();
+    let Some(objects) = objects else {
+        set_error(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    };
+    let timeout = (ms != INFINITE).then(|| Duration::from_millis(u64::from(ms)));
+    sync::wait_multiple(&objects, wait_all != 0, timeout)
+}
+
+pub extern "system" fn WaitForMultipleObjectsEx(
+    count: u32,
+    handles: *const *mut c_void,
+    wait_all: i32,
+    ms: u32,
+    _alertable: i32,
+) -> u32 {
+    WaitForMultipleObjects(count, handles, wait_all, ms)
 }
 
 pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
@@ -395,20 +492,33 @@ pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
 }
 
 /// `CreateThread`: the start routine runs in title code, on a thread with
-/// its own TEB and static TLS. Flags (`CREATE_SUSPENDED`) are not honoured yet.
+/// its own TEB and static TLS, after the images' thread-attach notices.
+/// `CREATE_SUSPENDED` keeps it from running until `ResumeThread`.
 pub extern "system" fn CreateThread(
     _attributes: *const c_void,
     stack_size: usize,
     start: usize,
     param: *mut c_void,
-    _flags: u32,
+    flags: u32,
     thread_id: *mut u32,
 ) -> *mut c_void {
-    let done = Arc::new(Event::new(true, false).expect("event"));
-    let signal = done.clone();
+    let suspended = flags & CREATE_SUSPENDED != 0;
+    let object = Arc::new(ThreadObject {
+        done: Arc::new(Event::new(true, false).expect("event")),
+        gate: Event::new(true, false).expect("event"),
+        state: Mutex::new(ThreadState {
+            suspend_count: u32::from(suspended),
+            running: false,
+            port: None,
+            exit_code: STILL_ACTIVE,
+        }),
+        start,
+        param: param as usize,
+    });
+    let (me, finished) = (object.clone(), object.clone());
     // SAFETY: `start` is the title's own thread routine.
     let started = unsafe {
-        native::spawn_title_thread(
+        native::spawn_title_thread_with(
             "title-thread",
             if stack_size == 0 {
                 DEFAULT_STACK
@@ -417,7 +527,20 @@ pub extern "system" fn CreateThread(
             },
             start,
             param as usize,
-            move |_| signal.set(),
+            // Before anything of the title's runs: park if suspended.
+            move || {
+                lock(&me.state).port = Some(native::threadctl::ThreadPort::current());
+                // A suspension that came in before the thread was up.
+                if lock(&me.state).suspend_count > 0 {
+                    me.gate.wait(None);
+                }
+                lock(&me.state).running = true;
+            },
+            move |code| {
+                lock(&finished.state).exit_code = code;
+                finished.done.set();
+                sync::signalled();
+            },
         )
     };
     match started {
@@ -427,7 +550,7 @@ pub extern "system" fn CreateThread(
                 unsafe { thread_id.write(t.id()) };
             }
             // The thread detaches: its end is seen through `done`.
-            new_handle(Object::Thread(done))
+            new_handle(Object::Thread(object))
         }
         Err(_) => {
             set_error(ERROR_NOT_ENOUGH_MEMORY);
@@ -436,12 +559,125 @@ pub extern "system" fn CreateThread(
     }
 }
 
+fn thread_of(handle: *mut c_void) -> Option<Arc<ThreadObject>> {
+    match lock(&HANDLES).get(&(handle as usize)) {
+        Some(Object::Thread(t)) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Where a thread is when Mach stops it should be title code, or it could
+/// hold a host lock the caller then needs. Retries briefly, then takes
+/// the thread wherever it is (one blocked in a host wait never gets there).
+fn suspend_port(port: &native::threadctl::ThreadPort) -> bool {
+    for _ in 0..200 {
+        if !port.suspend() {
+            return false;
+        }
+        match port.rip() {
+            Some(rip) if seh::unwind::image_base_of(rip as usize).is_none() => {
+                port.resume();
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            _ => return true,
+        }
+    }
+    port.suspend()
+}
+
+pub extern "system" fn SuspendThread(handle: *mut c_void) -> u32 {
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    };
+    let mut state = lock(&t.state);
+    let previous = state.suspend_count;
+    state.suspend_count += 1;
+    if previous == 0
+        && state.running
+        && let Some(port) = &state.port
+    {
+        suspend_port(port);
+    }
+    previous
+}
+
+pub extern "system" fn ResumeThread(handle: *mut c_void) -> u32 {
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    };
+    let mut state = lock(&t.state);
+    let previous = state.suspend_count;
+    if previous > 0 {
+        state.suspend_count -= 1;
+        if state.suspend_count == 0 {
+            if !state.running {
+                t.gate.set();
+            } else if let Some(port) = &state.port {
+                port.resume();
+            }
+        }
+    }
+    previous
+}
+
+/// `GetThreadContext`: the registers of a suspended thread (a thread that
+/// has not run yet is at its start routine, with its parameter in `rcx`).
+pub extern "system" fn GetThreadContext(handle: *mut c_void, context: *mut Context) -> i32 {
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let state = lock(&t.state);
+    // SAFETY: the title passes a CONTEXT.
+    let context = unsafe { &mut *context };
+    let ok = if state.running {
+        state.port.as_ref().is_some_and(|port| {
+            // Mach reads a stopped thread only.
+            let stopped = state.suspend_count > 0;
+            (stopped || suspend_port(port)) && {
+                let ok = port.context(context);
+                if !stopped {
+                    port.resume();
+                }
+                ok
+            }
+        })
+    } else {
+        *context = Context::zeroed();
+        context.context_flags = seh::context::CONTEXT_FULL;
+        context.rip = t.start as u64;
+        context.gpr[seh::context::RCX] = t.param as u64;
+        true
+    };
+    if !ok {
+        set_error(ERROR_INVALID_PARAMETER);
+    }
+    i32::from(ok)
+}
+
+pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) -> i32 {
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    // SAFETY: the title passes a valid pointer.
+    unsafe { code.write(lock(&t.state).exit_code) };
+    1
+}
+
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
-    // The API sets and kernelbase forward to kernel32's functions.
-    let kernel =
-        dll == "kernel32.dll" || dll == "kernelbase.dll" || dll.starts_with("api-ms-win-core-");
+    // The API sets and kernelbase forward to kernel32's functions; the
+    // exception functions are ntdll's (and `__C_specific_handler` the C
+    // runtime's).
+    let kernel = dll == "kernel32.dll"
+        || dll == "kernelbase.dll"
+        || dll == "ntdll.dll"
+        || dll.starts_with("vcruntime140")
+        || dll.starts_with("api-ms-win-core-");
     if !kernel {
         return None;
     }
@@ -452,6 +688,12 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
                 _ => None,
             }
         };
+    }
+    if let Some(address) = exceptions(name) {
+        return Some(address);
+    }
+    if let Some(address) = sync::lookup(name).or_else(|| files::lookup(name)) {
+        return Some(address);
     }
     table!(
         GetLastError,
@@ -476,7 +718,41 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         CreateSemaphoreW,
         ReleaseSemaphore,
         WaitForSingleObject,
+        WaitForSingleObjectEx,
+        WaitForMultipleObjects,
+        WaitForMultipleObjectsEx,
         CloseHandle,
         CreateThread,
+        SuspendThread,
+        ResumeThread,
+        GetThreadContext,
+        GetExitCodeThread,
     )
+}
+
+/// Exceptions: `RtlCaptureContext` and `RaiseException` read the caller's
+/// registers, so they are the loader's own Windows-ABI assembly, bound with
+/// no bridge; the rest are the loader's host functions.
+fn exceptions(name: &str) -> Option<usize> {
+    use native::seh::api;
+    let direct = |address: usize| {
+        native::declare_direct(address);
+        Some(address)
+    };
+    match name {
+        "RtlCaptureContext" => direct(api::capture_context_address()),
+        "RaiseException" => direct(api::raise_exception_address()),
+        "RtlLookupFunctionEntry" => Some(api::lookup_function_entry as *const () as usize),
+        "RtlVirtualUnwind" => Some(api::virtual_unwind as *const () as usize),
+        "RtlAddFunctionTable" => Some(api::add_function_table as *const () as usize),
+        "RtlDeleteFunctionTable" => Some(api::delete_function_table as *const () as usize),
+        "RtlPcToFileHeader" => Some(api::pc_to_file_header as *const () as usize),
+        "RtlRestoreContext" => Some(api::restore_context as *const () as usize),
+        "RtlUnwindEx" => Some(api::unwind_ex as *const () as usize),
+        "__C_specific_handler" => Some(api::c_specific_handler as *const () as usize),
+        "AddVectoredExceptionHandler" => Some(api::add_vectored as *const () as usize),
+        "RemoveVectoredExceptionHandler" => Some(api::remove_vectored as *const () as usize),
+        "SetUnhandledExceptionFilter" => Some(api::set_unhandled as *const () as usize),
+        _ => None,
+    }
 }

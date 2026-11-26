@@ -31,7 +31,7 @@ use super::teb::{self, OFF_HOST_TSD};
 
 /// The macOS machdep call that sets the calling thread's GS base. Rosetta
 /// implements it; native x86-64 macOS does too.
-const SET_GS_BASE: u32 = 0x300_0003;
+pub(crate) const SET_GS_BASE: u32 = 0x300_0003;
 
 core::arch::global_asm!(
     ".p2align 4",
@@ -287,6 +287,27 @@ pub fn declare_win64(address: usize) {
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_default()
         .insert(address);
+}
+
+/// Functions of ours that follow the Windows ABI and switch GS themselves
+/// (`RtlCaptureContext`, `RaiseException`): bound with no stub at all.
+static DIRECT: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Declares that the function at `address` needs no bridge stub.
+pub fn declare_direct(address: usize) {
+    DIRECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default()
+        .insert(address);
+}
+
+pub(crate) fn is_direct(address: usize) -> bool {
+    DIRECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&address))
 }
 
 pub(crate) fn is_win64(address: usize) -> bool {

@@ -87,6 +87,7 @@ struct ThreadTeb {
 impl ThreadTeb {
     /// Builds the calling thread's TEB. Must run with the host GS base.
     fn new() -> ThreadTeb {
+        super::seh::install();
         let layout = Layout::from_size_align(TEB_SIZE, 0x1000).expect("layout");
         // SAFETY: a non-zero layout.
         let teb = unsafe { alloc_zeroed(layout) };

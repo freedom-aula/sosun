@@ -66,3 +66,7 @@ pub use windows::{LoadedImage, WithTitleDlls, load, load_title_dll, load_title_d
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+/// `DLL_THREAD_ATTACH`.
+pub const DLL_THREAD_ATTACH: u32 = 2;
+/// `DLL_THREAD_DETACH`.
+pub const DLL_THREAD_DETACH: u32 = 3;

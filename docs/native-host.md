@@ -13,7 +13,10 @@ Wine-based work continues on the `test/run-C*` branches. This branch (`native/ho
 | `victory-loader::native`: map, relocate, protect, bind, TLS, TEB, calling-convention bridge, run | Done, x86-64 Rosetta host |
 | `victory-hle::host_posix`: first kernel32 calls on POSIX | 24 functions |
 | Probe PE end to end under Rosetta | Done |
-| Exceptions (SEH, vectored handlers), files, `xmem`, DirectStorage, window and audio on macOS | Not started (see below) |
+| Exceptions: signal handler, vectored handlers, SEH over `.pdata`, `RaiseException` | Done (`native::seh`), probe-tested |
+| Threads: `DLL_THREAD_ATTACH/DETACH`, `CREATE_SUSPENDED`, `SuspendThread`/`ResumeThread`/`GetThreadContext` (Mach), `WaitForMultipleObjects`, critical sections, SRW locks, condition variables | Done (`host_posix`, `host_posix/sync.rs`) |
+| Files: `CreateFile`, `ReadFile`, `WriteFile`, `SetFilePointer(Ex)`, `GetFileSize(Ex)`, `FindFirstFile`, attributes, virtual drives | Done (`host_posix/files.rs`) |
+| `xmem`, DirectStorage, window and audio on macOS | Not started (see below) |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
 
 Run the tests with:
@@ -197,12 +200,26 @@ The recompiler produces arm64 code for the title's functions and runs it in an a
 6. **Exceptions.** A fault in recompiled code arrives as `SIGSEGV` or `SIGBUS` with a host PC. The recompiler gives the host a side table from host PC ranges to guest RIP and a way to rebuild the guest register file (as `Mach` thread state or from the saved context), so the host can run the vectored-handler chain with a Windows `CONTEXT` and `EXCEPTION_RECORD`, and either resume (`EXCEPTION_CONTINUE_EXECUTION`: re-enter at the recompiled block for the faulting guest instruction) or unwind. C++ and SEH unwinding use `.pdata` and `UNWIND_INFO` over the guest context (the walker in `crash.rs` is portable and moves into `native`), and handler and `__finally` addresses are guest addresses of recompiled functions. `RaiseException` and the HLE's own failures enter the same dispatcher.
 7. **Self-modifying and patched code.** `masked.rs` patches (stores Rosetta cannot resume) are unneeded under the recompiler, which lowers them itself.
 
+## Exceptions, threads and files on macOS (`native::seh`, `host_posix`)
+
+**Signals, not a Mach exception port.** A SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP handler (on the thread's alternate stack) tells title code (GS = TEB) from host code (GS = TSD) by `gs:[0x30]`, copies the thread state into a Windows `CONTEXT` and `EXCEPTION_RECORD` on the thread's own stack, and redirects the thread to `victory_exception_entry`. Nothing runs in signal context, there is no second thread or `thread_get_state`, and the faulting registers are exact. The entry switches GS to the host base, then `dispatch` runs the vectored handlers, then walks the frames (`unwind::lookup`/`virtual_unwind`, the x64 unwinder incl. epilogues and chained info) calling each language handler (`__C_specific_handler` is ours: scope tables, `__except` filters, `__finally` via `RtlUnwindEx`), then the unhandled filter. Title handlers run through `call_win64` (GS = TEB, host base restored after); continuing or unwinding ends in `victory_restore_context`, which sets the TEB last. `RtlCaptureContext` and `RaiseException` are Windows-ABI assembly bound with no bridge (`declare_direct`). Access violations carry the read/write flag and address (`info[0]`, `info[1]`); macOS's `si_code` numbers for SIGFPE differ from Linux's. A fault in host code is not dispatched (chained to Rust's handler, then default); that and debugger interplay are what a Mach exception port would add.
+
+The probe must be built with `-fasynchronous-unwind-tables -fexceptions -Xclang -fasync-exceptions` (gnullvm clang supports `__try/__except/__finally`; without async EH clang drops the `__except` around plain loads and stores).
+
+Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread (a call from title code outside a dispatch returns); C++ handlers (`__CxxFrameHandler`) are not provided; unwinding stops at host frames (a host function that calls back into title code is not crossed); no stack-overflow handling; `SetThreadContext` is not done.
+
+**Threads.** `spawn_title_thread_with` sends `DLL_THREAD_ATTACH` before and `DLL_THREAD_DETACH` after the start routine to every image registered with `register_thread_callbacks` (`run_entry` registers the main image). `CREATE_SUSPENDED` holds the thread at a gate; once running, `SuspendThread` is `thread_suspend` on the Mach port, retried briefly until the thread is in title code (so it holds no host lock), and `GetThreadContext` is `thread_get_state` (x86 state under Rosetta works). Waits on several objects use one epoch counter that every signal bumps; wait-all takes under a lock and gives back what it took if it cannot take all. Critical sections, SRW locks and condition variables live in the title's own structures over `wait_on_address`. Not done: mutexes (`CreateMutexW`), waitable timers, APCs, `SetThreadContext`, thread priorities.
+
+**Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Overlapped reads complete before returning. Not done: the C runtime's `fopen`/`_wopen`/`_stat64`, `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
+
+**What `dstorage.rs` needs** (left for later): `open_for_reading` should call `host_posix::files::translate` and `std::fs::File` instead of `CreateFileW`; its worker pool and queues can use `FileExt::read_at`; completion events go through the host's event handles (`sync::signalled` after setting one, so waits on several objects see it); reads into title memory need no `kernel_will_write` once the GPU shares memory; its memory-mapped paths need `mmap` through `victory-platform`.
+
 ## Next steps, in order
 
 1. `xmem.rs` onto `PagePool`, on both backends (Wine first, since it removes the 64 KiB view cost there; then macOS). It is the interface the Metal agent is waiting for, and the biggest performance item on the Wine path. Then `VirtualAlloc` alignment (64 KiB) in the POSIX shim.
-2. Exceptions on macOS: the signal handler, `CONTEXT` translation, vectored handler chain, `RtlLookupFunctionEntry`/`RtlVirtualUnwind` over the mapped image, SEH dispatch (`__C_specific_handler`). The title's CRT and `crash.rs` depend on it; nothing real runs for long without it.
-3. Thread notices (`DLL_THREAD_ATTACH/DETACH`) from `spawn_title_thread`, `CREATE_SUSPENDED`, `SuspendThread`/`ResumeThread` (Mach), `WaitForMultipleObjects`, critical sections and SRW locks in the shim.
-4. Files: port `files.rs` (path rewriting) to POSIX behind the shim, then `storage.rs` and `dstorage.rs` (worker pool, `pread`).
+2. (done) Exceptions on macOS. Left: C++ exceptions (`__CxxFrameHandler`), a Mach exception port for host-code faults and debuggers, stack overflow.
+3. (done) Thread notices, suspension, waits, locks. Left: mutexes, timers, `SetThreadContext`.
+4. Files: the C runtime's file calls, `MoveFileEx`, disk space, then `dstorage.rs` (see above).
 5. Move the remaining `cfg(windows)` HLE modules to compile on macOS with their Win32 calls behind `victory-platform`: `lifecycle` (window, `NSWindow`), `net`, `apu`/`audio` (CoreAudio), `media`.
 6. Cheaper crossings: inline the TEB-only host calls (`GetLastError`, `TlsGetValue`, `GetCurrentThreadId`) in the stubs; batch crossings for hot calls.
 7. Add `sig` to `HleExport`, generate bridge stubs from it (float arguments through the System V bridge, a recompiler-facing description).
@@ -214,7 +231,7 @@ The recompiler produces arm64 code for the title's functions and runs it in an a
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.
 - `host_posix` is 24 functions, enough for the probe, not a title.
 - `VirtualAlloc` is page granular, not 64 KiB; `VirtualFree(MEM_RELEASE)` takes a base from `VirtualAlloc` only.
-- `CreateThread` ignores flags; threads started by title code get no `DLL_THREAD_ATTACH` notice; TLS images must be registered before the threads that use them.
+- TLS images must be registered before the threads that use them; thread notices go to every registered image on every title thread.
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
 - The probe's `.tls` handling is hand-written (`_tls_used`, `_tls_start`, `_tls_end`), since it links no CRT. A real MinGW or MSVC title brings its own.

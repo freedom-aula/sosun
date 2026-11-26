@@ -177,8 +177,59 @@ mod run {
         assert_eq!(report.missing[0].symbol, "ProbeNotImplemented");
         assert!(report.hle >= 1 && report.host >= 10, "{report:?}");
         image.finalize().unwrap();
+        native::register_thread_callbacks(&image);
         let missing = image.export("probe_missing").unwrap();
         (Box::leak(Box::new(image)), missing)
+    }
+
+    /// Runs one of the probe's check functions on a fresh thread (so its
+    /// own TEB), and returns the bits it set.
+    fn run_probe(export: &str, arg: u64) -> u32 {
+        let (image, _) = load(true, UnimplementedPolicy::Trap);
+        let f = image.export(export).unwrap();
+        std::thread::spawn(move || {
+            // SAFETY: a function of the probe taking one argument.
+            unsafe { call_win64(f, &[arg]) as u32 }
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[track_caller]
+    fn assert_all(result: u32, all: u32, what: &str) {
+        assert_eq!(result, all, "{what}: missing bits {:#06x}", all & !result);
+    }
+
+    #[test]
+    fn threads_notices_suspension_and_context() {
+        assert_all(run_probe("probe_threads", 0), 0xFF, "probe_threads");
+    }
+
+    #[test]
+    fn waits_critical_sections_srw_locks_and_condition_variables() {
+        // Bits 8 and up of probe_threads' enum belong to probe_sync.
+        assert_all(run_probe("probe_sync", 0) >> 8, 0x7FFFF >> 8, "probe_sync");
+    }
+
+    #[test]
+    fn files_open_read_seek_find_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello, victory\n").unwrap();
+        let wide: Vec<u16> = dir
+            .path()
+            .to_str()
+            .unwrap()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let result = run_probe("probe_files", wide.as_ptr() as u64);
+        assert_all(result, 0x3FF, "probe_files");
+        assert_eq!(std::fs::read(dir.path().join("written.bin")).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn exceptions_reach_seh_scopes_and_vectored_handlers() {
+        assert_all(run_probe("probe_seh", 0), 0x7FFF, "probe_seh");
     }
 
     #[test]

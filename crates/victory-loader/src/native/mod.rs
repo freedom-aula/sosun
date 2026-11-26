@@ -12,6 +12,7 @@
 //! components (the Metal backend, the recompiler) code against.
 
 mod image;
+pub mod seh;
 
 pub use image::{NativeImage, TlsTemplate};
 
@@ -23,10 +24,12 @@ pub mod bridge;
 mod run;
 #[cfg(target_arch = "x86_64")]
 pub mod teb;
+#[cfg(target_arch = "x86_64")]
+pub mod threadctl;
 
 #[cfg(target_arch = "x86_64")]
 pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
-pub use bridge::{call_win64, declare_win64};
+pub use bridge::{call_win64, declare_direct, declare_win64};
 #[cfg(target_arch = "x86_64")]
-pub use run::{attach, run_entry, spawn_title_thread};
+pub use run::{attach, register_thread_callbacks, run_entry, spawn_title_thread, spawn_title_thread_with};

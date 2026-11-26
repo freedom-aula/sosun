@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 
-use super::bridge::{StubBlock, is_win64};
+use super::bridge::{StubBlock, is_direct, is_win64};
 use super::image::NativeImage;
 use crate::{
     BindReport, ImportResolver, MissingImport, Provenance, Resolution, UnimplementedPolicy,
@@ -71,7 +71,11 @@ pub fn bind_imports(
                         Provenance::Hle => report.hle += 1,
                         _ => report.host += 1,
                     }
-                    block.emit(address, 0, is_win64(address))?
+                    if is_direct(address) {
+                        address
+                    } else {
+                        block.emit(address, 0, is_win64(address))?
+                    }
                 }
                 Resolution::Missing => {
                     let site: &'static ImportSite = Box::leak(Box::new(ImportSite {

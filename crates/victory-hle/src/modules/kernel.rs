@@ -373,7 +373,8 @@ pub extern "system" fn SuspendThread(thread: *mut c_void) -> u32 {
 }
 
 pub(crate) fn module() -> HleModule {
-    HleModule {
+    #[allow(unused_mut)]
+    let mut module = HleModule {
         name: "kernel",
         dlls: &[
             "kernel32.dll",
@@ -403,10 +404,16 @@ pub(crate) fn module() -> HleModule {
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
-            hle_export!(SetUnhandledExceptionFilter),
-            hle_export!(SuspendThread),
         ],
-    }
+    };
+    // On macOS the host's own versions (`host_posix`) are the real ones: the
+    // exception dispatcher and Mach thread control live there.
+    #[cfg(windows)]
+    module.exports.extend([
+        hle_export!(SetUnhandledExceptionFilter),
+        hle_export!(SuspendThread),
+    ]);
+    module
 }
 
 /// The return addresses above the caller, as `module+rva`, for logs.
