@@ -492,7 +492,7 @@ fn ps_prim_mask(p: &Program, user: u32, guessed: bool) -> Option<u8> {
 /// Whether `init_v` (a live-in SGPR) flows only through copies / `v_writelane`+`v_readlane`
 /// spills into `m0`, and every consumer of those `m0` values is `v_interp_*` (or the benign
 /// `MSG_ORDERED_PS_DONE` sendmsg, which ignores `m0` in hardware).
-// shortcut: guessed shaders may also mask or shift the value on the way to M0, extend the
+// shortcut: guessed shaders may also mask, shift or extract bits on the way to M0, extend the
 // recognised scalar operations if a new compiler pattern still uses the value only for M0.
 pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bool {
     use std::collections::HashSet;
@@ -534,7 +534,7 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                             },
                         ) if (name == "s_mov_b32"
                             && matches!(src.first(), Some(&Operand::Scalar { code: s, .. }) if inst.read(Reg::S(s)) == Some(v)))
-                            || (guessed && matches!(name, "s_and_b32" | "s_or_b32" | "s_lshl_b32" | "s_lshr_b32")) =>
+                            || (guessed && matches!(name, "s_and_b32" | "s_or_b32" | "s_lshl_b32" | "s_lshr_b32" | "s_bfe_u32")) =>
                         {
                             // The mask bits have no host use, including through SCC.
                             if let Some(scc) = inst.write(Reg::Scc)
