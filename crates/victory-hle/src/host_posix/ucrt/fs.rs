@@ -314,11 +314,16 @@ pub extern "system" fn _getcwd(buf: *mut u8, max: i32) -> *mut u8 {
         bad_param(EINVAL);
         return std::ptr::null_mut();
     }
-    let Ok(cwd) = std::env::current_dir() else {
-        return std::ptr::null_mut();
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            set_errno(win_errno(&e));
+            return std::ptr::null_mut();
+        }
     };
     let s = cwd.to_string_lossy().into_owned();
-    // No buffer: a malloc block of at least `max` bytes, as `_wgetcwd` makes.
+    // No buffer: a malloc block of at least `max` bytes, as `_wgetcwd` makes (`heap::malloc`
+    // sets ENOMEM when it fails).
     if buf.is_null() {
         return malloc_str(&s, max.max(0) as usize);
     }
