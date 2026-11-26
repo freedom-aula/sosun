@@ -350,7 +350,7 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
         // Debugging: a request polled this long is stuck; say where its queue's requests are.
         static POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 5000 == 0 {
+        if n.is_multiple_of(5000) {
             log_pending(this, index, n);
         }
     }

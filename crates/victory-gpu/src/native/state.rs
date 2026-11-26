@@ -823,7 +823,7 @@ mod tests {
                 assert_eq!(crate::resource::element(dxgi), Some((bytes as u64, 1)), "{name} element");
             }
             let reads = [(name.to_owned(), 0u32)];
-            let g = Graphics::guessed(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
+            let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
             let (attrs, streams) = g.vertex_layout(&reads).unwrap_or_else(|| panic!("layout for {name}"));
             assert_eq!(attrs.len(), 1);
             assert_eq!(attrs[0].format, expected, "{name}");
@@ -833,7 +833,7 @@ mod tests {
         // Unknown tags, invalid channel counts, and non-VB semantics must be refused.
         for bad in ["VBF0", "VBF5", "VBU0", "VBU5", "VBH3", "VBM3", "VBN3", "VBP3", "VBT3", "VBG4", "VBX4", "FOO4", "VBF40"] {
             let reads = [(bad.to_owned(), 0u32)];
-            let g = Graphics::guessed(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
+            let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &reads, false);
             assert!(g.vertex_layout(&reads).is_none(), "{bad} should be refused");
         }
     }
