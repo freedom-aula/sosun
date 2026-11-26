@@ -18,6 +18,7 @@ pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
     Bgra8Unorm,
+    Bgra8UnormSrgb,
     Rgba16Float,
     R32Float,
     D32Float,
@@ -71,7 +72,7 @@ impl Format {
     pub fn block(self) -> (usize, usize) {
         use Format::*;
         match self {
-            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
+            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Bgra8UnormSrgb | R32Float | D32Float => (1, 4),
             Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
             Rg16Uint => (1, 4),
             D32FloatS8 => (1, 8),
