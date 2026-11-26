@@ -1041,4 +1041,43 @@ mod tests {
         let h = super::super::translate_with(&c, options).unwrap();
         assert_eq!(h.stage, HwStage::Ms);
     }
+
+    /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
+    /// mesh program).
+    fn mesh(code: &[u32]) -> Result<super::super::HostShader, ShaderError> {
+        let c = container(HwStage::Vs, &words(code), &meta_with(&[rec(2, 0, 0, 0)])).unwrap();
+        let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
+        super::super::translate_with(&c, options)
+    }
+
+    /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
+    /// an EXEC region (lane < count), a VALU compare of an SGPR, ANDed with EXEC, its SCC kept in
+    /// an SGPR and branched on later. The compare holds the same bit in every lane, so SCC (some
+    /// lane set) is that bit, in every lane.
+    #[test]
+    fn a_mesh_program_keeps_the_scc_of_a_uniform_lane_mask() {
+        let program = |cmp: [u32; 2]| {
+            [
+                0xBEFE_0481, // s_mov_b64 exec, 1
+                0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0x7DA8_0008, // v_cmpx_gt_u32 s8, v0
+                0xBF88_0007, // s_cbranch_execz 7
+                cmp[0], cmp[1], // v_cmp_ge_f32 vcc, <src0>, 0
+                0x8796_7E6A, // s_and_b64 s[22:23], vcc, exec
+                0xBE94_03FD, // s_mov_b32 s20, src_scc
+                0xBF01_8014, // s_cmp_lg_i32 s20, 0
+                0xBF84_0001, // s_cbranch_scc0 1
+                0x7E00_02F2, // v_mov_b32 v0, 1.0
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+                0xF800_0941, 0x0000_0001, // exp prim v1 done
+                ENDPGM,
+            ]
+        };
+        mesh(&program([0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
+        // A compare of a VGPR differs between lanes: SCC is a ballot the mesh stage cannot take.
+        let e = mesh(&program([0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
+        assert!(e.to_string().contains("lane mask"), "{e}");
+    }
 }

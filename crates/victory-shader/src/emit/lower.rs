@@ -338,6 +338,9 @@ struct Lower<'a> {
     /// SCC written by a scalar operation on masks, by value: the dwords of
     /// the mask result it says is not zero.
     mask_scc: Map<Value, (Value, Option<Value>)>,
+    /// Mesh: SCC of a uniform lane mask ANDed with EXEC ([`Self::uniform_and_exec`]): the
+    /// mask's bit, with the atoms EXEC decides fixed.
+    uniform_scc: Map<Value, (Bool, Vec<(Atom, bool)>)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -835,6 +838,7 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: Map::default(),
             mask_scc: Map::default(),
+            uniform_scc: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -2057,6 +2061,17 @@ impl<'a> Lower<'a> {
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
+        }
+        if let (Some(Val::Missing(_)), Some((m, fixed))) = (found, self.uniform_scc.get(&v)) {
+            let (m, fixed) = (*m, fixed.clone());
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let any = Val::Bit(self.boolean_given(m, &fixed, at, &mut Map::default())?);
+            self.vals.insert(v, any);
+            return Ok(any);
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
@@ -4771,7 +4786,7 @@ impl<'a> Lower<'a> {
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
         {
-            if let (Some(scc), true) = (scc, self.mask_data != MaskData::None) {
+            if let Some(scc) = scc {
                 // The result is EXEC when written, else the destination.
                 let pair = |l: u8| {
                     let lo = inst.write(Reg::S(l))?;
@@ -4781,8 +4796,13 @@ impl<'a> Lower<'a> {
                     let hi = inst.write(Reg::S(l + 1)).filter(|_| self.x.native.wave64);
                     Some((lo, hi))
                 };
-                if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
-                    self.mask_scc.insert(scc, r);
+                if self.mask_data != MaskData::None {
+                    if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
+                        self.mask_scc.insert(scc, r);
+                    }
+                } else if let Some(u) = self.uniform_and_exec(inst) {
+                    // Mesh: no ballot, but a uniform mask needs none.
+                    self.uniform_scc.insert(scc, u);
                 }
             }
             return Err(LANE_MASK);
@@ -12846,6 +12866,87 @@ impl<'a> Lower<'a> {
         };
         memo.insert(b, r);
         r
+    }
+
+    /// `s_and` of a lane mask and EXEC (the console compiler's form of a wave-uniform boolean,
+    /// `v_cmp` of SGPRs then `s_and_b64 sN, vcc, exec`) whose bit is the same in every lane of
+    /// EXEC: the mask, and the values EXEC gives its other atoms. Its SCC (some lane set) is
+    /// then that bit in every lane, those outside EXEC included, as the console's wave has it.
+    // Guess: EXEC is not empty where the title's programs do this (they branch around their
+    // EXEC regions with `s_cbranch_execz`); with an empty EXEC the console's SCC is 0.
+    fn uniform_and_exec(&self, inst: &Inst) -> Option<(Bool, Vec<(Atom, bool)>)> {
+        let width = if self.x.native.wave64 { "s_and_b64" } else { "s_and_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        if inst.name() != width || src.len() != 2 {
+            return None;
+        }
+        let code = |k: usize| match src[k] {
+            Operand::Scalar { code, .. } => Some(code),
+            _ => None,
+        };
+        let other = match (code(0)?, code(1)?) {
+            (EXEC, c) | (c, EXEC) if c != EXEC => c,
+            _ => return None,
+        };
+        let st = &self.x.st;
+        let m = *st.masks.get(&inst.read(Reg::S(other))?)?;
+        let exec = *st.masks.get(&inst.read(Reg::S(EXEC))?)?;
+        let mut fixed = Vec::new();
+        for a in st.bools.support(m) {
+            if !self.uniform_atom(a) {
+                fixed.push((a, st.bools.decides(&[(exec, true)], a)?));
+            }
+        }
+        Some((m, fixed))
+    }
+
+    /// [`Self::boolean`] of `b` with the atoms of `fixed` set.
+    fn boolean_given(
+        &mut self,
+        b: Bool,
+        fixed: &[(Atom, bool)],
+        at: usize,
+        memo: &mut Map<Bool, V>,
+    ) -> Result<V, Why> {
+        let Some((atom, lo, hi)) = self.x.st.bools.node(b) else {
+            return Ok(self.s.m.bool(b == Bool::TRUE));
+        };
+        if let Some(&v) = memo.get(&b) {
+            return Ok(v);
+        }
+        let v = match fixed.iter().find(|f| f.0 == atom) {
+            Some(&(_, true)) => self.boolean_given(hi, fixed, at, memo)?,
+            Some(&(_, false)) => self.boolean_given(lo, fixed, at, memo)?,
+            None => {
+                let a = self.atom(atom, at)?;
+                let h = self.boolean_given(hi, fixed, at, memo)?;
+                let l = self.boolean_given(lo, fixed, at, memo)?;
+                self.s.m.select(at, a, h, l)
+            }
+        };
+        memo.insert(b, v);
+        Ok(v)
+    }
+
+    /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a
+    /// compare (or carry) of SGPRs and constants, which a wave holds once for all its lanes.
+    fn uniform_atom(&self, a: Atom) -> bool {
+        let st = &self.x.st;
+        match a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => self.def_inst(v).is_some_and(|i| {
+                i.reads.iter().all(|&(r, x)| match r {
+                    Reg::V(_) => false,
+                    Reg::S(c) => {
+                        c == EXEC
+                            || c == EXEC + 1
+                            || !st.masks.contains_key(&x) && !st.highs.contains_key(&x)
+                    }
+                    Reg::Scc => true,
+                })
+            }),
+            _ => false,
+        }
     }
 
     /// The instruction writing `v`.
