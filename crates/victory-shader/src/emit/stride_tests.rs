@@ -621,6 +621,31 @@ const D16_ROUND_TRIP_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
+/// buffer of 2 dwords a lane. Each lane stores its 4 halves to element
+/// `lane` of the typed view (`_d16_xyzw`), then its last 2 halves to the
+/// same element as channels x and y only (`_d16_xy`).
+const D16_PARTIAL_STORE_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0
+    0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE034_1000,
+    0x8003_0103, // buffer_load_dwordx2 v[1:2], v3, s[12:15], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE21C_2000,
+    0x8002_0100, // buffer_store_format_d16_xyzw v[1:2], v0, s[8:11], 0 idxen
+    0xE214_2000,
+    0x8002_0200, // buffer_store_format_d16_xy v2, v0, s[8:11], 0 idxen
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s0 a table with a typed buffer SRV, s1 a table with a raw UAV.
 /// Each lane loads element `lane` (`_d16_x`) and stores the dword it got to
 /// dword `lane` of the raw UAV.
@@ -725,6 +750,39 @@ fn d16_typed_buffer_accesses_pass_bits_through_integer_views() {
         for (label, words) in run_tables(&shader, &views, vec![stride, 4, 4]) {
             assert_eq!(words[0], data, "{label} {format:?}: the typed view's bytes");
             assert_eq!(words[1], data, "{label} {format:?}: what the loads read");
+        }
+    }
+}
+
+/// A typed store of fewer channels than the element has writes 0 to the
+/// others, as the console's hardware does (LLVM 88421ea, Mesa 4a6ee2c4833:
+/// unset components of buffer stores are zero on GFX11 and older): after
+/// all four channels, a store of x and y leaves (x, y, 0, 0), not the z and
+/// w stored before.
+#[test]
+fn typed_buffer_stores_of_some_channels_zero_the_others() {
+    let shader = build(
+        D16_PARTIAL_STORE_WAVE32,
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![entry(ResourceType::Uav, 4, 0), entry(ResourceType::Srv, 4, 1)],
+        32,
+    );
+    let bits: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(0x8000 | l) | (0x7C01 + l) << 16, (1 + l) | (0xFFFF - l) << 16])
+        .collect();
+    let halves: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(0x3C00 + l) | (0xC000 + 3 * l) << 16, (0x1400 + l) | (0x5BFF - l) << 16])
+        .collect();
+    let cases: [(DXGI_FORMAT, u32, &[u32]); 2] = [
+        (DXGI_FORMAT_R16G16B16A16_UINT, 8 | VIEW_INTEGER, &bits),
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &halves),
+    ];
+    for (format, stride, data) in cases {
+        // Element `lane`: the second dword of the lane's data, then 0.
+        let want: Vec<u32> = data.chunks(2).flat_map(|d| [d[1], 0]).collect();
+        let views = [View::TypedUav(format, 32, 8), View::Buffer { data, stride: Stride::Raw }];
+        for (label, words) in run_tables(&shader, &views, vec![stride, 4]) {
+            assert_eq!(words[0], want, "{label} {format:?}: the typed view's bytes");
         }
     }
 }
