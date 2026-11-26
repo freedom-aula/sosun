@@ -183,9 +183,13 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new(t: &Title<Metal>) -> Fixture {
+        Fixture::with_id(t, 1)
+    }
+
+    fn with_id(t: &Title<Metal>, id: usize) -> Fixture {
         let mem = Alias::new(POOL).unwrap();
         let info = PoolInfo {
-            id: 1,
+            id,
             base: mem.primary as usize,
             len: POOL,
             memory_entry: None,
@@ -397,6 +401,26 @@ fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
     // The old destination was left alone.
     assert_eq!(f.get(0x6_0000, 64), [CANARY; 64]);
     assert_eq!(t.shaders.pipelines, 1);
+}
+
+/// A released pool's view pair goes to the next pool, and a heap that wrote the old pair (the
+/// host's own) writes it again: the same title addresses reach the new pool.
+#[test]
+fn a_released_pools_pair_serves_the_next_pool() {
+    let Some(mut t) = title() else { return };
+    let cs = shader(COMPUTED, 4);
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let f = Fixture::new(&t);
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x2_0000, 0x6_0000);
+    t.host.memory().pool_released(&f.info);
+    drop(f);
+    let g = Fixture::with_id(&t, 2);
+    prepare_computed(&g, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&g, 0x2_0000, 0x6_0000);
 }
 
 /// Memory no pool shows reads as zero and its writes are dropped, in a page past a mapping, in a

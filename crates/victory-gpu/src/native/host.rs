@@ -163,16 +163,27 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The buffer and pool-mapping address of `[addr, addr + len)` of title memory.
     pub fn resolve(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
-        let mut buffers = self.buffers.borrow_mut();
-        for gone in self.memory.take_released() {
-            buffers.remove(&gone);
-        }
+        self.forget_released();
         let (pool, ptr) = self
             .memory
             .resolve(addr, len)
             .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}"))?;
-        drop(buffers);
         Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+    }
+
+    /// Drops what the host keeps of pools released since the last call: their buffers, and their
+    /// view pairs (free for other pools from now on).
+    fn forget_released(&self) {
+        let gone = self.memory.take_released();
+        if gone.is_empty() {
+            return;
+        }
+        let mut buffers = self.buffers.borrow_mut();
+        let mut c = self.contract.borrow_mut();
+        for id in gone {
+            buffers.remove(&id);
+            c.pairs.release(id);
+        }
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.
@@ -532,24 +543,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn write_pairs(&self, heap: &NativeHeap<B>) -> Result<(), String> {
         let null = self.null_view()?;
         let c = self.contract.borrow();
-        let have = heap.pairs.get();
+        let (epoch, have) = heap.pairs.get();
+        let have = if epoch == c.pairs.epoch { have } else { 0 };
         let want = c.pairs.keys.len() + 1;
         for n in have..want {
             let index = addr::pair_index(heap.count as u32, n as u32) as usize;
-            let (buffer, ptr, size) = if n == 0 {
-                (null.buf.clone(), null.ptr().cast_const(), 0)
-            } else {
-                let key = c.pairs.keys[n - 1];
-                let buffer = self.pool_buffer(key.pool, key.base, key.len as usize)?;
-                let (from, size) = Pairs::span(&key);
-                (buffer, (key.base + from as usize) as *const u8, size)
+            // Pair 0, and a pair whose pool was released: the null view.
+            let (buffer, ptr, size) = match n.checked_sub(1).and_then(|k| c.pairs.keys[k]) {
+                None => (null.buf.clone(), null.ptr().cast_const(), 0),
+                Some(key) => {
+                    let buffer = self.pool_buffer(key.pool, key.base, key.len as usize)?;
+                    let (from, size) = Pairs::span(&key);
+                    (buffer, (key.base + from as usize) as *const u8, size)
+                }
             };
             // Both of the pair name the same bytes (the converter's descriptors are the same).
             for i in [index, index + 1] {
                 self.backend.write_buffer(&heap.heap, i, &buffer, ptr, size);
             }
         }
-        heap.pairs.set(want);
+        heap.pairs.set((c.pairs.epoch, want));
         Ok(())
     }
 
@@ -864,6 +877,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count: None,
             heap: None,
         };
+        self.forget_released();
         match cmd {
             Cmd::Dispatch {
                 root,

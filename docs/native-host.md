@@ -583,6 +583,17 @@ refusals in one story load). These are counted per host
 (`NativeHost::unmapped`). The first one warns without any switch, as the
 refused piece did, and each one is logged at debug level with its address.
 
+#### Title memory view pairs of released pools are reused
+
+The pool-offset contract (`native/addr.rs`) has 255 view pairs per resource heap, one per
+`(pool, 2 GiB chunk)`. They used to be handed out for good: once 255 were taken, pages of every
+later pool read as the null view (zeros, writes dropped), and a released pool kept its pair, whose
+buffer a heap that wrote its pairs later tried to wrap over the freed mapping. Now a released
+pool's pairs are freed (`Pairs::release`, when the host next takes the pool table's released
+pools) and the next pool takes the first free one. The pairs carry an epoch that changes whenever
+an existing pair changes; a heap whose pairs were written in another epoch writes them all again
+(a freed one as the null view). When all are taken the host warns once.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers
