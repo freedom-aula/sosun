@@ -1066,3 +1066,16 @@ property that stops the tail from clicking at block boundaries), and
 `convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
 `VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
 input).
+
+## Depth-stencil textures are not watched or uploaded from CPU memory
+
+Depth and depth-stencil textures (`Format::D32Float`, `Format::D32FloatS8`, `Format::D16Unorm`,
+including placed or typeless depth resources such as DXGI formats `19`/`20`/`45` and `118..=120`)
+are GPU targets whose CPU tile layout in `resource::native_info` describes plane 0 alone (4 or
+2 bytes per texel), whereas Metal backs combined depth-stencil formats as `MTLPixelFormat(260)`
+(`Depth32Float_Stencil8`, 8 bytes per texel). Watching or uploading CPU memory for those textures
+previously caused `victory_metal::gfx: upload_texture skipped: D32FloatS8` warnings in
+`transfer_fits` (`row_pitch` smaller than Metal's combined depth-stencil row bytes) and wasted
+CPU hashing/detiling work. `Title::realize` and `Title::sync_keys` now exclude `desc.format.is_depth()`
+from `watch`, `VICTORY_MAGENTA`, `unloaded`, and CPU detile/upload (test: `victory-gpu`
+`native::texture_tests::depth_textures_are_not_watched_or_uploaded_from_cpu_memory`).
