@@ -497,9 +497,11 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 99, 72, 78 | BC7, BC1, BC3 UNORM_SRGB | 512x512, 32x32, 512x512 | the `_sRGB` BC formats |
 | 53 | R16_TYPELESS | 2048x8192 depth (a shadow map) | Depth16Unorm (R16Unorm when not depth) |
 | 55 | D16_UNORM | (its depth views) | Depth16Unorm |
-| 3, 17, 36, 51, 57 | R32G32B32A32, R32G32, R16G16, R8G8, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
+| 3, 17, 36, 57 | R32G32B32A32, R32G32, R16G16, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
 | 11, 13 | R16G16B16A16_UNORM, _SNORM | 128x4, 256x256 | RGBA16Unorm, RGBA16Snorm |
-| 49, 50 | R8G8_TYPELESS, _UNORM | 16x16, 64x64 | RG8Unorm |
+| 49 | R8G8_UNORM | 16x16 | RG8Unorm |
+| 50 | R8G8_UINT | 64x64 | RG8Uint |
+| 51 | R8G8_SNORM | 1024x1024 | RG8Snorm |
 | 54 | R16_FLOAT | 512x512 | R16Float |
 
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
