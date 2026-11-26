@@ -36,6 +36,8 @@ use windows_sys::core::BOOL;
 use super::xmem_posix::{BOOL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, find_export};
 #[cfg(not(windows))]
 pub use super::xmem_posix::{BasicInformation, XMemVirtualAlloc, XMemVirtualQuery};
+#[cfg(all(not(windows), target_arch = "x86_64"))]
+pub(crate) use super::xmem_posix::forget_physical;
 
 use crate::{HleModule, hle_export};
 

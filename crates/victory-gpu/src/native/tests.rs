@@ -240,6 +240,79 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
 
 type Vertex = [f32; 8];
 
+/// Issue #15 (writes that land elsewhere): a descriptor the title reuses for a buffer the host
+/// cannot reach kept the host entry of the buffer it named before, so a shader went on writing
+/// that buffer. The entry now shows nothing: the dispatch still runs, and the old buffer stays as
+/// it was.
+#[test]
+fn a_view_of_unmapped_memory_no_longer_shows_the_previous_buffer() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..64u32).collect::<Vec<_>>());
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let view = |va: u64| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1); // raw buffer view of 64 elements
+        (d[10], d[11]) = (va as u32, (va >> 32) as u32);
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    crate::descriptor::create_placed_srv(
+        std::ptr::null_mut(),
+        &resource,
+        &view(pool.va(src)),
+        start,
+    );
+    let uav = |va: u64| {
+        let mut d = view(va);
+        (d[4], d[6]) = (64, 0);
+        crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &d, start + 32);
+    };
+    uav(pool.va(dst));
+    assert!(h.mirror(start).unwrap() && h.mirror(start + 32).unwrap());
+
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let dispatch = || {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+    };
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
+
+    // The same slot, now a view of memory in no pool.
+    pool.write(dst, &[0xEEEE_EEEEu32; 64]);
+    uav(0x10_0000_0000);
+    assert!(h.mirror(start + 32).is_err(), "not in a pool");
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        [0xEEEE_EEEEu32; 64],
+        "written through a stale entry"
+    );
+
+    // Mapped memory again: the real view comes back.
+    uav(pool.va(dst));
+    assert!(h.mirror(start + 32).unwrap());
+    dispatch();
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
+    drop(slots);
+}
+
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
     [x, y, 0.5, 0.5, c[0], c[1], c[2], c[3]]
 }
