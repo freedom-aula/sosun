@@ -1408,6 +1408,63 @@ fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
     );
 }
 
+// =========================================================================
+// "v_cvt_pknorm_u16_f32 is not supported"
+// =========================================================================
+
+#[test]
+fn normalized_16_bit_packing_lowers_in_pixel_shader() {
+    // v_mov_b32_e32 v1, 0.5
+    // v_mov_b32_e32 v2, 1.0
+    // <pack> v0, <src0>, <src1>
+    // exp mrt0 v0, v0, v0, v0 done vm
+    // s_endpgm
+    let code = |pack: [u32; 2]| {
+        [
+            0x7E02_02F0,
+            0x7E04_02F2,
+            pack[0],
+            pack[1],
+            0xF800_180F,
+            0x0000_0000,
+            0xBF81_0000,
+        ]
+    };
+    for (what, pack) in [
+        (
+            "v_cvt_pknorm_u16_f32 v0, v1, v2",
+            [0xD769_0000, 0x0202_0501],
+        ),
+        (
+            "v_cvt_pknorm_i16_f32 v0, v1, v2",
+            [0xD768_0000, 0x0202_0501],
+        ),
+        (
+            "v_cvt_pknorm_u16_f32 v0, |v1|, -v2",
+            [0xD769_0100, 0x4202_0501],
+        ),
+        (
+            "v_cvt_pknorm_u16_f32 v0, 0.5, v2",
+            [0xD769_0000, 0x0202_04F0],
+        ),
+    ] {
+        for wave32_host in [false, true] {
+            lower_ps(&code(pack), true, vec![], vec![], 0, 0, vec![], wave32_host)
+                .unwrap_or_else(|e| panic!("{what}, wave32_host={wave32_host}: {e}"));
+        }
+    }
+    // v_cvt_pknorm_u16_f16 v0, v1, v2: the f16 forms stay refused.
+    let f16 = code([0xD713_0000, 0x0202_0501]);
+    let err = lower_ps(&f16, true, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string()
+            .contains("v_cvt_pknorm_u16_f16 is not supported"),
+        "got `{err}`"
+    );
+}
+
 /// What "a computed buffer descriptor used as a view" names: only an image
 /// instruction asks for a view of four computed dwords, as its sampler (told
 /// apart here) or as a 128-bit image descriptor (`r128`, instruction bit 15).

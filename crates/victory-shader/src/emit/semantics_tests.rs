@@ -2960,6 +2960,88 @@ fn byte_packing_matches_the_hardware() {
     )]));
 }
 
+/// One half of `v_cvt_pknorm_u16_f32` (`signed`: of `v_cvt_pknorm_i16_f32`):
+/// round(clamp(x, 0 or -1, 1) * 65535 or 32767) to nearest even, the
+/// product an f32, as Mesa computes packUnorm2x16 and packSnorm2x16, which
+/// its ACO compiler emits these instructions for. NaN 0 is the lowering's
+/// guess: no public source states it.
+fn pknorm(x: u32, signed: bool) -> u32 {
+    let x = fl(x);
+    if x.is_nan() {
+        0
+    } else if signed {
+        (x.clamp(-1.0, 1.0) * 32767.0).round_ties_even() as i32 as u32 & 0xFFFF
+    } else {
+        (x.clamp(0.0, 1.0) * 65535.0).round_ties_even() as u32
+    }
+}
+
+/// `v_cvt_pknorm_u16_f32` and `v_cvt_pknorm_i16_f32`: S0 to the low half,
+/// S1 to the high one (RDNA2 ISA: VOP3 only, a packed pair of normalized
+/// shorts), with source modifiers.
+#[test]
+fn normalized_packing_matches_the_hardware() {
+    // Known answers, worked out apart from the model: (x, unsigned, signed).
+    // 0.5 is the one exact tie (32767.5 and 16383.5); the last two are
+    // inputs whose f32 product is the tie 2.5, where rounding half up
+    // would give 3.
+    let known = [
+        (0.0f32.to_bits(), 0, 0),
+        (1.0f32.to_bits(), 0xFFFF, 0x7FFF),
+        (0.25f32.to_bits(), 0x4000, 0x2000),
+        (0.5f32.to_bits(), 0x8000, 0x4000),
+        (0.75f32.to_bits(), 0xBFFF, 0x5FFF),
+        (0.1f32.to_bits(), 0x199A, 0x0CCD),
+        ((-0.25f32).to_bits(), 0, 0xE000),
+        ((-0.5f32).to_bits(), 0, 0xC000),
+        ((-1.0f32).to_bits(), 0, 0x8001),
+        ((-2.0f32).to_bits(), 0, 0x8001),
+        (1.5f32.to_bits(), 0xFFFF, 0x7FFF),
+        (0x3F7F_FFFF, 0xFFFF, 0x7FFF),
+        (0x7F80_0000, 0xFFFF, 0x7FFF),
+        (0xFF80_0000, 0, 0x8001),
+        (0x7FC0_0000, 0, 0),
+        (0xFFC0_0000, 0, 0),
+        (0x0000_0001, 0, 0),
+        (0x3820_00A0, 2, 1),
+        (0x38A0_0140, 5, 2),
+    ];
+    for (x, unsigned, signed) in known {
+        assert_eq!(pknorm(x, false), unsigned, "unsigned {x:#010x}");
+        assert_eq!(pknorm(x, true), signed, "signed {x:#010x}");
+    }
+    let mut xs = F32_EDGES.to_vec();
+    xs.extend(known.map(|k| k.0));
+    let ys = [
+        0.0f32.to_bits(),
+        0.5f32.to_bits(),
+        (-0.5f32).to_bits(),
+        1.0f32.to_bits(),
+        0x3820_00A0,
+        0x7FC0_0000,
+        0xFF80_0000,
+    ];
+    let inputs = pairs(&xs, &ys);
+    let mut probes = Vec::new();
+    for (op, signed) in [(0x369, false), (0x368, true)] {
+        for m in source_mods()
+            .into_iter()
+            .filter(|m| (m.abs | m.neg) & 4 == 0)
+        {
+            probes.push(probe(
+                vop3(op, 5, [v(1), v(2), 0], m),
+                inputs.clone(),
+                INT,
+                move |i| {
+                    let half = |k: usize| pknorm(mods_in(i[k], k, m), signed);
+                    vec![half(0) | half(1) << 16]
+                },
+            ));
+        }
+    }
+    assert_clean(check(&probes));
+}
+
 /// The other half of a branch: `s_andn2_wrexec_b32` (EXEC = S0 & ~EXEC,
 /// the title's else) after a `v_cmpx`, each side writing its own lanes.
 #[test]
