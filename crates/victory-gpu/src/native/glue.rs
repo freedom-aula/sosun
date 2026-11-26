@@ -572,23 +572,24 @@ pub(crate) fn texture_created(res: This) {
     }
 }
 
-/// `OMSetRenderTargets`: the host textures of the views' resources.
+/// `OMSetRenderTargets`: the host textures of the views' resources, in the views' formats.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let keys: Vec<Option<usize>> = color
+        let views: Vec<Option<(usize, u32)>> = color
             .iter()
-            .map(|&h| crate::descriptor::rtv_record(h).map(|r| r.resource as usize))
+            .map(|&h| crate::descriptor::rtv_record(h).map(|r| (r.resource as usize, r.format())))
             .collect();
+        let keys: Vec<Option<usize>> = views.iter().map(|v| v.map(|(k, _)| k)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
         l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
-        let made: Option<Vec<_>> = keys
+        let made: Option<Vec<_>> = views
             .iter()
-            .map(|slot| slot.and_then(|k| t.texture_of(k)))
+            .map(|slot| slot.and_then(|(k, named)| t.target_of(k, named)))
             .collect();
-        let Some(color) = made else {
+        let Some(made) = made else {
             l.targets_ready = false;
             l.targets = TargetFormats::default();
             l.target_keys.clear();
@@ -598,9 +599,10 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         };
         l.targets_ready = true;
         l.targets = TargetFormats {
-            color: keys.iter().flatten().filter_map(|&k| t.format_of(k)).collect(),
+            color: made.iter().map(|(_, format)| *format).collect(),
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
+        let color: Vec<_> = made.into_iter().map(|(texture, _)| texture).collect();
         // Debugging: no depth attachment at all.
         let drop_depth = env_set!("VICTORY_DEBUG_NO_DEPTH_ATTACH");
         if drop_depth {
@@ -613,7 +615,9 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
 /// `ClearRenderTargetView`. shortcut: the whole target, whatever rectangles the title passes.
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
-        if let Some(tex) = crate::descriptor::rtv_record(handle).and_then(|r| t.texture_of(r.resource as usize)) {
+        if let Some((tex, _)) = crate::descriptor::rtv_record(handle)
+            .and_then(|r| t.target_of(r.resource as usize, r.format()))
+        {
             if let Some(r) = crate::descriptor::rtv_record(handle) {
                 trace_bump(r.resource as usize, 1);
             }
