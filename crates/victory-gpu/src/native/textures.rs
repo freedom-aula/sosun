@@ -79,28 +79,67 @@ impl TextureInfo {
 
 /// Uploads and change probes must see the same bytes, including across holes in title memory.
 fn read_texture_bytes(at: *const u8, out: &mut [u8]) {
-    if super::safe_read(at, out) {
+    #[cfg(target_os = "macos")]
+    read_texture_chunk(
+        at,
+        out,
+        super::safe_read,
+        victory_platform::mem::next_region,
+    );
+    #[cfg(not(target_os = "macos"))]
+    if !super::safe_read(at, out) {
+        out.fill(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_texture_chunk(
+    at: *const u8,
+    out: &mut [u8],
+    mut read: impl FnMut(*const u8, &mut [u8]) -> bool,
+    mut next_region: impl FnMut(usize) -> Option<victory_platform::mem::Region>,
+) {
+    use victory_platform::mem::{Protect, page_size};
+
+    if read(at, out) {
         return;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let page = victory_platform::mem::page_size();
-        let first = page - at.addr() % page;
-        if out.len() > first {
-            // Mach can refuse the entire read for one inaccessible page. Retry each page
-            // separately, including the partial pages at either end of an unaligned texture.
-            let mut offset = 0;
-            let (head, tail) = out.split_at_mut(first);
-            for part in std::iter::once(head).chain(tail.chunks_mut(page)) {
-                if !super::safe_read(at.wrapping_add(offset), part) {
+    // A failed read can leave partial data in a reused probe buffer.
+    out.fill(0);
+    let base = at.addr();
+    let page = page_size();
+    if out.len() <= page - base % page {
+        return;
+    }
+    let Some(end) = base.checked_add(out.len()) else {
+        return;
+    };
+    let mut cur = base;
+    while cur < end {
+        let Some(region) = next_region(cur) else {
+            break;
+        };
+        let start = cur.max(region.base);
+        let stop = end.min(region.base.saturating_add(region.len));
+        if start >= stop {
+            break;
+        }
+        if region.protect.0 & Protect::READ.0 != 0
+            && !read(start as *const u8, &mut out[start - base..stop - base])
+        {
+            // The mapping may have changed after the query. Salvage this span page by page.
+            let mut pos = start;
+            while pos < stop {
+                let n = (page - pos % page).min(stop - pos);
+                let part = &mut out[pos - base..pos - base + n];
+                if !read(pos as *const u8, part) {
                     part.fill(0);
                 }
-                offset += part.len();
+                pos += n;
             }
-            return;
         }
+        cur = stop;
     }
-    out.fill(0);
 }
 
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
@@ -992,6 +1031,65 @@ mod tests {
             to_host(format, &mut texels);
             from_host(format, &mut texels);
             assert_eq!(texels, title, "{format}");
+        }
+    }
+
+    #[test]
+    fn an_inaccessible_megabyte_takes_one_failed_read_and_one_region_query() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, protect};
+
+        let len = 1 << 20;
+        let memory = Region::new(len, None).unwrap();
+        // SAFETY: the test owns this entire mapping until the reader finishes.
+        unsafe { protect(memory.ptr, len, Protect::NO_ACCESS) }.unwrap();
+        let mut out = vec![0xff; len];
+        let (mut reads, mut queries) = (0, 0);
+        read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            |at, out| {
+                reads += 1;
+                crate::native::safe_read(at, out)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(out.iter().all(|&b| b == 0));
+        assert_eq!((reads, queries), (1, 1));
+    }
+
+    #[test]
+    fn a_region_that_changes_after_the_query_still_preserves_readable_pages() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(4 * page, None).unwrap();
+        // SAFETY: the test owns all four pages and writes them before changing protection.
+        unsafe {
+            memory.ptr.write_bytes(0x72, 4 * page);
+            protect(memory.ptr, page, Protect::NO_ACCESS).unwrap();
+        }
+        let mut out = vec![0xff; 4 * page - 2];
+        read_texture_chunk(
+            memory.ptr.wrapping_add(1),
+            &mut out,
+            crate::native::safe_read,
+            |at| {
+                let region = next_region(at);
+                if at == memory.ptr.addr() + page {
+                    // SAFETY: the third page is ours. Revoke access just after querying the span.
+                    unsafe { protect(memory.ptr.add(2 * page), page, Protect::NO_ACCESS) }.unwrap();
+                }
+                region
+            },
+        );
+        for (offset, &byte) in out.iter().enumerate() {
+            let readable = matches!((offset + 1) / page, 1 | 3);
+            assert_eq!(byte, if readable { 0x72 } else { 0 });
         }
     }
 
