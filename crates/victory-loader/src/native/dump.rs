@@ -57,7 +57,13 @@ fn collect() -> Vec<String> {
         if target != 0 {
             let ret = read(teb, OFF_IN_HOST_RET);
             let name = traced_name(read(teb, OFF_IN_HOST_CTX))
-                .map_or(format!("host function {target:#x}"), |(dll, name)| format!("{dll}!{name}"));
+                .map_or(format!("host function {target:#x}"), |(dll, name, slot)| {
+                    if name.is_empty() {
+                        format!("{dll} method {slot:#x}")
+                    } else {
+                        format!("{dll}!{name}")
+                    }
+                });
             line += &format!("in {name}");
             // The bridge's frame: the title's rbp is at [rbp], the return
             // address at [rbp + 8], the title's rsp after it at rbp + 16.

@@ -310,13 +310,13 @@ pub(crate) fn trace_imports() -> bool {
 }
 
 /// `(dll, symbol)` of an import stub's context word, as [`traced_import`] made it.
-pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str)> {
+pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str, usize)> {
     if context & 1 == 0 {
         return None;
     }
     // SAFETY: odd context words are leaked `Traced` records plus one.
     let info = unsafe { &*((context - 1) as *const Traced) };
-    Some((info.area, info.name))
+    Some((info.area, info.name, info.slot * 8))
 }
 
 extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
