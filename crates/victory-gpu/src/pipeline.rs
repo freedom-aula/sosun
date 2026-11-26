@@ -141,9 +141,9 @@ impl Shader {
 #[cfg(target_os = "macos")]
 impl Shader {
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
-    pub(crate) fn translate_extra(&self, rect: bool, extra: u32) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+    pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::shaders::translate_extra(&container, rect, extra).map(Arc::new)
+        crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
     }
 
     /// The translation for rectangle-list draws, made on first use.
@@ -547,8 +547,8 @@ pub(crate) extern "system" fn create_compute(
 
 /// Device methods 0x1c8 and 0x218: a pipeline state from a console description whose layout is
 /// not known yet (`(desc, iid, out)`, the pipeline state's IID; title+0x2477578 and +0x24800d5).
-/// shortcut: the description is not read; the pipeline has no shaders, so draws with it are
-/// dropped.
+/// With graphics inference enabled on macOS, read the shader pieces of the first slot.
+/// shortcut: outside the inferred path, the pipeline has no shaders until the description is decoded.
 pub(crate) extern "system" fn create_unread_1c8(
     _: This,
     desc: *const u8,
@@ -558,65 +558,79 @@ pub(crate) extern "system" fn create_unread_1c8(
     // `VICTORY_GUESS_GRAPHICS=1`: a pipeline from the pieces of the first slot, with the
     // inferred state of `victory_shader::emit::graphics` and `native::state::Graphics::guessed`.
     #[cfg(target_os = "macos")]
-    if !desc.is_null()
-        && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some()
+    if !desc.is_null() && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
         // SAFETY: the title passes a description of this layout.
-        && let Some(stages) = unsafe { graphics_containers(desc.add(8)) }
-    {
-        return hand_out(
-            stages,
-            Some(Box::new(crate::native::state::Graphics::guess_base())),
-            iid,
-            out,
-        );
-    }
-    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() && !desc.is_null() {
-        static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
-            // SAFETY: a debugging read of the title's description.
-            let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
-            tracing::info!(?words, "a graphics description with no vertex shader piece");
+        match unsafe { graphics_containers(desc.add(8)) } {
+            Ok(stages) => return hand_out(
+                stages,
+                Some(Box::new(crate::native::state::Graphics::guess_base())),
+                iid,
+                out,
+            ),
+            Err(reason) => {
+                static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                    // SAFETY: a debugging read of the title's description.
+                    let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
+                    tracing::info!(?words, reason, "a graphics description whose shader pieces could not be inferred");
+                }
+            }
         }
     }
     create_unread_at(0x1c8, desc, iid, out)
 }
 
 /// The vertex and pixel shader containers of the slot at `slot` of a graphics description (pairs
-/// 4/5 and 2/3: code and metadata) as guessed pipelines have them; `None` when the slot lacks a
-/// vertex shader or a piece does not make a container.
+/// 4/5 and 2/3: code and metadata) as guessed pipelines have them. An empty stage list is a
+/// slot without a vertex piece.
 ///
 /// # Safety
 /// `slot` points at a slot of eight (pointer, size) pairs.
 #[cfg(target_os = "macos")]
-unsafe fn graphics_containers(slot: *const u8) -> Option<Vec<Arc<Shader>>> {
+unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'static str> {
     use victory_shader::HwStage;
-    let piece = |pair: usize| -> Option<&[u8]> {
-        // SAFETY: as the caller says; the pieces are the title's, of the size it gives.
+    let entry = |pair: usize| {
+        // SAFETY: the caller supplies all eight pairs.
         unsafe {
             let ptr = slot.add(16 * pair).cast::<usize>().read_unaligned();
             let size = slot.add(16 * pair + 8).cast::<usize>().read_unaligned();
+            (ptr, size)
+        }
+    };
+    let piece = |pair: usize| -> Option<&[u8]> {
+        let (ptr, size) = entry(pair);
+        // SAFETY: as the caller says; the pieces are the title's, of the size it gives.
+        unsafe {
             (ptr != 0 && size != 0 && size <= 1 << 22)
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
     let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
-        Ok(c) => Some(shader(name, &c)),
+        Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
-            None
+            Err("a graphics piece whose shader could not be inferred")
         }
     };
     // The vertex shader is pair 4/5, or pair 6/7 when that is empty (observed; the pairs vary).
     let (code, meta) = match (piece(4), piece(5)) {
         (Some(code), Some(meta)) => (code, meta),
-        _ => (piece(6)?, piece(7)?),
+        _ => match (piece(6), piece(7)) {
+            (Some(code), Some(meta)) => (code, meta),
+            // shortcut: no vertex producer means the slot is skipped, decode stage registers
+            // before attempting a mesh pipeline here.
+            _ if (4..8).all(|pair| entry(pair) == (0, 0)) => return Ok(Vec::new()),
+            _ => return Err("missing or invalid vertex code or metadata"),
+        },
     };
     let vs = make(HwStage::Vs, "vertex", code, meta)?;
     let mut shaders = vec![vs];
-    if let (Some(code), Some(meta)) = (piece(2), piece(3)) {
-        shaders.push(make(HwStage::Ps, "pixel", code, meta)?);
+    match (piece(2), piece(3)) {
+        (Some(code), Some(meta)) => shaders.push(make(HwStage::Ps, "pixel", code, meta)?),
+        _ if entry(2) == (0, 0) && entry(3) == (0, 0) => {}
+        _ => return Err("missing or invalid pixel code or metadata"),
     }
-    Some(shaders)
+    Ok(shaders)
 }
 
 /// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
@@ -1082,6 +1096,44 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guessed_graphics_skips_vertexless_slots_and_lowers_depth_only() {
+        let code = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
+        let pixel = code(&[
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xF800_180F,
+            0, // exp mrt0 v0, v0, v0, v0 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        let vertex = code(&[
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xF800_08CF,
+            0, // exp pos0 v0, v0, v0, v0 done
+            0xBF81_0000, // s_endpgm
+        ]);
+        let meta = [0u8; 0x10];
+        let piece = |bytes: &[u8]| [bytes.as_ptr() as usize, bytes.len()];
+        let read = |pairs: &[[usize; 2]; 8]| {
+            // SAFETY: pairs covers the slot's eight entries and the live slices above back them.
+            unsafe { graphics_containers(pairs.as_ptr().cast()) }
+        };
+        let mut pairs = [[0; 2]; 8];
+        pairs[2] = piece(&pixel);
+        pairs[3] = piece(&meta);
+        assert!(read(&pairs).unwrap().is_empty());
+        pairs[4] = piece(&vertex);
+        assert_eq!(read(&pairs).err(), Some("missing or invalid vertex code or metadata"));
+        pairs[2] = [0; 2];
+        pairs[3] = [0; 2];
+        pairs[5] = piece(&meta);
+        let depth_only = read(&pairs).unwrap();
+        assert_eq!(depth_only.len(), 1);
+        assert_eq!(depth_only[0].native().unwrap().stage, victory_shader::HwStage::Vs);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

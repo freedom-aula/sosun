@@ -311,11 +311,11 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}.ppm")), out);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}.ppm", info.memory as usize)), out);
             // The alpha channel as grey.
             let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
             alpha.extend(px.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[3], p[3]]));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_alpha.ppm")), alpha);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize)), alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
@@ -426,7 +426,12 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
             color: colors.iter().filter_map(|&k| t.format_of(k)).collect(),
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
-        l.list.set_render_targets(&color, depth.as_ref());
+        // Debugging: no depth attachment at all.
+        let drop_depth = std::env::var_os("VICTORY_DEBUG_NO_DEPTH_ATTACH").is_some();
+        if drop_depth {
+            l.targets.depth = None;
+        }
+        l.list.set_render_targets(&color, depth.as_ref().filter(|_| !drop_depth));
     });
 }
 
@@ -442,8 +447,20 @@ pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     });
 }
 
+#[inline(never)]
+fn trace_clear_dsv(flags: u32, depth: f32) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 6 || (n % 40 == 0 && n < 3000) {
+        tracing::info!(flags, depth, n, "ClearDepthStencilView");
+    }
+}
+
 /// `ClearDepthStencilView`: the depth (flag 1); the stencil is cleared with it.
 pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32) {
+    if tracing_targets() {
+        trace_clear_dsv(flags, depth);
+    }
     with_list(this, |t, l| {
         if flags & 1 != 0
             && let Some(tex) = crate::descriptor::dsv_record(handle).and_then(|r| t.texture_of(r.resource as usize))
@@ -623,6 +640,9 @@ fn make_host_pipe(
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
     graphics: Option<super::state::Graphics>,
 ) -> Pipe<Metal> {
+    if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
+        return Pipe::Skipped;
+    }
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -778,7 +798,13 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
             & !super::state::texcoords(&base_vs.dxil, victory_shader::FourCC::OSG1)
     });
     let widened = if extra != 0 {
-        match g.vs_source.translate_extra(rect, extra) {
+        let mut copy = [0u8; 32];
+        for &(orig, new) in g.ps.as_ref().map_or(&[][..], |ps| &ps.splits[..]) {
+            if orig < 32 && new < 32 {
+                copy[new as usize] = orig as u8 + 1;
+            }
+        }
+        match g.vs_source.translate_extra(rect, extra, copy) {
             Ok(h) => Some(h),
             Err(e) => {
                 t.refused_translation(&g.name, format!("extra outputs: {e}"));
@@ -792,13 +818,15 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
+    if tracing_targets() {
+        tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
+    }
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
     g.made.borrow_mut().insert(key, made.clone());
     made
 }
 
-/// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
-/// counted) when there is nothing to draw with.
+/// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
     // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
@@ -806,6 +834,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let targets = l.targets.clone();
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
+        Pipe::Skipped => return None,
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {

@@ -732,12 +732,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        if b.memory {
+                            self.memory_args(heaps.0.as_ref(), &mut p)?;
+                        }
                         if let Some(ps) = &b.ps {
                             let vs_args = std::mem::take(&mut p.root);
                             self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            if ps.memory {
+                                self.memory_args(heaps.0.as_ref(), &mut p)?;
+                            }
                             p.ps_root = Some(std::mem::replace(&mut p.root, vs_args));
                         }
-                        if let Some(h) = p.heap.clone() {
+                        if !b.memory && !b.ps.as_ref().is_some_and(|ps| ps.memory)
+                            && let Some(h) = p.heap.clone()
+                        {
                             self.write_pairs(&h)?;
                         }
                     }

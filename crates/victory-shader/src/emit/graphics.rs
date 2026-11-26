@@ -33,6 +33,12 @@ use crate::native::{
 /// code size, u32 metadata size, then the code and the metadata.
 pub const MAGIC: &[u8] = b"FSPG";
 
+pub(super) fn is_guessed(c: &dxbc::Container<'_>) -> bool {
+    c.part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .is_some_and(|part| part.data.starts_with(MAGIC))
+}
+
 /// The root slot a vertex shader's vertex buffer table (s0/s1) is given: no title root parameter.
 pub const VERTEX_TABLE: u8 = 253;
 
@@ -100,7 +106,34 @@ fn infer(
     }
     let list = crate::gfx10::decode(code)?;
     let wave64 = infer_wave64(&list);
-    let (mut layout, used) = metadata_resources(meta, RECORDS, true)?;
+    let (mut layout, mut used) = metadata_resources(meta, RECORDS, true)?;
+    // The registers the program names: its VGPR count, and what it reads on entry.
+    let p = crate::ir::build(code, wave64, 256)?;
+    if stage == HwStage::Vs
+        && matches!(u32_at(meta, 0), Ok(2))
+        && let Some(&[0x40, first]) = meta.get(12..14)
+    {
+        // shortcut: try header-relative 0x41 indices only when at least one lies below
+        // the stated start, until the register image identifies the user-data layout.
+        if first > 0
+            && layout.iter().any(|r| r.user_data < first)
+            && layout.iter().all(|r| u32::from(first) + u32::from(r.user_data) + r.sgprs <= 32)
+        {
+            let mut relative = layout.clone();
+            for r in &mut relative {
+                r.user_data += first;
+            }
+            if crate::resource::vertex_roots_match_rebased(&p, &layout, &relative)? {
+                layout = relative;
+                for r in &mut used {
+                    if r.root != RootType::ImmediateSampler {
+                        r.user_data = r.user_data.checked_add(first)
+                            .ok_or(Malformed("FSPG user-data index out of bounds"))?;
+                    }
+                }
+            }
+        }
+    }
     // shortcut: multi-dword root constants are only expanded when the immediately following
     // root signature slot (`slot + 1`) is also present in metadata; a trailing multi-dword
     // constant block stays 1 SGPR until the register image is decoded.
@@ -118,8 +151,6 @@ fn infer(
             }
         }
     }
-    // The registers the program names: its VGPR count, and what it reads on entry.
-    let p = crate::ir::build(code, wave64, 256)?;
     let occupied = |layout: &[RootParam], reg: u8| {
         let r = u32::from(reg);
         layout

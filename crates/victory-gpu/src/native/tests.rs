@@ -236,6 +236,8 @@ fn clear_and_draw_into_render_target() {
         .render_pipeline(&RenderPipelineDesc {
             vs: &fixture("tri_vs"),
             ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
             attributes: &attrs,
             streams: &[VertexStream {
                 slot: 0,

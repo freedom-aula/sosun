@@ -209,6 +209,14 @@ pub struct Io {
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+    raise_graphics(p, native, false)
+}
+
+pub(crate) fn raise_graphics(
+    p: &Program,
+    native: &NativeProgram,
+    guessed: bool,
+) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
@@ -329,7 +337,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 // Anchor to the primitive-mask SGPR when the code loads one exclusively into M0
                 // for interpolation (handles guessed PS whose user data is < 8 or has gaps),
                 // otherwise fall back to the 8-SGPR ABI floor.
-                let base = ps_prim_mask(p, user)
+                let base = ps_prim_mask(p, user, guessed)
                     .map(u32::from)
                     .unwrap_or_else(|| user.clamp(8, 104));
                 Some(base.min(104) as u8 + 2)
@@ -464,14 +472,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
 /// Finds a unique live-in SGPR `s<pm>` (`user <= pm <= 104`) that is used solely to feed `m0`
 /// for pixel interpolation (`v_interp_*`), following scalar copies, `v_writelane`/`v_readlane`
 /// spills, and phis.
-fn ps_prim_mask(p: &Program, user: u32) -> Option<u8> {
+fn ps_prim_mask(p: &Program, user: u32, guessed: bool) -> Option<u8> {
     let mut found = None;
     for &(reg, init_v) in &p.inputs {
         let Reg::S(pm) = reg else { continue };
         if pm > 104 || u32::from(pm) < user {
             continue;
         }
-        if is_prim_mask_only(p, init_v) {
+        if is_prim_mask_only(p, init_v, guessed) {
             if found.is_some() {
                 return None;
             }
@@ -484,7 +492,9 @@ fn ps_prim_mask(p: &Program, user: u32) -> Option<u8> {
 /// Whether `init_v` (a live-in SGPR) flows only through copies / `v_writelane`+`v_readlane`
 /// spills into `m0`, and every consumer of those `m0` values is `v_interp_*` (or the benign
 /// `MSG_ORDERED_PS_DONE` sendmsg, which ignores `m0` in hardware).
-fn is_prim_mask_only(p: &Program, init_v: Value) -> bool {
+// shortcut: guessed shaders may also mask or shift the value on the way to M0, extend the
+// recognised scalar operations if a new compiler pattern still uses the value only for M0.
+pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bool {
     use std::collections::HashSet;
     let m0 = crate::ir::M0;
     let mut scalar_vals = HashSet::from([init_v]);
@@ -516,14 +526,25 @@ fn is_prim_mask_only(p: &Program, init_v: Value) -> bool {
                     }
                     match (inst.name(), &inst.fields) {
                         (
-                            "s_mov_b32",
+                            name,
                             Fields::Sop {
                                 dst: Some(Operand::Scalar { code: d, .. }),
                                 src,
                                 ..
                             },
-                        ) if matches!(src.first(), Some(&Operand::Scalar { code: s, .. }) if inst.read(Reg::S(s)) == Some(v)) =>
+                        ) if (name == "s_mov_b32"
+                            && matches!(src.first(), Some(&Operand::Scalar { code: s, .. }) if inst.read(Reg::S(s)) == Some(v)))
+                            || (guessed && matches!(name, "s_and_b32" | "s_or_b32" | "s_lshl_b32" | "s_lshr_b32")) =>
                         {
+                            // The mask bits have no host use, including through SCC.
+                            if let Some(scc) = inst.write(Reg::Scc)
+                                && p.blocks.iter().any(|b| {
+                                    b.phis.iter().any(|phi| phi.args.contains(&scc))
+                                        || b.insts.iter().any(|inst| inst.read(Reg::Scc) == Some(scc))
+                                })
+                            {
+                                return false;
+                            }
                             let Some(dv) = inst.write(Reg::S(*d)) else {
                                 return false;
                             };

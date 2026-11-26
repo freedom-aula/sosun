@@ -95,6 +95,8 @@ impl Rig {
         let mut desc = RenderPipelineDesc {
             vs: &vs,
             ps: Some(&ps),
+            vs_layout: None,
+            ps_layout: None,
             attributes: &ATTRS,
             streams: &STREAMS,
             color: &[Format::Rgba8Unorm],

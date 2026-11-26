@@ -298,10 +298,12 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })
     .map_err(e)?;
     Ok(HostShader {
+        splits: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

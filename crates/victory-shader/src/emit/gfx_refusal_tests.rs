@@ -15,6 +15,55 @@ fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+#[test]
+fn guessed_pixel_computed_buffer_loads_use_title_memory() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // CBV, root constants in slot 0, live-in s0
+    let code = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8705_FF05,
+        0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0x8F06_9090, // s_lshl_b32 s6, 16, 16
+        0x8805_0605, // s_or_b32 s5, s5, s6
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x00014fac
+        0xE034_3004,
+        0x8001_0200, // buffer_load_dwordx2 v[2:3], v[0:1], s[4:7], 0 idxen offen offset:4
+        0xF420_0202,
+        0xFA00_000C, // s_buffer_load_dword s8, s[4:7], 12
+        0x7E08_0208, // v_mov_b32 v4, s8
+        0xF800_180F,
+        0x0404_0302, // exp mrt0 v2, v3, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    let container = |code: &[u32]| graphics::container(HwStage::Ps, &bytes_of(code), &meta).unwrap();
+    let options = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    for flags in [0x0001_4FAC, 0x3001_4FAC] {
+        let mut code = code;
+        code[8] = flags;
+        let shader = translate_with(&container(&code), options).unwrap();
+        assert!(shader.memory);
+        assert!(!shader.memory_writes && !shader.heap);
+        assert_eq!(shader.user_data.len(), 1);
+        assert_eq!(shader.user_data[0].slot, 0);
+    }
+    let mut dynamic_count = code;
+    dynamic_count[6] = 0xBE86_0300; // s_mov_b32 s6, s0
+    assert!(translate_with(&container(&dynamic_count), options).unwrap().memory);
+    assert!(translate_with(&container(&code), Options::default()).is_err());
+
+    let mut swizzled = code;
+    swizzled[5] = 0x8805_FF05; // s_or_b32 s5, s5, 0x80000000
+    let mut swizzled = swizzled.to_vec();
+    swizzled.insert(6, 0x8000_0000);
+    let err = translate_with(&container(&swizzled), options).err().unwrap();
+    assert!(err.to_string().contains("computed buffer descriptor with swizzling"), "{err}");
+}
+
 fn sig_el(
     name: &str,
     index: u32,
@@ -84,6 +133,7 @@ fn lower_ps(
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
+        copy_params: [0; 32],
     })
 }
 
@@ -126,6 +176,7 @@ fn lower_vs(
         zero_copy_memory: false,
         view_marks: false,
         rect_list,
+        copy_params: [0; 32],
     })
 }
 
@@ -753,6 +804,39 @@ fn refusal3_non_interp_hardware_sgpr_remains_refused() {
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
+#[test]
+fn guessed_pixel_masked_prim_mask_anchors_the_pops_input() {
+    let code = [
+        0x8705_FF06,
+        0x0000_FFFF, // s_and_b32 s5, s6, 0xffff
+        0xBEFC_0305, // s_mov_b32 m0, s5
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0xBF06_EF07, // s_cmp_eq_u32 s7, src_pops_exiting_wave_id
+        0x8512_8081, // s_cselect_b32 s18, 1, 0
+        0x7E0A_0212, // v_mov_b32 v5, s18
+        0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        0xF800_180F,
+        0x0404_0504, // exp mrt0 v4, v5, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    let lower = |code: &[u32]| {
+        let container = graphics::container(HwStage::Ps, &bytes_of(code), &[0; 0x10]).unwrap();
+        translate_with(&container, Options::default())
+    };
+    lower(&code).unwrap();
+
+    let mut mixed = code;
+    mixed[7] = 0x7E0A_0206; // v_mov_b32 v5, s6: the mask also escapes into the export.
+    let err = lower(&mixed).err().unwrap();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+    let mut scc_use = code;
+    scc_use.swap(5, 6); // The select now consumes the SCC result of the mask operation.
+    let err = lower(&scc_use).err().unwrap();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
+
 // =========================================================================
 // Refusal #4: "one input interpolated two ways"
 // =========================================================================
@@ -926,6 +1010,90 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
             .contains("an address in an SGPR that is no root parameter"),
         "got `{err}`"
     );
+}
+
+#[test]
+fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
+    let mut meta = [0u8; 0x30];
+    meta[0] = 2;
+    meta[12..15].copy_from_slice(&[0x40, 4, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14..0x16].copy_from_slice(&[2, 3]); // CBV in a table
+    meta[0x18] = 8; // descriptor at byte 32 of the table
+    meta[0x24..0x27].copy_from_slice(&[4, 0, 3]); // four dwords, relative s0, title slot 3
+    let code = [
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2000,
+        0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+        0xF420_0406,
+        0xFA00_0000, // s_buffer_load_dword s16, s[12:15], 0
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x7E04_0210, // v_mov_b32 v2, s16
+        0xF800_08CF,
+        0x0202_0201, // exp pos0 v1, v2, v2, v2 done
+        0xBF81_0000,
+    ];
+    let lower = |code: &[u32], meta: &[u8]| {
+        let container = graphics::container(HwStage::Vs, &bytes_of(code), meta).unwrap();
+        translate_with(&container, Options::default())
+    };
+    let shader = lower(&code, &meta).unwrap();
+    assert!(!shader.heap);
+    assert_eq!(shader.user_data.len(), 1);
+    assert_eq!(shader.user_data[0].slot, 3);
+    assert_eq!(shader.user_data[0].root, RootType::Table);
+    assert!(parsed_isg1(&shader.dxil).iter().any(|e| e.name == "VBU1"));
+
+    meta[0x25] = 4; // The original absolute interpretation also supports an explicit s4 record.
+    assert_eq!(lower(&code, &meta).unwrap().user_data, shader.user_data);
+
+    let unbound = [
+        0xF400_0103,
+        0xFA00_0000, // s_load_dword s4, s[6:7], 0
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ];
+    meta[0x25] = 0;
+    let err = lower(&unbound, &meta).err().unwrap();
+    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+}
+
+#[test]
+fn guessed_vertex_rebases_a_header_relative_root_view() {
+    let mut meta = [0u8; 0x30];
+    meta[0] = 2;
+    meta[12..15].copy_from_slice(&[0x40, 4, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14..0x16].copy_from_slice(&[2, 1]); // Root CBV
+    meta[0x26] = 3; // Title slot 3
+    let code = bytes_of(&[
+        0xBE88_0404, // s_mov_b64 s[8:9], s[4:5]
+        0xBE8A_03C1, // s_mov_b32 s10, -1
+        0xBE8B_03FF,
+        0x3001_4FAC, // s_mov_b32 s11, 0x30014fac
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ]);
+    let lower = |meta: &[u8]| {
+        let container = graphics::container(HwStage::Vs, &code, meta).unwrap();
+        translate_with(&container, Options::default())
+    };
+    assert_eq!(lower(&meta).unwrap().root_cbvs, [3]);
+    meta[13] = 6;
+    let err = lower(&meta).err().unwrap();
+    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
 }
 
 // =========================================================================

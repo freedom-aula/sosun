@@ -245,6 +245,36 @@ impl<T> Shared<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn msvcp140_ucrt_imports_are_served() {
+        let imports: &[(&str, &[&str])] = &[
+            ("environment", &["_wgetcwd"]),
+            ("locale", &["_lock_locales", "_unlock_locales"]),
+            ("runtime", &["_endthreadex"]),
+            ("stdio", &["ungetwc"]),
+            ("string", &["__strncnt"]),
+            (
+                "time",
+                &[
+                    "_Getdays",
+                    "_Getmonths",
+                    "_Gettnames",
+                    "_Strftime",
+                    "_W_Getdays",
+                    "_W_Getmonths",
+                    "_W_Gettnames",
+                    "_Wcsftime",
+                ],
+            ),
+        ];
+        for (category, names) in imports {
+            let dll = format!("api-ms-win-crt-{category}-l1-1-0.dll");
+            for name in *names {
+                assert!(lookup(&dll, name).is_some(), "{dll}!{name}");
+            }
+        }
+    }
+
     /// With `VICTORY_UCRT_IMPORTS` naming a `--list-imports` dry-run output,
     /// every UCRT import in it must resolve (the HLE registry's own `exit`
     /// and `abort` are served there first, not here).
