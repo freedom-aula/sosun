@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/images/banner.svg" alt="Native VIctory for macOS: a neon tropical sunset with palm trees, a coastal skyline and a MacBook on the shore"></p>
-
 <h1 align="center">Native VIctory for macOS</h1>
 
 <p align="center">
