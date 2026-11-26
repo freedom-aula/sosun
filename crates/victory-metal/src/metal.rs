@@ -46,6 +46,12 @@ pub(crate) fn since_start() -> f64 {
 pub struct ResidencyCounts {
     /// `useResource` calls on title buffers (compute, render and blit encoders).
     pub use_resource: u64,
+    /// Resources named to encoders for descriptor heaps without sets.
+    pub heap_resources: u64,
+    /// The most entries naming a resource, and the most distinct allocations they name, seen in
+    /// one heap named to an encoder.
+    pub heap_entries: u64,
+    pub heap_allocations: u64,
     /// Buffers added to the pool set.
     pub added: u64,
     /// Queues the pool set was added to.
