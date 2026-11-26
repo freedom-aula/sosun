@@ -28,7 +28,7 @@ cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D 
 cargo xtask policy
 ```
 
-Known flaky under load: `victory-hle` `native_probe` waits test, and `victory-gpu` `memory::tests::a_submission_that_missed_leaves_the_copies_at_once` (being fixed). The victory-gpu tests also crash when run as x86_64 under Rosetta, so run them on the native arm64 host (no `--target`).
+Known flaky under load: `victory-gpu` `memory::tests::a_submission_that_missed_leaves_the_copies_at_once` (being fixed). The victory-gpu tests also crash when run as x86_64 under Rosetta, so run them on the native arm64 host (no `--target`).
 
 ## Running the game
 

@@ -295,16 +295,39 @@ fn sleep_condition(
     let word = condition(cv);
     let ticket = word.load(Ordering::Acquire);
     release();
-    let timeout = (ms != u32::MAX).then(|| Duration::from_millis(u64::from(ms)));
-    // A wake between the load and the wait changes the word, and the wait
-    // returns at once.
-    let woken = wait_on_address(word, ticket, timeout);
-    reacquire();
-    if woken {
-        1
-    } else {
-        set_error(ERROR_TIMEOUT);
-        0
+    let deadline = (ms != u32::MAX).then(|| Instant::now() + Duration::from_millis(u64::from(ms)));
+    loop {
+        // A wake between the load and the wait changes the word, and the
+        // wait returns at once. A spurious return leaves the word alone:
+        // with a deadline, only a changed word is a wake, so the wait goes
+        // on until the time is up (wait_on_address's callers re-check, as
+        // here). Without a deadline any return is taken as a wake, which is
+        // legal for a condition variable: the caller re-checks its own
+        // predicate.
+        let left = match deadline {
+            None => None,
+            Some(d) => match d.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => {
+                    reacquire();
+                    set_error(ERROR_TIMEOUT);
+                    return 0;
+                }
+            },
+        };
+        if !wait_on_address(word, ticket, left) {
+            reacquire();
+            set_error(ERROR_TIMEOUT);
+            return 0;
+        }
+        if deadline.is_none() || word.load(Ordering::Acquire) != ticket {
+            reacquire();
+            return 1;
+        }
+        // The word did not change, a spurious return. wait_on_address also
+        // returns at once on EFAULT-type errors, so back off instead of
+        // spinning until the deadline.
+        std::thread::sleep(Duration::from_micros(100));
     }
 }
 
@@ -450,5 +473,60 @@ mod tests {
             );
             assert_eq!(after, seen, "marked an available lock as waiting");
         }
+    }
+
+    /// A CV in "title memory", shared by the waiter thread and this one.
+    fn cv_fixture() -> (*mut c_void, *mut u8) {
+        let cv = Box::leak(Box::new(0u64)) as *mut u64 as *mut c_void;
+        let cs = Box::leak(Box::new([0u8; 64])) as *mut [u8; 64] as *mut u8;
+        InitializeCriticalSection(cs);
+        InitializeConditionVariable(cv);
+        (cv, cs)
+    }
+
+    #[test]
+    fn a_wake_that_changes_nothing_is_not_a_condition_variable_signal() {
+        // wake_one wakes a waiter without changing the word; only a changed
+        // word is a signal, so the wait must still end as a time-out (the
+        // native_probe waits test saw these under load, 1 run in 3).
+        let (cv, cs) = cv_fixture();
+        let (cv_addr, cs_addr) = (cv as usize, cs as usize);
+        let waiter = std::thread::spawn(move || {
+            let (cv, cs) = (cv_addr as *mut c_void, cs_addr as *mut u8);
+            EnterCriticalSection(cs);
+            let start = Instant::now();
+            let slept = SleepConditionVariableCS(cv, cs, 1_000);
+            LeaveCriticalSection(cs);
+            (slept, start.elapsed())
+        });
+        // Wake word-less, repeatedly, so one lands while the waiter is parked
+        // even on a busy host.
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            wake_one(condition(cv));
+        }
+        let (slept, waited) = waiter.join().unwrap();
+        assert_eq!(slept, 0, "a word-less wake is not a signal");
+        // Loose for slow hosts: the wait ran past the wakes to its deadline.
+        assert!(waited >= Duration::from_millis(500), "{waited:?}");
+    }
+
+    #[test]
+    fn a_condition_variable_wake_ends_the_wait_at_once() {
+        let (cv, cs) = cv_fixture();
+        let (cv_addr, cs_addr) = (cv as usize, cs as usize);
+        let waiter = std::thread::spawn(move || {
+            let (cv, cs) = (cv_addr as *mut c_void, cs_addr as *mut u8);
+            EnterCriticalSection(cs);
+            let start = Instant::now();
+            let slept = SleepConditionVariableCS(cv, cs, 30_000);
+            LeaveCriticalSection(cs);
+            (slept, start.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        WakeConditionVariable(cv);
+        let (slept, waited) = waiter.join().unwrap();
+        assert_eq!(slept, 1);
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
     }
 }
