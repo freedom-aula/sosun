@@ -377,8 +377,8 @@ not needed to build:
 A root descriptor table is the **GPU address of its first entry** in the top-level argument buffer
 (`heap_address(heap, i)` pushed with `RootArgs::address`, like a root view); `DescriptorTable(SRV(t0),
 UAV(u0))` is two adjacent entries and a second `DescriptorTable(Sampler(s0))` points into the sampler
-heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]` (the
-tests only use tables). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
+heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]`, for
+every stage (`victory-gpu`'s `native::heap_tests` draw with vertex, mesh and pixel shaders that do). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
 `Buffer<T>`) are not written yet.
 
 Proven by `srv_and_uav_through_a_descriptor_table` (a compute shader reads an SRV and writes a UAV, both
@@ -586,7 +586,8 @@ and raises fence values.
   winding, fill, depth bias, depth clip; per draw: viewport, scissor, stencil reference, blend factor).
   A shader the host cannot run is refused with a reason, counted (`glue::shader_stats()`) and its work
   dropped; the submission and its fences go on. Refused today: title memory read at computed addresses in
-  a graphics pipeline (compute shaders have it, below), heap indexing by the shader, root views as heap
+  a graphics pipeline (compute shaders have it, below), heap indexing by a compute shader (graphics
+  shaders may), root views as heap
   views, write marks and view addresses, a pixel stage with arguments of its own (one argument block
   serves a pipeline), multisampling, vertex inputs missing from the layout.
 - **Title memory at computed addresses: the pool-offset contract** (`native/addr.rs`, compute shaders). A
@@ -641,7 +642,7 @@ and raises fence values.
    computed addresses (above), user data in root constants and root views. Not done: graphics pipelines
    with translator output (the page table, immediate samplers as static samplers of the converter's root
    signature, per-stage argument blocks: the D3D12 host's visibility has no equivalent in one argument
-   buffer), heap indexing by the shader, view addresses and write marks. The table is rebuilt whole when a
+   buffer), heap indexing by a compute shader, view addresses and write marks. The table is rebuilt whole when a
    mapping changes (incremental update is the next step), and the null view relies on the converter's
    bounds check, which was verified for loads and stores of a 64-lane compute shader only.
 2. Textures: the XOR modes are addressed by addrlib's RB+ equations (`victory_formats::texture`, tables
