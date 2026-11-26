@@ -884,8 +884,10 @@ models every step, "a value that is no reduction or prefix". The first step not 
 hint, not proof: the value refused may not depend on it. `pipeline::pieces_tests::
 the_host_refuses_a_whole_wave_section_naming_its_step` (`victory-gpu`) checks the refusal on the
 native host's own path: the container made from the title's pieces, the host's options. The
-story-load log of issue #110 (Series S) has three compute programs refused with the old message;
-nothing is lowered yet.
+story-load log of issue #110 (Series S) has three compute programs refused with the old message.
+The simulator now follows a constant loaded by `s_mov_b32` inside the section. For example, a
+signed minimum can use `INT_MAX` from an SGPR as its inactive-lane identity. Whether the three
+logged programs use this pattern is unknown.
 
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two

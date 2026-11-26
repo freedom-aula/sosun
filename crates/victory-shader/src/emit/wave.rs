@@ -384,6 +384,14 @@ fn simulate(
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            // A reduction can load its inactive-lane identity into an SGPR.
+            if name == "s_mov_b32"
+                && let Some(k) = constant(inst)
+                && let [(Reg::S(_), dst)] = inst.writes.as_slice()
+            {
+                uni.insert(*dst, Sym::K(k as u32));
+                continue;
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
