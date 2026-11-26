@@ -1,0 +1,7 @@
+LIBRARY winhttp.dll
+EXPORTS
+WinHttpOpen
+WinHttpConnect
+WinHttpOpenRequest
+WinHttpSendRequest
+WinHttpCloseHandle

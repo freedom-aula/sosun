@@ -31,6 +31,7 @@ mod mf;
 mod mixer;
 mod winhttp;
 mod winsock;
+mod xaudio2;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
@@ -730,7 +731,8 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     if let Some(address) = system::lookup(&dll, name)
         .or_else(|| winsock::lookup(&dll, name))
         .or_else(|| winhttp::lookup(&dll, name))
-        .or_else(|| mf::lookup(&dll, name)) {
+        .or_else(|| mf::lookup(&dll, name))
+        .or_else(|| xaudio2::lookup(&dll, name)) {
         return Some(address);
     }
     // The API sets and kernelbase forward to kernel32's functions; the

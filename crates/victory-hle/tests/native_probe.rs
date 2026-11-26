@@ -274,6 +274,14 @@ mod run {
         );
     }
 
+    /// Winsock by ordinal (a loopback echo, off-machine refused), WinHTTP set
+    /// up and never sent, Media Foundation making nothing, and XAudio2
+    /// ordinal 1 played through COM vtables of host stubs, under Rosetta.
+    #[test]
+    fn network_media_and_audio_imports_work() {
+        assert_all(run_probe("probe_netaudio", 0), 0xFFF, "probe_netaudio");
+    }
+
     #[test]
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
         // The probe's vectored handler hears every thread's exceptions.

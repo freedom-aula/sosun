@@ -145,10 +145,14 @@ impl Source {
     /// The context of the buffer playing, the number queued, and the frames
     /// played so far.
     pub fn state(&self) -> (usize, u32, u64) {
+        let into_front = self
+            .queue
+            .front()
+            .map_or(0, |b| (self.position as usize).saturating_sub(b.begin));
         (
             self.queue.front().map_or(0, |b| b.context),
             self.queue.len() as u32,
-            self.played,
+            self.played + into_front as u64,
         )
     }
 }
