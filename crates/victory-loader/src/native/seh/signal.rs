@@ -158,6 +158,15 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
         // longest instruction and the page after is mapped or the read faults
         // like the instruction would have.
         let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
+        if code.starts_with(&[0x0F, 0x01, 0xFC]) {
+            // clzero (AMD, not in Rosetta): zeroes the cache line at rax.
+            let line = (word(0) & !63) as *mut u8;
+            // SAFETY: the instruction would have written this line.
+            unsafe { line.write_bytes(0, 64) };
+            // SAFETY: the saved rip, past the instruction.
+            unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
+            return;
+        }
         if let Some(len) = cache_hint_len(code) {
             // SAFETY: the saved rip, past the hint.
             unsafe {
