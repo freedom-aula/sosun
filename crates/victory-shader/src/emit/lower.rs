@@ -714,7 +714,10 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if x.st.lockstep {
+                    split_barriers = super::lockstep::lds_barriers(p);
+                    synced = true;
+                } else if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }

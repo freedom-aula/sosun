@@ -122,6 +122,24 @@ pub(crate) fn branches(p: &Program) -> Program {
     q
 }
 
+/// Where lockstep LDS takes group barriers, by block and instruction (a barrier goes before the
+/// instruction; at the block's length, after its last): around each LDS write, so what one host
+/// wave writes is seen by the other's next read, and neither writes over what the other has yet to
+/// read. Every thread reaches each one, so they sit outside the guards.
+pub(crate) fn lds_barriers(p: &Program) -> crate::structure::Set<(usize, usize)> {
+    let mut at = crate::structure::Set::default();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let n = inst.name();
+            let reads = n.starts_with("ds_read") || n.starts_with("ds_swizzle") || n.contains("permute");
+            if matches!(inst.fields, Fields::Ds { .. }) && !reads {
+                at.extend([(b, i), (b, i + 1)]);
+            }
+        }
+    }
+    at
+}
+
 fn max_value(p: &Program) -> Option<Value> {
     let insts = p.blocks.iter().flat_map(|b| &b.insts);
     let regs = insts.flat_map(|i| i.reads.iter().chain(&i.writes).map(|r| r.1));

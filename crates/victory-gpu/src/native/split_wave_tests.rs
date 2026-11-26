@@ -499,3 +499,92 @@ fn a_first_lane_read_in_lockstep_is_the_console_waves_first_lane() {
     assert_eq!(got[10..64], [1010; 54]);
     assert_eq!(got[74..], [1035; 54]);
 }
+
+#[test]
+fn a_per_lane_loop_shares_lds_across_the_halves_in_lockstep() {
+    // Lane i loops `i & 3` times; each trip it adds the value lane `i ^ 32` last wrote to LDS to
+    // its own and writes that back, with no barrier (the console runs the wave in lockstep).
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x3A06_02FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v1: lane i ^ 32's slot
+        0x3608_0083, // v_and_b32 v4, 3, v0
+        0x7E0A_0300, // v_mov_b32 v5, v0
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        skip_execz(8),
+        DS_READ_V2_AT_V3[0],
+        DS_READ_V2_AT_V3[1],
+        S_WAITCNT_LGKM,
+        0x4A0A_0505, // v_add_nc_u32 v5, v5, v2
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xBF82_FFF5, // s_branch loop
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run_lockstep(&w, 1, 64);
+    if got.is_empty() {
+        return;
+    }
+    // The console: each trip, every lane still looping reads, then each writes.
+    let (mut acc, mut lds): (Vec<u32>, Vec<u32>) = ((0..64).collect(), (0..64).collect());
+    for trip in 0..3 {
+        let on: Vec<usize> = (0..64).filter(|&i| i & 3 > trip).collect();
+        let read: Vec<u32> = on.iter().map(|&i| lds[i ^ 32]).collect();
+        for (&i, r) in on.iter().zip(read) {
+            acc[i] += r;
+            lds[i] = acc[i];
+        }
+    }
+    assert_eq!(got, acc);
+}
+
+#[test]
+fn a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep() {
+    // In lanes 0..49, an inclusive prefix sum of the lane indices over the whole wave (lanes off
+    // give 0): DPP row shifts, the other row's lane 15, then lane 31 added in the upper half.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x7D88_00B2, // v_cmp_gt_u32 vcc, 50, v0
+        LANES_BELOW_40[1],
+        skip_execz(23),
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0003,
+        0x0022_0080, // v_cndmask_b32_e64 v3, 0, v0, s[8:9]
+        0x4A06_06FA,
+        0xFF09_1103, // v_add_nc_u32_dpp v3, v3, v3 row_shr:1 bound_ctrl:1
+        0x4A06_06FA,
+        0xFF09_1203, // v_add_nc_u32_dpp v3, v3, v3 row_shr:2 bound_ctrl:1
+        0x4A06_06FA,
+        0xFF09_1403, // v_add_nc_u32_dpp v3, v3, v3 row_shr:4 bound_ctrl:1
+        0x4A06_06FA,
+        0xFF09_1803, // v_add_nc_u32_dpp v3, v3, v3 row_shr:8 bound_ctrl:1
+        0xD778_0002,
+        0x0305_8303, // v_permlanex16_b32 v2, v3, -1, -1
+        0x4A06_06FA,
+        0xAF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xa
+        0xD760_000A,
+        0x0201_3F03, // v_readlane_b32 s10, v3, 31
+        0x7E04_020A, // v_mov_b32 v2, s10
+        0x4A06_06FA,
+        0xCF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xc
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ];
+    let got = run_lockstep(&w, 0, 64);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..50], (0..50).map(|i| i * (i + 1) / 2).collect::<Vec<u32>>());
+    assert_eq!(got[50..], [CANARY; 14]);
+}
