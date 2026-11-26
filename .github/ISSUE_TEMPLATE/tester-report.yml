@@ -1,0 +1,49 @@
+name: Tester report
+description: You ran the game on your Mac. Tell us how far it got.
+title: "[Tester] <chip>, <RAM>: <how far it got>"
+labels: ["tester report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Please never attach or link game files.
+  - type: input
+    id: mac
+    attributes:
+      label: Mac
+      description: Chip, RAM and macOS version
+      placeholder: "M3 Max, 64 GB, macOS 15.6"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD` (also in the first lines of the log)
+    validations:
+      required: true
+  - type: dropdown
+    id: reached
+    attributes:
+      label: How far did it get?
+      options:
+        - Setup or build failed
+        - Crashed before anything showed
+        - Window opened, stayed black
+        - Stopped at about 19 seconds (breakpoint / int3)
+        - Something visible on screen
+        - Further than that
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Anything you noticed, plus any VICTORY_* variables you set.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Drag in the `runs/<date>/victory.log` file that run-native.sh saved.
+    validations:
+      required: true

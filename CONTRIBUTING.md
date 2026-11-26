@@ -1,50 +1,67 @@
-# Contributing to VIctory for macOS
+# Contributing to Native VIctory for macOS
 
-Thank you for wanting to help. The goal is simple to state: GTA VI on an Apple Silicon Mac, from a copy that the player owns. There is work here for people who know Rust, graphics, Wine, macOS or none of these yet.
+Thanks for helping. The goal: GTA VI running natively on an Apple Silicon Mac, from a copy the player owns. There is work for testers, Rust programmers, graphics people, reverse engineers and compiler people.
 
 ## The one rule
 
-Nothing from the game is ever committed. That covers executables, DLLs, shaders, textures, audio, keys, dumps, decrypted files and screenshots of game content. Everything is built from files that the user supplies on their own machine. A check called `cargo xtask policy` enforces this on every commit, and pull requests that break it are closed. Please also do not post or link game files in issues.
+**Nothing from the game is ever committed or posted.** That covers executables, DLLs, shaders, textures, audio, keys, dumps, decrypted files, disassembly listings and screenshots of game content. The same goes for Microsoft's GDK and Apple's SDK files (the Metal Shader Converter is installed by each user, never vendored). `cargo xtask policy` checks this. Pull requests that break it are closed. Findings such as "the boot waits on the record at this address" are fine and welcome; copied code or bytes are not.
 
-D3DMetal and anything else from Apple's Game Porting Toolkit stays out of the repository too, because Apple's licence does not allow sharing it.
+## Set up
 
-## Getting started
-
-Follow the three steps in the [README](README.md) to set up your Mac. Then check that both test runs pass before you change anything.
+Follow the [Quick start](README.md#quick-start). Then make sure the tests pass before you change anything:
 
 ```bash
-cargo test --workspace
+rustup run 1.98.1 cargo test --target x86_64-apple-darwin -p victory-hle -p victory-loader -p victory
 ```
 
 ```bash
-WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
+rustup run 1.98.1 cargo test -p victory-shader -p victory-hle
 ```
 
-Read [docs/macos.md](docs/macos.md) for how the port works and what was already found, and [docs/architecture.md](docs/architecture.md) for VIctory itself.
+The CI gate is a strict clippy run for Windows, which you can run on a Mac:
 
-## Where help is needed
+```bash
+rustup run 1.98.1 cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnullvm -- -D warnings
+```
 
-These are the open areas, roughly from most to least useful.
+## Find something to work on
 
-- **World rendering.** The game reaches its world but draws little of it, on Windows too. Shader translation gaps and missing GPU features are listed in VIctory's own status table. Work on the shared crates helps every platform.
-- **D3DMetal differences.** Metal and the console GPU disagree in small ways, as `sin(NaN)` showed. A test that passes on Windows and fails under D3DMetal usually points at one of these. Find it, fix it in the translator or the GPU layer, and add a test.
-- **Speed.** Rosetta, Wine and D3DMetal each cost time. Profiling the frame loop on a Mac and finding where it goes is very valuable.
-- **A native Mac host.** The long-term route replaces Wine with a native macOS host and a Metal backend. It is described at the end of `docs/macos.md`, and design discussion in an issue is welcome before any code.
-- **Setup and packaging.** Making `setup.sh` faster or more robust, or turning it into a Mac app, helps everyone who is not a developer.
-- **Testing on other Macs.** Results from M1, M2 and M3 machines, and from different macOS versions, help a lot. Open an issue with your Mac model, your macOS version and the output of both test runs. The [Mac test fleet](docs/fleet.md) does this for you: it takes a task from the issues, runs both suites and posts the counts.
+- [docs/ROADMAP.md](docs/ROADMAP.md) lists the open problems, with what is already known about each.
+- Issues labelled `good first issue` are small and self-contained.
+- Comment on an issue before starting something big, so two people don't do the same work.
 
-## Making a change
+## How the code is laid out
 
-1. Fork the repository and make a branch for your change.
-2. Keep each commit small, with a short subject line that says what it changes, such as `fix(gpu): keep the clamp's budget per list`.
-3. Add or update a test when you change behaviour. GPU behaviour is best tested under Wine with D3DMetal, as in the second command above.
-4. Run `cargo fmt`, `cargo clippy` and both test runs.
-5. Open a pull request that says what changed, why, and how you tested it.
+| Crate | What it does |
+| --- | --- |
+| `crates/victory-loader` | Maps the game's PE files, TLS, exceptions, the Windows↔macOS calling-convention bridge (`native/`) |
+| `crates/victory-hle` | The Windows and Xbox system calls, reimplemented (`host_posix/` for macOS, `modules/` for Xbox APIs) |
+| `crates/victory-gpu` | Console Direct3D 12.X; `native/` is the Metal path |
+| `crates/victory-shader` | GFX10 (RDNA2) shader decoding and translation to DXIL |
+| `crates/victory-metal` | Metal and Metal Shader Converter glue |
+| `crates/victory-platform` | Memory, threads and sync on macOS and Windows |
+| `apps/victory` | The command-line front end (`victory run`) |
 
-## Reporting a problem
+## Debugging a run
 
-Open an issue and include your Mac model, your macOS version, the version of the Game Porting Toolkit you used, and the full output of the command that failed, inside a code block. If `./setup.sh` failed, the log files it names are the most useful thing to attach.
+Every diagnostic is an environment variable, documented in [docs/native-host.md](docs/native-host.md) under "Bring-up diagnostics". A few common ones:
 
-## Licence
+| Variable | What it does |
+| --- | --- |
+| `VICTORY_GUESS_GRAPHICS=1` | Build graphics pipelines from the console descriptions (on by default in `run-native.sh`) |
+| `VICTORY_DUMP_TARGETS=<dir>,<s>,<every>` | Save render targets as PNGs |
+| `VICTORY_TRACE_FAILS=1` | Log every failing system call |
+| `VICTORY_DUMP_THREADS=<s>` | Dump every thread's stack after `<s>` seconds |
+| `VICTORY_DEBUG_PS=in<N>` / `VICTORY_DEBUG_VS_POS=1` | Graphics bisection switches |
 
-This project is licensed under GPL-3.0, like VIctory, which it is built on. By contributing, you agree that your work is shared under the same licence.
+## Pull requests
+
+- Keep each pull request to one change, with a test where it is testable without the game.
+- Run the tests and the clippy gate above.
+- Gate new diagnostics behind a `VICTORY_*` variable and document them in docs/native-host.md.
+- When you guess at undocumented console behaviour, say so in a comment and in native-host.md's list of guesses.
+- By contributing, you agree to license your work under the GPL-3.0.
+
+## Be kind
+
+Be patient with newcomers, assume good faith, and keep discussion about the code. Harassment of any kind isn't tolerated.
