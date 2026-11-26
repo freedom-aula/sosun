@@ -1424,11 +1424,22 @@ fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
 
 /// [`typed_store_cs`] with the words `setup` run just before the store.
 fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    store_cs(4, setup, store)
+}
+
+/// [`typed_store_cs_after`] with a descriptor of `dwords` (4, or 8 for an
+/// image) in s[8:].
+fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
     let mut words = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
-        0xF408_0202,
-        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        // s_load_dwordx4 s[8:11] (x8 s[8:15]), s[4:5], 0x0
+        if dwords == 8 {
+            0xF40C_0202
+        } else {
+            0xF408_0202
+        },
+        0xFA00_0000,
         0x7E02_0300, // v_mov_b32 v1, v0
         0x7E04_0300, // v_mov_b32 v2, v0
         0x7E06_0300, // v_mov_b32 v3, v0
@@ -1455,7 +1466,7 @@ fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
             table_offset_dwords: 0,
             lower_bound: 0,
             stride: 0,
-            dwords: 4,
+            dwords,
             user_data: 0,
             slot: 0,
         }],
@@ -1745,6 +1756,63 @@ fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
     assert_eq!(
         err,
         ShaderError::Unsupported { offset: at + 12, what: "a computed buffer descriptor used as a view" }
+    );
+}
+
+// =========================================================================
+// Compute: "an image store of some channels"
+// =========================================================================
+
+/// Image stores of some channels write the whole texel (0 in the channels
+/// dmask leaves out: `valu_tests` runs some), the data holding the dmask's
+/// channels in turn, so they lower as the four-channel store does.
+#[test]
+fn image_stores_of_some_channels_lower() {
+    // v_mov_b32 v5, v0; v_mov_b32 v6, 0: the texel (lane, 0).
+    let at = [0x7E0A_0300, 0x7E0C_0280];
+    let stores: &[(u32, u32, &str)] = &[
+        (
+            0xF020_1108,
+            0x0002_0105,
+            "image_store v1, v[5:6], s[8:15] dmask:0x1 dim:2D unorm",
+        ),
+        (
+            0xF020_1308,
+            0x0002_0105,
+            "image_store v[1:2], v[5:6], s[8:15] dmask:0x3 dim:2D unorm",
+        ),
+        (
+            0xF020_1508,
+            0x0002_0105,
+            "image_store v[1:2], v[5:6], s[8:15] dmask:0x5 dim:2D unorm",
+        ),
+        (
+            0xF020_1E08,
+            0x0002_0105,
+            "image_store v[1:3], v[5:6], s[8:15] dmask:0xe dim:2D unorm",
+        ),
+        (
+            0xF020_1F08,
+            0x0002_0105,
+            "image_store v[1:4], v[5:6], s[8:15] dmask:0xf dim:2D unorm",
+        ),
+        (
+            0xF020_1508,
+            0x8002_0105,
+            "image_store v1, v[5:6], s[8:15] dmask:0x5 dim:2D unorm d16",
+        ),
+    ];
+    for &(w0, w1, asm) in stores {
+        let l = store_cs(8, &at, [w0, w1]).unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+    // dmask 0: what the hardware stores is not documented.
+    let err = store_cs(8, &at, [0xF020_1008, 0x0002_0105])
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string().contains("an image store of no channel"),
+        "got `{err}`"
     );
 }
 

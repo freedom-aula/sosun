@@ -10368,10 +10368,20 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // shortcut: stores are taken to be of a float format (the
+            // console converts by the view's format).
+            // A store of fewer channels still writes the whole texel, the
+            // data holding the dmask's channels in turn. With a prefix dmask
+            // (0x1, 0x3, 0x7) the hardware stores 0 in the trailing channels
+            // left out (GFX11 and older; LLVM 88421ea "[AMDGPU] Trim zero
+            // components from buffer and image stores", Mesa 4a6ee2c4833
+            // "aco: shrink buffer stores with undef/zero components"), as for
+            // typed buffer stores. Guess (docs/native-host.md): a gapped
+            // dmask (0x5, or one without red) gets 0 in its gaps too, which
+            // that evidence does not cover. With no channel enabled the
+            // hardware's behaviour is undocumented: refused.
+            if matches!(inst.fields, Fields::Image { dmask: 0, .. }) {
+                return Err("an image store of no channel");
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -10382,7 +10392,12 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut k = 0u8;
+            for ch in 0..4 {
+                if dmask >> ch & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -10398,6 +10413,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                k += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
