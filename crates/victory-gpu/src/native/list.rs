@@ -701,6 +701,17 @@ impl<B: GraphicsBackend> NativeList<B> {
         })
     }
 
+    /// `DispatchMesh` of a mesh pipeline.
+    pub fn dispatch_mesh(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
+        self.draw_call(DrawCall::Mesh { groups: [x, y, z] })
+    }
+
+    /// One `DispatchMesh` of `ExecuteIndirect`: its group counts are the record at title address
+    /// `record`, read on the GPU; with `count`, only if the record's index is below the count.
+    pub fn dispatch_mesh_indirect(&mut self, record: u64, count: Option<(u64, u32)>) -> Result<(), String> {
+        self.draw_from(DrawCall::Mesh { groups: [0; 3] }, Some(record), count)
+    }
+
     pub fn draw_indexed_instanced(
         &mut self,
         indices: u32,

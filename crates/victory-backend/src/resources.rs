@@ -502,6 +502,8 @@ pub enum DrawCall {
         first_instance: u32,
         wide: bool,
     },
+    /// `DispatchMesh` of a mesh pipeline: thread groups in x, y, z.
+    Mesh { groups: [u32; 3] },
 }
 
 /// A viewport as `RSSetViewports` takes it: top left, size, depth range.

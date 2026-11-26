@@ -2,12 +2,17 @@
 //! translated as mesh shaders, made into Metal mesh pipelines and drawn.
 
 use super::addr_tests::title;
+use crate::native::list::{Binding, NativeList};
 use crate::native::shaders;
 use crate::native::state::Graphics;
-use crate::native::title::Pipe;
-use victory_backend::resources::Format;
+use crate::native::title::{Pipe, Title};
+use std::rc::Rc;
+use victory_backend::resources::{Format, GraphicsBackend, ResourceBackend, TextureDesc, Topology};
+use victory_metal::metal::Metal;
 use victory_shader::emit::HostShader;
 use victory_shader::native::HwStage;
+
+type Texture = <Metal as ResourceBackend>::Texture;
 
 /// A mesh-style vertex program as the title's start (lane 0 alone takes the group id, shifted by
 /// 7: groups of 128 lanes), whose lanes 0-2 export the corners of a triangle covering the target
@@ -62,4 +67,43 @@ fn a_mesh_style_vertex_program_makes_a_mesh_pipeline() {
         panic!("{:?}", t.shaders);
     };
     assert_eq!(pso.mesh_threads(), Some([128, 1, 1]));
+}
+
+/// An 8x8 RGBA8 target cleared to black, `pso` and `binding` set on a list.
+fn list_into(
+    t: &Title<Metal>,
+    pso: &Rc<<Metal as GraphicsBackend>::RenderPipeline>,
+    binding: Option<Rc<Binding>>,
+) -> (Rc<Texture>, NativeList<Metal>) {
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.clear_render_target(&color, [0.0; 4]);
+    list.set_graphics_pipeline(pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    (color, list)
+}
+
+fn pixels(t: &Title<Metal>, color: &Texture) -> Vec<[u8; 4]> {
+    let mut p = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(color, 0, 0, &mut p, 8 * 4, 0);
+    p.chunks(4).map(|c| c.try_into().unwrap()).collect()
+}
+
+/// `DispatchMesh` of one group of the triangle program colours the whole target.
+#[test]
+fn a_mesh_draw_colours_the_target() {
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }

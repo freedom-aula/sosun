@@ -468,6 +468,12 @@ formats, blend and write masks, and no vertex descriptor. Its thread-group size 
 reflection of the mesh shader (`IRShaderReflectionCopyMeshInfo`, `Msc::mesh_threads`, cached on disk
 as conversions are), kept on the pipeline (`RenderPipeline::mesh_threads`) for the draw.
 Test: `victory-gpu` `native::tests::mesh_tests::a_mesh_style_vertex_program_makes_a_mesh_pipeline`.
+A mesh pipeline draws with `DrawCall::Mesh { groups }` (`NativeList::dispatch_mesh`):
+`drawMeshThreadgroups` with that thread-group size and no object stage, or, for an `ExecuteIndirect`
+record (three group counts, Metal's `MTLDispatchThreadgroupsIndirectArguments` word for word),
+`drawMeshThreadgroupsWithIndirectBuffer`; a counted record goes through the same gate as counted draws
+(three words). A mesh call of a vertex pipeline, or the reverse, is dropped. Test:
+`mesh_tests::a_mesh_draw_colours_the_target`.
 
 ### Mapping into victory-gpu (not done; victory-gpu is untouched)
 

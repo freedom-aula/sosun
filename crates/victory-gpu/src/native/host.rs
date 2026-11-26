@@ -953,7 +953,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, if matches!(call, DrawCall::Indexed { .. }) { 20 } else { 16 })?);
+                    p.indirect = Some(self.resolve(*a, match call { DrawCall::Indexed { .. } => 20, DrawCall::Mesh { .. } => 12, DrawCall::Arrays { .. } => 16 })?);
                 }
                 if let Some((a, index)) = count {
                     let (b, at) = self.resolve(*a, 4)?;

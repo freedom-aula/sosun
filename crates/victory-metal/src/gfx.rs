@@ -1695,10 +1695,10 @@ impl Metal {
                 c.waitForFence(f);
             }
             for d in &rp.draws {
-                let words = if matches!(d.call, DrawCall::Indexed { .. }) {
-                    5
-                } else {
-                    4
+                let words = match d.call {
+                    DrawCall::Indexed { .. } => 5,
+                    DrawCall::Arrays { .. } => 4,
+                    DrawCall::Mesh { .. } => 3,
                 };
                 gates.push(match (d.count, d.indirect) {
                     (Some(count), Some(record)) => {
@@ -1755,10 +1755,20 @@ impl Metal {
         if let Some((f, started)) = order
             && started.get()
         {
-            e.waitForFence_beforeStages(f, MTLRenderStages::Vertex);
+            e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
         }
         let mut named = Vec::new();
         for (k, d) in rp.draws.iter().enumerate() {
+            // The stage that reads the draw's buffers before the pixel shader.
+            let first = match (d.pipeline.mesh, d.call) {
+                (Some(_), DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. }) => MTLRenderStages::Vertex,
+                _ => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| eprintln!("metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"));
+                    continue;
+                }
+            };
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
@@ -1829,7 +1839,7 @@ impl Metal {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
-                    MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                    first | MTLRenderStages::Fragment,
                 );
             }
             for (slot, (b, title)) in d.vertex_buffers.iter().enumerate() {
@@ -1864,7 +1874,7 @@ impl Metal {
                     e.useResource_usage_stages(
                         ProtocolObject::from_ref(&*ab.buf),
                         MTLResourceUsage::Read,
-                        MTLRenderStages::Vertex,
+                        first,
                     );
                 }
                 // A counted record is read from its gate's buffer.
@@ -1872,6 +1882,18 @@ impl Metal {
                     Some(g) => (&**g, 0),
                     None => (&*ab.buf, title as usize - ab.base as usize),
                 };
+                if let (Some(threads), DrawCall::Mesh { .. }) = (d.pipeline.mesh, d.call) {
+                    // SAFETY: the record (three group counts) is inside the live buffer.
+                    unsafe {
+                        e.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                            args,
+                            at,
+                            size([1, 1, 1]),
+                            threads,
+                        )
+                    };
+                    continue;
+                }
                 // SAFETY: the record is inside the live buffer (the caller resolved it).
                 unsafe { e.setVertexBuffer_offset_atIndex(Some(args), at, DRAW_ARGUMENTS) };
                 match (d.call, d.index_buffer) {
@@ -1905,12 +1927,22 @@ impl Metal {
                         e.endEncoding();
                         return Err("indexed draw without an index buffer".into());
                     }
+                    (DrawCall::Mesh { .. }, _) => unreachable!("a mesh draw of a vertex pipeline"),
                 }
                 continue;
             }
             let mut dp = [0u32; 5];
             let ib: u16;
             match d.call {
+                DrawCall::Mesh { groups } => {
+                    let threads = d.pipeline.mesh.expect("a mesh pipeline");
+                    let [x, y, z] = groups.map(|n| n as usize);
+                    e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                        size([x, y, z]),
+                        size([1, 1, 1]),
+                        threads,
+                    );
+                }
                 DrawCall::Arrays {
                     vertex_count,
                     instance_count,
