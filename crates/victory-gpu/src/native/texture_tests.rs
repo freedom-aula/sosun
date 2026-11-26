@@ -112,8 +112,9 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
 /// next submission, not a scanner round later (a round is seconds long once the title streams).
 #[test]
 fn a_texture_uploaded_blank_is_probed_at_each_submission() {
-    let Some(pool) = pool(9105, 4) else { return };
-    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    // 256 KiB: 64 pages, more than a sampling probe reads.
+    let Some(pool) = pool(9105, (256 << 10) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
     with_title(|t| {
@@ -125,6 +126,12 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     with_title(|t| {
         t.sync_dirty();
         assert_eq!(t.uploads_of(key), 2, "uploaded again at the next submission");
+    });
+    // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
+    pool.write(3 * 4096 + 100, &[1u8; 16]);
+    with_title(|t| {
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 3, "a small write is seen at the next submission too");
     });
 }
 
