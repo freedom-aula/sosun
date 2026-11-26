@@ -2389,6 +2389,54 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
     }
 }
 
+/// "a cross-lane operation outside compute" names the operation and the stage, so a tester log
+/// shows which form the title's pixel programs use (127 of 639 refusals in the M5 Ultra log of
+/// #147, all graphics). A quad permutation still lowers in a pixel program, not in a vertex one.
+#[test]
+fn a_cross_lane_operation_outside_compute_says_which_and_where() {
+    const MRT0: [u32; 2] = [0xF800_180F, 0x0101_0101]; // exp mrt0 v1, v1, v1, v1 done vm
+    const POS0: [u32; 2] = [0xF800_08CF, 0x0101_0101]; // exp pos0 v1, v1, v1, v1 done
+    const END: u32 = 0xBF81_0000; // s_endpgm
+    let row_shr = [0x7E02_02FA, 0xFF01_1100]; // v_mov_b32_dpp v1, v0 row_shr:1
+    let quad = [0x7E02_02FA, 0xFF00_B100]; // v_mov_b32_dpp v1, v0 quad_perm:[1,0,3,2]
+    // ds_bpermute_b32 v1, v0, v0; s_waitcnt lgkmcnt(0)
+    let bpermute = [0xDACC_0000, 0x0100_0000, 0xBF8C_C07F];
+    // v_readlane_b32 s4, v0, 3; v_mov_b32 v1, s4
+    let readlane = [0xD760_0004, 0x0201_0700, 0x7E02_0204];
+    let with = |op: &[u32], exp: [u32; 2]| [op, &exp[..], &[END]].concat();
+    let ps = |code: &[u32]| lower_ps(code, false, vec![], vec![], 0, 0, vec![], false);
+
+    ps(&with(&quad, MRT0)).unwrap_or_else(|e| panic!("quad_perm: {e}"));
+    for (op, want) in [
+        (
+            &row_shr[..],
+            "DPP row_shl, row_shr or row_ror in a pixel program",
+        ),
+        (&bpermute[..], "ds_bpermute_b32 in a pixel program"),
+        (
+            &readlane[..],
+            "v_readlane_b32 of a constant lane in a pixel program",
+        ),
+    ] {
+        let err = ps(&with(op, MRT0)).err().expect(want).to_string();
+        assert!(
+            err.contains(&format!("a cross-lane operation outside compute: {want}")),
+            "{err}"
+        );
+    }
+    for (op, want) in [
+        (&bpermute[..], "ds_bpermute_b32 in a vertex program"),
+        (&quad[..], "DPP quad_perm in a vertex program"),
+    ] {
+        let vs = lower_vs(&with(op, POS0), false, vec![], false);
+        let err = vs.err().expect(want).to_string();
+        assert!(
+            err.contains(&format!("a cross-lane operation outside compute: {want}")),
+            "{err}"
+        );
+    }
+}
+
 /// A `v_mul_f32` butterfly over the wave, as `WaveActiveProduct` expands, is
 /// the product of the lanes: it lowers like the sum and min/max sections.
 #[test]
