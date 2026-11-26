@@ -186,7 +186,25 @@ pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
 }
 
 pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
-    libm::nextafterf(x, y as f32)
+    // Compared as doubles: `y` rounded to a float can be `x` itself, which would not move.
+    let wide = f64::from(x);
+    if x.is_nan() || y.is_nan() {
+        return (wide + y) as f32;
+    }
+    if wide == y {
+        return y as f32;
+    }
+    let toward = if y > wide {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    };
+    let r = libm::nextafterf(x, toward);
+    // A finite float stepping past FLT_MAX overflows.
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 pub extern "win64" fn fma(x: f64, y: f64, z: f64) -> f64 {
@@ -607,6 +625,35 @@ mod tests {
         assert_eq!(nextafterf(1.0, 2.0), f32::from_bits(1.0f32.to_bits() + 1));
         assert!((erff(0.5) - 0.5204999).abs() < 1e-6);
         assert!((tgamma(5.0) - 24.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nexttowardf_steps_toward_its_double_target() {
+        // The target is a double: one between two floats still moves x a step.
+        let one = 1.0f32.to_bits();
+        assert_eq!(nexttowardf(1.0, 1.0 + 1e-10).to_bits(), one + 1);
+        assert_eq!(nexttowardf(1.0, 1.0 - 1e-10).to_bits(), one - 1);
+        assert_eq!(nexttowardf(0.0, 1e-300).to_bits(), 1);
+        assert_eq!(nexttowardf(-0.0, -1e-300).to_bits(), 0x8000_0001);
+        assert_eq!(nexttowardf(1.0, 1.0), 1.0);
+        assert_eq!(nexttowardf(1.0, 2.0).to_bits(), one + 1);
+        assert_eq!(nexttowardf(0.0, -0.0).to_bits(), 0x8000_0000);
+        assert_eq!(nexttowardf(-0.0, 0.0).to_bits(), 0);
+        for (target, sign) in [
+            (f64::INFINITY, 1.0),
+            (1e300, 1.0),
+            (f64::NEG_INFINITY, -1.0),
+        ] {
+            set_errno(0);
+            let r = nexttowardf(f32::MAX * sign as f32, target);
+            assert_eq!(r, f32::INFINITY * sign as f32);
+            assert_eq!(errno(), ERANGE, "overflow toward {target:e}");
+        }
+        set_errno(0);
+        assert_eq!(nexttowardf(f32::INFINITY, f64::INFINITY), f32::INFINITY);
+        assert_eq!(errno(), 0, "an infinity in is no overflow");
+        assert!(nexttowardf(1.0, f64::NAN).is_nan());
+        assert!(nexttowardf(f32::NAN, 1.0).is_nan());
     }
 
     #[test]
