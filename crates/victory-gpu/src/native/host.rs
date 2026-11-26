@@ -568,6 +568,116 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// `VICTORY_TRACE_CONTENT=<dir>`: for the first draws into a depth target, every texture and
+    /// constant buffer their descriptor tables hold: its view, the fraction of its title memory
+    /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
+    /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
+    #[inline(never)]
+    fn trace_content(&self, root: &[Option<Root<B>>]) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
+        // `<dir>[,<seconds>]`: from that many seconds after the first draw on.
+        let v = v.to_string_lossy().into_owned();
+        let (dir, after) = v.rsplit_once(',').map_or((v.as_str(), 0), |(d, s)| (d, s.parse().unwrap_or(0)));
+        let dir = std::path::PathBuf::from(dir);
+        if start.elapsed().as_secs() < after {
+            return;
+        }
+        // The boot passes (a 3840-wide texture sampled, nothing else) are skipped.
+        let boot = root.iter().any(|r| {
+            let Some(Root::Table(h, at)) = r else { return false };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            (0..8u64).any(|k| match crate::descriptor::view(base + k * Self::step(h.kind)) {
+                Some(crate::descriptor::View::Shader(r, _)) => texture_info_of(r).is_some_and(|i| i.width >= 3840),
+                _ => false,
+            })
+        });
+        // ... and the fullscreen triangle's (one 96-byte constant buffer and no texture).
+        let plain = !root.iter().any(|r| {
+            let Some(Root::Table(h, at)) = r else { return false };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            (0..8u64).any(|k| match crate::descriptor::view(base + k * Self::step(h.kind)) {
+                Some(crate::descriptor::View::Shader(..) | crate::descriptor::View::Placed(..)) => true,
+                Some(crate::descriptor::View::Constant(_, n)) => n != 96,
+                _ => false,
+            })
+        });
+        if boot || plain {
+            return;
+        }
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n >= 600 {
+            return;
+        }
+        let ppm = |name: String, w: usize, h: usize, px: &[u8], bgra: bool| {
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(name), out);
+        };
+        let kinds: Vec<String> = root
+            .iter()
+            .map(|r| match r {
+                Some(Root::Constants(w)) => format!("constants{w:?}"),
+                Some(Root::View(a)) => format!("view{a:#x}"),
+                Some(Root::Table(_, at)) => format!("table@{at}"),
+                None => "unset".into(),
+            })
+            .collect();
+        tracing::info!(draw = n, ?kinds, "content: draw");
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            let base = h.start + *at as u64 * Self::step(h.kind);
+            for k in 0..8u64 {
+                let handle = base + k * Self::step(h.kind);
+                let (key, info, what) = match crate::descriptor::view(handle) {
+                    Some(crate::descriptor::View::Constant(a, size)) => {
+                        let mut b = vec![0u8; (size as usize).min(1 << 16)];
+                        let ok = super::safe_read(a as *const u8, &mut b);
+                        let nz = b.iter().filter(|&&x| x != 0).count();
+                        let floats: Vec<f32> = b.chunks_exact(4).take(24).map(|w| f32::from_le_bytes(w.try_into().unwrap())).collect();
+                        tracing::info!(draw = n, slot, entry = k, addr = format!("{a:#x}"), size, readable = ok, nonzero = nz, ?floats, "content: constant buffer");
+                        continue;
+                    }
+                    Some(crate::descriptor::View::Shader(r, d)) => (r, texture_info_of(r), format!("srv {d:?}")),
+                    Some(crate::descriptor::View::Placed(_, res, d)) if res[0] > 1 => {
+                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                        (super::textures::placed_key(address, &res), placed_info_of(address, &res), format!("placed {res:?}"))
+                    }
+                    _ => continue,
+                };
+                let Some(info) = info else {
+                    tracing::info!(draw = n, slot, entry = k, what, "content: view without a texture");
+                    continue;
+                };
+                let tiled = super::textures::read_memory(info.memory, info.size.min(1 << 26));
+                let nz = tiled.iter().filter(|&&b| b != 0).count();
+                tracing::info!(draw = n, slot, entry = k, key = format!("{key:#x}"), format = info.format, w = info.width, h = info.height, layers = info.depth_or_layers, flags = info.flags, at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, what, "content: texture");
+                if !matches!(info.format, 28 | 87 | 91 | 29) || SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+                    continue;
+                }
+                SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+                let (w, hh) = (info.width as usize, info.height as usize);
+                let bgra = matches!(info.format, 87 | 91);
+                let mut px = vec![0u8; w * hh * 4];
+                if let Some(desc) = info.desc()
+                    && let Ok(tmp) = self.backend.create_texture(&desc)
+                    && super::textures::upload(&self.backend, &tmp, &info, &tiled).is_ok()
+                {
+                    self.backend.read_texture(&tmp, 0, 0, &mut px, w * 4, w * hh * 4);
+                    ppm(format!("c{n}_{k}_title.ppm"), w, hh, &px, bgra);
+                }
+                if let Some(Res::Texture(t)) = self.resources.borrow().get(&key) {
+                    self.backend.read_texture(t, 0, 0, &mut px, w * 4, w * hh * 4);
+                    ppm(format!("c{n}_{k}_host.ppm"), w, hh, &px, bgra);
+                }
+            }
+        }
+    }
+
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
@@ -607,11 +717,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heaps,
                 vertex,
                 index,
+                targets,
                 ..
             } => {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
+                self.trace_content(root);
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
@@ -855,5 +967,15 @@ fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
 
 #[cfg(not(target_os = "macos"))]
 fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn placed_info_of(address: u64, res: &[u32; 14]) -> Option<super::textures::TextureInfo> {
+    crate::resource::placed_info(address, res)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn placed_info_of(_: u64, _: &[u32; 14]) -> Option<super::textures::TextureInfo> {
     None
 }

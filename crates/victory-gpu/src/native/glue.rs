@@ -312,6 +312,10 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}.ppm")), out);
+            // The alpha channel as grey.
+            let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
+            alpha.extend(px.chunks_exact(4).flat_map(|p| [p[3], p[3], p[3]]));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_alpha.ppm")), alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
