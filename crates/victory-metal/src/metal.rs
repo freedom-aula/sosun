@@ -59,6 +59,11 @@ pub struct Queue(
     pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// Whether the pool residency set was added to it.
     pub(crate) std::cell::Cell<bool>,
+    /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
+    /// tracking cannot see those accesses: command buffers wait for the one before through this
+    /// event (and encoders within one through a fence), counted by `.3`.
+    pub(crate) Retained<ProtocolObject<dyn MTLEvent>>,
+    pub(crate) std::cell::Cell<u64>,
 );
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
 pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
@@ -134,7 +139,8 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        Ok(Queue(q, std::cell::Cell::new(false)))
+        let order = self.dev.newEvent().ok_or("newEvent failed")?;
+        Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {

@@ -18,6 +18,15 @@ use std::ptr::NonNull;
 
 type Res = Retained<ProtocolObject<dyn MTLResource>>;
 
+/// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
+/// for and updates when the queue's buffers are made resident by a set instead of named.
+struct Order {
+    fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
+    started: Cell<bool>,
+}
+
+type Ordering<'a> = Option<(&'a ProtocolObject<dyn MTLFence>, &'a Cell<bool>)>;
+
 /// `IRDescriptorTableEntry`: `{ gpuVA, textureViewID, metadata }`.
 const ENTRY: usize = 24;
 
@@ -688,12 +697,31 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
+        // With the pool set on the queue the encoders do not name the title's buffers, so Metal
+        // cannot order them: this command buffer starts after the previous one finished, and each
+        // encoder after the one before.
+        let set_on_queue = queue.1.get();
+        let order = set_on_queue.then(|| {
+            let n = queue.3.get();
+            queue.3.set(n + 1);
+            if n > 0 {
+                cb.encodeWaitForEvent_value(&queue.2, n);
+            }
+            Order {
+                fence: self.dev.newFence(),
+                started: Cell::new(false),
+            }
+        });
+        let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
         for pass in work.passes {
             match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, queue.1.get())?,
-                Pass::Render(rp) => self.encode_render(&cb, rp, queue.1.get())?,
-                Pass::Blit(ops) => self.encode_blit(&cb, ops)?,
+                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order)?,
+                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order)?,
+                Pass::Blit(ops) => self.encode_blit(&cb, ops, order)?,
             }
+        }
+        if set_on_queue {
+            cb.encodeSignalEvent_value(&queue.2, queue.3.get());
         }
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
@@ -708,8 +736,14 @@ impl Metal {
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         ops: &[BlitOp<'_, Metal>],
+        order: Ordering<'_>,
     ) -> Result<(), String> {
         let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+        if let Some((f, started)) = order
+            && started.get()
+        {
+            e.waitForFence(f);
+        }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
         for op in ops {
             match op {
@@ -730,6 +764,10 @@ impl Metal {
                     e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
                 }
             }
+        }
+        if let Some((f, started)) = order {
+            e.updateFence(f);
+            started.set(true);
         }
         e.endEncoding();
         Ok(())
@@ -752,11 +790,17 @@ impl Metal {
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         dispatches: &[crate::backend::Dispatch<'_, Metal>],
         set_on_queue: bool,
+        order: Ordering<'_>,
     ) -> Result<(), String> {
         if dispatches.is_empty() {
             return Ok(());
         }
         let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
+        if let Some((f, started)) = order
+            && started.get()
+        {
+            e.waitForFence(f);
+        }
         for d in dispatches {
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
@@ -771,6 +815,10 @@ impl Metal {
             }
             e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
         }
+        if let Some((f, started)) = order {
+            e.updateFence(f);
+            started.set(true);
+        }
         e.endEncoding();
         Ok(())
     }
@@ -780,6 +828,7 @@ impl Metal {
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         rp: &RenderPass<'_, Metal>,
         set_on_queue: bool,
+        order: Ordering<'_>,
     ) -> Result<(), String> {
         let desc = MTLRenderPassDescriptor::new();
         for (i, c) in rp.color.iter().enumerate() {
@@ -828,6 +877,11 @@ impl Metal {
         let e = cb
             .renderCommandEncoderWithDescriptor(&desc)
             .ok_or("no render encoder")?;
+        if let Some((f, started)) = order
+            && started.get()
+        {
+            e.waitForFence_beforeStages(f, MTLRenderStages::Vertex);
+        }
         let rt_size = rp
             .color
             .first()
@@ -1006,6 +1060,10 @@ impl Metal {
                     };
                 }
             }
+        }
+        if let Some((f, started)) = order {
+            e.updateFence_afterStages(f, MTLRenderStages::Fragment);
+            started.set(true);
         }
         e.endEncoding();
         Ok(())

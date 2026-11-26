@@ -580,6 +580,11 @@ and raises fence values.
   full-screen triangle, after the queue's earlier work (`PresentBackend`).
 - **Residency**: pool buffers join one `MTLResidencySet` when first used by a submission, the set is added
   to each queue once, and encoders skip `useResource` for them; a buffer leaves the set when dropped.
+  `useResource` also told Metal's hazard tracking which buffers an encoder touches by GPU address; without
+  it nothing orders a copy before the dispatch that reads its result (the one flaky test that showed it), so
+  on a queue with the set every command buffer waits for the previous one through a queue `MTLEvent` and
+  every encoder for the one before through an `MTLFence`: work on a queue is serial. D3D12 barriers
+  (`ResourceBarrier`) are still not translated; a title's UAV barriers are covered by that serialisation.
 
 ### What is left
 
