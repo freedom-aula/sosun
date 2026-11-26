@@ -208,6 +208,7 @@ mod tests {
         let static_at = w(4) as usize;
         assert_eq!(&blob[static_at..], &samplers);
         assert_eq!(blob.len(), static_at + 52);
+        // SAFETY: as above; an unknown version is refused before any read.
         assert!(unsafe { serialize(3, &desc) }.is_none());
     }
 }

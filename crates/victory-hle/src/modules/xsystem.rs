@@ -149,6 +149,7 @@ mod device_type {
     use std::ffi::c_void;
 
     use victory_gpu::console;
+
     use super::console_mode;
 
     use crate::modules::files::host;
@@ -285,6 +286,7 @@ mod device_type {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use victory_gpu::console::Console;
 
         fn w(s: &str) -> Vec<u16> {
             s.encode_utf16().chain([0]).collect()
