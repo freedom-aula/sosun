@@ -48,7 +48,7 @@ export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -s
 echo "Running $exe"
 echo "Log: $log"
 
-"$bin" run --execute "${headless[@]}" --unimplemented zero "$exe" >> "$log" 2>&1 &
+"$bin" run --execute ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
 if (( seconds > 0 )); then
   ( sleep "$seconds"; kill "$pid" 2>/dev/null ) &
