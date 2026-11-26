@@ -230,6 +230,51 @@ fn trace_bump(key: usize, which: usize) {
     }
 }
 
+/// `VICTORY_DUMP_TITLE=<dir>,<seconds>,<seconds>...`: at the first present after each time, the
+/// title memory behind every 8-bit colour target drawn to since the last present is read whole,
+/// the fraction of non-zero bytes logged, and the memory detiled into a scratch texture and
+/// written as `<dir>/m<time>_<n>.ppm`: what the title (CPU, DMA) put there, whatever the GPU did.
+#[inline(never)]
+fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static DONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let start = START.get_or_init(std::time::Instant::now);
+    let Ok(v) = std::env::var("VICTORY_DUMP_TITLE") else { return };
+    let mut parts = v.split(',');
+    let dir = parts.next().unwrap_or(".").to_owned();
+    let now = start.elapsed().as_secs();
+    let Some(time) = parts
+        .filter_map(|p| p.parse::<u64>().ok())
+        .find(|&t| now >= t && !DONE.lock().unwrap_or_else(|e| e.into_inner()).contains(&t))
+    else {
+        return;
+    };
+    DONE.lock().unwrap_or_else(|e| e.into_inner()).push(time);
+    with_title(|t| {
+        for (n, key) in stats.keys().enumerate() {
+            let Some(info) = crate::resource::texture_info(*key as This) else { continue };
+            if !matches!(info.format, 28 | 87 | 91 | 29) {
+                continue;
+            }
+            let tiled = super::textures::read_memory(info.memory, info.size);
+            let nz = tiled.iter().filter(|&&b| b != 0).count();
+            tracing::info!(time, n, key = format!("{key:#x}"), at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, "title memory of a colour target");
+            let Some(desc) = info.desc() else { continue };
+            let Ok(tex) = t.host.texture(&desc) else { continue };
+            if super::textures::upload(&t.host.backend, &tex, &info, &tiled).is_err() {
+                continue;
+            }
+            let (w, h) = (info.width as usize, info.height as usize);
+            let mut px = vec![0u8; w * h * 4];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
+            let bgra = matches!(info.format, 87 | 91);
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{time}_{n}.ppm")), out);
+        }
+    });
+}
+
 /// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
 /// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`.
 fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
@@ -291,6 +336,7 @@ fn trace_present(resource: This) {
         })
         .unwrap_or_default();
         dump_targets(&stats);
+        dump_title_memory(&stats);
         let pi = crate::resource::texture_info(resource);
         tracing::info!(
             present = ?resource,
