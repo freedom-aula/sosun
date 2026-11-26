@@ -16,6 +16,13 @@ same Cargo configuration when building and launching; a one-off build with
 launching. The launcher needs Cargo available and reports configuration errors
 rather than falling back to a possibly stale default binary.
 
+Both scripts also find rustup when it is installed but not on PATH yet: in
+`$CARGO_HOME/bin` (default `~/.cargo/bin`), where the rustup.rs installer puts
+it before a new terminal opens, and in `$HOMEBREW_PREFIX/opt/rustup/bin`, since
+Homebrew's rustup formula is keg-only. Setup warns and uses it. The launcher
+uses it only when no `cargo` is on PATH, and says so plainly when there is
+neither.
+
 Game-free regressions use real Cargo resolution and fixture executables under
 stock macOS Bash 3.2: `/bin/bash tools/macos/tests/target-directory.sh`.
 Setup prerequisites and its build are stubbed; no game or SDK files are needed.
@@ -218,7 +225,7 @@ Title to host (`victory_bridge_to_host`, reached through a 32-byte stub per impo
 
 The bridge covers up to 12 integer or pointer arguments. A function with `float` or `double` arguments cannot be remapped without its signature, because the two ABIs number the float registers differently once an integer comes first. Those are written `extern "win64"` and registered with `declare_win64(address)`; they go through `victory_bridge_win64`, which swaps GS and nothing else (up to 8 arguments; floats stay in `xmm0..3`). The probe does this with `ProbeScale(double, int)`. A float return needs nothing.
 
-An unresolved import gets a stub whose context word is its `ImportSite`; the bridge hands the site to the handler in place of the first argument, which logs (`ReturnZero`) or aborts (`Trap`), the same policies as the Wine path. The probe checks the names reach the report and that `ReturnZero` returns 0.
+An unresolved import gets a stub whose context word is its `ImportSite`; the bridge hands the site to the handler in place of the first argument, which logs (`ReturnZero`) or aborts (`Trap`), the same policies as the Wine path. The probe checks the names reach the report and that `ReturnZero` returns 0. Once per bound image (late-loaded DLLs included), `native imports bound` names them at warn level as `dll!symbol` (`dll!#n` for an ordinal) in its `unresolved` field, so a log shows what a DLL lacks before any of it is called; with nothing missing the line stays at info.
 
 Host to title (`call_win64(fn, &[u64])`): four register arguments, the rest on the stack above 32 bytes of shadow space, 16-byte alignment, GS to the thread's TEB, call, GS back. Used for TLS callbacks, entry points, thread start routines and every callback title code hands the host. It nests: title, host, title again, with an explicit base each time rather than a toggle. A test (`the_bridge_preserves_windows_callee_saved_registers`) runs hand-assembled Windows-ABI code that sets `rdi`, `rsi` and `xmm6`, calls a host function that clobbers all three, and checks they survive.
 
@@ -365,6 +372,25 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
+## LDS instructions addressed by M0
+
+`ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address
+operand and were refused as "an LDS address" (three compute programs in the story-load log of
+issue #123). They are now lowered as the RDNA2 ISA gives them (12.13, 10.4):
+- `ds_append` (`ds_consume`): one atomic add (subtract) of the count of the lanes running at the
+  LDS byte address M0 + offset, done by the first of them, and its old value returned to all of
+  them. The ISA calls the address "M0.base"; for LDS, M0 is the byte address itself, as LLVM sets
+  it (`AMDGPUDAGToDAGISel::SelectDSAppendConsume` copies the pointer to M0 unchanged).
+- `ds_read_addtid_b32` (`ds_write_addtid_b32`): the dword at offset + M0[15:0] + 4 × the lane's id
+  in the console's wave.
+They make the program use the console's lanes (`console_lanes`). Where the host splits a console
+wave (wave64 on 32-lane host waves, a group of more than 32 lanes) an append or consume is still
+refused, "ds_append or ds_consume in a console wave the host splits": the console makes one atomic
+for the whole wave. As for other LDS accesses, addresses are taken as aligned and in bounds (the
+ISA clamps append and consume by M0's size). The `ds_gws` group (GDS) stays refused, by name.
+`addr_tests::lds_append_consume_and_addtid_follow_m0_on_the_gpu` (`victory-gpu`) runs them on
+Metal, wave32 and wave64.
+
 ## Scalar absolute difference
 
 `s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in
@@ -372,6 +398,16 @@ the story-load log of issue #123). It is lowered as the RDNA2 ISA gives it (SOP2
 difference `S0 - S1`, wrapping, negated when negative as a signed number, and SCC set when the
 result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
 (`victory-gpu`) runs it on Metal, wrapping cases included.
+
+## 16-bit reads of inputs not marked 16-bit
+
+A pixel shader that interpolates an attribute with `v_interp_p1ll_f16`/`v_interp_p2_f16`, or
+reads its high half, when the stage data does not mark that input 16-bit (input flag bit 3) was
+refused as "a 16-bit read of a 32-bit input" (three guessed pipelines in the story-load log of
+issue #123). The refusal now says which, after a colon: "an f16 interpolation of an input not
+marked 16-bit" or "the high half of an input not marked 16-bit". Nothing is lowered: what such a
+read returns from a 32-bit attribute is not documented, and in a guessed pipeline the missing mark
+may be the stage data's (guessed) rather than the program's.
 
 ## Bring-up diagnostics (native path)
 
