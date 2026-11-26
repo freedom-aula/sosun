@@ -373,6 +373,8 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 
 - **Prewarming** (`VICTORY_NO_SHADER_PREWARM=1` turns it off): each distinct shader the title registers is handed to six `shader-prewarm` threads that call `Shader::native()` and drop the result, so translation happens during the title's load, off its threads. Without it the first world frame binds about 1,300 pipelines for the first time and translates each inline on the render thread; large compute shaders take 190-600 ms each (mostly structurisation), 60-70 of them add up to 25-29 s, and the title's own 30 s watchdog kills the game. `native()` is a `OnceLock`, so a bind that beats the pool waits for or does the translation itself, as before. The log says `shaders prewarmed n=<n> pending=<queued> dxil_mb=<held>` at each power of two; `dxil_mb` is the DXIL the prewarmed translations keep. Measured cold on an M5 Pro (series-s, 2026-11-27): the title registers about 21,600 shaders, the pool spends about 640 CPU-seconds on them (two thirds in the ~700 compute shaders of 64 KB or more; there are no larger pixel or vertex shaders), and the translations keep about 40 MB of DXIL while their containers are let go, so the prewarm adds no measurable peak memory (peak RSS 9.1 and 13.9 GB with it, 16.0 and 16.4 GB without; the spread between runs is larger than any effect). The world frame came 3-87 s later with it in those runs, within the spread of runs without it (158-202 s).
 
+A program with register-relative moves (`v_movrel*`, `v_swaprel`) is structured once fewer (`range::build`): its form with unbounded moves was structured first even when the bounded form was used. On synthetic programs of about 18,000 words with one such move, `range::build` went from 195-204 to 160-165 ms (nested branches) and 78-85 to 65-68 ms (shallow ones), release build, M5 Pro. Programs without such moves were structured once already. A program whose unbounded form does not structure is now tried bounded too.
+
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
 ## LDS instructions addressed by M0
@@ -803,6 +805,19 @@ the_host_refuses_a_whole_wave_section_naming_its_step` (`victory-gpu`) checks th
 native host's own path: the container made from the title's pieces, the host's options. The
 story-load log of issue #110 (Series S) has three compute programs refused with the old message;
 nothing is lowered yet.
+
+## Groups whose lanes are not a multiple of 64 (wave32 host)
+
+With `Options::wave32_host`, what crosses the two host waves of a console wave goes through the
+`xchg` group-shared array (`lower/halves.rs`, `docs/metal-backend.md`). A group of 96 lanes has a
+last console wave of 32 lanes: one host wave, no upper half, and nothing wrote that half's slots,
+so its ballot's high dword, its reductions and lane reads took whatever an earlier exchange (or
+nothing) left there. Now a slot no thread writes is not used: a ballot's missing half is 0, a
+reduction is the lower half's alone (the console's lanes past the group are off, so a whole-wave
+section adds the `v_cndmask` 0 they hold) and a lane read of a missing lane gives 0. Guess: the
+console's `v_readlane` of a lane the group lacks reads whatever that lane's VGPR holds; 0 is ours.
+`split_wave_tests::a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks` (`victory-gpu`)
+runs a ballot and a whole-wave sum in a 96-lane group on Metal.
 
 ## ExecuteIndirect on the native host
 

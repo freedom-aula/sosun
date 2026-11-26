@@ -666,7 +666,9 @@ once, or (group of one console wave) behind uniform scalar branches outside loop
 per-lane loops the value is left unknown and the program is refused if anything uses it; LDS shared without a
 barrier in divergent code is refused too. The barriers that sync such LDS (`split_wave_barriers`) go in the
 same places: blocks each thread runs once, or (the group being one console wave) reached by uniform scalar
-branches alone outside loops. A program refused for either is translated again with each `s_cbranch_execz`
+branches alone outside loops. A scalar branch on an SCC computed from a `v_readfirstlane` does not count as uniform
+here: each host wave reads its own first lane, so the halves can take different ways and never meet at the
+barrier (`split_scc`); code behind one is treated as divergent. A program refused for either is translated again with each `s_cbranch_execz`
 to a bare `s_endpgm` dropped (`ir::keep_lanes_to_end`): the usual `if (id < n) { whole shader }` early exit.
 Its lanes then run on to the end with EXEC off, as on the console while their wave has a lane left, and reach
 every barrier. Only a wave with no lane left runs that code too, which changes nothing but scalar memory
