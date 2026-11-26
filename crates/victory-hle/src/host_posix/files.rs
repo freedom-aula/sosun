@@ -211,8 +211,8 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
         OPEN_ALWAYS => {
             options.create(true).write(true);
         }
-        TRUNCATE_EXISTING => {
-            options.truncate(true).write(true);
+        TRUNCATE_EXISTING if access & (GENERIC_WRITE | GENERIC_ALL) != 0 => {
+            options.truncate(true);
         }
         _ => {
             set_error(ERROR_INVALID_PARAMETER);
@@ -878,6 +878,33 @@ mod tests {
         assert!(m("a?c", "abc"));
         assert!(!m("a?c", "ac"));
         assert!(!m("*.bin", "a.txt"));
+    }
+
+    #[test]
+    fn truncate_existing_requires_generic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.dat");
+        std::fs::write(&path, b"save").unwrap();
+        let name = wide(path.to_str().unwrap());
+        let truncate = |access| {
+            let null = std::ptr::null_mut();
+            CreateFileW(name.as_ptr(), access, 0, null, TRUNCATE_EXISTING, 0, null)
+        };
+
+        for access in [GENERIC_READ, 0, FILE_WRITE_DATA, FILE_APPEND_DATA] {
+            let handle = truncate(access);
+            assert_eq!(std::fs::read(&path).unwrap(), b"save");
+            assert_eq!(handle, invalid_handle());
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+
+        for access in [GENERIC_WRITE, GENERIC_ALL] {
+            std::fs::write(&path, b"save").unwrap();
+            let handle = truncate(access);
+            assert_ne!(handle, invalid_handle(), "access {access:#x}");
+            assert_eq!(super::super::CloseHandle(handle), 1);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        }
     }
 
     /// `FILE_APPEND_DATA` alone writes at the end of the file, whatever the file pointer says.

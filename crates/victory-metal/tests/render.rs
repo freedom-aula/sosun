@@ -783,3 +783,78 @@ fn the_static_sampler_table_follows_the_root_parameters() {
         assert_eq!(table.map(|r| (r.3, r.4)), Some((at, 8)), "{:?}", l.params);
     }
 }
+
+#[test]
+fn zero_count_draws_do_not_fail_validation() {
+    for m in backends() {
+        let s = Scene::new(&m, None);
+        let d1 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 0,
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        let d2 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 3,
+                instance_count: 0,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        let d3 = s.draw(
+            0.5,
+            DrawCall::Indexed {
+                index_count: 0,
+                instance_count: 1,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                wide: false,
+            },
+            0,
+            true,
+        );
+        let d4 = s.draw(
+            0.5,
+            DrawCall::Indexed {
+                index_count: 3,
+                instance_count: 0,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                wide: false,
+            },
+            0,
+            true,
+        );
+        let mut d5 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 3,
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        d5.state.viewport = Some(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 16.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        });
+        s.submit(&[s.pass(vec![d1, d2, d3, d4, d5], [0.0; 4])]);
+    }
+}

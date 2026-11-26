@@ -284,7 +284,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 **Threads.** `spawn_title_thread_with` sends `DLL_THREAD_ATTACH` before and `DLL_THREAD_DETACH` after the start routine to every image registered with `register_thread_callbacks` (`run_entry` registers the main image). `CREATE_SUSPENDED` holds the thread at a gate (the thread reads its suspension count and marks itself running under one lock, so a `SuspendThread` while it starts either parks it at the gate or finds it running); once running, `SuspendThread` is `thread_suspend` on the Mach port, retried briefly until the thread is in title code (so it holds no host lock), and `GetThreadContext` is `thread_get_state` (x86 state under Rosetta works). Waits on several objects use one epoch counter that every signal bumps (it wakes sleepers only while a thread is in such a wait, so a signal with none makes no system call); wait-all takes under a lock and gives back what it took if it cannot take all. Critical sections, SRW locks and condition variables live in the title's own structures over `wait_on_address`. Not done: mutexes (`CreateMutexW`), waitable timers, APCs, `SetThreadContext`, thread priorities.
 
-**Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Overlapped reads complete before returning. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
+**Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Overlapped reads complete before returning. `TRUNCATE_EXISTING` requires `GENERIC_WRITE` or `GENERIC_ALL`. A request with neither bit returns `ERROR_INVALID_PARAMETER` and preserves the file contents. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
 
 **dstorage on files.** `open_for_reading` calls `host_posix::files::translate`. dstorage signals no Win32 events today (completion is the status array; the fence methods are not implemented), so nothing there needs `sync::signalled`; when fences are added, a host event set by them must be followed by `sync::signalled` so waits on several objects see it. Still open: `FileExt::read_at` on the worker pool, no `kernel_will_write` once the GPU shares memory, `mmap` paths through `victory-platform`.
 
@@ -485,6 +485,12 @@ value on that edge". `addr_tests::a_wave64_mask_joined_with_data_takes_each_lane
 waves): lanes 32 to 35 take their bit from the high dword. The story-load log of issue #110
 (Series S) has three compute programs refused with the old message; whether they are this wave64
 form is not known.
+
+In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
+vector compare result. At the join each mesh thread uses its group index modulo the console
+wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
+A branch or operand that depends on a first-lane read can differ between the host waves and
+stays refused.
 
 ## Console pipeline descriptions (device slots 0x1c8 and 0x218)
 
@@ -893,7 +899,7 @@ Integer render targets never blend (Metal refuses a pipeline that blends one), w
 
 A render target view whose host texture cannot be made keeps its attachment slot: `glue::targets` binds nothing for that pass and refuses the draws that follow, instead of moving the later targets into earlier slots.
 
-A render target view's format says how its writes are stored, so a view that names the other format of its texture's sRGB pair (R8G8B8A8 or B8G8R8A8, UNORM against UNORM_SRGB) is drawn and cleared through a host view of the texture in that format (`Title::target_of`). The title draws its boot movie through a plain view (28) of an sRGB texture (29): drawn into the texture itself, the picture was encoded a second time and shown too bright. The view's other fields (mip, slice) are still not read.
+A render target view's format says how its writes are stored, so a view that names the other format of its texture's sRGB pair (R8G8B8A8 or B8G8R8A8, UNORM against UNORM_SRGB) is drawn and cleared through a host view of the texture in that format (`Title::target_of`). The title draws its boot movie through a plain view (28) of an sRGB texture (29): drawn into the texture itself, the picture was encoded a second time and shown too bright. A described single-sampled 1D or 2D view selects one mip and one array slice. Both the draw binding and the clear use a cached Metal view narrowed to that subresource, so the render pass uses the selected mip's size and distinct attachments do not merge into one pass. Invalid ranges, nonzero planes, and unsupported explicit layered 1D/2D or multisampled views are refused. A null description or a 3D view based at mip 0 and W slice 0 keeps the existing base attachment. Rectangles in a clear remain unsupported.
 
 ## Whole-wave sections the simulation does not follow
 
@@ -1079,3 +1085,15 @@ previously caused `victory_metal::gfx: upload_texture skipped: D32FloatS8` warni
 CPU hashing/detiling work. `Title::realize` and `Title::sync_keys` now exclude `desc.format.is_depth()`
 from `watch`, `VICTORY_MAGENTA`, `unloaded`, and CPU detile/upload (test: `victory-gpu`
 `native::texture_tests::depth_textures_are_not_watched_or_uploaded_from_cpu_memory`).
+
+## Zero-count dispatches, draws and buffer blits
+
+D3D12 treats zero-sized dispatches (`Dispatch`, `DispatchX` with thread counts), draws with zero
+vertices/indices/instances/mesh groups, zero-width/height viewports, and zero-length buffer copies
+or fills as no-ops, whereas Metal's validation layer asserts on `dispatchThreadgroups` with a zero
+grid dimension, `fillBuffer`/`copyFromBuffer` with a zero byte length, and `drawPrimitives`/
+`drawIndexedPrimitives` with `instanceCount == 0`. `NativeList` now skips recording empty direct
+commands (after checking the bound pipeline), and `victory-metal` skips encoding zero-sized direct
+dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
+`zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
+`victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).

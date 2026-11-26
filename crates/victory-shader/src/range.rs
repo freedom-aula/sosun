@@ -38,20 +38,47 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
-    let p = ir::build(code, wave64, vgprs)?;
-    let mut assumed: HashMap<usize, u8> = p
+    build_with_thread_counts(code, wave64, vgprs, false)
+}
+
+pub(crate) fn build_with_thread_counts(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    thread_counts: bool,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    let mut p = ir::build(code, wave64, vgprs)?;
+    let assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
         .flat_map(|b| &b.insts)
         .filter(|i| relative(i))
         .map(|i| (i.machine.offset, 0))
         .collect();
+    if !assumed.is_empty() {
+        // Prove ranges with full entry EXEC before applying the dispatch mask.
+        let (bounded, st) = bound_relative_moves(code, p, assumed)?;
+        if !thread_counts {
+            return Ok((bounded, st));
+        }
+        p = bounded;
+    }
+    p.thread_counts = thread_counts;
+    let st = structure::structure(&p);
+    Ok((p, st))
+}
+
+fn bound_relative_moves(
+    code: &[u8],
+    p: Program,
+    mut assumed: HashMap<usize, u8>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     // Each round grows a bound or drops a move; few programs need more than two.
     for _ in 0..8 {
         if assumed.is_empty() {
             break;
         }
-        let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
+        let q = ir::build_bounded(code, p.wave64, p.vgprs, &assumed)?;
         let Ok(s) = structure::structure(&q) else {
             break;
         };
@@ -64,7 +91,7 @@ pub fn build(
             if proven == assumed {
                 return Ok((q, Ok(s)));
             }
-            let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
+            let q = ir::build_bounded(code, p.wave64, p.vgprs, &proven)?;
             let s = structure::structure(&q);
             return Ok((q, s));
         }

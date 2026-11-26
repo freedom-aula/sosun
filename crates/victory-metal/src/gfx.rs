@@ -1547,6 +1547,12 @@ impl Metal {
         ops: &[BlitOp<'_, Metal>],
         order: Ordering<'_>,
     ) -> Result<(), String> {
+        let nonzero = |op: &BlitOp<'_, Metal>| match op {
+            BlitOp::Copy { len, .. } | BlitOp::Fill { len, .. } => *len > 0,
+        };
+        if !ops.iter().any(nonzero) {
+            return Ok(());
+        }
         let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
         if let Some((f, started)) = order
             && started.get()
@@ -1554,7 +1560,7 @@ impl Metal {
             e.waitForFence(f);
         }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
-        for op in ops {
+        for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
                     // SAFETY: both ranges lie inside live buffers (the caller resolved them).
@@ -1691,7 +1697,10 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
-        if dispatches.is_empty() {
+        let runs = |d: &crate::backend::Dispatch<'_, Metal>| {
+            d.indirect.is_some() || !d.groups.contains(&0)
+        };
+        if !dispatches.iter().any(runs) {
             return Ok(());
         }
         let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -1701,7 +1710,7 @@ impl Metal {
             e.waitForFence(f);
         }
         let mut named = Vec::new();
-        for d in dispatches {
+        for d in dispatches.iter().filter(|d| runs(d)) {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
                     // An open encoder left behind makes Metal abort at the next pass's encoder.
@@ -1749,7 +1758,7 @@ impl Metal {
         if self.trace_fails {
             let names = self.pipe_names.borrow();
             let mut l = String::from("compute: ");
-            for d in dispatches {
+            for d in dispatches.iter().filter(|d| runs(d)) {
                 let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
                 match names.get(&k) {
                     Some(n) => l.push_str(n),
@@ -1912,6 +1921,9 @@ impl Metal {
                     continue;
                 }
             };
+            if d.indirect.is_none() && empty_draw(&d.call) {
+                continue;
+            }
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
@@ -1945,6 +1957,9 @@ impl Metal {
             // The target's size bounds the scissor (Metal refuses a rectangle outside it).
             let (tw, th) = rt_size;
             if let Some(v) = d.state.viewport {
+                if v.width <= 0.0 || v.height <= 0.0 {
+                    continue;
+                }
                 e.setViewport(MTLViewport {
                     originX: v.x as f64,
                     originY: v.y as f64,
@@ -2175,6 +2190,19 @@ impl Metal {
     }
 }
 
+/// Whether a direct draw has a zero vertex, index, instance or mesh-group count.
+fn empty_draw(call: &DrawCall) -> bool {
+    match *call {
+        DrawCall::Arrays { vertex_count, instance_count, .. } => {
+            vertex_count == 0 || instance_count == 0
+        }
+        DrawCall::Indexed { index_count, instance_count, .. } => {
+            index_count == 0 || instance_count == 0
+        }
+        DrawCall::Mesh { groups } => groups.contains(&0),
+    }
+}
+
 fn set_draw_bytes(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, dp: &[u32; 5], index_type: u16) {
     // SAFETY: setVertexBytes copies the bytes before returning.
     unsafe {
@@ -2227,6 +2255,104 @@ mod transfer_tests {
         assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 1], 16, 0, 63).is_err());
         assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 32, 1 << 20).is_err());
         assert_eq!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 64, 128), Ok(128));
+    }
+}
+
+#[cfg(test)]
+mod render_target_tests {
+    use super::*;
+    use objc2_foundation::NSString;
+
+    #[test]
+    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.dim = TexDim::D2Array;
+        desc.depth_or_layers = 2;
+        desc.mips = 2;
+        desc.render_target = true;
+        let texture = metal.create_texture(&desc).unwrap();
+        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
+            }
+        }
+        let target = metal.create_texture_view(&texture, &ViewDesc {
+            format: Format::Rgba8Unorm,
+            mips: (1, 1),
+            slices: (1, 1),
+        }).expect("narrowed render target");
+        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
+
+        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 test_vertex(uint i [[vertex_id]]) {
+                return float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
+            }
+            fragment float4 test_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
+        "#), None).expect("compile generated Metal shaders");
+        let pipeline_desc = MTLRenderPipelineDescriptor::new();
+        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
+        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        pipeline_desc.setVertexFunction(Some(&vertex));
+        pipeline_desc.setFragmentFunction(Some(&fragment));
+        // SAFETY: the descriptor has a color attachment at index 0.
+        unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        let pipeline = RenderPipeline {
+            pso: metal.dev.newRenderPipelineStateWithDescriptor_error(&pipeline_desc).unwrap(),
+            depth: None,
+            cull: MTLCullMode::None,
+            raster: Raster::default(),
+            stencil: false,
+            mesh: None,
+            vs_static: None,
+            ps_static: None,
+        };
+        let queue = metal.create_queue().unwrap();
+        let fence = metal.create_fence(0).unwrap();
+        let passes = [Pass::Render(RenderPass {
+            color: vec![ColorTarget { texture: &target, clear: None }],
+            depth: None,
+            draws: vec![Draw {
+                pipeline: &pipeline,
+                topology: Topology::Triangles,
+                state: DrawState::default(),
+                root: RootArgs::default(),
+                fragment_root: None,
+                heaps: Heaps::default(),
+                resources: vec![],
+                vertex_buffers: vec![],
+                index_buffer: None,
+                call: DrawCall::Arrays {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                },
+                indirect: None,
+                count: None,
+            }],
+        })];
+        metal.submit_passes(&queue, &PassSubmission {
+            passes: &passes,
+            waits: &[],
+            signals: &[(&fence, 1)],
+        }).expect("draw through narrowed view");
+        assert!(metal.wait(&fence, 1, 2000), "draw did not complete");
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                let mut data = vec![0; n * n * 4];
+                metal.read_texture(&texture, mip, slice, &mut data, n * 4, 0);
+                let expected = if (mip, slice) == (1, 1) { [0, 255, 0, 255] } else { sentinel(mip, slice) };
+                assert!(data.as_chunks::<4>().0.iter().all(|p| *p == expected),
+                        "mip {mip} slice {slice}: expected {expected:?}, got {:?}", &data[..4]);
+            }
+        }
     }
 }
 
