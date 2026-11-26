@@ -249,3 +249,21 @@ fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
         assert!(pixels(&t, &color).iter().all(|p| *p == want), "s8 = {s8}: {:?}", pixels(&t, &color));
     }
 }
+
+/// The halves fit the converter's mesh size (32 KiB of outputs): ten parameters a literal fills
+/// (so each may hold halves) still make a mesh pipeline, those past the room left without them.
+#[test]
+fn halves_of_many_parameters_stay_within_the_mesh_size() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0x7E10_02FF, 0x3C00_3800]); // v_mov_b32 v8, 0x3c003800
+    let at = at + 2;
+    // exp param<n> v8, v8, v8, v8
+    words.splice(at..at, (0..10u32).flat_map(|n| [0xF800_020F | n << 4, 0x0808_0808]));
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(..) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+}

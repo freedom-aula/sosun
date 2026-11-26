@@ -52,8 +52,8 @@ pub const VERTEX_TABLE: u8 = 253;
 /// that half computes, up to the f16 rounding the pixel side applies.
 pub(crate) const HALF: &str = "HALF";
 
-/// Signature rows a guessed vertex or mesh program may export, the halves included: Metal takes
-/// at most 124 scalar inputs to a fragment function (31 rows).
+/// Signature elements (of up to four channels) a guessed vertex or mesh program may export, the
+/// halves included: Metal takes at most 124 scalar inputs to a fragment function (31 rows).
 const MAX_ROWS: u32 = 31;
 
 /// Where the metadata's records start (the header is 0x10 bytes).
@@ -265,7 +265,7 @@ fn infer(
         .unwrap_or(0);
 
     let (mut params, mut targets) = (Vec::<(u8, u8)>::new(), Vec::<(u8, u8)>::new());
-    let mut attrs: Vec<(u8, u8, bool)> = Vec::new(); // (attribute, 32-bit channels, flat)
+    let mut attrs: Vec<(u8, u8, bool)> = Vec::new(); // (attribute, channels, flat)
     let mut halves: Vec<(u8, u8, u8)> = Vec::new(); // (attribute, low, high halves' channels)
     let mut depth = false;
     let mut interpolates = false;
@@ -275,13 +275,12 @@ fn infer(
         let mut attr = |a: &Operand| {
             if let Operand::Attr { index, chan, high } = *a {
                 let half = f16 || high;
-                let bits = if half { 0 } else { 1 << chan };
                 match attrs.iter_mut().find(|e| e.0 == index) {
                     Some(e) => {
-                        e.1 |= bits;
+                        e.1 |= 1 << chan;
                         e.2 &= flat;
                     }
-                    None => attrs.push((index, bits, flat)),
+                    None => attrs.push((index, 1 << chan, flat)),
                 }
                 if half {
                     let e = match halves.iter().position(|e| e.0 == index) {
@@ -338,16 +337,6 @@ fn infer(
             .map(|&(n, m)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
             .collect();
         outs.push(element("SV_Position", 0, 3, rows, 0xf));
-        // Each parameter's halves (`HALF`), as many as fit.
-        let mut next = rows + 1;
-        for &(n, m) in &params {
-            if next + 2 > MAX_ROWS {
-                break;
-            }
-            outs.push(element(HALF, 2 * u32::from(n), 0, next, m));
-            outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, m));
-            next += 2;
-        }
         let outputs = params
             .iter()
             .map(|&(n, _)| VsOutput {
@@ -363,11 +352,27 @@ fn infer(
         } else {
             StageIo::Vs { inputs: Vec::new(), outputs }
         };
+        // The halves (`HALF`) of each parameter that may hold them, as many as fit: a mesh
+        // stage's outputs take 16 bytes a row for each vertex, at most 32 KiB in all (the
+        // converter's limit).
+        let max_rows = match &io {
+            StageIo::Ms(ms) => (32 * 1024 / (16 * ms.max_vertices.max(1))).min(MAX_ROWS),
+            _ => MAX_ROWS,
+        };
+        let packed = packed_params(&p);
+        let mut next = rows + 1;
+        for &(n, m) in params.iter().filter(|p| packed.contains(&p.0)) {
+            if outs.len() + 2 > max_rows as usize {
+                break;
+            }
+            outs.push(element(HALF, 2 * u32::from(n), 0, next, m));
+            outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, m));
+            next += 2;
+        }
         (io, (Vec::new(), outs))
     } else {
         let mut ins: Vec<SigElement> = attrs
             .iter()
-            .filter(|a| a.1 != 0)
             .map(|&(n, m, _)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
             .collect();
         let mut next_row = attrs.iter().map(|a| u32::from(a.0) + 1).max().unwrap_or(0);
@@ -492,6 +497,72 @@ fn infer(
         )
     };
     Ok((NativeProgram { stage, wave64, vgprs, layout, used, io, code: code.to_vec() }, sigs))
+}
+
+/// The parameters (`exp param<n>`) whose value may hold two f16 halves in some channel: all but
+/// those whose every channel comes, through moves, `v_cndmask_b32` and joins, from 32-bit float
+/// operations (`*_f32`, not a packing conversion) and inline constants. A guess that keeps the
+/// halves to the parameters that can need them; a literal, an SGPR, a load or a program input
+/// may hold halves.
+fn packed_params(p: &Program) -> std::collections::HashSet<u8> {
+    use std::collections::HashMap;
+    let mut insts: HashMap<Value, &Inst> = HashMap::new();
+    let mut phis: HashMap<Value, &[Value]> = HashMap::new();
+    for b in &p.blocks {
+        for ph in &b.phis {
+            phis.insert(ph.value, &ph.args);
+        }
+        for i in &b.insts {
+            for &(_, w) in &i.writes {
+                insts.insert(w, i);
+            }
+        }
+    }
+    let plain = |v: Value| {
+        let (mut todo, mut seen) = (vec![v], std::collections::HashSet::new());
+        while let Some(v) = todo.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if let Some(args) = phis.get(&v) {
+                todo.extend(args.iter().copied());
+                continue;
+            }
+            let Some(i) = insts.get(&v) else { return false };
+            let name = i.name();
+            let Fields::Valu(f) = &i.fields else { return false };
+            let srcs = match name {
+                "v_mov_b32" => &f.src[..f.src.len().min(1)],
+                "v_cndmask_b32" => &f.src[..f.src.len().min(2)],
+                _ if name.ends_with("_f32") && !name.starts_with("v_cvt_pk") => continue,
+                _ => return false,
+            };
+            for s in srcs {
+                match *s {
+                    Operand::Const(_) => {}
+                    Operand::Vector { reg, .. } => match i.read(Reg::V(reg)) {
+                        Some(v) => todo.push(v),
+                        None => return false,
+                    },
+                    _ => return false,
+                }
+            }
+        }
+        true
+    };
+    let mut out = std::collections::HashSet::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        if let Fields::Exp { target: t @ 32..=63, src, .. } = &i.fields {
+            let packed = src.iter().flatten().any(|s| match *s {
+                Operand::Vector { reg, .. } => !i.read(Reg::V(reg)).is_some_and(plain),
+                _ => true,
+            });
+            if packed {
+                out.insert(t - 32);
+            }
+        }
+    }
+    out
 }
 
 /// `exp prim`'s target.
@@ -1109,6 +1180,24 @@ mod tests {
         let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
         let h = super::super::translate_with(&c, options).unwrap();
         assert_eq!(h.stage, HwStage::Ms);
+    }
+
+    /// Only parameters that may hold two f16 halves get `HALF` outputs: param0 is a 32-bit float
+    /// product, param1 a literal.
+    #[test]
+    fn halves_go_to_parameters_that_may_hold_them() {
+        let code = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x1004_0301, // v_mul_f32 v2, v1, v1
+            0x7E06_02FF, 0x3C00_3800, // v_mov_b32 v3, 0x3c003800
+            0xF800_0201, 0x0000_0002, // exp param0 v2
+            0xF800_0211, 0x0000_0003, // exp param1 v3
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let (_, (_, outs)) = infer(HwStage::Vs, &words(&code), &meta_with(&[])).unwrap();
+        let halves: Vec<u32> = outs.iter().filter(|o| o.name == HALF).map(|o| o.index).collect();
+        assert_eq!(halves, [2, 3], "{outs:?}");
     }
 
     /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
