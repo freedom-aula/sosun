@@ -9,6 +9,16 @@ cd "$(dirname "$0")/../.."
 SRC=tests/fixtures/native-probe
 OUT="${1:-target/fixtures/native-probe.exe}"
 LLVM="${LLVM_PREFIX:-/opt/homebrew/opt/llvm}"
+LLD="${LLD_PREFIX:-/opt/homebrew/opt/lld}"
+MINGW="${MINGW_PREFIX:-/opt/homebrew/opt/mingw-w64/toolchain-x86_64}"
+# Name the cross tool that is missing rather than fail on it half way.
+for tool in "$LLVM/bin/llvm-dlltool" "$LLVM/bin/clang" "$LLD/bin/ld.lld" "$MINGW/x86_64-w64-mingw32"; do
+    if [ ! -e "$tool" ]; then
+        echo "build-native-probe.sh: $tool is missing. Install the cross tools with" \
+            "'brew install llvm lld mingw-w64', or set LLVM_PREFIX, LLD_PREFIX or MINGW_PREFIX." >&2
+        exit 1
+    fi
+done
 WORK="$(dirname "$OUT")/native-probe-libs"
 mkdir -p "$WORK"
 for def in xgameruntime victory-probe-host victory-probe-dll ucrtbase-probe ucrt-math; do
