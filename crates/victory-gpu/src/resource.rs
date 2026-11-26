@@ -1841,6 +1841,17 @@ fn native_info(desc: &ResourceDesc, memory: *const u8) -> Option<crate::native::
     })
 }
 
+/// Native clear attachments represent single-layer, single-sampled 1D/2D resources.
+/// Check the original sample count: the native texture description drops it.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_dsv_clear_supported(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let desc = &resource(this).desc;
+    matches!(desc.dimension, 2 | 3) && desc.depth_or_array_size == 1 && desc.sample_count == 1
+}
+
 /// A title texture object's description and memory; `None` for buffers and layouts not known.
 #[cfg(target_os = "macos")]
 pub(crate) fn texture_info(this: This) -> Option<crate::native::textures::TextureInfo> {

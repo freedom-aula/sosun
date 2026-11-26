@@ -190,6 +190,9 @@ impl<B: GraphicsBackend> Targets<B> {
     }
 }
 
+/// Target and independent depth/stencil clear values (`None` preserves a plane).
+type DepthClear<T> = (Rc<T>, Option<f32>, Option<u8>);
+
 pub enum Cmd<B: GraphicsBackend> {
     Dispatch {
         pso: Rc<ComputePso<B>>,
@@ -209,7 +212,7 @@ pub enum Cmd<B: GraphicsBackend> {
     },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
-        depth: Option<(Rc<B::Texture>, f32)>,
+        depth: Option<DepthClear<B::Texture>>,
     },
     Draw {
         pso: Rc<B::RenderPipeline>,
@@ -493,10 +496,22 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     pub fn clear_depth(&mut self, target: &Rc<B::Texture>, depth: f32) {
-        self.cmds.push(Cmd::Clear {
-            color: None,
-            depth: Some((target.clone(), depth)),
-        });
+        self.clear_depth_stencil(target, Some(depth), None);
+    }
+
+    /// Clear only the requested planes; absent values preserve their contents.
+    pub fn clear_depth_stencil(
+        &mut self,
+        target: &Rc<B::Texture>,
+        depth: Option<f32>,
+        stencil: Option<u8>,
+    ) {
+        if depth.is_some() || stencil.is_some() {
+            self.cmds.push(Cmd::Clear {
+                color: None,
+                depth: Some((target.clone(), depth, stencil)),
+            });
+        }
     }
 
     /// `RSSetViewports` (the first viewport; the host draws into one).

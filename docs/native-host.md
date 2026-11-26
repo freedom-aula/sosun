@@ -517,6 +517,31 @@ offsets back from them (the field layouts below match the values seen):
 
 `Graphics::guess_from` now reads all of these over the guessed defaults: cull (FACE 0 = counter-clockwise front), depth enable, write and function (hardware + 1 = D3D12), stencil enable, read and write masks, front and back ops and functions (the back face's only with BACKFACE_ENABLE), and each target's write mask. Most depth tests are GREATER_EQUAL (reversed Z), where the guess was LESS_EQUAL with writes. The polygon offset floats are not mapped. `VICTORY_GUESS_BLEND_ONLY=1` keeps the earlier blend-only reading, for comparison. A run past setup to the loading screen gave the same presented images, byte for byte, as without this change. The setup screens were not checked: runs now skip them, probably because the profile is saved.
 
+#### Independent depth and stencil clears
+
+The native `ClearDepthStencilView` path now carries the stencil value and both clear flags
+through the recorded command to Metal. Depth-only clears preserve stencil; stencil-only
+clears preserve depth; a combined clear sets both to the requested values. Previously the
+native bridge dropped stencil-only clears and the stencil value, while Metal reset stencil
+to zero whenever depth was cleared. The backend's `DepthTarget` has independent depth and
+stencil clear values (`None` means load/preserve), including passes that only draw.
+
+Synthetic Metal tests draw into a `D32FloatS8` target and read back color selected by depth
+and stencil comparisons. They cover depth-only preservation after a stencil-writing draw,
+stencil-only and combined clears to 0, 173 and 255, command snapshots, and rejection of
+mismatched depth/stencil. No title run is needed. This does not establish the cause of the
+brightness-screen problem. The native bridge skips rectangle-limited clears and views it
+cannot represent: explicit views must be TEXTURE1D or TEXTURE2D at mip 0, and the resource must be a
+single-layer, single-sampled 1D or 2D texture (also for default/null descriptions).
+1D textures use height-one Metal backing. Sample count is checked on the original
+resource description because the native texture description does not retain it. These guards apply to all
+clear flags, so unsupported requests cannot wipe the entire base depth/stencil attachment.
+Bridge regression coverage calls the title-facing clear ABI with real descriptor records,
+checks rectangle and mip-1 clears record no command, and verifies full base-view clears
+still record commands for depth-only, stencil-only and combined flags. Array/unknown views
+and default views of multisampled resources are also rejected; explicit and default
+single-layer 1D views still record full mip-0 clears. Rectangle and subresource clear support remains unimplemented.
+
 #### Texture formats the host lacked
 
 The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
