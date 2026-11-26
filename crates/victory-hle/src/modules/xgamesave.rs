@@ -650,7 +650,12 @@ fn report(
             last_modified: *last_modified,
             needs_sync: false,
         };
-        if !callback(&info, context) {
+        // SAFETY: the title's callback.
+        if unsafe {
+            crate::title::call(callback as usize, &[&raw const info as u64, context as u64])
+        } as u8
+            == 0
+        {
             break;
         }
     }
@@ -797,7 +802,12 @@ extern "system" fn enumerate_blobs(
             name: name.as_ptr(),
             size: size as u32,
         };
-        if !callback(&info, context) {
+        // SAFETY: the title's callback.
+        if unsafe {
+            crate::title::call(callback as usize, &[&raw const info as u64, context as u64])
+        } as u8
+            == 0
+        {
             break;
         }
     }

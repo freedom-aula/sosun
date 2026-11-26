@@ -72,6 +72,11 @@ pub fn delete_function_table(entries: usize) -> bool {
     tables.len() != before
 }
 
+/// Whether any image has been mapped (so title code exists to hand things to).
+pub fn any_image() -> bool {
+    tables().iter().any(|t| t.image_len != 0)
+}
+
 /// The base of the image holding `pc`, mapped by us (what
 /// `RtlPcToFileHeader` answers).
 pub fn image_base_of(pc: usize) -> Option<usize> {

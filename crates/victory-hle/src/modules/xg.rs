@@ -129,8 +129,10 @@ pub extern "system" fn XGCreateTextureComputer(
         mips,
         texture,
     });
-    // SAFETY: checked non-null.
-    unsafe { out.write(Box::into_raw(computer)) };
+    let computer = Box::into_raw(computer);
+    // SAFETY: checked non-null; a live heap object whose first word is its
+    // table.
+    unsafe { out.write(crate::title::expose(computer, 13, "xg texture computer").cast_mut()) };
     S_OK
 }
 

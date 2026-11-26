@@ -1,3 +1,4 @@
 LIBRARY xgameruntime.dll
 EXPORTS
 XGameRuntimeInitialize
+QueryApiImpl

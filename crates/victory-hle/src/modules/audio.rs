@@ -949,8 +949,10 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
             since: Instant::now(),
         }),
     });
-    // SAFETY: checked non-null.
-    unsafe { out.write(Box::into_raw(acp)) };
+    let acp = Box::into_raw(acp);
+    // SAFETY: checked non-null; a live heap object whose first word is its
+    // table of 6 methods.
+    unsafe { out.write(crate::title::expose(acp, 6, "acp").cast_mut()) };
     S_OK
 }
 

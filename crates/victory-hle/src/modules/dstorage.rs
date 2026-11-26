@@ -54,9 +54,7 @@ static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE)
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
-        Some(&iid) if iid == FACTORY => {
-            put(out, std::ptr::from_ref(&FACTORY_OBJECT).cast_mut().cast())
-        }
+        Some(&iid) if iid == FACTORY => put(out, FACTORY_OBJECT.expose()),
         iid => {
             tracing::warn!(iid = ?iid.map(Guid::to_string), "DStorageGetFactory: unknown interface");
             E_NOINTERFACE
@@ -75,12 +73,13 @@ struct Instance<T> {
 
 impl<T> Instance<T> {
     fn create(base: Object, state: T) -> *mut c_void {
-        Box::into_raw(Box::new(Instance {
+        let instance = Box::into_raw(Box::new(Instance {
             base,
             refs: AtomicU32::new(1),
             state,
-        }))
-        .cast()
+        }));
+        // SAFETY: just allocated.
+        unsafe { (*instance).base.expose() }
     }
 }
 

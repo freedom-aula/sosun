@@ -320,6 +320,135 @@ pub(crate) fn is_win64(address: usize) -> bool {
 
 const STUB_SIZE: usize = 32;
 
+/// Bridge stubs for host functions the title calls through pointers it was
+/// handed (the methods of a COM object), not through its import table, one
+/// per `(target, win64)` in the same order; `win64` says the function is
+/// `extern "win64"` (floats in their Windows registers). The stubs live for
+/// the life of the process.
+pub fn host_callbacks(targets: &[(usize, bool)]) -> Result<Vec<usize>> {
+    let mut block = StubBlock::new(targets.len())?;
+    let stubs = targets
+        .iter()
+        .map(|&(target, win64)| block.emit(target, 0, win64))
+        .collect::<Result<Vec<_>>>()?;
+    block.seal()?;
+    Ok(stubs)
+}
+
+/// Whether `address` is code of a mapped title image (or DLL), as opposed to
+/// a function of ours. A host function pointer may be handed back to us in
+/// place of a title callback; only title code needs [`call_win64`].
+pub fn is_title_code(address: usize) -> bool {
+    super::seh::unwind::image_base_of(address).is_some()
+}
+
+/// Extra slots after the last real one in a bridged table. A title that
+/// calls a method we never listed would read past the table and jump to
+/// whatever follows it (often zero); these answer `E_NOTIMPL` and log.
+const SPARE_SLOTS: usize = 64;
+
+struct Spare {
+    area: &'static str,
+    slot: usize,
+}
+
+extern "C" fn spare_slot(spare: &Spare) -> i32 {
+    tracing::warn!(
+        area = spare.area,
+        slot = format_args!("{:#x}", spare.slot * 8),
+        "title called a method past the end of our table"
+    );
+    0x8000_4001_u32 as i32 // E_NOTIMPL
+}
+
+/// Raw table address to its bridged copy, and the reverse set of copies.
+static TABLES: Mutex<Option<(std::collections::HashMap<usize, usize>, HashSet<usize>)>> =
+    Mutex::new(None);
+
+/// A copy of the method table at `raw` (`len` slots) that title code can
+/// call: each slot is a bridge stub for the host function in it (null stays
+/// null), followed by [`SPARE_SLOTS`] logging stubs. Cached per `raw`, so
+/// every object sharing a table shares the copy. Leaked.
+///
+/// # Safety
+/// `raw` points at `len` function addresses of the host.
+pub unsafe fn bridged_table(
+    raw: *const *const (),
+    len: usize,
+    area: &'static str,
+) -> Result<*const *const ()> {
+    let mut guard = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_raw, copies) = guard.get_or_insert_default();
+    if copies.contains(&(raw as usize)) {
+        return Ok(raw);
+    }
+    if let Some(&copy) = by_raw.get(&(raw as usize)) {
+        return Ok(copy as *const *const ());
+    }
+    // SAFETY: the caller's table.
+    let slots = unsafe { std::slice::from_raw_parts(raw, len) };
+    let targets: Vec<(usize, bool)> = slots
+        .iter()
+        .filter(|s| !s.is_null())
+        .map(|&s| (s as usize, is_win64(s as usize)))
+        .collect();
+    // One stub per distinct target keeps AddRef, Release, `missing` shared.
+    let mut unique: Vec<(usize, bool)> = targets.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut block = StubBlock::new(unique.len() + SPARE_SLOTS)?;
+    let mut stub_of = std::collections::HashMap::new();
+    for &(target, win64) in &unique {
+        stub_of.insert(target, block.emit(target, 0, win64)?);
+    }
+    let mut copy: Vec<usize> = slots
+        .iter()
+        .map(|&s| stub_of.get(&(s as usize)).copied().unwrap_or(0))
+        .collect();
+    for i in 0..SPARE_SLOTS {
+        let spare = Box::leak(Box::new(Spare {
+            area,
+            slot: len + i,
+        }));
+        copy.push(block.emit(
+            spare_slot as *const () as usize,
+            spare as *const Spare as usize,
+            false,
+        )?);
+    }
+    block.seal()?;
+    let copy = Box::leak(copy.into_boxed_slice())
+        .as_ptr()
+        .cast::<*const ()>();
+    by_raw.insert(raw as usize, copy as usize);
+    copies.insert(copy as usize);
+    Ok(copy)
+}
+
+/// Gives the COM-style object at `this` (first word: its method table of
+/// `len` slots) a table title code can call, in place. `this` stays the
+/// object's address, so our methods find their state as before; only the
+/// table word changes. Idempotent; does nothing before an image is mapped.
+///
+/// # Safety
+/// `this` is a live object of ours whose first word is such a table
+/// pointer, in writable memory.
+pub unsafe fn expose_object(this: *const (), len: usize, area: &'static str) {
+    // Nothing to hand it to (unit tests of the runtime call methods directly).
+    if !super::seh::unwind::any_image() {
+        return;
+    }
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    // SAFETY: the first word is a pointer-sized table pointer.
+    let word = unsafe { &*this.cast::<AtomicPtr<*const ()>>() };
+    let raw = word.load(Ordering::Acquire).cast_const();
+    // SAFETY: forwarded.
+    match unsafe { bridged_table(raw, len, area) } {
+        Ok(copy) => word.store(copy.cast_mut(), Ordering::Release),
+        Err(e) => tracing::error!(area, "cannot bridge a method table: {e:#}"),
+    }
+}
+
 /// Executable memory holding one stub per host function bound to the title.
 pub struct StubBlock {
     base: *mut u8,

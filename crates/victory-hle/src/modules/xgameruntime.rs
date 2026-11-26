@@ -70,9 +70,11 @@ impl std::fmt::Display for Guid {
 /// method table. Ours are static, so reference counting is a no-op.
 #[repr(C)]
 pub struct Object {
-    vtable: *const *const (),
+    /// Atomic because [`Object::expose`] swaps it for a bridged copy.
+    vtable: std::sync::atomic::AtomicPtr<*const ()>,
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
+    slots: usize,
 }
 
 // SAFETY: the table is a static array of function addresses.
@@ -81,9 +83,20 @@ unsafe impl Sync for Object {}
 impl Object {
     pub const fn new<const N: usize>(area: &'static str, methods: &'static Methods<N>) -> Object {
         Object {
-            vtable: methods.0.as_ptr(),
+            vtable: std::sync::atomic::AtomicPtr::new(methods.0.as_ptr().cast_mut()),
             area,
+            slots: N,
         }
+    }
+
+    /// The pointer to give the title for this object: the object's own
+    /// address, its method table first made callable from title code (see
+    /// `title::expose`).
+    pub fn expose(&self) -> *mut c_void {
+        // SAFETY: an object of ours; its first word is the table pointer.
+        unsafe { crate::title::expose(self, self.slots, self.area) }
+            .cast_mut()
+            .cast()
     }
 }
 
@@ -177,7 +190,14 @@ pub fn token() -> u64 {
 pub(crate) fn method<F: Copy>(object: &Object, slot: usize) -> F {
     // SAFETY: the caller names the slot's signature; tables cover the slots
     // tests use.
-    unsafe { std::mem::transmute_copy(&*object.vtable.add(slot / 8)) }
+    unsafe {
+        std::mem::transmute_copy(
+            &*object
+                .vtable
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .add(slot / 8),
+        )
+    }
 }
 
 pub extern "system" fn XGameRuntimeInitialize() -> HRESULT {
@@ -249,7 +269,7 @@ pub extern "system" fn QueryApiImpl(
         && !out.is_null()
     {
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write((object as *const Object).cast_mut().cast()) };
+        unsafe { out.write(object.expose()) };
         return S_OK;
     }
     let mut queried = QUERIED.lock().unwrap_or_else(|e| e.into_inner());
@@ -312,16 +332,22 @@ mod tests {
         let ordinal = std::ptr::without_provenance::<u8>(1);
         assert!(GetProcAddress(runtime, ordinal).is_null());
 
-        type Init = extern "system" fn(u64, u64, u64) -> HRESULT;
-        type Query = extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
-        // SAFETY: the addresses are our functions with these signatures.
-        let (init, query) = unsafe {
-            (
-                std::mem::transmute::<*mut c_void, Init>(proc(c"InitializeApiImplEx")),
-                std::mem::transmute::<*mut c_void, Query>(proc(c"QueryApiImpl")),
-            )
+        // On the native macOS path the pointers are bridge stubs, Windows
+        // ABI entries to call as title code does.
+        let call = |name: &CStr, args: &[u64]| -> u64 {
+            let f = proc(name) as usize;
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            // SAFETY: a bridge stub of one of our functions.
+            return unsafe { victory_loader::native::call_win64(f, args) };
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            // SAFETY: our functions, up to three integer arguments.
+            unsafe {
+                std::mem::transmute::<usize, extern "system" fn(u64, u64, u64) -> u64>(f)(
+                    args[0], args[1], args[2],
+                )
+            }
         };
-        assert_eq!(init(1, 2, 2), S_OK);
+        assert_eq!(call(c"InitializeApiImplEx", &[1, 2, 2]) as i32, S_OK);
         let guid = Guid {
             data1: 1,
             data2: 2,
@@ -330,7 +356,15 @@ mod tests {
         };
         let untouched = 0x1234 as *mut c_void;
         let mut out = untouched;
-        assert!(query(&guid, &guid, &mut out) < 0);
+        let hr = call(
+            c"QueryApiImpl",
+            &[
+                &raw const guid as u64,
+                &raw const guid as u64,
+                &raw mut out as u64,
+            ],
+        );
+        assert!((hr as i32) < 0);
         assert_eq!(out, untouched);
         assert_eq!(FreeLibrary(runtime), 1);
 

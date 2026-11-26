@@ -245,9 +245,6 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
-type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-type FreeRoutine = extern "system" fn(*mut c_void, u64);
-
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (Grand Theft Auto VI does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
@@ -295,8 +292,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
-            let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
+            unsafe { crate::title::call(hook, &[size as u64, attributes]) as usize as *mut c_void }
         }
     }
 }
@@ -307,8 +303,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
         0 => XMemFreeDefault(address, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
-            let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
-            free(address, attributes)
+            unsafe { crate::title::call(hook, &[address as u64, attributes]) };
         }
     }
 }

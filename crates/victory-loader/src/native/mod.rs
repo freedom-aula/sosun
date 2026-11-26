@@ -31,7 +31,10 @@ pub mod threadctl;
 #[cfg(target_arch = "x86_64")]
 pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
-pub use bridge::{call_win64, declare_direct, declare_win64};
+pub use bridge::{
+    bridged_table, call_win64, declare_direct, declare_win64, expose_object, host_callbacks,
+    is_title_code,
+};
 #[cfg(target_arch = "x86_64")]
 pub use run::{
     attach, attach_dll, disable_thread_calls, register_dll_thread_notices,

@@ -20,6 +20,7 @@ typedef void *ptr;
 
 /* xgameruntime.dll: console API, answered by victory-hle's registry. */
 IMPORT int XGameRuntimeInitialize(void);
+IMPORT int QueryApiImpl(const u8 *provider, const u8 *iid, ptr *out);
 
 /* kernel32.dll: the host's own on Windows, victory-hle's POSIX versions here. */
 IMPORT u32 GetLastError(void);
@@ -1006,6 +1007,72 @@ u32 probe_modules(ptr unused)
         ok |= M_FREE;
     if (k32 && !GetProcAddress(k32, (const char *)(u64)0x7FFE))
         ok |= M_ORDINAL_MISSING;
+    return ok;
+}
+
+/* ---- HLE objects called through their method tables ---------------------- */
+
+/* The task-queue provider's id (the provider and its own interface id). */
+static const u8 TASK_QUEUE_ID[16] = {0xcb, 0x7d, 0x3b, 0x07, 0xcf, 0x1f, 0x30, 0x40,
+                                     0x94, 0xbe, 0xe3, 0xc9, 0xeb, 0x62, 0x34, 0x28};
+
+enum {
+    V_QUERY = 1u << 0,
+    V_ADDREF = 1u << 1,
+    V_CREATE = 1u << 2,
+    V_SUBMIT = 1u << 3,
+    V_DISPATCH = 1u << 4,
+    V_CB_RAN = 1u << 5,
+    V_CB_TEB = 1u << 6,
+    V_SPARE = 1u << 7,
+    V_CLOSE = 1u << 8,
+};
+
+static volatile u32 vt_ran;
+static volatile u64 vt_context;
+static volatile u32 vt_teb_ok;
+
+/* Run by the host (XTaskQueueDispatch) on this thread: title code called
+ * from our runtime, so GS must be the TEB again. */
+static void vt_callback(ptr context, u8 canceled)
+{
+    u64 teb = read_gs(0x30);
+    vt_teb_ok = teb != 0 && read_gs(0x30) == *(u64 *)(teb + 0x30);
+    vt_context = (u64)context;
+    vt_ran += canceled ? 100 : 1;
+}
+
+u32 probe_vtable(ptr unused)
+{
+    (void)unused;
+    u32 ok = 0;
+    ptr object = 0;
+    if (QueryApiImpl(TASK_QUEUE_ID, TASK_QUEUE_ID, &object) != 0 || !object)
+        return 0;
+    ok |= V_QUERY;
+    /* The method table the title got is read by title code at [object]. */
+    void **vtable = *(void ***)object;
+    if (((u32(*)(ptr))vtable[1])(object) == 1)
+        ok |= V_ADDREF;
+    ptr queue = 0;
+    if (((int (*)(ptr, u32, u32, ptr *))vtable[0x60 / 8])(object, 0, 0, &queue) == 0 && queue)
+        ok |= V_CREATE;
+    if (!queue)
+        return ok;
+    if (((int (*)(ptr, ptr, u32, ptr, ptr))vtable[0x90 / 8])(object, queue, 0, (ptr)0x5150, (ptr)vt_callback) == 0)
+        ok |= V_SUBMIT;
+    if (((u8(*)(ptr, ptr, u32, u32))vtable[0x80 / 8])(object, queue, 0, 1000))
+        ok |= V_DISPATCH;
+    if (vt_ran == 1 && vt_context == 0x5150)
+        ok |= V_CB_RAN;
+    if (vt_teb_ok)
+        ok |= V_CB_TEB;
+    /* A slot past the end of our table answers E_NOTIMPL instead of
+     * jumping into whatever follows it. */
+    if (((int (*)(ptr))vtable[0x100 / 8])(object) == (int)0x80004001u)
+        ok |= V_SPARE;
+    ((void (*)(ptr, ptr))vtable[0x88 / 8])(object, queue);
+    ok |= V_CLOSE;
     return ok;
 }
 

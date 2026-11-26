@@ -318,6 +318,16 @@ mod run {
         assert_all(run_probe("probe_modules", 0), 0x7FF, "probe_modules");
     }
 
+    /// An HLE object the title got from `QueryApiImpl` is called through its
+    /// method table from title code (every slot a bridge stub, `this` still
+    /// the object), a slot past the table's end answers `E_NOTIMPL`, and our
+    /// runtime calls a title callback back with GS = the TEB.
+    #[test]
+    fn hle_objects_are_callable_through_their_method_tables() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert_all(run_probe("probe_vtable", 0), 0x1FF, "probe_vtable");
+    }
+
     #[test]
     fn the_probe_runs_under_rosetta_and_passes_every_check() {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

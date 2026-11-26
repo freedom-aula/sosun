@@ -81,8 +81,7 @@ impl Task {
 
     fn run(self, canceled: bool) {
         // SAFETY: built from a `Callback` in `new`.
-        let callback: Callback = unsafe { std::mem::transmute(self.callback) };
-        callback(self.context as *mut c_void, canceled);
+        unsafe { crate::title::call(self.callback, &[self.context as u64, canceled.into()]) };
     }
 }
 
@@ -251,8 +250,12 @@ impl Queue {
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
-            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
+            unsafe {
+                crate::title::call(
+                    callback,
+                    &[context as u64, Arc::as_ptr(self) as u64, port.into()],
+                )
+            };
         }
     }
 }
@@ -415,7 +418,8 @@ pub fn XTaskQueueTerminate(
         task.run(true);
     }
     if let Some(callback) = callback {
-        callback(context);
+        // SAFETY: the title's `TerminatedCallback`.
+        unsafe { crate::title::call(callback as usize, &[context as u64]) };
     }
     S_OK
 }
@@ -513,7 +517,11 @@ impl Call {
             buffer,
             context: self.context as *mut c_void,
         };
-        (self.provider)(op, &data)
+        // SAFETY: the title's `Provider` (or one of ours).
+        unsafe {
+            crate::title::call(self.provider as usize, &[op.into(), &raw const data as u64]) as u32
+                as i32
+        }
     }
 }
 
@@ -664,7 +672,8 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
         let block = block.cast::<AsyncBlock>();
         // SAFETY: read before the status was published; see below.
         if let Some(routine) = unsafe { (*block).callback } {
-            routine(block);
+            // SAFETY: the title's `CompletionRoutine`.
+            unsafe { crate::title::call(routine as usize, &[block as u64]) };
         }
     }
     if result == E_PENDING {
@@ -951,8 +960,9 @@ pub fn XAsyncRun(block: *mut AsyncBlock, work: Option<Work>) -> HRESULT {
             OP_BEGIN => XAsyncSchedule(data.block, 0),
             OP_DO_WORK => {
                 // SAFETY: the context is the `Work` given to `XAsyncRun`.
-                let work = unsafe { std::mem::transmute::<*mut c_void, Work>(data.context) };
-                work(data.block)
+                unsafe {
+                    crate::title::call(data.context as usize, &[data.block as u64]) as u32 as i32
+                }
             }
             _ => S_OK,
         }

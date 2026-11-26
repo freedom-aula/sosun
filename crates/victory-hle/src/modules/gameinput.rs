@@ -281,7 +281,10 @@ struct Ref(NonNull<Reading>);
 
 impl Ref {
     fn new(reading: Reading) -> Ref {
-        Ref(NonNull::from(Box::leak(Box::new(reading))))
+        let reading = Box::leak(Box::new(reading));
+        // SAFETY: a live heap object whose first word is its table.
+        unsafe { crate::title::expose(&raw const *reading, 25, "game input reading") };
+        Ref(NonNull::from(reading))
     }
 
     /// Another reference, for the title.
@@ -409,6 +412,7 @@ impl Hub {
             (*hub).object.hub = hub;
             for device in &mut (*hub).devices {
                 device.hub = hub;
+                crate::title::expose(&raw const *device, 21, "game input device");
             }
             &*hub
         }
@@ -463,14 +467,20 @@ impl Hub {
                 }
                 state.running.push((r.token, me));
             }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
-                &self.devices[e.device],
-                e.timestamp,
-                e.current,
-                e.previous,
-            );
+            // SAFETY: the title's `DeviceCallback`.
+            unsafe {
+                crate::title::call(
+                    r.callback as usize,
+                    &[
+                        r.token,
+                        r.context as u64,
+                        &raw const self.devices[e.device] as u64,
+                        e.timestamp,
+                        e.current.into(),
+                        e.previous.into(),
+                    ],
+                )
+            };
             let mut state = self.state();
             if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
                 state.running.swap_remove(i);
@@ -581,7 +591,8 @@ pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
         return E_INVALIDARG;
     }
     // SAFETY: checked non-null; the title passes room for a pointer.
-    unsafe { out.write(&HUB.object) };
+    // SAFETY: the hub's object, heap allocated, first word its table.
+    unsafe { out.write(crate::title::expose(&HUB.object, 22, "game input")) };
     S_OK
 }
 

@@ -176,6 +176,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
     match m.exports.iter().find(|e| e.name == name) {
+        #[allow(clippy::unnecessary_cast)] // `usize` here, a pointer elsewhere
         Some(e) => title_callable(e.address as usize),
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
@@ -287,10 +288,8 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
     match TITLE_FILTER.load(std::sync::atomic::Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
         filter => {
-            type Filter = extern "system" fn(*const c_void) -> i32;
             // SAFETY: the title registered this filter.
-            let filter: Filter = unsafe { std::mem::transmute(filter) };
-            filter(info)
+            unsafe { crate::title::call(filter, &[info as u64]) as u32 as i32 }
         }
     }
 }
