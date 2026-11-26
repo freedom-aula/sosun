@@ -677,6 +677,38 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
     }
 }
 
+/// Depth and depth-stencil textures are GPU targets whose CPU tile layout (e.g. a 4-byte or
+/// 2-byte depth plane) does not match Metal's combined texel layout, so they must not be watched
+/// or uploaded from CPU memory even when placed/typeless (not marked as a render target).
+#[test]
+fn depth_textures_are_not_watched_or_uploaded_from_cpu_memory() {
+    let Some(pool) = pool(9202, (512 << 10) / page_size() + 1) else { return };
+    // DXGI formats: 20 (D32_FLOAT_S8X24_UINT), 40 (D32_FLOAT), 55 (D16_UNORM),
+    // and typeless 19 (R32G8X24_TYPELESS) with flags = 0 (not marked ALLOW_RENDER_TARGET).
+    for (i, format) in [20u32, 40, 55, 19].into_iter().enumerate() {
+        let at = i * 0x20000;
+        let res = crate::resource::test_texture_at(
+            pool.va(at),
+            (64, 64),
+            1,
+            format,
+            Swizzle::SW_64KB_R_X.0,
+            0,
+        );
+        let key = res as usize;
+        with_title(|t| {
+            assert!(t.realize(key), "format {format} should realize");
+            t.sync_textures();
+            assert_eq!(t.uploads_of(key), 0, "depth format {format} must not upload on sync_textures");
+        });
+        pool.write(at, &[0xA5u8; 64]);
+        with_title(|t| {
+            t.sync_dirty();
+            assert_eq!(t.uploads_of(key), 0, "depth format {format} must not upload on sync_dirty");
+        });
+    }
+}
+
 /// A described RTV binds and clears its selected subresource in the named format.
 #[test]
 fn a_render_target_view_selects_its_mip_and_slice() {

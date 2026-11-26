@@ -609,22 +609,27 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
-        // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
-        // it changes, as it is not otherwise seen (a GPU write never changes title memory).
-        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
-        start_scanner();
-        // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
-        // was never drawn into, and a black one was drawn black.
-        if info.render_target() && env_set!("VICTORY_MAGENTA") {
-            let m = &info.layout.mips[0];
-            let n = info.layout.desc.element_bytes as usize;
-            let row = m.width as usize * n;
-            let pixel = [0xffu8, 0, 0xff, 0xff];
-            let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
-            self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
-        }
-        if !info.render_target() {
-            self.unloaded.insert(key);
+        // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
+        // 4-byte or 2-byte plane 0) does not match Metal's combined depth-stencil texel layout,
+        // so watching or uploading CPU memory cannot produce valid replaceRegion transfers.
+        if !desc.format.is_depth() {
+            // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded
+            // when it changes, as it is not otherwise seen (a GPU write never changes title memory).
+            watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
+            start_scanner();
+            // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
+            // was never drawn into, and a black one was drawn black.
+            if info.render_target() && env_set!("VICTORY_MAGENTA") {
+                let m = &info.layout.mips[0];
+                let n = info.layout.desc.element_bytes as usize;
+                let row = m.width as usize * n;
+                let pixel = [0xffu8, 0, 0xff, 0xff];
+                let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
+                self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
+            }
+            if !info.render_target() {
+                self.unloaded.insert(key);
+            }
         }
         self.textures.insert(
             key,
@@ -808,6 +813,9 @@ impl<B: PresentBackend> Title<B> {
             let Some(t) = textures.get_mut(&key) else {
                 continue;
             };
+            if t.info.desc().is_some_and(|d| d.format.is_depth()) {
+                continue;
+            }
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
