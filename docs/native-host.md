@@ -311,6 +311,21 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C locale's). A failed invalid-parameter check calls the title's handler if it set one and returns the error; it does not terminate. `_endthread(ex)` is not served (it needs an exit primitive in the loader's thread spawn); `_get_osfhandle`/`_open_osfhandle`, `_ecvt`/`_fcvt`/`_gcvt`, positional `%1$d` formats and the `_mbs*` multibyte-string family are not either. `ucrt::tests::every_ucrt_import_of_a_dry_run_is_served` checks a `--list-imports` output when `VICTORY_UCRT_IMPORTS` names it. The probe (`probe_ucrt` in `tests/fixtures/native-probe/probe.c`) links `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll` and runs 17 checks under Rosetta.
 
+## Descriptors changed after loading
+
+A buffer or image descriptor whose dwords are not one load's consecutive dwords, though one of
+them is loaded, was refused as "a descriptor changed after loading" (34 compute programs in the
+story-load log of issue #123). The forms the translator reads stay as they were (a descriptor made
+raw for byte accesses, `made_raw`). Any other is now refused naming the first dword that is not the
+load's next one and what made it (`Tracer::changed`), after that text and a colon: "dword N is a
+constant", "comes from another load or place in it", "masked or merged (s_and, s_or, s_bfi...)",
+"added to (s_add, s_sub...)", "shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)",
+"chosen by a select or a join", "is a program input" or "computed otherwise". Nothing new is
+lowered: the next tester log tells which forms to lower (a V# base address moved by an offset in
+dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
+`pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
+path: the container made from the title's pieces, the host's options.
+
 ## Known limits of this slice
 
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.

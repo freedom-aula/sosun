@@ -1258,10 +1258,61 @@ impl<'a> Tracer<'a> {
                 if self.def(v).is_some_and(|i| i.name().starts_with("s_load_")))
         };
         Err(if words.iter().any(loaded) {
-            "a descriptor changed after loading"
+            self.changed(words)
         } else {
             "a descriptor neither loaded nor built"
         })
+    }
+
+    /// Why a descriptor with a loaded dword is no load's: the first dword that is not the load's
+    /// next one, and what made it, so a refusal log says which form a title uses.
+    fn changed(&self, words: &[Term]) -> &'static str {
+        // The load of the first loaded dword, and where in it the descriptor would start.
+        let reference = words.iter().enumerate().find_map(|(k, w)| {
+            let Term::Value(v) = *w else { return None };
+            let inst = self.def(v).filter(|i| i.name().starts_with("s_load_"))?;
+            let at = inst.writes.iter().position(|x| x.1 == v)?;
+            Some((inst, at.checked_sub(k)))
+        });
+        let Some((load, Some(start))) = reference else {
+            return changed_why(0, Change::OtherLoad);
+        };
+        let Some((k, word)) = words
+            .iter()
+            .enumerate()
+            .find(|&(k, w)| load.writes.get(start + k).is_none_or(|x| *w != Term::Value(x.1)))
+        else {
+            return changed_why(0, Change::OtherLoad);
+        };
+        let kind = match *word {
+            Term::Const(_) => Change::Constant,
+            Term::Value(v) if self.phis[v.0 as usize].is_some() => Change::Selected,
+            Term::Value(v) => match self.def(v).map(Inst::name) {
+                None => Change::Input,
+                Some(n) if n.starts_with("s_load_") => Change::OtherLoad,
+                Some(n) if n.starts_with("s_cselect") || n.starts_with("s_cmov") => {
+                    Change::Selected
+                }
+                Some(n)
+                    if ["s_and", "s_or", "s_xor", "s_nand", "s_nor", "s_xnor", "s_bfi", "s_bfm"]
+                        .iter()
+                        .any(|p| n.starts_with(p))
+                        || n.starts_with("s_bitset") =>
+                {
+                    Change::Masked
+                }
+                Some(n) if ["s_add", "s_sub"].iter().any(|p| n.starts_with(p)) => Change::Offset,
+                Some(n)
+                    if ["s_mul", "s_lshl", "s_lshr", "s_ashr", "s_bfe"]
+                        .iter()
+                        .any(|p| n.starts_with(p)) =>
+                {
+                    Change::Scaled
+                }
+                Some(_) => Change::Computed,
+            },
+        };
+        changed_why(k, kind)
     }
 
     /// Bits that may be set in a built buffer descriptor's high dword.
@@ -2188,6 +2239,55 @@ impl<'a> Tracer<'a> {
     }
 }
 
+/// What a dword of a descriptor that is no load's is instead (see `Tracer::changed`).
+#[derive(Clone, Copy)]
+enum Change {
+    Constant,
+    OtherLoad,
+    Masked,
+    Offset,
+    Scaled,
+    Selected,
+    Input,
+    Computed,
+}
+
+/// "a descriptor changed after loading", then which dword and how.
+fn changed_why(dword: usize, kind: Change) -> &'static str {
+    macro_rules! how {
+        ($d:literal) => {
+            match kind {
+                Change::Constant => concat!("a descriptor changed after loading: dword ", $d,
+                    " is a constant"),
+                Change::OtherLoad => concat!("a descriptor changed after loading: dword ", $d,
+                    " comes from another load or place in it"),
+                Change::Masked => concat!("a descriptor changed after loading: dword ", $d,
+                    " masked or merged (s_and, s_or, s_bfi...)"),
+                Change::Offset => concat!("a descriptor changed after loading: dword ", $d,
+                    " added to (s_add, s_sub...)"),
+                Change::Scaled => concat!("a descriptor changed after loading: dword ", $d,
+                    " shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)"),
+                Change::Selected => concat!("a descriptor changed after loading: dword ", $d,
+                    " chosen by a select or a join"),
+                Change::Input => concat!("a descriptor changed after loading: dword ", $d,
+                    " is a program input"),
+                Change::Computed => concat!("a descriptor changed after loading: dword ", $d,
+                    " computed otherwise"),
+            }
+        };
+    }
+    match dword {
+        0 => how!("0"),
+        1 => how!("1"),
+        2 => how!("2"),
+        3 => how!("3"),
+        4 => how!("4"),
+        5 => how!("5"),
+        6 => how!("6"),
+        _ => how!("7"),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Moved {
     Const(u32),
@@ -2916,6 +3016,42 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
     }
 
+    /// A loaded buffer descriptor changed before use is refused naming the first dword that is
+    /// no longer the load's and how it was made: here records replaced by a constant, then the
+    /// base address offset.
+    #[test]
+    fn a_descriptor_changed_after_loading_says_which_dword_and_how() {
+        let run = |change: &[u32]| {
+            let mut words = vec![
+                0xBE88_0304, // s_mov_b32 s8, s4
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF408_0204,
+                0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            ];
+            words.extend_from_slice(change);
+            words.extend([
+                0xE078_1000,
+                0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            match track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref()) {
+                Err(ShaderError::Unsupported { what, .. }) => what,
+                r => panic!("{:?}", r.err()),
+            }
+        };
+        assert_eq!(
+            run(&[0xBE8A_03C0]), // s_mov_b32 s10, 64
+            "a descriptor changed after loading: dword 2 is a constant"
+        );
+        assert_eq!(
+            run(&[0x8008_9008, 0x8209_8009]), // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
+            "a descriptor changed after loading: dword 0 added to (s_add, s_sub...)"
+        );
+    }
+
     /// The FidelityFX upscaler's byte accesses make a loaded buffer
     /// descriptor raw first (stride cleared, records times stride, bounds
     /// in bytes): the access reads the loaded descriptor. Any other change
@@ -2956,7 +3092,8 @@ pub(crate) mod tests {
             run(0xC000_FFFE).unwrap_err(),
             ShaderError::Unsupported {
                 offset: 0x3c,
-                what: "a descriptor changed after loading"
+                what: "a descriptor changed after loading: dword 1 masked or merged (s_and, s_or, \
+                       s_bfi...)"
             }
         );
     }
@@ -3063,7 +3200,8 @@ pub(crate) mod tests {
             err,
             ShaderError::Unsupported {
                 offset: 36,
-                what: "a descriptor changed after loading"
+                what: "a descriptor changed after loading: dword 2 comes from another load or \
+                       place in it"
             }
         );
     }
