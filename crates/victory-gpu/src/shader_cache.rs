@@ -223,6 +223,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         rect_list: false,
         copy_params: [0; 32],
         extra_params: 0,
+        // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
+        thread_counts: false,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());

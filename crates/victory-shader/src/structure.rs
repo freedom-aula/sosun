@@ -756,7 +756,14 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            // Every lane, or the lanes a dispatch of thread counts launches
+            // (the lowering gives each lane its bit).
+            let on = if p.thread_counts {
+                self.b.atom(Atom::Lane(lo), 0)
+            } else {
+                Bool::TRUE
+            };
+            self.masks.insert((lo, hi), on);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
@@ -2204,6 +2211,25 @@ mod tests {
         assert_eq!(s.guards[0][0], None, "the compare runs in every lane");
         let g = s.guards[0][1].expect("guard");
         assert!(matches!(s.bools.support(g)[..], [Atom::Lane(_)]));
+    }
+
+    #[test]
+    fn exec_on_entry_is_a_lane_mask_under_thread_counts() {
+        let mut p = build(
+            &[
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(structure(&p).unwrap().guards[0][0], None, "every lane is on");
+        // A dispatch of thread counts launches some of the lanes: the move is
+        // guarded by the entry EXEC's own bit.
+        p.thread_counts = true;
+        let s = structure(&p).unwrap();
+        let exec = p.inputs.iter().find(|i| i.0 == Reg::S(EXEC)).unwrap().1;
+        let g = s.guards[0][0].expect("guard");
+        assert_eq!(s.bools.node(g), Some((Atom::Lane(exec), Bool::FALSE, Bool::TRUE)));
     }
 
     #[test]

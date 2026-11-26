@@ -108,6 +108,27 @@ fn refresh(t: &mut MetalTitle) {
             if !stuck.is_empty() {
                 *last = Some(std::time::Instant::now());
                 tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+                // What a held queue or a fence waits for may be owed by a command buffer the GPU
+                // lost (out of memory): those are paid from the CPU so the title goes on.
+                let lost = victory_metal::gfx::recover_lost();
+                if lost > 0 {
+                    tracing::warn!("recovered {lost} command buffers the GPU never reported on");
+                }
+                // Nothing is submitted while every queue is held, so the per-submission report
+                // of command buffers the GPU has not finished would stay silent.
+                if env_set!("VICTORY_TRACE_GPU_FAILS") {
+                    let flying = victory_metal::gfx::report_in_flight();
+                    let order: Vec<String> = t
+                        .backend_queues()
+                        .map(|(k, q)| (k, q.order_state()))
+                        .filter(|(_, (done, made))| done != made)
+                        .map(|(k, (done, made))| format!("queue {k:#x} at {done} of {made}"))
+                        .collect();
+                    tracing::warn!(
+                        "command buffers in flight while work is held: {flying}; order events behind: {order:?}; commands dropped at unmapped memory so far: {}",
+                        t.host.unmapped()
+                    );
+                }
             }
         }
     }
@@ -135,6 +156,9 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -229,13 +253,17 @@ pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::presen
 
 /// `VICTORY_TRACE_TARGETS=1`: per frame, what drew into or cleared which title texture, and what
 /// was presented (logged at each present).
-fn tracing_targets() -> bool {
+pub(crate) fn tracing_targets() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| env_set!("VICTORY_TRACE_TARGETS"))
 }
 
 /// Draws and clears by title texture since the last present, and dropped texture operations.
-static TRACE: Mutex<Option<std::collections::HashMap<usize, [u32; 2]>>> = Mutex::new(None);
+static TRACE: Mutex<Option<std::collections::HashMap<usize, [u32; 3]>>> = Mutex::new(None);
+/// Draws dropped since the last present, by reason (with `VICTORY_TRACE_TARGETS`).
+static DROP_REASONS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+/// Draws dropped since the last present for want of a host pipeline, by shaders and targets.
+static DROP_PIPES: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
 static DROPPED_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn trace_bump(key: usize, which: usize) {
@@ -249,7 +277,7 @@ fn trace_bump(key: usize, which: usize) {
 /// the fraction of non-zero bytes logged, and the memory detiled into a scratch texture and
 /// written as `<dir>/m<time>_<n>.ppm`: what the title (CPU, DMA) put there, whatever the GPU did.
 #[inline(never)]
-fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 3]>) {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     static DONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let start = START.get_or_init(std::time::Instant::now);
@@ -290,8 +318,9 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
 }
 
 /// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
-/// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`.
-fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+/// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`; HDR
+/// and 10-bit targets (DXGI 2, 10, 24, 26) are tone-mapped into `..._f<format>.ppm`, their range logged.
+fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
     use std::sync::atomic::AtomicBool;
     static DONE: AtomicBool = AtomicBool::new(false);
     static LAST: Mutex<Option<u64>> = Mutex::new(None);
@@ -315,11 +344,32 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
     with_title(|t| {
         for (n, key) in stats.keys().enumerate() {
             let Some(info) = crate::resource::texture_info(*key as This) else { continue };
+            let (w, h) = (info.width as usize, info.height as usize);
+            if matches!(info.format, 2 | 10 | 24 | 26) {
+                // HDR and 10-bit targets: tone-mapped to 8 bits, with their range logged.
+                let Some(tex) = t.texture_of(*key) else { continue };
+                let bpp = match info.format { 2 => 16, 10 => 8, _ => 4 };
+                let mut raw = vec![0u8; w * h * bpp];
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+                let rgb: Vec<[f32; 3]> = raw.chunks_exact(bpp).map(|p| decode_hdr(info.format, p)).collect();
+                let finite = rgb.iter().flatten().filter(|v| v.is_finite());
+                let (mut max, mut sum, mut count, mut lit) = (0f32, 0f64, 0usize, 0usize);
+                for v in finite {
+                    max = max.max(*v);
+                    sum += f64::from(*v);
+                    count += 1;
+                    lit += usize::from(*v > 1e-4);
+                }
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_f{}.ppm", info.memory as usize, info.format)), out);
+                tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, max, mean = sum / count.max(1) as f64, lit = lit as f64 / (rgb.len() * 3).max(1) as f64, "target dumped");
+                continue;
+            }
             if !matches!(info.format, 28 | 87 | 91 | 29) {
                 continue;
             }
             let Some(tex) = t.texture_of(*key) else { continue };
-            let (w, h) = (info.width as usize, info.height as usize);
             let mut px = vec![0u8; w * h * 4];
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
             let bgra = matches!(info.format, 87 | 91);
@@ -335,6 +385,29 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
     });
 }
 
+/// One texel of an HDR or 10-bit colour target (DXGI 2, 10, 24, 26) as linear RGB.
+fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
+    let word = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+    // An unsigned small float: `mbits` mantissa bits over a 5-bit exponent.
+    let small = |v: u32, mbits: u32| {
+        let (e, m) = ((v >> mbits) & 0x1f, v & ((1 << mbits) - 1));
+        if e == 0 { m as f32 * 2f32.powi(-14 - mbits as i32) } else { (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15) }
+    };
+    match format {
+        2 => [0, 4, 8].map(|i| f32::from_bits(word(i))),
+        10 => [0, 2, 4].map(|i| {
+            let h = u32::from(u16::from_le_bytes([p[i], p[i + 1]]));
+            let v = small(h & 0x7fff, 10);
+            if h >> 15 == 1 { -v } else if (h >> 10) & 0x1f == 0x1f { f32::NAN } else { v }
+        }),
+        24 => [0, 10, 20].map(|s| ((word(0) >> s) & 0x3ff) as f32 / 1023.0),
+        _ => {
+            let v = word(0);
+            [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5)]
+        }
+    }
+}
+
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
@@ -348,15 +421,21 @@ pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
 fn trace_present(resource: This) {
         let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
+        let reasons = std::mem::take(&mut *DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut pipes = std::mem::take(&mut *DROP_PIPES.lock().unwrap_or_else(|e| e.into_inner()));
+        pipes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (what, n) in &pipes {
+            tracing::info!(n, what, "draws dropped (no host pipeline, or an indirect execution)");
+        }
         let described: Vec<String> = with_title(|t| {
             stats
                 .iter()
-                .map(|(k, [d, c])| {
+                .map(|(k, [d, c, x])| {
                     let i = crate::resource::texture_info(*k as This);
                     let (f, w, h, a) = i.map_or((0, 0, 0, 0), |i| (i.format, i.width, i.height, i.memory as usize));
                     let mark = if *k == resource as usize { " PRESENTED" } else { "" };
                     let _ = &t;
-                    format!("{k:#x} fmt {f} {w}x{h} at {a:#x} draws {d} clears {c}{mark}")
+                    format!("{k:#x} fmt {f} {w}x{h} at {a:#x} draws {d} clears {c} dropped {x}{mark}")
                 })
                 .collect()
         })
@@ -371,6 +450,7 @@ fn trace_present(resource: This) {
             targets = ?described,
             dropped_ops = ?ops.iter().take(8).collect::<Vec<_>>(),
             dropped = ops.len(),
+            ?reasons,
             "frame targets"
         );
 }
@@ -473,12 +553,13 @@ pub(crate) fn pipeline_released(pipeline: This) {
     with_title(|t| {
         t.pipelines.remove(&key);
         t.console_pipes.retain(|(k, _), _| *k != key);
+        t.thread_pipes.remove(&key);
     });
 }
 
 pub(crate) fn resource_released(res: This) {
     with_title(|t| {
-        t.host.forget_resource(res as usize);
+        t.host.release_resource(res as usize);
         t.texture_released(res as usize);
     });
 }
@@ -692,10 +773,36 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A draw into `l`'s targets that the host drops, counted per target for the trace.
+fn trace_drop(l: &MetalList) {
+    l.target_keys.iter().for_each(|&k| trace_bump(k, 2));
+}
+
+/// A dropped draw or execution, by what it was (its shaders and targets), for the frame trace.
+pub(crate) fn trace_drop_pipe(key: String) {
+    let mut d = DROP_PIPES.lock().unwrap_or_else(|e| e.into_inner());
+    match d.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, n)) => *n += 1,
+        None => d.push((key, 1)),
+    }
+}
+
+/// Work dropped since the last present, by reason, for the `VICTORY_TRACE_TARGETS` frame line.
+pub(crate) fn trace_reason(why: &'static str) {
+    if tracing_targets() {
+        let mut r = DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner());
+        match r.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, n)) => *n += 1,
+            None => r.push((why, 1)),
+        }
+    }
+}
+
 /// Counts a draw or dispatch the host drops, and warns the first time for each `why`.
 fn dropped(why: &'static str) {
     DROPPED.fetch_add(1, Ordering::Relaxed);
     warn_once(why);
+    trace_reason(why);
 }
 
 /// A warning logged once per distinct `what` for the run.
@@ -732,8 +839,8 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
-    let r = with_title(|t| t.host.backend.residency_counts()).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, "native draws so far");
+    let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
     super::descriptor_trace::log(frame);
 }
 
@@ -756,6 +863,25 @@ fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<M
     }
     let graphics = graphics.map(|g| g.0);
     (make_host_pipe(t, stages, graphics), console)
+}
+
+/// The host pipeline of compute pipeline `key` for dispatches of thread counts, made at first
+/// use: its shader translated for them (`Options::thread_counts`).
+fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    if let Some(p) = t.thread_pipes.get(&key) {
+        return p.clone();
+    }
+    let (hash, shader) = crate::pipeline::native_threads(key as This);
+    let name = format!("compute {hash} by thread counts");
+    let made = match shader {
+        Ok(cs) => t.compute_pipe(&cs, &name),
+        Err(e) => {
+            t.refused_translation(&name, e);
+            Pipe::Refused
+        }
+    };
+    t.thread_pipes.insert(key, made.clone());
+    made
 }
 
 fn make_host_pipe(
@@ -833,6 +959,21 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
             }
         }
         _ => dropped("a dispatch without a host compute pipeline"),
+    });
+}
+
+/// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
+/// them it is dropped: run as group counts, its lanes past the counts would write over memory
+/// that is not theirs.
+pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
+    with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
+        Pipe::Compute(pso) => {
+            l.list.set_compute_pipeline(&pso);
+            if let Err(e) = l.list.dispatch_threads(threads) {
+                tracing::warn!(error = %e, "dispatch of thread counts");
+            }
+        }
+        _ => dropped("a dispatch of thread counts without a host compute pipeline"),
     });
 }
 
@@ -950,9 +1091,12 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
 }
 
 /// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
-fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+/// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
+/// pipeline).
+fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
+        trace_drop(l);
         return None;
     }
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
@@ -970,16 +1114,33 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
         }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
+            trace_reason("a mesh pipeline");
+            trace_drop(l);
             return None;
         }
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {
         dropped("a draw without a host render pipeline (refused or not translated)");
+        trace_drop(l);
+        if tracing_targets() {
+            let shaders: Vec<String> = crate::pipeline::native_stages(l.pipeline as This)
+                .map(|(stages, _)| stages.iter().map(|(s, sh)| format!("{s} {}", sh.hash)).collect())
+                .unwrap_or_default();
+            trace_drop_pipe(format!("{shaders:?} into {:?}", l.targets));
+        }
         return None;
     };
+    if pso.mesh_threads().is_some() != mesh {
+        dropped(if mesh { "a mesh dispatch of a vertex pipeline" } else { "a draw of a mesh pipeline" });
+        trace_drop(l);
+        return None;
+    }
     let topology = if rect {
         Some(victory_backend::resources::Topology::TriangleStrip)
+    } else if mesh {
+        // A mesh shader declares its own topology; the list's is unused.
+        Some(victory_backend::resources::Topology::Triangles)
     } else {
         super::state::topology(l.topology)
     };
@@ -989,6 +1150,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
             tracing::warn!(topology = l.topology, "a draw dropped for its primitive topology");
         }
         dropped("a draw of a primitive topology the host does not draw");
+        trace_drop(l);
         return None;
     };
     l.list.set_graphics_pipeline(&pso, topology);
@@ -1017,7 +1179,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         return;
     }
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l) {
+        if let Some(rect) = graphics(t, l, false) {
             if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
@@ -1051,10 +1213,11 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l) {
+        if let Some(rect) = graphics(t, l, false) {
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
                 dropped("an indexed rectangle-list draw");
+                trace_drop(l);
                 return;
             }
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
@@ -1072,7 +1235,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
 /// `ExecuteIndirect` of a single-command signature: `max` draws or dispatches, record `i` at title
 /// address `records + i * stride`, each read on the GPU; with a count buffer at title address
 /// `count`, record `i` runs only if `i` is below the count, also read on the GPU (D3D12 runs
-/// min(count, max) records). False when the host cannot run it (mesh dispatches); the caller logs
+/// min(count, max) records). False when the host cannot run it; the caller logs
 /// that. Rectangle lists drop here.
 pub(crate) fn execute_indirect(
     this: This,
@@ -1085,7 +1248,25 @@ pub(crate) fn execute_indirect(
     use crate::signature::Command;
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
     match command {
-        Command::DispatchMesh => false,
+        Command::DispatchMesh => {
+            RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
+            with_list(this, |t, l| {
+                if graphics(t, l, true).is_none() {
+                    return;
+                }
+                for i in 0..max {
+                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
+                        Ok(()) => {
+                            ENCODED.fetch_add(1, Ordering::Relaxed);
+                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                        }
+                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
+                    }
+                }
+                trace_present_draw(t, l);
+            });
+            true
+        }
         Command::Dispatch => {
             with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
                 Pipe::Compute(pso) => {
@@ -1106,11 +1287,12 @@ pub(crate) fn execute_indirect(
         }
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
-            with_list(this, |t, l| match graphics(t, l) {
+            with_list(this, |t, l| match graphics(t, l, false) {
                 // shortcut: a rectangle list's records count vertices of three-corner rectangles;
                 // drawing them needs the counts rewritten on the GPU first.
                 Some(true) => {
                     dropped("an indirect rectangle-list draw");
+                    trace_drop(l);
                     true
                 }
                 Some(false) => {
@@ -1216,13 +1398,16 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if env_set!("VICTORY_TRACE_WRITES") {
         let inside = pools().resolve(address, bytes as u64).is_some();
-        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}, list {this:p}");
     }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 
 /// A wait for a memory value, recorded at the current position of the list.
 pub(crate) fn wait_value(this: This, w: Wait) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("list wait at {:#x} cmp {} ref {:#x}, list {this:p}", w.address, w.comparison, w.reference);
+    }
     with_list(this, |_, l| l.wait(w));
 }
 

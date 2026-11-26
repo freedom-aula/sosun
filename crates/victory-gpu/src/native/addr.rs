@@ -26,7 +26,6 @@
 //! entry, 16 GiB of mappings is 2 MiB of words. A 64 KiB title page that is not wholly inside one
 //! mapping of one pool (mappings of 16 KiB granularity, or a pool boundary) is a null page.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::rc::Rc;
 use victory_backend::backend::ComputeBackend;
 
@@ -205,35 +204,26 @@ pub fn lookup(words: &[u32], va: u64) -> Option<(u32, u32)> {
     (view != words[LEVEL_1]).then(|| (view, (va as u32).wrapping_sub(start)))
 }
 
-/// Zeroed, page-aligned host memory wrapped as a GPU buffer: the table, the null view.
+/// A zeroed GPU buffer of the host's own: the table, the null view. The backend owns its memory,
+/// so work submitted with it keeps it after the host replaced it (a table is replaced whenever a
+/// mapping changed, and the GPU may run work submitted with the old one much later: a queue held
+/// behind a wait).
 pub struct Pages<B: ComputeBackend> {
     pub buf: Rc<B::Buffer>,
     ptr: *mut u8,
-    layout: Layout,
+    len: usize,
 }
 
 impl<B: ComputeBackend> Pages<B> {
     /// `bytes` rounded up to 16 KiB (a page on Apple silicon; a multiple of every page size here).
     pub fn new(backend: &B, bytes: usize) -> Result<Pages<B>, String> {
-        let layout = Layout::from_size_align(bytes.max(1).next_multiple_of(1 << 14), 1 << 14)
-            .map_err(|e| e.to_string())?;
-        // SAFETY: a non-zero size.
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return Err(format!("no memory for {} bytes", layout.size()));
-        }
-        match backend.wrap_title_memory(ptr, layout.size()) {
-            Ok(buf) => Ok(Pages {
-                buf: Rc::new(buf),
-                ptr,
-                layout,
-            }),
-            Err(e) => {
-                // SAFETY: allocated above with this layout, not wrapped.
-                unsafe { dealloc(ptr, layout) };
-                Err(e)
-            }
-        }
+        let len = bytes.max(1).next_multiple_of(1 << 14);
+        let (buf, ptr) = backend.host_buffer(len)?;
+        Ok(Pages {
+            buf: Rc::new(buf),
+            ptr,
+            len,
+        })
     }
 
     pub fn ptr(&self) -> *mut u8 {
@@ -242,16 +232,9 @@ impl<B: ComputeBackend> Pages<B> {
 
     /// Writes `words` from the start.
     pub fn write(&self, words: &[u32]) {
-        assert!(words.len() * 4 <= self.layout.size());
-        // SAFETY: inside the allocation; the GPU does not read a table before it is bound.
+        assert!(words.len() * 4 <= self.len);
+        // SAFETY: inside the buffer `buf` keeps; the GPU does not read a table before it is bound.
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.ptr.cast(), words.len()) };
-    }
-}
-
-impl<B: ComputeBackend> Drop for Pages<B> {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `new` with this layout.
-        unsafe { dealloc(self.ptr, self.layout) };
     }
 }
 

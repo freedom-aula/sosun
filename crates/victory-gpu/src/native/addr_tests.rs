@@ -122,9 +122,22 @@ pub(super) fn translate_io(
     threads: u32,
     options: victory_shader::emit::Options,
 ) -> HostShader {
+    translate_wave(words, sgprs, rsrc2, threads, true, options)
+}
+
+/// [`translate_io`] of a program of 64-lane waves (`wave64`) or 32, structured for dispatches of
+/// thread counts when `options` ask for them (as `translate_with` does).
+pub(super) fn translate_wave(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    wave64: bool,
+    options: victory_shader::emit::Options,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![RootParam {
             root: RootType::Constants,
@@ -141,7 +154,8 @@ pub(super) fn translate_io(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let mut p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    p.thread_counts = options.thread_counts;
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
@@ -299,6 +313,59 @@ fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
         assert_eq!(f.get(0x2_0000, 64), vec![want; 64], "|{a} - {b}|");
         assert_eq!(f.get(0x2_0100, 64), vec![u32::from(want != 0); 64], "SCC of |{a} - {b}|");
     }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// `s_sext_i32_i8` and `s_sext_i32_i16` of s2 on the GPU: the low byte and the low half
+/// sign-extended to 32 bits (RDNA2 ISA, SOP1), stored to dst and dst + 256.
+#[test]
+fn scalar_sign_extensions_on_the_gpu() {
+    const SEXT: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xBE84_1902, // s_sext_i32_i8 s4, s2
+        0xBE85_1A02, // s_sext_i32_i16 s5, s2
+        0x7E04_0204, // v_mov_b32_e32 v2, s4
+        0x7E06_0205, // v_mov_b32_e32 v3, s5
+        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xDC70_8100, 0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
+        0xBF81_0000, // s_endpgm
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(SEXT, 3);
+    let [lo, hi] = halves(VA_A);
+    for (x, i8, i16) in [
+        (0x1234_80F0u32, 0xFFFF_FFF0u32, 0xFFFF_80F0u32),
+        (0xFFFF_7F70, 0x70, 0x7F70),
+        (0x0000_0080, 0xFFFF_FF80, 0x80),
+    ] {
+        dispatch(&mut t, &cs, &[lo, hi, x], false);
+        assert_eq!(f.get(0x2_0000, 64), vec![i8; 64], "s_sext_i32_i8 {x:#x}");
+        assert_eq!(f.get(0x2_0100, 64), vec![i16; 64], "s_sext_i32_i16 {x:#x}");
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// A VALU compare with DPP on the GPU: `v_cmp_gt_f32 vcc, v2 quad_perm:[2,3,0,1], v2` of
+/// v2 = the lane index compares the value two lanes over in the quad with the lane's own, so
+/// lanes 0 and 1 of each quad hold 1 and lanes 2 and 3 hold 0.
+#[test]
+fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
+    const DPP_CMP: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7C08_04FA, 0xFF0C_4E02, // v_cmp_gt_f32 vcc, v2, v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+        0xD501_0002, 0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(DPP_CMP, 2);
+    let [lo, hi] = halves(VA_A);
+    dispatch(&mut t, &cs, &[lo, hi], false);
+    let want: Vec<u32> = (0..64).map(|i| u32::from(i % 4 < 2)).collect();
+    assert_eq!(f.get(0x2_0000, 64), want);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
@@ -465,6 +532,44 @@ fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
     // The old destination was left alone.
     assert_eq!(f.get(0x6_0000, 64), [CANARY; 64]);
     assert_eq!(t.shaders.pipelines, 1);
+}
+
+/// Work the GPU has not run yet reads the page table it was submitted with, however often the pool
+/// table changes meanwhile: a dispatch waits for a fence while the title moves a view twelve times,
+/// with a dispatch (and so a new table) each time. The host freed a table eight rebuilds after it
+/// was replaced, so the waiting dispatch read freed memory, or a later table's words in it, and
+/// wrote wherever those sent it (Grand Theft Auto VI's first world frame: its BVH builder's empty
+/// nodes over streamed resources, with a compute queue held for seconds).
+#[test]
+fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(COMPUTED, 4);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "addr") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let mut waiting = NativeList::default();
+    waiting.set_compute_pipeline(&pso);
+    waiting.set_compute_root_constants(0, &[a, b, c, d]);
+    waiting.dispatch(1, 1, 1).unwrap();
+    use victory_metal::backend::ComputeBackend;
+    let backend = &t.host.backend;
+    let (q, gate, done) = (backend.create_queue().unwrap(), backend.create_fence(0).unwrap(), backend.create_fence(0).unwrap());
+    t.host.execute(&q, &[&waiting], &[(&gate, 1)], &[(&done, 1)]).unwrap();
+
+    // Dispatches of memory no pool shows (nothing written), each after VA_A moved in the pool.
+    let [e, g] = halves(0x55_0000_0000);
+    for k in 0..12 {
+        let offset = if k % 2 == 0 { 0x4_0000 } else { 0 };
+        t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, offset);
+        dispatch(&mut t, &cs, &[e, g, e, g], false);
+    }
+    t.host.backend.signal(&gate, 1);
+    assert!(t.host.backend.wait(&done, 1, 10_000), "GPU did not finish");
+    check_computed(&f, 0x2_0000, 0x6_0000);
 }
 
 /// A released pool's view pair goes to the next pool, and a heap that wrote the old pair (the

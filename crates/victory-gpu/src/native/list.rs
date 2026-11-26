@@ -23,6 +23,56 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    pub images: std::cell::RefCell<Shown>,
+}
+
+/// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those
+/// may be stale: an entry counts only while `of` still names the texture).
+#[derive(Default)]
+pub struct Shown {
+    of: std::collections::HashMap<usize, usize>,
+    entries: std::collections::HashMap<usize, Vec<usize>>,
+    /// The entries cleared when a texture was released, by its object's address.
+    gone: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+impl<B: GraphicsBackend> NativeHeap<B> {
+    /// Entry `index` now shows title texture `resource` (`None`: a buffer or a sampler).
+    pub fn shows(&self, index: usize, resource: Option<usize>) {
+        let Shown { of, entries, .. } = &mut *self.images.borrow_mut();
+        match resource {
+            Some(r) => {
+                if of.insert(index, r) != Some(r) {
+                    entries.entry(r).or_default().push(index);
+                }
+            }
+            None => {
+                of.remove(&index);
+            }
+        }
+    }
+
+    /// The entries that show title texture `resource`, which they stop showing.
+    pub fn take_entries(&self, resource: usize) -> Vec<usize> {
+        let Shown { of, entries, gone } = &mut *self.images.borrow_mut();
+        let mut listed = entries.remove(&resource).unwrap_or_default();
+        listed.retain(|i| of.get(i) == Some(&resource));
+        listed.sort_unstable();
+        listed.dedup();
+        listed.iter().for_each(|i| {
+            of.remove(i);
+        });
+        if !listed.is_empty() {
+            gone.insert(resource, listed.clone());
+        }
+        listed
+    }
+
+    /// The entries [`Self::take_entries`] took when the texture last at `resource` was released,
+    /// once: the title has made a texture at that address again.
+    pub fn take_gone(&self, resource: usize) -> Vec<usize> {
+        self.images.borrow_mut().gone.remove(&resource).unwrap_or_default()
+    }
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
@@ -199,6 +249,9 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         groups: [usize; 3],
+        /// The thread counts of a dispatch that gives them (`DispatchX` with thread dimensions),
+        /// for the pipeline's lanes to start EXEC by; `u32::MAX` for any other dispatch.
+        threads: [u32; 3],
         /// `ExecuteIndirect`: the title address of the group counts, read on the GPU.
         indirect: Option<u64>,
         /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
@@ -245,6 +298,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root,
                 heaps,
                 groups,
+                threads,
                 indirect,
                 count,
             } => Cmd::Dispatch {
@@ -252,6 +306,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
+                threads: *threads,
                 indirect: *indirect,
                 count: *count,
             },
@@ -477,13 +532,22 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `Dispatch`. Needs the compute pipeline set.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
-        self.dispatch_from([x as usize, y as usize, z as usize], None, None)
+        self.dispatch_from([x as usize, y as usize, z as usize], [u32::MAX; 3], None, None)
+    }
+
+    /// `DispatchX` with thread counts, of a pipeline translated for them
+    /// (`victory_shader::emit::Options::thread_counts`): whole groups, rounded up, whose threads
+    /// past the counts start with EXEC off.
+    pub fn dispatch_threads(&mut self, threads: [u32; 3]) -> Result<(), String> {
+        let per = self.state.compute.as_ref().ok_or("dispatch without a compute pipeline")?.threads;
+        let groups = std::array::from_fn(|d| (threads[d] as usize).div_ceil(per[d]));
+        self.dispatch_from(groups, threads, None, None)
     }
 
     /// One dispatch of `ExecuteIndirect`: its group counts are the three words at title address
     /// `record`, read on the GPU.
     pub fn dispatch_indirect(&mut self, record: u64) -> Result<(), String> {
-        self.dispatch_from([0; 3], Some(record), None)
+        self.dispatch_from([0; 3], [u32::MAX; 3], Some(record), None)
     }
 
     /// Record `index` of an `ExecuteIndirect` of dispatches with a count buffer at title address
@@ -494,12 +558,13 @@ impl<B: GraphicsBackend> NativeList<B> {
         count: u64,
         index: u32,
     ) -> Result<(), String> {
-        self.dispatch_from([0; 3], Some(record), Some((count, index)))
+        self.dispatch_from([0; 3], [u32::MAX; 3], Some(record), Some((count, index)))
     }
 
     fn dispatch_from(
         &mut self,
         groups: [usize; 3],
+        threads: [u32; 3],
         indirect: Option<u64>,
         count: Option<(u64, u32)>,
     ) -> Result<(), String> {
@@ -513,6 +578,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.compute_root.clone(),
             heaps: self.state.heaps.clone(),
             groups,
+            threads,
             indirect,
             count,
         });
@@ -699,6 +765,17 @@ impl<B: GraphicsBackend> NativeList<B> {
             first_vertex,
             first_instance,
         })
+    }
+
+    /// `DispatchMesh` of a mesh pipeline.
+    pub fn dispatch_mesh(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
+        self.draw_call(DrawCall::Mesh { groups: [x, y, z] })
+    }
+
+    /// One `DispatchMesh` of `ExecuteIndirect`: its group counts are the record at title address
+    /// `record`, read on the GPU; with `count`, only if the record's index is below the count.
+    pub fn dispatch_mesh_indirect(&mut self, record: u64, count: Option<(u64, u32)>) -> Result<(), String> {
+        self.draw_from(DrawCall::Mesh { groups: [0; 3] }, Some(record), count)
     }
 
     pub fn draw_indexed_instanced(
