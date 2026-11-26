@@ -25,8 +25,10 @@
 //! Group barriers need every thread of the group. Such an operation is
 //! therefore lowered only in a block each thread runs exactly once
 //! ([`once_blocks`](super::once_blocks)), or, in a group that is one console
-//! wave, in one reached by uniform (SCC) branches alone and outside any loop:
-//! both halves then arrive together. Elsewhere (in a branch of EXEC, a
+//! wave, in one reached by uniform (SCC) branches alone and outside any loop
+//! ([`wave_blocks`](super::wave_blocks)): both halves then arrive together.
+//! An SCC computed from a `v_readfirstlane` is not uniform here: each half
+//! reads its own first lane. Elsewhere (in a branch of EXEC, a
 //! per-lane loop) the translation is refused. Cost: two barriers and a
 //! shared-memory round trip per such operation, 4 bytes per thread of
 //! group-shared memory in all, and `WaveSize(32)` in place of 64.
@@ -39,7 +41,6 @@ use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
-use crate::structure::Atom;
 
 impl Lower<'_> {
     /// A group barrier with a shared-memory fence in DXIL block `at`.
@@ -54,18 +55,6 @@ impl Lower<'_> {
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
         if self.once[ir] {
-            return Ok(());
-        }
-        let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
-        let st = self.x.st;
-        if lanes <= 64
-            && !self.on_cycle(ir)
-            && st
-                .bools
-                .support(st.reach[ir])
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(_)))
-        {
             return Ok(());
         }
         Err(super::DIVERGENT_EXCHANGE)
