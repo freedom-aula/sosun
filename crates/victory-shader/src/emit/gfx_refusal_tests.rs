@@ -133,6 +133,7 @@ fn lower_ps(
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
+        copy_params: [0; 32],
     })
 }
 
@@ -175,6 +176,7 @@ fn lower_vs(
         zero_copy_memory: false,
         view_marks: false,
         rect_list,
+        copy_params: [0; 32],
     })
 }
 

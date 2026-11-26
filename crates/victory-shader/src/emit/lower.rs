@@ -35,6 +35,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Pixel inputs split off an input read two ways: (original, new) semantic indices.
+    pub splits: Vec<(u32, u32)>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -110,6 +112,8 @@ pub(crate) struct Parts<'a> {
     pub zero_copy_memory: bool,
     /// See [`Options::rect_list`](super::Options).
     pub rect_list: bool,
+    /// See [`Options::copy_params`](super::Options).
+    pub copy_params: [u8; 32],
 }
 
 enum Stop {
@@ -1519,7 +1523,13 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let splits = self
+            .split_inputs
+            .iter()
+            .map(|(&(orig, _), &new)| (self.s.inputs[orig].index, self.s.inputs[new].index))
+            .collect();
         Ok(Lowered {
+            splits,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -11648,6 +11658,30 @@ impl<'a> Lower<'a> {
                 stores.push((id, col, value, None));
             }
         }
+        // A parameter a split pixel input copies (`Options::copy_params`) is written with the
+        // original's values.
+        if self.x.copy_params != [0; 32] && !primitive {
+            let mut copies = Vec::new();
+            for &(id, col, value, half) in &stores {
+                let src = &self.s.outputs[id];
+                if src.kind != 0 || src.index >= 32 {
+                    continue;
+                }
+                for (m, &from) in self.x.copy_params.iter().enumerate() {
+                    if from != 0
+                        && u32::from(from) - 1 == src.index
+                        && let Some(to) = self
+                            .s
+                            .outputs
+                            .iter()
+                            .position(|o| o.kind == 0 && o.name == src.name && o.index == m as u32)
+                    {
+                        copies.push((to, col, value, half));
+                    }
+                }
+            }
+            stores.extend(copies);
+        }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
             if primitive {
                 &mut l.s.prims
@@ -12663,6 +12697,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
+            copy_params: [0; 32],
             view_marks: false,
         })
         .map(|_| ())
@@ -12720,6 +12755,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
+            copy_params: [0; 32],
             view_marks: false,
         })
     }
@@ -12922,6 +12958,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
+            copy_params: [0; 32],
             view_marks: false,
         })
         .unwrap();
@@ -13758,6 +13795,7 @@ mod tests {
             wave32_host,
             zero_copy_memory: false,
             rect_list: false,
+            copy_params: [0; 32],
             view_marks: false,
         })
         .expect("lower")

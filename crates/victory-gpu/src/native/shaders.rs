@@ -41,8 +41,8 @@ pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
 /// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
-pub fn translate_extra(container: &[u8], rect: bool, extra: u32) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, ..options() })
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
         .map_err(|e| e.to_string())
 }
 

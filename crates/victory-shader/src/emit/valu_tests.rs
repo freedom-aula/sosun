@@ -146,10 +146,12 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })?;
 
     let shader = HostShader {
+        splits: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1311,10 +1313,12 @@ fn lower_cs32_with(
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })
     .expect("lower");
     let shader = HostShader {
+        splits: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
