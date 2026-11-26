@@ -10377,17 +10377,48 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
-    /// `depth` deep) on edges where only an AND with an EXEC those lanes are not in reads it
-    /// (`anded_off_on_edge`), so the wave can hold any bits there.
+    /// `depth` deep) whose edge from it needs no value ([`Self::unneeded_arg`]), so the wave can
+    /// hold any bits there.
     fn never_seen(&self, value: Value, depth: u32) -> bool {
         let p = self.x.p;
-        if depth == 0 || p.blocks.iter().any(|b| b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == value))) {
+        depth > 0
+            && !self.read_by_code(value)
+            && p.blocks.iter().enumerate().all(|(e, blk)| {
+                blk.phis.iter().all(|phi| {
+                    phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
+                        self.unneeded_arg(e, phi, k, depth - 1)
+                    })
+                })
+            })
+    }
+
+    /// Whether an instruction (not a join) reads `value`.
+    fn read_by_code(&self, value: Value) -> bool {
+        let reads = |i: &Inst| i.reads.iter().any(|r| r.1 == value);
+        self.x.p.blocks.iter().any(|b| b.insts.iter().any(reads))
+    }
+
+    /// Whether no lane taking edge `n` into IR block `b` sees what that edge brings to `phi`:
+    /// only an AND with an EXEC those lanes are not in reads it ([`Self::anded_off_on_edge`]),
+    /// no lane sees the join at all, or (with nothing reading the join) those lanes leave `b`
+    /// only by edges whose joins do not take it or need no value there either (a register the
+    /// console compiler reuses on a path those lanes skip, as a nested if's else part writes
+    /// it again before any read).
+    fn unneeded_arg(&self, b: usize, phi: &Phi, n: usize, depth: u32) -> bool {
+        let p = self.x.p;
+        if self.anded_off_on_edge(b, phi.value, n) || self.never_seen(phi.value, depth) {
+            return true;
+        }
+        if depth == 0 || self.read_by_code(phi.value) {
             return false;
         }
-        p.blocks.iter().enumerate().all(|(bb, blk)| {
-            blk.phis.iter().all(|phi| {
-                phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
-                    self.anded_off_on_edge(bb, phi.value, k) || self.never_seen(phi.value, depth - 1)
+        let on_n = self.lane_edge(p.blocks[b].preds[n], b);
+        p.blocks.iter().enumerate().all(|(e, blk)| {
+            blk.phis.iter().all(|next| {
+                next.args.iter().enumerate().filter(|&(_, &a)| a == phi.value).all(|(k, _)| {
+                    let taken = || [on_n.clone(), self.lane_edge(b, e)].concat();
+                    (blk.preds[k] == b && !self.x.st.bools.meet(&taken()))
+                        || self.unneeded_arg(e, next, k, depth - 1)
                 })
             })
         })
@@ -13595,8 +13626,9 @@ impl<'a> Lower<'a> {
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
                     // but by such joins: any bit will do, so what the edge brings (data, or a
                     // value not made) is not needed.
-                    (None, _) if self.anded_off_on_edge(b, phi.value, n) => self.s.m.bool(false),
-                    (None, _) if self.never_seen(phi.value, 4) => self.s.m.bool(false),
+                    // shortcut: the search repeats work along a chain of joins (fine at the
+                    // title's ~10 deep); memoise it if a program's translation gets slow.
+                    (None, _) if self.unneeded_arg(b, phi, n, 16) => self.s.m.bool(false),
                     // No lanes or every lane, moved just before the edge: each lane's bit,
                     // whatever the lane layout and whichever lanes take the edge.
                     (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {

@@ -457,3 +457,44 @@ fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
     assert_eq!(got[..5], [1; 5]);
     assert_eq!(got[5..], [0; 59]);
 }
+
+#[test]
+fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed() {
+    // `s[8:9]` holds the lanes below 50, then loaded data for lanes 0..59 (a first join of data
+    // and a mask). An if/else on the lanes below 40 follows: the then part makes a new mask, and
+    // the lanes that skip it (40..63, holding the first join) run the else part, which writes
+    // the register again before any read. They never take the edge that brings the first join
+    // to the end, so no lane sees it (the title's 1280x720 compute pass; was refused: "data,
+    // ...").
+    let w = [
+        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0x7D88_00BC, // v_cmp_gt_u32 vcc, 60, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(3),
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_008A, // then: v_cmp_gt_u32 s[8:9], 10, v0
+        0x8AFE_7E06, // s_andn2_b64 exec, s[6:7], exec
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_00B2, // else: v_cmp_gt_u32 s[8:9], 50, v0
+        0xBEFE_0406, // end: s_mov_b64 exec, s[6:7]
+        0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..40], [0; 30]);
+    assert_eq!(got[40..50], [1; 10]);
+    assert_eq!(got[50..], [0; 14]);
+}
