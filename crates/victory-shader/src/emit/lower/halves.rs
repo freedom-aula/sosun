@@ -18,7 +18,9 @@
 //! reductions and prefix sums of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
 //! a reduction is each half's result, combined; a prefix sum adds the lower
-//! half's total in the upper half.
+//! half's total in the upper half. Lanes the group lacks (a group whose lanes
+//! are not a multiple of 64) write no slot: their ballot bits are 0, a missing
+//! upper half adds nothing to a reduction, and a lane read of one gives 0.
 //!
 //! Group barriers need every thread of the group. Such an operation is
 //! therefore lowered only in a block each thread runs exactly once
@@ -75,6 +77,20 @@ impl Lower<'_> {
         self.s.m.element(at, g, index)
     }
 
+    /// Whether exchange slot `index`, which holds lanes `index << shift` on, is a thread's, where
+    /// the group's lanes are not a multiple of 64 (its last console wave lacks lanes, or a whole
+    /// host wave, and no thread writes their slots). `None`: every slot is a thread's.
+    fn xchg_written(&mut self, at: usize, index: V, shift: u32) -> Option<V> {
+        let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if lanes.is_multiple_of(64) {
+            return None;
+        }
+        let k = self.s.m.i32(shift);
+        let first = self.s.m.bin(at, Bin::Shl, index, k);
+        let n = self.s.m.i32(lanes);
+        Some(self.s.m.cmp(at, pred::IULT, first, n))
+    }
+
     /// The console's ballot of `on` in DXIL block `at` (IR block `ir`): the
     /// low and high dwords.
     pub(super) fn wide_ballot(&mut self, at: usize, ir: usize, on: V) -> Result<(V, V), Why> {
@@ -104,6 +120,14 @@ impl Lower<'_> {
         let (lo_p, hi_p) = (self.xchg_slot(at, lo_at), self.xchg_slot(at, hi_at));
         let (lo, hi) = (self.s.m.load(at, lo_p), self.s.m.load(at, hi_p));
         self.xchg_barrier(at);
+        // A missing upper half has no lanes on.
+        let hi = match self.xchg_written(at, hi_at, 5) {
+            Some(there) => {
+                let z = self.s.m.i32(0);
+                self.s.m.select(at, there, hi, z)
+            }
+            None => hi,
+        };
         Ok((lo, hi))
     }
 
@@ -135,7 +159,11 @@ impl Lower<'_> {
         let p = self.xchg_slot(c, src);
         let r = self.s.m.load(c, p);
         self.xchg_barrier(c);
-        Ok(r)
+        // Guess: a lane the group lacks reads as 0 (the console reads whatever its VGPR holds).
+        Ok(match self.xchg_written(c, src, 0) {
+            Some(there) => self.s.m.select(c, there, r, z),
+            None => r,
+        })
     }
 
     /// A reduction (`r`, one host wave's) or prefix sum (`r`, over the lanes
@@ -194,7 +222,7 @@ impl Lower<'_> {
             let add = self.s.m.select(c, is_upper, lo, none);
             return Ok(self.s.m.bin(c, Bin::Add, r, add));
         }
-        Ok(match op {
+        let both = match op {
             Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
             Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
             Op::And => self.s.m.bin(c, Bin::And, lo, hi),
@@ -211,6 +239,11 @@ impl Lower<'_> {
                 self.s.m.select(c, t, lo, hi)
             }
             Op::AddH => return Err("a 16-bit wave reduction across the host's waves"),
+        };
+        // A missing upper half adds nothing: the lower half's result alone.
+        Ok(match self.xchg_written(c, hi_at, 5) {
+            Some(there) => self.s.m.select(c, there, both, lo),
+            None => both,
         })
     }
 }

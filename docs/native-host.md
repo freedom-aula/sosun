@@ -703,6 +703,19 @@ native host's own path: the container made from the title's pieces, the host's o
 story-load log of issue #110 (Series S) has three compute programs refused with the old message;
 nothing is lowered yet.
 
+## Groups whose lanes are not a multiple of 64 (wave32 host)
+
+With `Options::wave32_host`, what crosses the two host waves of a console wave goes through the
+`xchg` group-shared array (`lower/halves.rs`, `docs/metal-backend.md`). A group of 96 lanes has a
+last console wave of 32 lanes: one host wave, no upper half, and nothing wrote that half's slots,
+so its ballot's high dword, its reductions and lane reads took whatever an earlier exchange (or
+nothing) left there. Now a slot no thread writes is not used: a ballot's missing half is 0, a
+reduction is the lower half's alone (the console's lanes past the group are off, so a whole-wave
+section adds the `v_cndmask` 0 they hold) and a lane read of a missing lane gives 0. Guess: the
+console's `v_readlane` of a lane the group lacks reads whatever that lane's VGPR holds; 0 is ours.
+`split_wave_tests::a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks` (`victory-gpu`)
+runs a ballot and a whole-wave sum in a 96-lane group on Metal.
+
 ## ExecuteIndirect on the native host
 
 The prologue world load (frame ~2112) is the first place the title uses `ExecuteIndirect`. It creates five command signatures, each with one argument and no count buffer, and passes `max` 1 every time:
