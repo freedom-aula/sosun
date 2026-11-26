@@ -246,6 +246,9 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
             set_error(ERROR_INVALID_PARAMETER);
             return 0;
         };
+        // The physical-page views in it go first (`XMemVirtualAlloc`'s pool backing, views
+        // `XMemMapPhysicalPages` put there), as `XMemFreeDefault`'s release does.
+        crate::modules::xmem::forget_physical(address as usize, len);
         // SAFETY: a region this shim made.
         unsafe { mem::release(address.cast(), len) }.is_ok()
     } else if kind & MEM_DECOMMIT != 0 {
