@@ -26,7 +26,7 @@ use crate::gfx10::{Fields, Instruction, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
 use crate::native::{
     HwStage, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage, VsOutput,
-    metadata_resources,
+    expand_constants, metadata_resources,
 };
 
 /// The part a graphics piece pair is carried in: `"FSPG"`, u32 stage (0 vertex, 1 pixel), u32
@@ -134,23 +134,7 @@ fn infer(
             }
         }
     }
-    // shortcut: multi-dword root constants are only expanded when the immediately following
-    // root signature slot (`slot + 1`) is also present in metadata; a trailing multi-dword
-    // constant block stays 1 SGPR until the register image is decoded.
-    for i in 0..layout.len() {
-        if layout[i].root != RootType::Constants {
-            continue;
-        }
-        let (slot, start) = (layout[i].slot, layout[i].user_data);
-        if let Some(next) =
-            layout.iter().find(|p| p.slot == slot.wrapping_add(1) && p.user_data > start)
-        {
-            let span = u32::from(next.user_data - start);
-            if span > layout[i].sgprs && span <= 32 {
-                layout[i].sgprs = span;
-            }
-        }
-    }
+    expand_constants(&mut layout);
     let occupied = |layout: &[RootParam], reg: u8| {
         let r = u32::from(reg);
         layout

@@ -36,6 +36,7 @@ fn srv_and_uav_through_a_descriptor_table() {
             },
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
         }];
         run(&m, &w);
         let out: Vec<u32> = a.read(half, N);
@@ -102,6 +103,7 @@ impl Grid<'_> {
                 self.z,
             ],
             threads_per_group: [4, 4, 1],
+            indirect: None,
         }];
         run(m, &w);
         let f: Vec<f32> = a.read(0, cells * 4);
@@ -470,5 +472,38 @@ fn heap_overwrite_detaches_replaced_residency_allocations() {
         drop(t2);
         drop(heap);
         drop(t3);
+    }
+}
+
+#[test]
+fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
+    for m in backends() {
+        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+        let a = Arena::new(&m, 3);
+        let (dst, record) = (a.region.len / 2, N * 4);
+        a.write(0, &(0..N as u32).collect::<Vec<_>>());
+        // `D3D12_DISPATCH_ARGUMENTS`: half the groups.
+        a.write(record, &[(N / 128) as u32, 1, 1]);
+        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+        m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
+        m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
+        let w = [Dispatch {
+            pipeline: &p,
+            root: RootArgs::default()
+                .constants(&[5, 7])
+                .address(m.heap_address(&heap, 5)),
+            resources: vec![],
+            heaps: victory_metal::backend::Heaps {
+                resource: Some(&heap),
+                sampler: None,
+            },
+            groups: [0, 0, 0],
+            threads_per_group: [64, 1, 1],
+            indirect: Some((&a.buf, a.at(record) as *const u8)),
+        }];
+        run(&m, &w);
+        let out: Vec<u32> = a.read(dst, N);
+        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
+        assert!(out[N / 2..].iter().all(|v| *v == 0), "groups past the record's count do not run");
     }
 }

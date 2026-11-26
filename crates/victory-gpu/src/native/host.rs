@@ -78,6 +78,8 @@ struct Prep<B: GraphicsBackend> {
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
+    /// The `ExecuteIndirect` argument record.
+    indirect: Option<(Rc<B::Buffer>, *const u8)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
 }
@@ -817,12 +819,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
             vertex: vec![],
             index: None,
             blit: vec![],
+            indirect: None,
             heap: None,
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, groups, ..
+                root, pso, heaps, groups, indirect, ..
             } => {
+                if let Some(a) = indirect {
+                    p.indirect = Some(self.resolve(*a, 12)?);
+                }
                 tracing::debug!(?groups, "dispatch");
                 if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -851,8 +857,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 index,
                 call,
                 targets,
+                indirect,
                 ..
             } => {
+                if let Some(a) = indirect {
+                    p.indirect = Some(self.resolve(*a, if matches!(call, DrawCall::Indexed { .. }) { 20 } else { 16 })?);
+                }
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
@@ -996,6 +1006,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers.extend(p.vertex.iter().map(|b| &*b.0));
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
+            buffers.extend(p.indirect.iter().map(|b| &*b.0));
         }
         if let Err(e) = self.backend.make_resident(queue, &buffers) {
             tracing::warn!(error = %e, "pool buffers were not made resident");
@@ -1028,6 +1039,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             },
                             groups: *groups,
                             threads_per_group: pso.threads,
+                            indirect: preps[k].indirect.as_ref().map(|(b, p)| (&**b, *p)),
                         }
                     })
                     .collect(),
@@ -1137,6 +1149,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                         .collect(),
                                     index_buffer: preps[k].index.as_ref().map(|(b, p)| (&**b, *p)),
                                     call: *call,
+                                    indirect: preps[k].indirect.as_ref().map(|(b, p)| (&**b, *p)),
                                 }
                             })
                             .collect(),
