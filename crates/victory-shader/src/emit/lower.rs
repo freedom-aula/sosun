@@ -2286,7 +2286,8 @@ impl<'a> Lower<'a> {
     /// and selects on host ballots.
     fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
         // Each way out names where the mask comes from, so a refusal log says which is missing.
-        const MESH: Why = "a lane mask holding lanes elsewhere read as data: in a mesh program";
+        const STAGE: Why = "a lane mask holding lanes elsewhere read as data: in a mesh, hull or \
+                            geometry program";
         const INPUT: Why = "a lane mask holding lanes elsewhere read as data: a program input";
         const VECTOR: Why = "a lane mask holding lanes elsewhere read as data: not written by a \
                              scalar ALU instruction";
@@ -2301,7 +2302,7 @@ impl<'a> Lower<'a> {
         const OP: Why =
             "a lane mask holding lanes elsewhere read as data: a scalar operation not modelled";
         if self.mask_data == MaskData::None {
-            return Err(MESH);
+            return Err(STAGE);
         }
         let p = self.x.p;
         // A register the compiler reuses: a mask on one path, data on another.
