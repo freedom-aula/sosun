@@ -783,6 +783,8 @@ A sampler heap entry holds only the sampler's resource ID. The host used to drop
 
 #### CPU texture transfers are bounds-checked
 
+Texture uploads, the background scanner and submit-time probes first try one Mach read per chunk (up to 1 MiB). If a read spanning multiple pages fails, the host walks the VM regions that overlap the chunk. It leaves unmapped gaps and regions without read permission zero-filled and copies each readable span in one read. If that read also fails, for example because the title changed the mapping after the query, the host retries just that span at page boundaries. A 1 MiB chunk entirely inside a hole or a single no-access region costs one failed read and one region query. A failed probe contained in one page needs only its original read.
+
 `upload_texture` and `read_texture` compute what the mip needs from the texture's format (blocks wide times bytes per block, rows, slice pitch) and skip the Metal call, with a warning naming the format, region, pitches and buffer length (and a backtrace the first time), when the row pitch, slice pitch or buffer is too small. Metal's `AGX: Texture read/write assertion failed: bytes_per_row >= used_bytes_per_row` was seen 0.6-2 s before a burst of title-heap corruption, so a short pitch is suspected to let the driver run past the buffer; the check keeps that out of host memory (hypothesis, not yet proven).
 
 #### Rectangle-list corners and the Brightness logo (open)
