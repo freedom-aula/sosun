@@ -296,7 +296,8 @@ fn hex_form(v: f64, prec: Option<usize>, upper: bool, alt: bool) -> String {
             };
         }
         Some(p) => digits.push_str(&"0".repeat(p - 13)),
-        None => digits = digits.trim_end_matches('0').to_string(),
+        // The CRT's default precision is 13, so trailing zeros stay (glibc trims them).
+        None => {}
     }
     let dot = if digits.is_empty() && !alt { "" } else { "." };
     let s = format!(
@@ -1056,11 +1057,16 @@ mod tests {
         assert_eq!(run("%f %f", &[d(f64::NAN), d(-f64::NAN)]), "nan -nan(ind)");
         assert_eq!(run("%f", &[d(-0.0)]), "-0.000000");
         assert_eq!(run("%f", &[d(1e20)]), "100000000000000000000.000000");
-        assert_eq!(run("%a %A", &[d(1.0), d(0.5)]), "0x1p+0 0X1P-1");
+        // Thirteen digits unless a precision is given.
+        assert_eq!(
+            run("%a %A", &[d(1.0), d(0.5)]),
+            "0x1.0000000000000p+0 0X1.0000000000000P-1"
+        );
         assert_eq!(
             run("%a %.2a %a", &[d(3.0), d(1.0 + 1.0 / 3.0), d(0.0)]),
-            "0x1.8p+1 0x1.55p+0 0x0p+0"
+            "0x1.8000000000000p+1 0x1.55p+0 0x0.0000000000000p+0"
         );
+        assert_eq!(run("%.0a %#.0a", &[d(1.0), d(1.0)]), "0x1p+0 0x1.p+0");
         assert_eq!(run("%a", &[d(5e-324)]), "0x0.0000000000001p-1022");
     }
 

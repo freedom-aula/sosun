@@ -51,6 +51,24 @@ pub fn start_mem_watch() {
     });
 }
 
+/// `VICTORY_HOLD_BYTE=<hex address>:<hex byte>`: keeps that byte of title
+/// memory at the value, rewritten every 250 ms. Debugging aid, e.g. holding a
+/// title watchdog's pause flag while slow storage stretches its init.
+pub fn start_hold_byte() {
+    let Some((at, value)) = std::env::var("VICTORY_HOLD_BYTE").ok().and_then(|v| {
+        let (a, b) = v.split_once(':')?;
+        Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, u8::from_str_radix(b, 16).ok()?))
+    }) else {
+        return;
+    };
+    tracing::warn!("holding byte {at:#x} at {value:#x}");
+    std::thread::spawn(move || loop {
+        // SAFETY: debugging aid; the address is title data the user named.
+        unsafe { (at as *mut u8).write_volatile(value) };
+        std::thread::sleep(Duration::from_millis(250));
+    });
+}
+
 /// Starts the dumping thread if `VICTORY_DUMP_THREADS` is set.
 pub fn start() {
     let Some(secs) = seconds() else { return };
