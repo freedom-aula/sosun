@@ -457,9 +457,7 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     if n % every != 0 || n / every >= 12 {
         return;
     }
-    let shaders: Vec<String> = crate::pipeline::native_stages(l.pipeline as This)
-        .map(|(stages, _)| stages.iter().map(|(s, sh)| format!("{s} {}", sh.hash)).collect())
-        .unwrap_or_default();
+    let shaders = stage_hashes(l.pipeline);
     let targets: Vec<String> = l.target_keys.iter().map(|k| format!("{k:#x}")).collect();
     tracing::info!(n, pipeline = format!("{:#x}", l.pipeline), ?shaders, ?targets, "present draw");
     let (root, binding) = l.list.graphics_args();
@@ -934,8 +932,24 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
                 tracing::warn!(error = %e, "dispatch");
             }
         }
-        _ => dropped("a dispatch without a host compute pipeline"),
+        _ => dropped_dispatch(l, &format!("groups [{x}, {y}, {z}]")),
     });
+}
+
+/// A dispatch dropped for want of a host compute pipeline; with `VICTORY_TRACE_TARGETS`, counted
+/// by its shader and `how` (group counts, or indirect) for the frame line.
+fn dropped_dispatch(l: &MetalList, how: &str) {
+    dropped("a dispatch without a host compute pipeline");
+    if tracing_targets() {
+        trace_drop_pipe(format!("{:?} {how}", stage_hashes(l.pipeline)));
+    }
+}
+
+/// The stages of title pipeline `pipeline` with their shader hashes (for traces).
+fn stage_hashes(pipeline: usize) -> Vec<String> {
+    crate::pipeline::native_stages(pipeline as This)
+        .map(|(stages, _)| stages.iter().map(|(s, sh)| format!("{s} {}", sh.hash)).collect())
+        .unwrap_or_default()
 }
 
 /// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
@@ -1100,10 +1114,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
         dropped("a draw without a host render pipeline (refused or not translated)");
         trace_drop(l);
         if tracing_targets() {
-            let shaders: Vec<String> = crate::pipeline::native_stages(l.pipeline as This)
-                .map(|(stages, _)| stages.iter().map(|(s, sh)| format!("{s} {}", sh.hash)).collect())
-                .unwrap_or_default();
-            trace_drop_pipe(format!("{shaders:?} into {:?}", l.targets));
+            trace_drop_pipe(format!("{:?} into {:?}", stage_hashes(l.pipeline), l.targets));
         }
         return None;
     };
@@ -1257,7 +1268,7 @@ pub(crate) fn execute_indirect(
                         }
                     }
                 }
-                _ => dropped("a dispatch without a host compute pipeline"),
+                _ => dropped_dispatch(l, "indirect"),
             });
             true
         }
