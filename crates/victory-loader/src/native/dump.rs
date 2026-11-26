@@ -69,6 +69,7 @@ pub fn start() {
                 .collect();
             tracing::warn!("memory at {at:#x}: {}", words.join(" "));
         }
+        super::bridge::report_callbacks();
         for line in collect() {
             tracing::warn!("{line}");
         }
@@ -76,7 +77,7 @@ pub fn start() {
 }
 
 /// A qword at `at`, if the kernel says it can be read.
-fn read_checked(at: usize) -> Option<usize> {
+pub(crate) fn read_checked(at: usize) -> Option<usize> {
     unsafe extern "C" {
         static mach_task_self_: u32;
         fn mach_vm_read_overwrite(task: u32, address: u64, size: u64, data: u64, out: *mut u64) -> i32;

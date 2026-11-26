@@ -360,6 +360,15 @@ fn trace_present(resource: This) {
 
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
+    // frames from one that follows time.
+    static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *DELAY.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     if tracing_targets() {
         trace_present(resource);
     }
