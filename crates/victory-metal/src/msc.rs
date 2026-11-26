@@ -107,9 +107,14 @@ pub const DEFAULT_DYLIB: &str = "/usr/local/lib/libmetalirconverter.dylib";
 
 impl Msc {
     /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default.
-    pub fn open_default() -> Msc {
+    pub fn try_open_default() -> Result<Msc, String> {
         let path = std::env::var("VICTORY_MSC_DYLIB").unwrap_or_else(|_| DEFAULT_DYLIB.into());
-        Msc::open(&path).unwrap_or_else(|e| panic!("dlopen {path}: {e}"))
+        Msc::open(&path).map_err(|e| format!("dlopen {path}: {e}"))
+    }
+
+    /// Opens `VICTORY_MSC_DYLIB` if set, else the installed default, panicking on failure.
+    pub fn open_default() -> Msc {
+        Self::try_open_default().unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn open(path: &str) -> Result<Msc, String> {
@@ -180,7 +185,13 @@ impl Msc {
                 let mut err = std::ptr::null_mut();
                 signature = sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
                 if signature.is_null() {
-                    let code = if err.is_null() { 0 } else { sym::<ErrCode>(h, "IRErrorGetCode")(err) };
+                    let code = if err.is_null() {
+                        0
+                    } else {
+                        let code = sym::<ErrCode>(h, "IRErrorGetCode")(err);
+                        sym::<Destroy>(h, "IRErrorDestroy")(err);
+                        code
+                    };
                     sym::<Destroy>(h, "IRCompilerDestroy")(comp);
                     return Err(ConvError {
                         code,

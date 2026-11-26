@@ -386,7 +386,10 @@ impl Metal {
         dxil: &[u8],
         layout: Option<&victory_backend::backend::RootLayout>,
     ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
-        let (_, lib) = self.msc.convert_with(dxil, None, layout).map_err(|e| e.to_string())?;
+        let (_, lib) = self
+            .msc()?
+            .convert_with(dxil, None, layout)
+            .map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
         let name = l
             .functionNames()
