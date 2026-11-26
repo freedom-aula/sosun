@@ -457,8 +457,12 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let guessed = graphics::is_guessed(&c);
+    let computed_buffers = guessed && options.zero_copy_memory;
+    let res = resource::track_graphics(
+        &p, &native.layout, native.stage, st.as_ref().ok(), computed_buffers,
+    )?;
+    let io = io::raise_graphics(&p, &native, guessed)?;
     let st = st?;
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
@@ -579,14 +583,17 @@ pub fn emit_with(
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let guessed = graphics::is_guessed(c);
+    let l = match lower::lower_graphics(&parts(st, res), guessed) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            let res = resource::track_graphics(
+                p, &native.layout, native.stage, Some(&st), guessed && options.zero_copy_memory,
+            )?;
+            lower::lower_graphics(&parts(&st, &res), guessed)?
         }
         l => l?,
     };

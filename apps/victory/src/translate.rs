@@ -745,6 +745,11 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.dynamic += usize::from(address.dynamic.is_some());
                 Some(address)
             }
+            resource::Source::BuiltMemory { .. } => {
+                t.built += 1;
+                t.dynamic += 1;
+                None
+            }
             resource::Source::Constant(_) => {
                 t.constant += 1;
                 None
