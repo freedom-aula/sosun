@@ -44,8 +44,9 @@ else
 fi
 [[ -f "$exe" ]] || { echo "Not a file: $exe"; exit 2; }
 
-bin=target/x86_64-apple-darwin/release/victory
-[[ -x "$bin" ]] || { echo "victory is not built yet: run tools/macos/native-setup.sh first"; exit 2; }
+source tools/macos/native-binary.sh
+bin=$(native_binary) || exit 2
+[[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
 
 run_dir="runs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run_dir"
@@ -74,3 +75,4 @@ echo "Exit code $rc. Last lines of the log:"
 sed 's/\x1b\[[0-9;]*m//g' "$log" | tail -15 | cut -c1-200
 echo
 echo "To report: open a Tester report issue and attach $log"
+exit "$rc"
