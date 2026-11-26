@@ -285,6 +285,64 @@ fn a_queue_waits_for_a_fence_the_cpu_signals() {
     assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 + 100));
 }
 
+/// A queue's Wait on a fence the CPU signals more than 5 s later, as D3D12 allows. Metal ends a
+/// command buffer whose `MTLSharedEvent` wait lasts about 5 s with
+/// `kIOGPUCommandBufferCallbackErrorTimeout`, and drops its work and its signals: a wait encoded
+/// on the GPU before its signal exists loses the queue's later work and leaves its fence behind.
+#[test]
+fn a_queue_wait_longer_than_metals_event_wait_limit_still_runs_the_work() {
+    if !available() {
+        return;
+    }
+    let pool = pool(9008, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0u32; N]);
+    let (q, gate, done) = (Queue::new(), Fence::new(0), Fence::new(0));
+    q.wait(&gate, 1);
+    let list = List::new(pipeline());
+    affine(&list, 1, 100, pool.va(src), pool.va(dst));
+    list.close();
+    q.execute(&[&list]);
+    q.signal(&done, 1);
+    assert!(nothing_for(6_000, || done.completed() >= 1 || pool.read::<u32>(dst, 1)[0] != 0));
+    gate.signal(1);
+    wait_until("the work after the wait", || done.completed() >= 1);
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 + 100), "{:?}", &out[..4]);
+}
+
+/// A queue's Wait for a value another queue's Signal will reach once its work has run: the
+/// waiting queue's list reads what the signalling queue's list wrote.
+#[test]
+fn a_queue_waits_for_another_queues_signal() {
+    if !available() {
+        return;
+    }
+    let pool = pool(9009, 4);
+    let (src, mid, dst) = (0, 8192, 16384);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(mid, &[0u32; N]);
+    pool.write(dst, &[0u32; N]);
+    let pso = pipeline();
+    let (q1, q2) = (Queue::new(), Queue::new());
+    let (between, done) = (Fence::new(0), Fence::new(0));
+    let first = List::new(pso);
+    affine(&first, 2, 1, pool.va(src), pool.va(mid));
+    first.close();
+    q1.execute(&[&first]);
+    q1.signal(&between, 3);
+    q2.wait(&between, 3);
+    let second = List::new(pso);
+    affine(&second, 3, 0, pool.va(mid), pool.va(dst));
+    second.close();
+    q2.execute(&[&second]);
+    q2.signal(&done, 1);
+    assert_eq!(done.wait(1), S_OK);
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == (i as u32 * 2 + 1) * 3), "{:?}", &out[..4]);
+}
+
 /// Views a title writes (`CreateShaderResourceView` of a buffer resource it made at an address of
 /// its own memory, `CreateUnorderedAccessView`) into a shader-visible heap reach the shader
 /// through `SetDescriptorHeaps` and a root descriptor table.

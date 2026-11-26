@@ -115,8 +115,8 @@ pub(crate) struct World<'a, S> {
     /// Runs a piece (a queue, its segments in order) to completion, the
     /// bottom-of-pipe writes included.
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
-    /// Signals a fence.
-    pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Attempts a signal or ordered action; false leaves it at the FIFO head for retry.
+    pub(crate) signal: &'a mut dyn FnMut(usize, u64) -> bool,
 }
 
 impl<S> Held<S> {
@@ -158,12 +158,12 @@ impl<S> Held<S> {
                         }
                         // A Signal or Wait keeps its place: the piece before
                         // it runs first.
-                        Some((Item::Signal(..), ..)) => {
+                        Some((Item::Signal(token, value), ..)) => {
                             if !piece.is_empty() {
                                 (w.run)(*queue, std::mem::take(&mut piece));
                                 done.pieces += 1;
                             }
-                            true
+                            (w.signal)(*token, *value)
                         }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
                             let ok = (w.fence)(*fence) >= *value;
@@ -182,7 +182,7 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        Some(Item::Signal(..)) => {}
                         Some(Item::FenceWait(..)) | None => {}
                     }
                 }
@@ -213,6 +213,12 @@ impl<S> Held<S> {
                 Some((*q, items.len(), since.elapsed(), unmet))
             })
             .collect()
+    }
+
+    pub(crate) fn waits_for(&self, token: usize) -> bool {
+        self.queues.iter().any(|(_, items)| items.iter().any(|(item, ..)| {
+            matches!(item, Item::FenceWait(f, _) if *f == token)
+        }))
     }
 
     /// Whether no queue holds anything.
@@ -279,8 +285,33 @@ mod tests {
             let mut f = fake.borrow_mut();
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
+            true
         };
         held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+    }
+
+    #[test]
+    fn a_pending_action_holds_only_its_own_queue() {
+        let mut held = Held::new();
+        held.push(1, Item::Segment("render", vec![]));
+        held.push(1, Item::Signal(10, 0));
+        held.push(1, Item::Segment("after present", vec![]));
+        held.push(2, Item::Segment("independent", vec![]));
+        let log = RefCell::new(Vec::new());
+        let ready = std::cell::Cell::new(false);
+        let mut run = |_, pieces: Vec<&'static str>| log.borrow_mut().extend(pieces);
+        let mut signal = |_, _| {
+            if !ready.get() { return false; }
+            log.borrow_mut().push("present");
+            true
+        };
+        let mut world = World { read: &|_, _| None, fence: &|_| 0, run: &mut run, signal: &mut signal };
+        held.pump(&mut world);
+        assert_eq!(*log.borrow(), ["render", "independent"]);
+        ready.set(true);
+        held.pump(&mut world);
+        assert_eq!(*log.borrow(), ["render", "independent", "present", "after present"]);
+        assert!(held.is_empty());
     }
 
     #[test]
