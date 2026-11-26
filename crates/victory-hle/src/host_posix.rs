@@ -373,6 +373,15 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 fn new_handle(object: Object) -> *mut c_void {
     let handle = (NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize) << 2;
+    if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+        let kind = match &object {
+            Object::Event(_) => "event",
+            Object::Semaphore(_) => "semaphore",
+            Object::Thread(_) => "thread",
+            _ => "other",
+        };
+        tracing::warn!("handle {handle:#x} ({kind}) made at image+ {:x?}", native::dump::caller_chain());
+    }
     lock(&HANDLES).insert(handle, object);
     handle as *mut c_void
 }
@@ -425,7 +434,13 @@ pub extern "system" fn CreateSemaphoreW(
     _name: *const u16,
 ) -> *mut c_void {
     match Semaphore::new(initial as u32, max as u32) {
-        Ok(s) => new_handle(Object::Semaphore(Arc::new(s))),
+        Ok(s) => {
+            let h = new_handle(Object::Semaphore(Arc::new(s)));
+            if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                tracing::warn!("semaphore {h:?} initial {initial} max {max}");
+            }
+            h
+        }
         Err(_) => {
             set_error(ERROR_INVALID_PARAMETER);
             std::ptr::null_mut()
@@ -446,6 +461,7 @@ pub extern "system" fn ReleaseSemaphore(
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    watched(handle as usize, "release", count as u32);
     match s.release(count as u32) {
         Some(before) => {
             sync::signalled();
@@ -518,10 +534,25 @@ pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 
         set_error(ERROR_INVALID_HANDLE);
         return WAIT_FAILED;
     };
-    if object.wait(timeout) {
+    let got = object.wait(timeout);
+    watched(handle as usize, if got { "wait got it" } else { "wait timed out" }, ms);
+    if got {
         WAIT_OBJECT_0
     } else {
         WAIT_TIMEOUT
+    }
+}
+
+/// `VICTORY_WATCH_HANDLE=<hex>`: logs every wait and release on that handle.
+fn watched(handle: usize, what: &str, arg: u32) {
+    static WATCH: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_WATCH_HANDLE")
+            .ok()
+            .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    });
+    if handle == *WATCH && handle != 0 && (what != "wait timed out") {
+        tracing::warn!("watch {handle:#x}: {what} ({arg}) at image+ {:x?}", native::dump::caller_chain());
     }
 }
 
@@ -614,6 +645,9 @@ pub extern "system" fn CreateThread(
                 lock(&me.state).running = true;
             },
             move |code| {
+                if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                    tracing::warn!("title thread ends, code {code:#x}");
+                }
                 lock(&finished.state).exit_code = code;
                 finished.done.set();
                 sync::signalled();

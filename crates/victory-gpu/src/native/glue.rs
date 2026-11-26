@@ -90,9 +90,7 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Ok(mut g) = TITLE.try_lock()
-                    && let Some(t) = g.as_mut()
-                {
+                if let Some(t) = lock().as_mut() {
                     refresh(&mut t.0);
                 }
             }
@@ -101,6 +99,17 @@ fn start_timer() {
 
 fn refresh(t: &mut MetalTitle) {
     t.pump();
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|l| l.elapsed().as_secs() >= 5) {
+            let stuck = t.stuck(std::time::Duration::from_secs(2));
+            if !stuck.is_empty() {
+                *last = Some(std::time::Instant::now());
+                tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+            }
+        }
+    }
     for (fence, value) in t.completed() {
         crate::fence::raise(fence as This, value);
     }
@@ -125,6 +134,9 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    if let Some(ms) = std::env::var("VICTORY_SUBMIT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;

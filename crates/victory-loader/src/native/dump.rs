@@ -37,6 +37,18 @@ pub fn start() {
     });
 }
 
+/// A qword at `at`, if the kernel says it can be read.
+fn read_checked(at: usize) -> Option<usize> {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_read_overwrite(task: u32, address: u64, size: u64, data: u64, out: *mut u64) -> i32;
+    }
+    let (mut v, mut got) = (0usize, 0u64);
+    // SAFETY: `v` is 8 writable bytes; the kernel checks the source.
+    let r = unsafe { mach_vm_read_overwrite(mach_task_self_, at as u64, 8, &raw mut v as u64, &mut got) };
+    (r == 0 && got == 8).then_some(v)
+}
+
 fn read(teb: usize, off: usize) -> usize {
     // SAFETY: inside a live TEB block.
     unsafe { ((teb + off) as *const usize).read() }
@@ -73,6 +85,25 @@ fn collect() -> Vec<String> {
             // SAFETY: the bridge's own frame on that thread's stack.
             ctx.gpr[RBP] = unsafe { (rbp as *const u64).read() };
             chain = super::seh::backtrace(ctx, bounds);
+            // VICTORY_DUMP_REGS=1: the title's callee-saved registers at the call (the bridge
+            // pushed them below its frame pointer) and the qwords they point at.
+            if std::env::var_os("VICTORY_DUMP_REGS").is_some() {
+                let regs: Vec<String> = ["rbx", "rdi", "rsi", "r12", "r13", "r14"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let v = read_checked(rbp - 8 * (i + 1)).unwrap_or(0);
+                        // Not into the image: only data.
+                        let words: Vec<String> = (0..4)
+                            .filter(|_| !(0x1_4000_0000..0x1_5000_0000).contains(&v))
+                            .map(|w| read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}")))
+                            .collect();
+                        format!("{n}={v:#x} [{}]", words.join(" "))
+                    })
+                    .collect();
+                let arg = |off: usize| read_checked(rbp - off).unwrap_or(0);
+                line += &format!(" args {:#x} {:#x} regs {}", arg(0x100), arg(0xF8), regs.join(" "));
+            }
         } else if port.context(&mut ctx) {
             if unwind::image_base_of(ctx.rip as usize).is_some() {
                 line += "in title code";
@@ -87,4 +118,23 @@ fn collect() -> Vec<String> {
         out.push(format!("{line}, title image+ {offsets:x?}"));
     }
     out
+}
+
+/// The calling thread's title call chain (image offsets) while it is in a host call, for
+/// diagnostics such as `VICTORY_TRACE_HANDLES`.
+pub fn caller_chain() -> Vec<usize> {
+    let teb = super::teb::current() as usize;
+    if teb == 0 || read(teb, OFF_IN_HOST) == 0 {
+        return Vec::new();
+    }
+    let rbp = read(teb, OFF_IN_HOST_RBP);
+    let mut ctx = Context::zeroed();
+    ctx.rip = read(teb, OFF_IN_HOST_RET) as u64;
+    ctx.gpr[RSP] = (rbp + 16) as u64;
+    // SAFETY: the bridge's own frame on this thread's stack.
+    ctx.gpr[RBP] = unsafe { (rbp as *const u64).read() };
+    let bounds = Some((read(teb, OFF_STACK_LIMIT), read(teb, OFF_STACK_BASE)));
+    let chain = super::seh::backtrace(ctx, bounds);
+    let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
+    chain.iter().map(|&pc| pc.wrapping_sub(base)).collect()
 }

@@ -154,6 +154,8 @@ pub struct Title<B: PresentBackend> {
     /// Signals held behind work: the queue, fence and value, by the number the held item carries.
     signals: HashMap<usize, (usize, usize, u64)>,
     next_signal: usize,
+    /// The highest value each fence was told to reach, and when that changed (diagnostics).
+    requested: HashMap<usize, (u64, std::time::Instant)>,
     pub stats: Stats,
 }
 
@@ -169,6 +171,7 @@ impl<B: PresentBackend> Title<B> {
             pending: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
+            requested: HashMap::new(),
             held: Held::new(),
             signals: HashMap::new(),
             next_signal: 0,
@@ -252,6 +255,10 @@ impl<B: PresentBackend> Title<B> {
     /// `ID3D12CommandQueue::Signal`: behind work the queue still holds, else on the GPU at once
     /// (after the work already submitted to its queue).
     pub fn signal_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
+        let r = self.requested.entry(fence).or_insert((0, std::time::Instant::now()));
+        if value > r.0 {
+            *r = (value, std::time::Instant::now());
+        }
         if self.held.holds_work(queue) {
             let n = self.next_signal;
             self.next_signal += 1;
@@ -336,6 +343,45 @@ impl<B: PresentBackend> Title<B> {
             signal: &mut signal,
         });
         stats.waited += done.waited.len() as u64;
+    }
+
+    /// Queues whose head has been held longer than `limit`: a line each, with the waits that do
+    /// not hold (address, comparison, reference, mask, current value).
+    pub fn stuck(&self, limit: std::time::Duration) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .requested
+            .iter()
+            .filter_map(|(k, &(want, since))| {
+                let f = self.fences.get(k)?;
+                let done = self.host.backend.completed(f);
+                (done < want && since.elapsed() >= limit)
+                    .then(|| format!("fence {k:#x}: signal of {want} queued {:.1?} ago, GPU at {done}", since.elapsed()))
+            })
+            .collect();
+        let memory = self.host.memory();
+        let read = |address: u64, bytes: u8| read_title(&memory, address, bytes);
+        out.extend(self
+            .held
+            .blocked(&read)
+            .into_iter()
+            .filter(|(.., since, _)| *since >= limit)
+            .map(|(q, items, since, unmet)| {
+                let waits: Vec<String> = unmet
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "{:#x} cmp {} ref {:#x} mask {:#x} now {:?}",
+                            w.address,
+                            w.comparison,
+                            w.reference,
+                            w.mask,
+                            read(w.address, w.bytes)
+                        )
+                    })
+                    .collect();
+                format!("queue {q:#x}: {items} held, head for {since:.1?}, waits {waits:?}")
+            }));
+        out
     }
 
     /// Gives the host the app's drawable layer (`CAMetalLayer` on Metal, by address): frames the

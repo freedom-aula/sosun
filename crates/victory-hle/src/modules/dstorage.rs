@@ -489,6 +489,26 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
             .count();
         tracing::info!(workers = started, "dstorage: workers");
+        if std::env::var_os("VICTORY_DSTORAGE_LOG").is_some() {
+            let _ = std::thread::Builder::new().name("dstorage log".into()).spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let g = scheduler.lock();
+                    let lanes: Vec<String> = g
+                        .lanes
+                        .iter()
+                        .filter(|(_, l)| l.entries() > 0)
+                        .map(|(id, l)| {
+                            format!(
+                                "lane {id}: unsubmitted {} held {} reads {} statuses {} running {} cap {}",
+                                l.unsubmitted.len(), l.held.len(), l.reads.len(), l.statuses.len(), l.running.len(), l.capacity
+                            )
+                        })
+                        .collect();
+                    tracing::warn!(staged = g.staged, staging = g.staging, ?lanes, "dstorage state");
+                }
+            });
+        }
     });
     Some(scheduler)
 }
