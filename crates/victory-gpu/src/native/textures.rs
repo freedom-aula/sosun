@@ -77,13 +77,38 @@ impl TextureInfo {
     }
 }
 
+/// Uploads and change probes must see the same bytes, including across holes in title memory.
+fn read_texture_bytes(at: *const u8, out: &mut [u8]) {
+    if super::safe_read(at, out) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let page = victory_platform::mem::page_size();
+        let first = page - at.addr() % page;
+        if out.len() > first {
+            // Mach can refuse the entire read for one inaccessible page. Retry each page
+            // separately, including the partial pages at either end of an unaligned texture.
+            let mut offset = 0;
+            let (head, tail) = out.split_at_mut(first);
+            for part in std::iter::once(head).chain(tail.chunks_mut(page)) {
+                if !super::safe_read(at.wrapping_add(offset), part) {
+                    part.fill(0);
+                }
+                offset += part.len();
+            }
+            return;
+        }
+    }
+    out.fill(0);
+}
+
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     const CHUNK: usize = 1 << 20;
     let mut out = vec![0u8; len];
     for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
-        // Only an address, checked by the kernel when read.
-        let _ = super::safe_read(at.wrapping_add(i * CHUNK), chunk);
+        read_texture_bytes(at.wrapping_add(i * CHUNK), chunk);
     }
     out
 }
@@ -267,8 +292,7 @@ fn scan_round(
         let mut h = blake3::Hasher::new();
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
-            buf[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut buf[..n]);
             h.update(&buf[..n]);
         }
         let h = h.finalize();
@@ -383,8 +407,7 @@ fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
     if scratch.len() < n {
         scratch.resize(n, 0);
     }
-    scratch[..n].fill(0);
-    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+    read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
     scratch[..n].iter().any(|&b| b != 0)
 }
 
@@ -402,8 +425,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
         }
         for off in (0..size).step_by(CHUNK) {
             let n = CHUNK.min(size - off);
-            scratch[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
             seen(&scratch[..n]);
         }
         return;
@@ -416,8 +438,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     for k in 0..PROBE_PAGES {
         let off = k * pages / PROBE_PAGES * PAGE;
         let n = PROBE_SAMPLE.min(size - off);
-        scratch[..n].fill(0);
-        let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+        read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
         seen(&scratch[..n]);
     }
 }
@@ -972,6 +993,35 @@ mod tests {
             from_host(format, &mut texels);
             assert_eq!(texels, title, "{format}");
         }
+    }
+
+    #[test]
+    fn a_texture_read_preserves_texels_on_both_sides_of_an_unreadable_page() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(3 * page, None).unwrap();
+        // SAFETY: all three pages belong to this test. Protect only the middle one after filling it.
+        unsafe {
+            memory.ptr.write_bytes(0x31, 2 * page);
+            memory.ptr.add(2 * page).write_bytes(0x72, page);
+            protect(memory.ptr.add(page), page, Protect::NO_ACCESS).unwrap();
+        }
+        let start = memory.ptr.wrapping_add(page - 7);
+        let mut expected = vec![0; 7 + page + 11];
+        expected[..7].fill(0x31);
+        expected[7 + page..].fill(0x72);
+
+        let bytes = read_memory(start, expected.len());
+        assert_eq!(&bytes[..7], &expected[..7]);
+        assert!(bytes[7..7 + page].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[7 + page..], &expected[7 + page..]);
+        let mut scratch = vec![0xff; expected.len()];
+        assert_eq!(
+            probe_hash(start as usize, expected.len(), true, &mut scratch),
+            blake3::hash(&expected)
+        );
     }
 
     #[test]
