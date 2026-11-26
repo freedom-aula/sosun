@@ -308,11 +308,24 @@ fn to_f64(f: &Float) -> f64 {
     }
 }
 
+/// Whether a number read as an infinity or a zero is out of range, which the CRT reports with
+/// `ERANGE`: an infinity from digits (overflow), or a zero from nonzero digits (underflow).
+fn out_of_range(f: &Float, infinite: bool, zero: bool) -> bool {
+    match f {
+        Float::Number(t) => {
+            let digits = t.split(['e', 'E']).next().unwrap_or("");
+            infinite || (zero && digits.bytes().any(|b| matches!(b, b'1'..=b'9')))
+        }
+        Float::Hex { mantissa, .. } => infinite || (zero && *mantissa != 0),
+        Float::Inf(_) | Float::Nan(_) => false,
+    }
+}
+
 /// Parses a prefix of `s` as a double: the value and the bytes consumed.
 pub(super) fn parse_double(s: &[u8]) -> Option<(f64, usize)> {
     let (f, n) = float_prefix(s)?;
     let v = to_f64(&f);
-    if v.is_infinite() && matches!(f, Float::Number(_) | Float::Hex { .. }) {
+    if out_of_range(&f, v.is_infinite(), v == 0.0) {
         set_errno(ERANGE);
     }
     Some((v, n))
@@ -324,7 +337,7 @@ fn parse_single(s: &[u8]) -> Option<(f32, usize)> {
         Float::Number(t) => t.parse().unwrap_or(0.0),
         other => to_f64(other) as f32,
     };
-    if v.is_infinite() && matches!(f, Float::Number(_) | Float::Hex { .. }) {
+    if out_of_range(&f, v.is_infinite(), v == 0.0) {
         set_errno(ERANGE);
     }
     Some((v, n))
@@ -974,6 +987,27 @@ mod tests {
         assert_eq!(atoi(b"123\0".as_ptr()), 123);
         assert_eq!(wcstol(w("  -7").as_ptr(), std::ptr::null_mut(), 10), -7);
         assert_eq!(_wtoi64(w("5000000000").as_ptr()), 5_000_000_000);
+    }
+
+    #[test]
+    fn an_underflow_to_zero_sets_erange() {
+        let read = |s: &[u8]| {
+            set_errno(0);
+            let v = strtod(s.as_ptr(), std::ptr::null_mut());
+            (v, super::super::errno())
+        };
+        assert_eq!(read(b"1e-400\0"), (0.0, ERANGE));
+        assert_eq!(read(b"-0.0000001e-330\0"), (-0.0, ERANGE));
+        // Zero digits are a zero, not an underflow; a subnormal is no underflow to zero.
+        assert_eq!(read(b"0e-400\0"), (0.0, 0));
+        assert_eq!(read(b"0.000\0"), (0.0, 0));
+        assert_eq!(read(b"4.9e-324\0"), (f64::from_bits(1), 0));
+        set_errno(0);
+        assert_eq!(strtof(b"1e-50\0".as_ptr(), std::ptr::null_mut()), 0.0);
+        assert_eq!(super::super::errno(), ERANGE);
+        set_errno(0);
+        assert_eq!(strtof(b"1e-30\0".as_ptr(), std::ptr::null_mut()), 1e-30);
+        assert_eq!(super::super::errno(), 0);
     }
 
     #[test]
