@@ -337,7 +337,7 @@ fn infer(
         let of = |n: u8| packing.get(&n).copied().unwrap_or(Packing::Plain);
         // Four channels whatever the code exports: Metal links a fragment input only to an
         // output of the same type, and the pixel side reads channels the code does not show.
-        // A parameter only packing instructions make has no `TEXCOORD`, only its halves.
+        // A parameter only packing instructions make has its `TEXCOORD` last, if there is room.
         let mut outs: Vec<SigElement> = params
             .iter()
             .filter(|p| of(p.0) != Packing::Halves)
@@ -359,24 +359,33 @@ fn infer(
         } else {
             StageIo::Vs { inputs: Vec::new(), outputs }
         };
-        // The halves (`HALF`) of each parameter that may hold them, as many as fit, those only
-        // packing instructions make first: a mesh stage's outputs take 16 bytes an element for
-        // each vertex, at most 32 KiB in all (the converter's limit).
+        // The halves (`HALF`) of each parameter that may hold them, as many as fit, by how
+        // likely: a mesh stage's outputs take 16 bytes an element for each vertex, at most
+        // 32 KiB in all (the converter's limit).
         let max = match &io {
             StageIo::Ms(ms) => (32 * 1024 / (16 * ms.max_vertices.max(1))).min(MAX_ROWS),
             _ => MAX_ROWS,
         } as usize;
         let mut next = rows + 1;
-        for kind in [Packing::Halves, Packing::Unknown] {
+        let mut raw = Vec::new();
+        for kind in [Packing::Halves, Packing::Mixed, Packing::Unknown] {
             for &(n, _) in params.iter().filter(|p| of(p.0) == kind) {
                 if outs.len() + 2 <= max {
                     outs.push(element(HALF, 2 * u32::from(n), 0, next, 0xf));
                     outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, 0xf));
                     next += 2;
-                } else if kind == Packing::Halves {
-                    // No room for its halves: the dword itself, as for any other parameter.
-                    outs.push(element("TEXCOORD", u32::from(n), 0, u32::from(n), 0xf));
                 }
+                if kind == Packing::Halves {
+                    raw.push(n);
+                }
+            }
+        }
+        // The dwords of the parameters of halves too, as room allows (a pixel program may read
+        // them as 32 bits, flat): after every parameter's halves.
+        for n in raw {
+            let halves = outs.iter().any(|o| o.name == HALF && o.index == 2 * u32::from(n));
+            if !halves || outs.len() < max {
+                outs.push(element("TEXCOORD", u32::from(n), 0, u32::from(n), 0xf));
             }
         }
         (io, (Vec::new(), outs))
@@ -514,24 +523,32 @@ fn infer(
     Ok((NativeProgram { stage, wave64, vgprs, layout, used, io, code: code.to_vec() }, sigs))
 }
 
-/// What a guessed parameter's dwords hold, from the instructions that make them.
+/// What a guessed parameter's dwords hold, from the instructions that make them (its channels'
+/// values followed back through moves, `v_cndmask_b32` and joins to their sources).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Packing {
-    /// 32-bit values: every channel comes from 32-bit float operations (`*_f32`, not a
-    /// packing conversion) and inline constants.
+    /// 32-bit values: every source is a 32-bit operation (`*_f32` but a 16-bit conversion,
+    /// `*_u32`, `*_i32`), an inline constant or a literal that is a normal f32 with a low half
+    /// of 0.
     Plain,
-    /// Two f16 halves a dword: every channel comes from packing or 16-bit instructions
-    /// (`v_fma_mix*`, `v_cvt_pk*`, `v_pack_b32_f16`, `v_pk_*`, `*_f16`) and inline constants.
+    /// Two f16 halves a dword: every source is a packing or 16-bit instruction (`v_fma_mix*`,
+    /// `v_cvt_pk*`, `v_cvt_f16_*`, `v_pack_b32_f16`, `v_pk_*`, `*_f16`), an inline constant or
+    /// a literal that is no normal f32 (as halves such as 0x3c00 or 0xffffbc00 read).
     Halves,
-    /// Either: a load, a literal, an SGPR, an input, another instruction, or a mix.
+    /// Some sources are of the second kind, others not.
+    Mixed,
+    /// Neither: loads, SGPRs, other literals and instructions, with no 16-bit source. Program
+    /// inputs count as no source (ids, or what lanes that export nothing on a path hold).
     Unknown,
 }
 
-/// Each parameter's (`exp param<n>`) [`Packing`], following its channels' values back through
-/// moves, `v_cndmask_b32` and joins. A guess (docs/native-host.md, "16-bit parameters of guessed
-/// pipelines") that keeps the halves to the parameters that can need them.
+/// Each parameter's (`exp param<n>`) [`Packing`]. A guess (docs/native-host.md, "16-bit
+/// parameters of guessed pipelines") that keeps the halves to the parameters that can need them.
 fn packed_params(p: &Program) -> std::collections::HashMap<u8, Packing> {
     use std::collections::{HashMap, HashSet};
+    const PLAIN: u8 = 1;
+    const HALVES: u8 = 2;
+    const OTHER: u8 = 4;
     let mut insts: HashMap<Value, &Inst> = HashMap::new();
     let mut phis: HashMap<Value, &[Value]> = HashMap::new();
     for b in &p.blocks {
@@ -544,14 +561,9 @@ fn packed_params(p: &Program) -> std::collections::HashMap<u8, Packing> {
             }
         }
     }
-    // The packing of a value; None for one that fits both (inline constants only).
-    let of = |v: Value| {
-        let (mut todo, mut seen, mut kind) = (vec![v], HashSet::new(), None);
-        let mut meet = |k: Packing| match kind {
-            None => kind = Some(k),
-            Some(was) if was != k => kind = Some(Packing::Unknown),
-            _ => {}
-        };
+    // The kinds of source a value comes from.
+    let sources = |v: Value| {
+        let (mut todo, mut seen, mut kinds) = (vec![v], HashSet::new(), 0u8);
         while let Some(v) = todo.pop() {
             if !seen.insert(v) {
                 continue;
@@ -560,57 +572,74 @@ fn packed_params(p: &Program) -> std::collections::HashMap<u8, Packing> {
                 todo.extend(args.iter().copied());
                 continue;
             }
-            let (Some(i), Some(name)) = (insts.get(&v), insts.get(&v).map(|i| i.name())) else {
-                return Packing::Unknown;
-            };
-            let Fields::Valu(f) = &i.fields else { return Packing::Unknown };
-            let srcs = match name {
-                "v_mov_b32" => &f.src[..f.src.len().min(1)],
-                "v_cndmask_b32" => &f.src[..f.src.len().min(2)],
-                _ if name.starts_with("v_cvt_pk")
-                    || name.starts_with("v_fma_mix")
-                    || name.starts_with("v_pk_")
-                    || name == "v_pack_b32_f16"
-                    || name.ends_with("_f16") =>
+            let Some(i) = insts.get(&v) else { continue };
+            let name = i.name();
+            let srcs = match (&i.fields, name) {
+                (Fields::Valu(f), "v_mov_b32") => &f.src[..f.src.len().min(1)],
+                (Fields::Valu(f), "v_cndmask_b32") => &f.src[..f.src.len().min(2)],
+                (Fields::Valu(_), _)
+                    if name.starts_with("v_cvt_pk")
+                        || name.starts_with("v_cvt_f16_")
+                        || name.starts_with("v_fma_mix")
+                        || name.starts_with("v_pk_")
+                        || name == "v_pack_b32_f16"
+                        || name.ends_with("_f16") =>
                 {
-                    meet(Packing::Halves);
+                    kinds |= HALVES;
                     continue;
                 }
-                _ if name.ends_with("_f32") => {
-                    meet(Packing::Plain);
+                (Fields::Valu(_), _)
+                    if name.ends_with("_f32") || name.ends_with("_u32") || name.ends_with("_i32") =>
+                {
+                    kinds |= PLAIN;
                     continue;
                 }
-                _ => return Packing::Unknown,
+                _ => {
+                    kinds |= OTHER;
+                    continue;
+                }
             };
             for s in srcs {
                 match *s {
                     Operand::Const(_) => {}
+                    Operand::Literal(0) => {}
+                    Operand::Literal(x) if matches!(x >> 23 & 0xff, 0 | 0xff) => kinds |= HALVES,
+                    Operand::Literal(x) if x & 0xffff == 0 => kinds |= PLAIN,
+                    Operand::Literal(_) => kinds |= OTHER,
                     Operand::Vector { reg, .. } => match i.read(Reg::V(reg)) {
                         Some(v) => todo.push(v),
-                        None => return Packing::Unknown,
+                        None => kinds |= OTHER,
                     },
-                    _ => return Packing::Unknown,
+                    _ => kinds |= OTHER,
                 }
             }
         }
-        kind.unwrap_or(Packing::Plain)
+        kinds
     };
-    let mut out: HashMap<u8, Packing> = HashMap::new();
+    let mut kinds: HashMap<u8, u8> = HashMap::new();
     for i in p.blocks.iter().flat_map(|b| &b.insts) {
         if let Fields::Exp { target: t @ 32..=63, src, .. } = &i.fields {
+            let k = kinds.entry(t - 32).or_insert(0);
             for s in src.iter().flatten() {
-                let k = match *s {
-                    Operand::Vector { reg, .. } => i.read(Reg::V(reg)).map_or(Packing::Unknown, of),
-                    _ => Packing::Unknown,
+                *k |= match *s {
+                    Operand::Vector { reg, .. } => i.read(Reg::V(reg)).map_or(OTHER, sources),
+                    _ => OTHER,
                 };
-                let e = out.entry(t - 32).or_insert(k);
-                if *e != k {
-                    *e = Packing::Unknown;
-                }
             }
         }
     }
-    out
+    kinds
+        .into_iter()
+        .map(|(n, k)| {
+            let packing = match k {
+                0 | PLAIN => Packing::Plain,
+                HALVES => Packing::Halves,
+                _ if k & HALVES != 0 => Packing::Mixed,
+                _ => Packing::Unknown,
+            };
+            (n, packing)
+        })
+        .collect()
 }
 
 /// `exp prim`'s target.
@@ -1230,9 +1259,9 @@ mod tests {
         assert_eq!(h.stage, HwStage::Ms);
     }
 
-    /// Only parameters that may hold two f16 halves get `HALF` outputs, and only those that
-    /// can hold nothing else lose their `TEXCOORD`: param0 is a 32-bit float product, param1 a
-    /// literal (either), param2 a `v_cvt_pkrtz_f16_f32` or 0 (halves).
+    /// Only parameters that may hold two f16 halves get `HALF` outputs, those that can hold
+    /// nothing else first and their `TEXCOORD` last: param0 is a 32-bit float product (plain),
+    /// param1 a literal of two f16s (either), param2 a `v_cvt_pkrtz_f16_f32` or 0 (halves).
     #[test]
     fn halves_go_to_parameters_that_may_hold_them() {
         let code = [
@@ -1251,7 +1280,9 @@ mod tests {
         let (_, (_, outs)) = infer(HwStage::Vs, &words(&code), &meta_with(&[])).unwrap();
         let named = |name: &str| -> Vec<u32> { outs.iter().filter(|o| o.name == name).map(|o| o.index).collect() };
         assert_eq!(named(HALF), [4, 5, 2, 3], "{outs:?}");
-        assert_eq!(named("TEXCOORD"), [0, 1], "{outs:?}");
+        assert_eq!(named("TEXCOORD"), [0, 1, 2], "{outs:?}");
+        let k = packed_params(&crate::ir::build(&words(&code), true, 256).unwrap());
+        assert_eq!((k[&0], k[&1], k[&2]), (Packing::Plain, Packing::Unknown, Packing::Halves));
     }
 
     /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
