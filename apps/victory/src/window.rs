@@ -8,8 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-// No binding crate links AppKit, so its classes would not be registered without this.
+// No binding crate links AppKit or GameController, so their classes would not be registered
+// without this.
 #[link(name = "AppKit", kind = "framework")]
+#[link(name = "GameController", kind = "framework")]
 unsafe extern "C" {}
 
 use anyhow::{Context, Result};
@@ -237,6 +239,89 @@ unsafe fn key_event(event: *mut AnyObject) -> bool {
     true
 }
 
+/// Polls the first connected `GCController` with an `extendedGamepad` (Xbox,
+/// DualSense, or MFi) and updates `GameInput`. Releases controller state when
+/// no extended gamepad is connected.
+unsafe fn poll_controller() {
+    use victory_hle::modules::gameinput::ControllerSnapshot;
+    // SAFETY: documented GameController framework getters on valid ObjC objects.
+    unsafe {
+        let controllers: *mut AnyObject = msg_send![class!(GCController), controllers];
+        if controllers.is_null() {
+            victory_hle::modules::gameinput::release_live_pad();
+            return;
+        }
+        let count: usize = msg_send![controllers, count];
+        for i in 0..count {
+            let ctrl: *mut AnyObject = msg_send![controllers, objectAtIndex: i];
+            if ctrl.is_null() {
+                continue;
+            }
+            let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
+            if gp.is_null() {
+                continue;
+            }
+            let pressed = |btn: *mut AnyObject| -> bool {
+                !btn.is_null() && {
+                    let b: Bool = msg_send![btn, isPressed];
+                    b.as_bool()
+                }
+            };
+            let trigger = |btn: *mut AnyObject| -> f32 {
+                if btn.is_null() { 0.0 } else { msg_send![btn, value] }
+            };
+            let axis = |dpad: *mut AnyObject| -> (f32, f32) {
+                if dpad.is_null() {
+                    return (0.0, 0.0);
+                }
+                let x_axis: *mut AnyObject = msg_send![dpad, xAxis];
+                let y_axis: *mut AnyObject = msg_send![dpad, yAxis];
+                let x: f32 = if x_axis.is_null() { 0.0 } else { msg_send![x_axis, value] };
+                let y: f32 = if y_axis.is_null() { 0.0 } else { msg_send![y_axis, value] };
+                (x, y)
+            };
+            let dpad: *mut AnyObject = msg_send![gp, dpad];
+            let (up, down, left, right) = if dpad.is_null() {
+                (false, false, false, false)
+            } else {
+                (
+                    pressed(msg_send![dpad, up]),
+                    pressed(msg_send![dpad, down]),
+                    pressed(msg_send![dpad, left]),
+                    pressed(msg_send![dpad, right]),
+                )
+            };
+            let (left_x, left_y) = axis(msg_send![gp, leftThumbstick]);
+            let (right_x, right_y) = axis(msg_send![gp, rightThumbstick]);
+            let snap = ControllerSnapshot {
+                a: pressed(msg_send![gp, buttonA]),
+                b: pressed(msg_send![gp, buttonB]),
+                x: pressed(msg_send![gp, buttonX]),
+                y: pressed(msg_send![gp, buttonY]),
+                up,
+                down,
+                left,
+                right,
+                left_shoulder: pressed(msg_send![gp, leftShoulder]),
+                right_shoulder: pressed(msg_send![gp, rightShoulder]),
+                left_stick: pressed(msg_send![gp, leftThumbstickButton]),
+                right_stick: pressed(msg_send![gp, rightThumbstickButton]),
+                menu: pressed(msg_send![gp, buttonMenu]),
+                view: pressed(msg_send![gp, buttonOptions]),
+                left_trigger: trigger(msg_send![gp, leftTrigger]),
+                right_trigger: trigger(msg_send![gp, rightTrigger]),
+                left_x,
+                left_y,
+                right_x,
+                right_y,
+            };
+            victory_hle::modules::gameinput::set_live_pad(snap);
+            return;
+        }
+        victory_hle::modules::gameinput::release_live_pad();
+    }
+}
+
 /// Runs the loop until `finished`, or the window is gone.
 unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
     let mode = NSString::from_str("kCFRunLoopDefaultMode"); // NSDefaultRunLoopMode
@@ -259,8 +344,11 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
                 }
                 let key: Bool = msg_send![window, isKeyWindow];
                 if !key.as_bool() {
-                    // A key-up sent to another window never reaches us.
+                    // A key-up or release sent to another window never reaches us.
                     victory_hle::modules::gameinput::release_live_keys();
+                    victory_hle::modules::gameinput::release_live_pad();
+                } else {
+                    poll_controller();
                 }
                 let _: () = msg_send![app, updateWindows];
                 let shown: Bool = msg_send![window, isVisible];
@@ -269,6 +357,8 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
             }
         });
         if !go_on {
+            victory_hle::modules::gameinput::release_live_keys();
+            victory_hle::modules::gameinput::release_live_pad();
             // SAFETY: as above.
             let shown: Bool = unsafe { msg_send![window, isVisible] };
             if shown.as_bool() {
@@ -380,6 +470,17 @@ mod tests {
             assert!(!unsafe { key_event(other) });
 
             victory_hle::modules::gameinput::release_live_keys();
+        });
+    }
+
+    /// Smoke-tests linking `GameController.framework` and querying
+    /// `[GCController controllers]` via `poll_controller` without panicking.
+    #[test]
+    fn poll_controller_queries_game_controller_framework_cleanly() {
+        super::autoreleasepool(|_| {
+            // SAFETY: plain GameController query.
+            unsafe { super::poll_controller() };
+            victory_hle::modules::gameinput::release_live_pad();
         });
     }
 }
