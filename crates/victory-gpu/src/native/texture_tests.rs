@@ -825,6 +825,74 @@ fn a_render_target_view_selects_its_mip_and_slice() {
     }
 }
 
+/// A rectangle-list draw (`D3D_PRIMITIVE_TOPOLOGY_RECTLIST`, 17) on a described (non-guessed)
+/// pipeline must draw the supplied vertices as `Topology::Triangles` instead of issuing
+/// 4-vertex instanced strips designed for `Options::rect_list`.
+#[test]
+fn described_rectangle_list_draw_uses_supplied_triangles() {
+    let Some(pool) = pool(9204, 4) else { return };
+    let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    let pso = with_title(|t| {
+        let vs = super::fixture("tri_vs");
+        let ps = super::fixture("tri_ps");
+        t.host
+            .render_pipeline(&RenderPipelineDesc {
+                vs: &vs,
+                ps: Some(&ps),
+                vs_layout: None,
+                ps_layout: None,
+                attributes: &[
+                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                    VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+                ],
+                streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+                color: &[Format::Rgba8Unorm],
+                depth: None,
+                depth_test: None,
+                cull: Cull::None,
+                ..Default::default()
+            })
+            .unwrap()
+    })
+    .unwrap();
+    let pipe_key = 0xDEAD_BEE0usize;
+    glue::install_test_render_pipeline(pipe_key, pso);
+
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+        list,
+        1,
+        &handle,
+        0,
+        std::ptr::null(),
+    );
+    glue::topology(list, 17);
+    glue::draw(list, 6, 1, 3, 0);
+
+    let recorded = with_list(list, |_, l| match l.list.cmds.last() {
+        Some(crate::native::list::Cmd::Draw {
+            topology,
+            call:
+                DrawCall::Arrays {
+                    vertex_count,
+                    instance_count,
+                    first_vertex,
+                    first_instance,
+                },
+            ..
+        }) => Some((*topology, *vertex_count, *instance_count, *first_vertex, *first_instance)),
+        _ => None,
+    })
+    .flatten()
+    .expect("recorded draw");
+    assert_eq!(recorded, (Topology::Triangles, 6, 1, 3, 0));
+}
+
 /// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
 /// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
 #[test]

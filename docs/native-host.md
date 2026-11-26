@@ -1102,6 +1102,17 @@ dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
 `zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
 `victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).
 
+## Described pipeline rectangle-list draws use `Triangles`
+
+Only guessed console pipelines translate vertex shaders with `Options::rect_list` to generate the
+fourth corner from 4-vertex `TriangleStrip` instances. Previously, a rectangle-list draw
+(`topology = 17`) bound to a described `Pipe::Render` warned `"drawn without its fourth corner"`
+but still kept `rect = true`, emitting `Topology::TriangleStrip` with `draw_instanced(4, vertices / 3, 0, first / 3)`
+against per-vertex inputs. Described rectangle-list draws now reset `rect = false` and emit
+`Topology::Triangles` with `draw_instanced(vertices, instances, first, first_instance)` so each
+3-corner rectangle renders its supplied triangle and respects `first` (test: `victory-gpu`
+`native::tests::texture_tests::described_rectangle_list_draw_uses_supplied_triangles`).
+
 ## Texture copies on the native Metal host
 
 `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource, buffer
