@@ -114,7 +114,8 @@ impl PoolTable {
         let (mut title_end, mut pool_end) = (at + m.len, m.offset + m.len);
         while end > title_end {
             let next = g.maps.get(&title_end)?;
-            if next.pool != m.pool || next.offset != pool_end {
+            // An empty mapping continues nothing: without this the walk would not advance.
+            if next.len == 0 || next.pool != m.pool || next.offset != pool_end {
                 return None;
             }
             title_end += next.len;
@@ -248,6 +249,22 @@ mod tests {
         assert!(t.resolve(0x7002_fff0, 0x20).is_none());
         // A length that wraps is refused, not followed.
         assert!(t.resolve(0x7000_0000, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn an_empty_mapping_ends_the_walk() {
+        let t = PoolTable::default();
+        let p = pool(1);
+        t.pool_created(&p);
+        t.mapped(0x7000_0000, 0x1_0000, &p, 0x4_0000);
+        // Empty, at the next address, with the pool and offset that would continue the first.
+        t.mapped(0x7001_0000, 0, &p, 0x5_0000);
+        assert!(t.resolve(0x7000_fff0, 0x20).is_none());
+        // What lies wholly in the first mapping still resolves.
+        assert_eq!(t.resolve(0x7000_fff0, 0x10).unwrap().1 as usize, p.base + 0x4_fff0);
+        // An address in the empty mapping is in no mapping.
+        t.unmapped(0x7000_0000, 0x1_0000);
+        assert!(t.resolve(0x7001_0000, 1).is_none());
     }
 
     #[test]
