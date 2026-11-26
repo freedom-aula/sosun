@@ -135,9 +135,6 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
-    if let Some(ms) = std::env::var("VICTORY_SUBMIT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;

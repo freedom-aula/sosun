@@ -95,7 +95,7 @@ fn collect() -> Vec<String> {
                         let v = read_checked(rbp - 8 * (i + 1)).unwrap_or(0);
                         // Not into the image: only data.
                         let words: Vec<String> = (0..4)
-                            .filter(|_| !(0x1_4000_0000..0x1_5000_0000).contains(&v))
+                            .filter(|_| !(0x1_4000_0000..0x1_4600_0000).contains(&v))
                             .map(|w| read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}")))
                             .collect();
                         format!("{n}={v:#x} [{}]", words.join(" "))
