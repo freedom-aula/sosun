@@ -1547,6 +1547,12 @@ impl Metal {
         ops: &[BlitOp<'_, Metal>],
         order: Ordering<'_>,
     ) -> Result<(), String> {
+        let nonzero = |op: &BlitOp<'_, Metal>| match op {
+            BlitOp::Copy { len, .. } | BlitOp::Fill { len, .. } => *len > 0,
+        };
+        if !ops.iter().any(nonzero) {
+            return Ok(());
+        }
         let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
         if let Some((f, started)) = order
             && started.get()
@@ -1554,7 +1560,7 @@ impl Metal {
             e.waitForFence(f);
         }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
-        for op in ops {
+        for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
                     // SAFETY: both ranges lie inside live buffers (the caller resolved them).
@@ -1691,7 +1697,10 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
-        if dispatches.is_empty() {
+        let runs = |d: &crate::backend::Dispatch<'_, Metal>| {
+            d.indirect.is_some() || !d.groups.contains(&0)
+        };
+        if !dispatches.iter().any(runs) {
             return Ok(());
         }
         let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -1701,7 +1710,7 @@ impl Metal {
             e.waitForFence(f);
         }
         let mut named = Vec::new();
-        for d in dispatches {
+        for d in dispatches.iter().filter(|d| runs(d)) {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
                     // An open encoder left behind makes Metal abort at the next pass's encoder.
@@ -1749,7 +1758,7 @@ impl Metal {
         if self.trace_fails {
             let names = self.pipe_names.borrow();
             let mut l = String::from("compute: ");
-            for d in dispatches {
+            for d in dispatches.iter().filter(|d| runs(d)) {
                 let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
                 match names.get(&k) {
                     Some(n) => l.push_str(n),
@@ -1912,6 +1921,9 @@ impl Metal {
                     continue;
                 }
             };
+            if d.indirect.is_none() && empty_draw(&d.call) {
+                continue;
+            }
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
@@ -1945,6 +1957,9 @@ impl Metal {
             // The target's size bounds the scissor (Metal refuses a rectangle outside it).
             let (tw, th) = rt_size;
             if let Some(v) = d.state.viewport {
+                if v.width <= 0.0 || v.height <= 0.0 {
+                    continue;
+                }
                 e.setViewport(MTLViewport {
                     originX: v.x as f64,
                     originY: v.y as f64,
@@ -2172,6 +2187,19 @@ impl Metal {
         }
         e.endEncoding();
         Ok(())
+    }
+}
+
+/// Whether a direct draw has a zero vertex, index, instance or mesh-group count.
+fn empty_draw(call: &DrawCall) -> bool {
+    match *call {
+        DrawCall::Arrays { vertex_count, instance_count, .. } => {
+            vertex_count == 0 || instance_count == 0
+        }
+        DrawCall::Indexed { index_count, instance_count, .. } => {
+            index_count == 0 || instance_count == 0
+        }
+        DrawCall::Mesh { groups } => groups.contains(&0),
     }
 }
 
