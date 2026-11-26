@@ -6663,8 +6663,10 @@ impl<'a> Lower<'a> {
             let end = self.s.m.int_const(i64t, i64::from(bytes * (k + 1)));
             let in_bounds = match bounds {
                 0 => {
-                    let end = self.s.m.bin(c, Bin::Add, off, end);
-                    let fits = self.s.m.cmp(c, pred::IULE, end, stride);
+                    // Mode 0 checks the component's starting offset, not its
+                    // end (RDNA2 ISA table 35). Mode 3 checks the payload end.
+                    let start = self.s.m.bin(c, Bin::Add, off, delta);
+                    let fits = self.s.m.cmp(c, pred::IULT, start, stride);
                     Some(self.s.m.bin(c, Bin::And, record_ok, fits))
                 }
                 1 => Some(record_ok),

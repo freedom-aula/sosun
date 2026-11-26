@@ -807,19 +807,27 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
         let entry = 4096 + 2 * (block as usize * 4096 + (page as usize >> 16 & 0xFFF));
         table[entry..entry + 2].copy_from_slice(&[view, page as u32]);
     }
-    // (base byte, stride, records, index, vector offset, scalar offset)
+    // Explicit acceptance masks (bit = OOB_SELECT), reviewed against RDNA2
+    // table 35, rather than repeating the emitter's bounds expressions.
+    // Mode 0 checks the start offset: a halfword starting at stride-1 is
+    // accepted. Mode 3 checks the payload end and rejects that halfword.
+    // (base byte, stride, records, index, vector offset, scalar offset,
+    //  byte acceptance mask, halfword acceptance mask)
     let cases = [
-        (0, 4, 4, 0, 0, 0), (0, 4, 4, 0, 1, 0),
-        (0, 4, 4, 0, 2, 0), (0, 4, 4, 0, 3, 0),
-        (0, 4, 4, 0, 4, 0), // byte-range/stride end
-        (0, 4, 4, 1, 0, 0), // indexed addressing
-        (0, 4, 4, 4, 0, 0), // index exactly at record count
-        (0, 4, 0, 0, 0, 0), // even bounds mode 2 treats an empty descriptor as OOB
-        (0, 4, 1, 0, 0, 0), // one-byte buffer: halfword must fail mode 3
-        (0, 4, 4, 0, 0, 3), // SOFFSET moves the base
-        (0xFFFC, 4, 4, 0, 3, 0), // page and low-address carry
-        (0xFFFC, 4, 8, 1, 0, 0), // index into the next page
-        (0x1_FFFC, 4, 4, 0, 3, 0), // high byte in an unmapped page reads zero
+        (0, 4, 4, 0, 0, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 1, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 2, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 3, 0, 0b1111, 0b0111),
+        (0, 4, 4, 0, 4, 0, 0b0110, 0b0110),
+        (0, 4, 4, 1, 0, 0, 0b0111, 0b0111),
+        (0, 4, 4, 4, 0, 0, 0b0100, 0b0100),
+        (0, 4, 0, 0, 0, 0, 0b0000, 0b0000),
+        (0, 4, 1, 0, 0, 0, 0b1111, 0b0111),
+        // Scalar offsets are excluded, as documented by LLVM's buffer intrinsics.
+        (0, 4, 4, 0, 0, 3, 0b1111, 0b1111),
+        (0xFFFC, 4, 4, 0, 3, 0, 0b1111, 0b0111),
+        (0xFFFC, 4, 8, 1, 0, 0, 0b1111, 0b1111),
+        (0x1_FFFC, 4, 4, 0, 3, 0, 0b1111, 0b0111),
     ];
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -828,14 +836,13 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
             continue;
         };
         for op in 8..=11 {
-            let bytes = if op < 10 { 1 } else { 2 };
             for bounds in 0..4 {
                 let shader = super::gfx_refusal_tests::computed_subword_test_shader(op, bounds);
                 if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
                     v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
                 }
                 let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-                for (base, stride, records, index, offset, scalar) in cases {
+                for (base, stride, records, index, offset, scalar, byte_modes, half_modes) in cases {
                     let address = PAGE + u64::from(base);
                     let constants = [address as u32, (address >> 32) as u32 | stride << 16,
                         records, index, offset, scalar];
@@ -853,12 +860,8 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
                         samplers: &[], groups: [1, 1, 1],
                     }).unwrap_or_else(|e| panic!("{label}: {e}"));
                     let byte_offset = index * stride + offset;
-                    let valid = match bounds {
-                        0 => index < records && offset + bytes <= stride,
-                        1 => index < records,
-                        2 => records != 0,
-                        _ => byte_offset + bytes <= records,
-                    };
+                    let modes = if op < 10 { byte_modes } else { half_modes };
+                    let valid = modes & (1 << bounds) != 0;
                     let mut expected = 0u32;
                     if valid {
                         let at = (base + scalar + byte_offset) as usize;
