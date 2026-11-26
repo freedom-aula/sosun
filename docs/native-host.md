@@ -494,13 +494,16 @@ and stencil comparisons. They cover depth-only preservation after a stencil-writ
 stencil-only and combined clears to 0, 173 and 255, command snapshots, and rejection of
 mismatched depth/stencil. No title run is needed. This does not establish the cause of the
 brightness-screen problem. The native bridge skips rectangle-limited clears and views it
-cannot represent: explicit views must be TEXTURE2D at mip 0, and the resource must be a
-single-layer 2D texture (also for default/null descriptions). These guards apply to all
+cannot represent: explicit views must be TEXTURE1D or TEXTURE2D at mip 0, and the resource must be a
+single-layer, single-sampled 1D or 2D texture (also for default/null descriptions).
+1D textures use height-one Metal backing. Sample count is checked on the original
+resource description because the native texture description does not retain it. These guards apply to all
 clear flags, so unsupported requests cannot wipe the entire base depth/stencil attachment.
 Bridge regression coverage calls the title-facing clear ABI with real descriptor records,
 checks rectangle and mip-1 clears record no command, and verifies full base-view clears
 still record commands for depth-only, stencil-only and combined flags. Array/unknown views
-are also rejected. Rectangle and subresource clear support remains unimplemented.
+and default views of multisampled resources are also rejected; explicit and default
+single-layer 1D views still record full mip-0 clears. Rectangle and subresource clear support remains unimplemented.
 
 #### Texture formats the host lacked
 

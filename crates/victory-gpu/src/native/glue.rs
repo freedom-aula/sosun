@@ -499,8 +499,7 @@ pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil
     let Some(record) = crate::descriptor::dsv_record(handle).filter(|r| r.native_dsv_base_view()) else {
         return;
     };
-    let Some(info) = crate::resource::texture_info(record.resource) else { return };
-    if info.dimension != victory_formats::texture::Dimension::Tex2d || info.depth_or_layers != 1 {
+    if !crate::resource::native_dsv_clear_supported(record.resource) {
         return;
     }
     with_list(this, |t, l| {
