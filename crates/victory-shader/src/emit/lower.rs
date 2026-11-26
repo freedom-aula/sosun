@@ -6596,8 +6596,9 @@ impl<'a> Lower<'a> {
     }
 
     /// A guessed PS's linear buffer descriptor in SGPRs, addressed in title memory.
-    // shortcut: aligned dword reads with constant control flags and nonnegative SMEM
-    // immediates only, extend when shaders need other access types or descriptor forms.
+    // shortcut: constant control flags and nonnegative SMEM immediates only.
+    // Subword reads assume SH_MEM_CONFIG.alignment_mode = UNALIGNED; the
+    // guessed path does not yet decode that register. Dword alignment is unchanged.
     fn computed_buffer(
         &mut self,
         inst: &Inst,
@@ -6632,7 +6633,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let index = index.unwrap_or(zero);
         let bounds = (control >> 28) & 3;
-        let records = if bounds == 2 { zero } else { word(self, 2)? };
+        let records = word(self, 2)?;
 
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
@@ -6647,12 +6648,19 @@ impl<'a> Lower<'a> {
 
         let record_ok = self.s.m.cmp(c, pred::IULT, index, records);
         let byte_count = widen(self, records);
+        let (bytes, signed) = match inst.name() {
+            "buffer_load_ubyte" => (1, false),
+            "buffer_load_sbyte" => (1, true),
+            "buffer_load_ushort" => (2, false),
+            "buffer_load_sshort" => (2, true),
+            _ => (4, false),
+        };
         let mut values = Vec::new();
         for k in 0..count {
             let c = self.cur;
-            let delta = self.s.m.int_const(i64t, i64::from(4 * k));
+            let delta = self.s.m.int_const(i64t, i64::from(bytes * k));
             let at = self.s.m.bin(c, Bin::Add, byte, delta);
-            let end = self.s.m.int_const(i64t, i64::from(4 * (k + 1)));
+            let end = self.s.m.int_const(i64t, i64::from(bytes * (k + 1)));
             let in_bounds = match bounds {
                 0 => {
                     let end = self.s.m.bin(c, Bin::Add, off, end);
@@ -6660,7 +6668,9 @@ impl<'a> Lower<'a> {
                     Some(self.s.m.bin(c, Bin::And, record_ok, fits))
                 }
                 1 => Some(record_ok),
-                2 => None,
+                // OOB_SELECT=2 disables range checks, but an empty descriptor
+                // still returns zero (RDNA2 ISA section 8.1.5, table 35).
+                2 => Some(self.s.m.cmp(c, pred::NE, records, zero)),
                 _ => {
                     let end = self.s.m.bin(c, Bin::Add, byte, end);
                     Some(self.s.m.cmp(c, pred::IULE, end, byte_count))
@@ -6670,11 +6680,46 @@ impl<'a> Lower<'a> {
             let (low, high) = self.split64(at);
             let (lo, hi) = self.add64(lo, hi, low, false);
             let hi = self.s.m.bin(self.cur, Bin::Add, hi, high);
-            let (h, byte) = self.memory(lo, hi, 4, false, None);
-            let value = self.raw_dword(h, byte);
+            let value = if bytes == 4 {
+                let (h, byte) = self.memory(lo, hi, 4, false, None);
+                self.raw_dword(h, byte)
+            } else {
+                self.memory_subword(lo, hi, bytes, signed)
+            };
             values.push(self.end_guarded(start, &[(value, zero)])[0]);
         }
         Ok(values)
+    }
+
+    /// Read each byte through its own page-table lookup, including a halfword
+    /// straddling a dword, a 64 KiB page, or the low 32 bits of the address.
+    /// Bounds have already been checked for the whole element, not its backing dwords.
+    fn memory_subword(&mut self, lo: V, hi: V, bytes: u32, signed: bool) -> V {
+        let mut value = self.s.m.i32(0);
+        for k in 0..bytes {
+            let delta = self.s.m.i32(k);
+            let (low, high) = self.add64(lo, hi, delta, false);
+            let not3 = self.s.m.i32(!3);
+            let aligned = self.s.m.bin(self.cur, Bin::And, low, not3);
+            let (h, at) = self.memory(aligned, high, 4, false, None);
+            let word = self.raw_dword(h, at);
+            let c = self.cur;
+            let three = self.s.m.i32(3);
+            let lane = self.s.m.bin(c, Bin::And, low, three);
+            let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+            let byte = self.s.m.bin(c, Bin::LShr, word, shift);
+            let mask = self.s.m.i32(0xFF);
+            let byte = self.s.m.bin(c, Bin::And, byte, mask);
+            let shift = self.s.m.i32(8 * k);
+            let byte = self.s.m.bin(c, Bin::Shl, byte, shift);
+            value = self.s.m.bin(c, Bin::Or, value, byte);
+        }
+        if signed {
+            let shift = self.s.m.i32(32 - bytes * 8);
+            value = self.s.m.bin(self.cur, Bin::Shl, value, shift);
+            value = self.s.m.bin(self.cur, Bin::AShr, value, shift);
+        }
+        value
     }
 
     /// The byte stride of the buffer view a heap-indexed descriptor names
@@ -11151,8 +11196,8 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         if matches!(src, Source::BuiltMemory { .. }) {
-            if typed || store || atomic.is_some() || sub.is_some() {
-                return Err("a computed buffer descriptor used for an access other than a dword load");
+            if typed || store || atomic.is_some() {
+                return Err("a computed buffer descriptor used for an unsupported buffer access");
             }
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
