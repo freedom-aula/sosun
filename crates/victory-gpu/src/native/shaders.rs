@@ -247,11 +247,8 @@ impl<B: PresentBackend> Title<B> {
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
         // user data (descriptor table offsets, root constants) from address 0.
-        // shortcut: a stage with immediate (static) samplers keeps the converter's own layout,
-        // since `RootLayout` cannot declare them yet; add them to it to fix those stages too.
-        let layout = |s: &HostShader, b: &Binding| if s.static_samplers.is_empty() { b.layout() } else { None };
-        let vs_layout = layout(vs, &vs_binding);
-        let ps_layout = ps.zip(ps_binding.as_ref()).and_then(|(s, b)| layout(s, b));
+        let vs_layout = vs_binding.layout();
+        let ps_layout = ps.map(Binding::of).and_then(|b| b.layout());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),

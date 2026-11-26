@@ -46,6 +46,8 @@ pub struct Binding {
     /// Some user data takes the heap index of a view of a root view's buffer (and the address's
     /// offset in it): the heap needs the view pairs.
     pub root_views: bool,
+    /// The shader's immediate samplers, as [`RootLayout::static_samplers`] declares them.
+    pub static_samplers: Vec<[u32; 10]>,
 }
 
 /// A root view's kind.
@@ -74,6 +76,16 @@ impl Binding {
                 u.root == victory_shader::RootType::Descriptor
                     && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
             }),
+            static_samplers: shader
+                .static_samplers
+                .iter()
+                .map(|s| {
+                    // Anisotropic filtering with a point mip filter becomes linear-mip, as on
+                    // D3D12 devices without it.
+                    let [u, v, w] = s.address;
+                    [s.filter_for_host(false), u, v, w, s.mip_lod_bias.to_bits(), s.max_anisotropy, s.comparison, s.border, s.min_lod.to_bits(), s.max_lod.to_bits()]
+                })
+                .collect(),
         }
     }
 
@@ -104,10 +116,11 @@ impl Binding {
                 space: MEMORY_SPACE,
             });
         }
-        (!params.is_empty()).then_some(RootLayout {
+        (!params.is_empty() || !self.static_samplers.is_empty()).then(|| RootLayout {
             params,
             // Memory no mapped pool holds is read through a view of size 0.
             bounds_checked: true,
+            static_samplers: self.static_samplers.clone(),
         })
     }
 }
