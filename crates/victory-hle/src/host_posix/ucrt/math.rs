@@ -57,7 +57,8 @@ macro_rules! unary {
         }
         pub extern "win64" fn $f(x: f32) -> f32 {
             let g: fn(f64) -> f64 = $e;
-            check(&[f64::from(x)], g(f64::from(x))) as f32
+            // Checked as the float it returns: a double can be finite where the float is not.
+            check(&[f64::from(x)], f64::from(g(f64::from(x)) as f32)) as f32
         }
     )*};
 }
@@ -84,7 +85,8 @@ macro_rules! binary {
         }
         pub extern "win64" fn $f(x: f32, y: f32) -> f32 {
             let g: fn(f64, f64) -> f64 = $e;
-            check(&[f64::from(x), f64::from(y)], g(f64::from(x), f64::from(y))) as f32
+            let r = g(f64::from(x), f64::from(y)) as f32;
+            check(&[f64::from(x), f64::from(y)], f64::from(r)) as f32
         }
     )*};
 }
@@ -220,7 +222,7 @@ pub extern "win64" fn ldexp(x: f64, e: i32) -> f64 {
 }
 
 pub extern "win64" fn ldexpf(x: f32, e: i32) -> f32 {
-    check(&[f64::from(x)], scalbn_(f64::from(x), e)) as f32
+    check(&[f64::from(x)], f64::from(scalbn_(f64::from(x), e) as f32)) as f32
 }
 
 fn scalbn_(x: f64, e: i32) -> f64 {
@@ -310,7 +312,18 @@ fn remquo_(x: f64, y: f64) -> (f64, i32) {
     if !r.is_finite() {
         return (check(&[x, y], r), 0);
     }
-    let q = ((x - r) / y).round().abs() as u64 & 7;
+    // The low three bits of the quotient's magnitude. `(x - r) / y` loses them once the
+    // quotient passes 2^53; `|x| mod 8|y|` (exact) keeps them: |x| = 8k|y| + m, so the
+    // quotient is 8k plus that of m, which `remainder` rounds the same way (8k is even).
+    // When 8|y| overflows, |x / y| is below 8 and m is |x| itself.
+    let (ax, ay) = (x.abs(), y.abs());
+    let m = if ay <= f64::MAX / 8.0 {
+        libm::fmod(ax, 8.0 * ay)
+    } else {
+        ax
+    };
+    // Divided before subtracting: m - remainder(m, |y|) itself can overflow near DBL_MAX.
+    let q = (m / ay - libm::remainder(m, ay) / ay).round() as u64 & 7;
     (
         r,
         if (x < 0.0) != (y < 0.0) {
@@ -675,6 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn a_float_that_overflows_sets_erange() {
+        // Finite as a double, infinite once rounded to a float.
+        fn overflows(what: &str, call: impl Fn() -> f32) {
+            set_errno(0);
+            assert!(call().is_infinite(), "{what}");
+            assert_eq!(errno(), ERANGE, "{what}");
+        }
+        overflows("expf(100)", || expf(100.0));
+        overflows("coshf(100)", || coshf(100.0));
+        overflows("powf(10, 50)", || powf(10.0, 50.0));
+        overflows("hypotf(3e38, 3e38)", || hypotf(3e38, 3e38));
+        overflows("ldexpf(1, 200)", || ldexpf(1.0, 200));
+        // A finite result, and an infinity from an infinite argument, leave errno as it was.
+        set_errno(7);
+        assert_eq!(expf(10.0), 10f32.exp());
+        assert_eq!(errno(), 7);
+        assert_eq!(expf(f32::INFINITY), f32::INFINITY);
+        assert_eq!(powf(f32::INFINITY, 2.0), f32::INFINITY);
+        assert_eq!(ldexpf(f32::INFINITY, 1), f32::INFINITY);
+        assert_eq!(errno(), 7);
+    }
+
+    #[test]
     fn classification_uses_msvc_codes() {
         assert_eq!(_dclass(f64::NAN), 2);
         assert_eq!(_dclass(f64::INFINITY), 1);
@@ -707,6 +743,59 @@ mod tests {
         let mut q = 0;
         assert_eq!(remquo(10.0, 3.0, &mut q), 1.0);
         assert_eq!(q, 3);
+    }
+
+    unsafe extern "C" {
+        /// The host's own `remquo`, the reference for the quotient bits.
+        #[link_name = "remquo"]
+        fn host_remquo(x: f64, y: f64, quo: *mut i32) -> f64;
+    }
+
+    #[test]
+    fn remquo_keeps_the_low_bits_of_a_huge_quotient() {
+        // The quotient here is about 5.9e156, far past 2^53; its low three bits are 100.
+        let mut q = 0;
+        remquo(7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!((q, q & 7), (4, 4));
+        remquo(-7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!(q, -4);
+        // Near DBL_MAX: |x| - r would overflow, the quotient is 2.
+        remquo(f64::MAX, 1.0e308, &mut q);
+        assert_eq!(q, 2);
+        // Every exponent: the sign and the low three bits of the magnitude, as C asks.
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..100_000 {
+            let (x, y) = (f64::from_bits(next() >> 1), f64::from_bits(next() >> 1));
+            if !x.is_finite() || !y.is_finite() || y == 0.0 {
+                continue;
+            }
+            for (x, y) in [(x, y), (-x, y), (x, -y)] {
+                let (mut ours, mut host) = (0, 0);
+                let r = remquo(x, y, &mut ours);
+                // SAFETY: a pure libm function.
+                let host_r = unsafe { host_remquo(x, y, &mut host) };
+                assert_eq!(r.to_bits(), host_r.to_bits(), "remquo({x:e}, {y:e})");
+                let low = host.unsigned_abs() & 7;
+                assert_eq!(
+                    ours.unsigned_abs() & 7,
+                    low,
+                    "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                );
+                if low != 0 {
+                    assert_eq!(
+                        ours < 0,
+                        host < 0,
+                        "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
