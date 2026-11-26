@@ -1701,13 +1701,15 @@ impl<'a> Tracer<'a> {
     }
 
     /// The loaded words of a buffer descriptor whose dword 1 is the load's ANDed with a constant
-    /// that clears stride bits alone (bits 16-29; the base address bits 0-15 and the swizzle
-    /// bits 30-31 kept), for a buffer access that is not typed. With stride 0 the address is
-    /// base + offsets (the index times the stride adds nothing, RDNA2 ISA 8.1.5), which the
-    /// loaded view's raw access gives once the index is dropped (`Resources::unstrided`).
+    /// that clears the whole stride and nothing else (bits 16-29 cleared; the base address bits
+    /// 0-15 and the swizzle bits 30-31 kept), for a buffer access that is not typed. With
+    /// stride 0 the address is base + offsets (the index times the stride adds nothing, RDNA2
+    /// ISA 8.1.5), which the loaded view's raw access gives once the index is dropped
+    /// (`Resources::unstrided`).
     // Guess: the bounds stay the host view's size. That is the console's when the title's V#
     // checks raw bounds in bytes (OOB_SELECT 3, no swizzle: offset + payload > num_records, in
-    // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range.
+    // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range,
+    // and select 1 would check the dropped index against num_records.
     fn stride_cleared(&self, inst: &Inst, op: &Operand) -> Option<Vec<Term>> {
         let Fields::Buffer { format: None, .. } = inst.fields else {
             return None;
@@ -1726,7 +1728,9 @@ impl<'a> Tracer<'a> {
         };
         const STRIDE: u32 = 0x3FFF_0000;
         let loaded = match self.sop2(w1, &["s_and_b32"])?.1 {
-            [x, Term::Const(c)] | [Term::Const(c), x] if !c & !STRIDE == 0 && c != u32::MAX => x,
+            // The whole stride cleared (a part could leave a stride, and the index would count),
+            // nothing else.
+            [x, Term::Const(c)] | [Term::Const(c), x] if c & STRIDE == 0 && !c & !STRIDE == 0 => x,
             _ => return None,
         };
         words[1] = loaded;

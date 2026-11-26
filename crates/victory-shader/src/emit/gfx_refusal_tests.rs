@@ -943,8 +943,9 @@ fn lds_instructions_addressed_by_m0_translate() {
 
 /// A loaded buffer descriptor whose stride the program clears (`s_and_b32` of dword 1 with
 /// 0xc000ffff, a title's form) is the loaded view read raw, the index adding nothing (RDNA2 ISA
-/// 8.1.5): its dword loads translate, by index or by offset. A mask that also clears base address
-/// bits, and a typed load, stay refused.
+/// 8.1.5): its dword loads translate, by index or by offset. A mask that clears only part of the
+/// stride (which may then not be 0), one that also clears base address bits, and a typed load stay
+/// refused.
 #[test]
 fn a_descriptor_with_its_stride_cleared_reads_the_loaded_view_raw() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -973,12 +974,14 @@ fn a_descriptor_with_its_stride_cleared_reads_the_loaded_view_raw() {
     let (idxen, offen, typed) = (0xE030_2000, 0xE030_1000, 0xE000_2000);
     program(0xC000_FFFF, idxen).unwrap();
     program(0xC000_FFFF, offen).unwrap();
-    program(0xC03F_FFFF, idxen).unwrap(); // part of the stride
     let refused = |r: Result<_, ShaderError>| match r {
         Err(ShaderError::Unsupported { what, .. }) => what,
         Ok(_) => panic!("translated"),
         Err(e) => panic!("{e}"),
     };
+    // A stride of 16 (bit 20) survives 0xc03fffff: the index would still count.
+    let part = refused(program(0xC03F_FFFF, idxen));
+    assert!(part.contains("dword 1 masked or merged"), "{part}");
     let base = refused(program(0xC000_FFFE, idxen));
     assert!(base.contains("dword 1 masked or merged"), "{base}");
     let format = refused(program(0xC000_FFFF, typed));
