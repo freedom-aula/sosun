@@ -575,6 +575,11 @@ u32 probe_threads(ptr unused)
 static u8 cs_area[64] __attribute__((aligned(16)));
 static u8 srw_area[16] __attribute__((aligned(16)));
 static u8 cv_area[16] __attribute__((aligned(16)));
+
+/* Bounds on waits for another thread to get scheduled at all: loose for
+   slow hosts, where scheduling a thread can take seconds. Waits that must
+   time out stay short: a time-out cannot come early on a monotonic clock. */
+enum { THREAD_SCHEDULED_MS = 30000 };
 static volatile u32 shared_counter, cv_ready, cv_seen;
 static ptr consumer_done;
 
@@ -650,9 +655,9 @@ u32 probe_sync(ptr unused)
         ok |= T_WAIT_ALL_KEEPS;
     SetEvent(e[0]);
     ptr th = CreateThread(0, 0, (ptr)late_setter, e[1], 0, 0);
-    if (WaitForMultipleObjects(2, e, 1, 5000) == 0)
+    if (WaitForMultipleObjects(2, e, 1, THREAD_SCHEDULED_MS) == 0)
         ok |= T_WAIT_ALL;
-    WaitForSingleObject(th, 5000);
+    WaitForSingleObject(th, THREAD_SCHEDULED_MS);
     CloseHandle(th);
     CloseHandle(e[0]);
     CloseHandle(e[1]);
@@ -667,7 +672,7 @@ u32 probe_sync(ptr unused)
     ptr w[2];
     w[0] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
     w[1] = CreateThread(0, 0, (ptr)cs_worker, (ptr)1, 0, 0);
-    WaitForMultipleObjects(2, w, 1, 20000);
+    WaitForMultipleObjects(2, w, 1, THREAD_SCHEDULED_MS);
     if (shared_counter == 40000)
         ok |= T_CS;
     CloseHandle(w[0]);
@@ -677,7 +682,7 @@ u32 probe_sync(ptr unused)
     EnterCriticalSection(cs_area);
     shared_counter = 0xFFFFFFFF;
     ptr tr = CreateThread(0, 0, (ptr)try_from_other, 0, 0, 0);
-    u32 tried = WaitForSingleObject(tr, 5000);
+    u32 tried = WaitForSingleObject(tr, THREAD_SCHEDULED_MS);
     u32 rejected = tr && tried == 0 && shared_counter == 0;
     LeaveCriticalSection(cs_area);
     CloseHandle(tr);
@@ -695,7 +700,7 @@ u32 probe_sync(ptr unused)
     shared_counter = 0;
     w[0] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
     w[1] = CreateThread(0, 0, (ptr)cs_worker, 0, 0, 0);
-    WaitForMultipleObjects(2, w, 1, 20000);
+    WaitForMultipleObjects(2, w, 1, THREAD_SCHEDULED_MS);
     if (shared_counter == 40000)
         ok |= T_SRW;
     CloseHandle(w[0]);
@@ -718,7 +723,7 @@ u32 probe_sync(ptr unused)
     cv_ready = 1;
     LeaveCriticalSection(cs_area);
     WakeConditionVariable(cv_area);
-    if (WaitForSingleObject(consumer_done, 5000) == 0 && cv_seen)
+    if (WaitForSingleObject(consumer_done, THREAD_SCHEDULED_MS) == 0 && cv_seen)
         ok |= T_CV;
     CloseHandle(c);
     CloseHandle(consumer_done);
@@ -733,11 +738,11 @@ u32 probe_sync(ptr unused)
     ran_flag = 0;
     ptr d = CreateThread(0, 0, (ptr)delayed_flag, 0, 0, 0);
     u64 t0 = GetTickCount64();
-    while (!ran_flag && GetTickCount64() < t0 + 3000)
+    while (!ran_flag && GetTickCount64() < t0 + THREAD_SCHEDULED_MS)
         SwitchToThread();
     if (ran_flag)
         ok |= T_SWITCH;
-    WaitForSingleObject(d, 5000);
+    WaitForSingleObject(d, THREAD_SCHEDULED_MS);
     CloseHandle(d);
     return ok;
 }
