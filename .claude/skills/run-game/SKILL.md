@@ -17,6 +17,7 @@ nice cargo build --release -j6 --target x86_64-apple-darwin -p victory
 ## Run
 
 - Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Click the window; the keyboard drives the pad (Enter/Space = A, Esc/Backspace = B, arrows = D-pad, WASD = left stick, Tab = Menu, Q/E = shoulders, Z/C = triggers).
+- After a run: `tools/macos/run-summary.sh [runs/<date>/victory.log]` prints fps per 64 frames, shader refusals, dropped work, GPU errors and how the run ended (newest log by default).
 - Headless, for agents: `tools/macos/run-native.sh --headless --seconds 120 <game folder>`, or the binary directly:
 
 ```bash

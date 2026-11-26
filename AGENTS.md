@@ -32,7 +32,7 @@ Known flaky under load: `victory-hle` `native_probe` waits test, and `victory-gp
 
 ## Running the game
 
-You need your own copy of the game. Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Headless, for agents and scripts: `--headless --seconds N`. Logs go to `runs/<date>/victory.log`. Details and diagnostics are in the `run-game` and `debug-graphics` skills (`.claude/skills/`).
+You need your own copy of the game. Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Headless, for agents and scripts: `--headless --seconds N`. Logs go to `runs/<date>/victory.log`. `tools/macos/run-summary.sh [log]` summarises a run log (fps per 64 frames, shader stalls and refusals, dropped work, GPU errors, how it ended). Details and diagnostics are in the `run-game` and `debug-graphics` skills (`.claude/skills/`).
 
 - Run one game at a time. If several agents share a machine, serialise runs with a lock: `/usr/bin/lockf -k <some>/game.lock timeout 150 nice <command>`.
 - Keep builds polite: `-j6` or fewer, under `nice`.
