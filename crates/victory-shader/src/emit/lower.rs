@@ -5252,6 +5252,16 @@ impl<'a> Lower<'a> {
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
             }
+            "s_absdiff_i32" => {
+                // D = S0 - S1 (wrapping), negated if negative; SCC = D != 0 (RDNA2 ISA, SOP2).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                let r = self.s.m.select(c, neg, n, d);
+                (r, Some(self.s.m.cmp(c, pred::NE, r, z)))
+            }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
                 let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
