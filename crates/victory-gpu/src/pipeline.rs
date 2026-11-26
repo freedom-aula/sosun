@@ -581,6 +581,15 @@ fn dump_description(slot: usize, desc: *const u8) {
             let (p, len) = (words[i], words[i + 1]);
             if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
                 let bytes = std::slice::from_raw_parts(p as *const u8, (len as usize).min(if n < 3 { 0x1000 } else { 48 }));
+                if let Some(dir) = std::env::var_os("VICTORY_DUMP_DESC_DIR")
+                    && n < 12
+                {
+                    let all = std::slice::from_raw_parts(p as *const u8, len as usize);
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir).join(format!("{slot:x}_{n}_{:03x}.bin", i * 8)),
+                        all,
+                    );
+                }
                 let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 eprintln!("  BLOB +{:#x} ptr={p:#x} len={len:#x} {hex}", i * 8);
             }
