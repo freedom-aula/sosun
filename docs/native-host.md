@@ -4,6 +4,22 @@ This is the design and status of the host that runs VIctory on macOS with no Win
 
 Wine-based work continues on the `test/run-C*` branches. This branch (`native/host-2`) only adds code beside it. On Windows and Wine the loader and runtime behave as before.
 
+## macOS setup and launcher paths
+
+`native-setup.sh` and `run-native.sh` use Cargo's resolved `target_directory`
+from `cargo metadata --format-version 1 --no-deps --offline`. This honors
+`CARGO_TARGET_DIR` and local/global `build.target-dir` configuration, including
+paths with spaces (the setup finding in [#13](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/13)).
+Both select `x86_64-apple-darwin/release/victory` within that directory. Use the
+same Cargo configuration when building and launching; a one-off build with
+`--target-dir` must be matched by configuration or an environment override when
+launching. The launcher needs Cargo available and reports configuration errors
+rather than falling back to a possibly stale default binary.
+
+Game-free regressions use real Cargo resolution and fixture executables under
+stock macOS Bash 3.2: `/bin/bash tools/macos/tests/target-directory.sh`.
+Setup prerequisites and its build are stubbed; no game or SDK files are needed.
+
 ## Status
 
 | Piece | State |

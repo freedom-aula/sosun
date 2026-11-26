@@ -40,9 +40,11 @@ ok "toolchain ready"
 echo
 echo "Building victory (release, x86_64, runs under Rosetta). The first build takes a few minutes."
 # The toolchain's own bin first: a Homebrew rustc earlier on PATH has no x86_64 std.
-PATH="$(rustup run 1.98.1 rustc --print sysroot)/bin:$PATH" \
-  cargo build --release --target x86_64-apple-darwin -p victory
-ok "built target/x86_64-apple-darwin/release/victory"
+export PATH="$(rustup run 1.98.1 rustc --print sysroot)/bin:$PATH"
+source tools/macos/native-binary.sh
+bin=$(native_binary) || fail "could not locate the Cargo build output"
+cargo build --release --target x86_64-apple-darwin -p victory
+ok "built $bin"
 
 echo
 echo "Done. Run the game with:"
