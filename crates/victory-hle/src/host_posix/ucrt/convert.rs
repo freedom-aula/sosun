@@ -833,7 +833,6 @@ pub extern "system" fn _mbstrlen(s: *const u8) -> usize {
     }
 }
 
-/// `mbsrtowcs(dst, &src, n, state)`: advances `*src` past what was converted.
 /// The bytes of `s` that make its first `units` UTF-16 units, whole characters only.
 fn bytes_for_units(s: &[u8], units: usize) -> usize {
     let (mut i, mut made) = (0, 0);
@@ -859,6 +858,7 @@ fn units_for_bytes(s: &[u16], bytes: usize) -> usize {
     i
 }
 
+/// `mbsrtowcs(dst, &src, n, state)`: advances `*src` past what was converted.
 pub extern "system" fn mbsrtowcs(
     dst: *mut u16,
     src: *mut *const u8,
