@@ -34,7 +34,7 @@ Refused shaders drop their draws and dispatches. Unique shaders refused in the s
 - "a structured buffer of unknown stride": about 13. Since: an indexed table buffer takes its stride from the view-stride table (FSPX metadata gives none).
 - "a buffer descriptor built around a computed address": about 12. Since: loads in compute lower through title memory; stores, atomics and typed access stay refused.
 - scalar `s_pack_*_b32_b16` and `s_bitreplicate_b64_b32`: small. Since: lowered.
-- Open in other pull requests: image stores of some channels (#94), an address in an undeclared SGPR pair (#69).
+- Since #69: an address in an undeclared SGPR pair tracks as title memory, and the guessed layout declares the pair as root constants, so the vertex shaders' "an address in an SGPR that is no root parameter" lower (docs/native-host.md, "Undeclared SGPR addresses").
 - Older, small: pixel "a computed buffer descriptor used as a view" (a sampler or 128-bit image descriptor built in code, see docs/native-host.md, "Computed pixel buffers"), "a hardware SGPR input", and vertex "an address in an SGPR that is no root parameter".
 - "an unknown root type" (FSPX root types 2 and 7+): none in the story-load run of 27 November. The "about 70 to 78" first counted under that name were root type 0 (the message did not give the number then; see docs/native-host.md, "Guessed graphics pipelines", Metadata). Types 2 and 7+ stay refused until a shader with one is seen.
 
