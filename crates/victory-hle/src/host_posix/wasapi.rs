@@ -31,6 +31,8 @@ use super::lock;
 use super::mixer::{self, Format};
 use super::xaudio2::{parse_format, table};
 
+mod spatial;
+
 type HRESULT = i32;
 
 const S_OK: HRESULT = 0;
@@ -59,6 +61,7 @@ const BUFFERFLAGS_SILENT: u32 = 2;
 /// What the device mixes, and what CoreAudio is opened at.
 const MIX_RATE: u32 = 48_000;
 const DEVICE_CHANNELS: usize = 2;
+const STEREO: Format = Format { channels: 2, rate: MIX_RATE, bits: 32, float: true };
 /// 10 ms, in 100 ns units.
 const DEFAULT_PERIOD: i64 = 100_000;
 
@@ -321,11 +324,16 @@ impl Shared {
             out
         };
         drop(staging);
-        let mut state = lock(&self.state);
-        state.released += frames as u64;
-        state.peak = stereo.iter().fold(state.peak, |p, s| p.max(s.abs()));
-        state.ring.push(&stereo);
+        self.push(&stereo);
         S_OK
+    }
+
+    /// Queues stereo frames for the device.
+    pub fn push(&self, stereo: &[f32]) {
+        let mut state = lock(&self.state);
+        state.released += (stereo.len() / DEVICE_CHANNELS) as u64;
+        state.peak = stereo.iter().fold(state.peak, |p, s| p.max(s.abs()));
+        state.ring.push(stereo);
     }
 
     /// CoreAudio wants `out` (stereo floats). Returns the title's event
@@ -554,6 +562,9 @@ extern "win64" fn device_activate(
     let iid = read_guid(iid);
     if out.is_null() {
         return E_POINTER;
+    }
+    if iid == spatial::IID_CLIENT {
+        return put(out, spatial::client().cast());
     }
     if ![IID_CLIENT, IID_CLIENT2, IID_CLIENT3].contains(&iid) {
         warn_once(format!("IMMDevice::Activate of {iid:02x?}"));
