@@ -487,14 +487,24 @@ fn trace_clear_dsv(flags: u32, depth: f32) {
 }
 
 /// `ClearDepthStencilView`: depth (flag 1) and stencil (flag 2) are independent.
-pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil: u8) {
+pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil: u8, count: u32) {
     if tracing_targets() {
         trace_clear_dsv(flags, depth);
     }
+    // Neither rectangle bounds nor attachment mip/layer selection are represented by
+    // NativeList's clear command. Do not widen an unsupported clear to the base texture.
+    if count != 0 || flags & 3 == 0 {
+        return;
+    }
+    let Some(record) = crate::descriptor::dsv_record(handle).filter(|r| r.native_dsv_base_view()) else {
+        return;
+    };
+    let Some(info) = crate::resource::texture_info(record.resource) else { return };
+    if info.dimension != victory_formats::texture::Dimension::Tex2d || info.depth_or_layers != 1 {
+        return;
+    }
     with_list(this, |t, l| {
-        if flags & 3 != 0
-            && let Some(tex) = crate::descriptor::dsv_record(handle).and_then(|r| t.texture_of(r.resource as usize))
-        {
+        if let Some(tex) = t.texture_of(record.resource as usize) {
             l.list.clear_depth_stencil(
                 &tex,
                 (flags & 1 != 0).then_some(depth),
