@@ -9904,8 +9904,15 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
+        // Which read, so a refusal log says what the stage data lacks (an input it does not
+        // list at all is refused before this).
+        let unmarked = if attribute.high {
+            "a 16-bit read of a 32-bit input: the high half of an input not marked 16-bit"
+        } else {
+            "a 16-bit read of a 32-bit input: an f16 interpolation of an input not marked 16-bit"
+        };
         let x = match packing {
-            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
+            None if f16 || attribute.high => return Err(unmarked),
             None => channel(self, attribute.row, attribute.channel)?,
             Some(pack2) => {
                 // 16-bit values: one in the low half of each dword, or two

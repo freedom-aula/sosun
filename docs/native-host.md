@@ -353,6 +353,16 @@ difference `S0 - S1`, wrapping, negated when negative as a signed number, and SC
 result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
 (`victory-gpu`) runs it on Metal, wrapping cases included.
 
+## 16-bit reads of inputs not marked 16-bit
+
+A pixel shader that interpolates an attribute with `v_interp_p1ll_f16`/`v_interp_p2_f16`, or
+reads its high half, when the stage data does not mark that input 16-bit (input flag bit 3) was
+refused as "a 16-bit read of a 32-bit input" (three guessed pipelines in the story-load log of
+issue #123). The refusal now says which, after a colon: "an f16 interpolation of an input not
+marked 16-bit" or "the high half of an input not marked 16-bit". Nothing is lowered: what such a
+read returns from a 32-bit attribute is not documented, and in a guessed pipeline the missing mark
+may be the stage data's (guessed) rather than the program's.
+
 ## Bring-up diagnostics (native path)
 
 Off by default, environment variables of the host process:
