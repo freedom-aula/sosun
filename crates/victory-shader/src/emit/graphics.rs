@@ -1093,6 +1093,23 @@ mod tests {
         mesh(&code).unwrap();
     }
 
+    /// `s_sext_i32_i16` and `s_sext_i32_i8` (some of the title's mesh programs) translate.
+    #[test]
+    fn scalar_sign_extensions_translate() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE89_1A08, // s_sext_i32_i16 s9, s8
+            0xBE8A_1909, // s_sext_i32_i8 s10, s9
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
+    }
+
     /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
     /// an EXEC region (lane < count), a VALU compare of an SGPR, ANDed with EXEC, its SCC kept in
     /// an SGPR and branched on later. The compare holds the same bit in every lane, so SCC (some
