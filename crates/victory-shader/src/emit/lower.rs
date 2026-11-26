@@ -726,8 +726,7 @@ impl<'a> Lower<'a> {
             if host32 {
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
-                let sections = (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty());
-                halves = lanes > 32 && (console_lanes || sections);
+                halves = lanes > 32 && (console_lanes || super::wave::has_sections(p));
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
@@ -15021,6 +15020,21 @@ mod tests {
             view_marks: false,
         })
         .expect("lower")
+    }
+
+    #[test]
+    fn host32_simulates_each_whole_wave_section_once() {
+        let words = [
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            RESTORE_EXEC,
+            S_ENDPGM,
+        ];
+        let simulations = &crate::emit::wave::SIMULATIONS;
+        let before = simulations.get();
+        let shader = lowered(&words, 64, false, true);
+        assert_eq!(shader.wave_size, Some(32));
+        assert_eq!(simulations.get() - before, 1);
     }
 
     #[test]

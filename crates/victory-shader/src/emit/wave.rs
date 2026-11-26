@@ -157,9 +157,23 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
-    let mut i = 0;
-    while i < insts.len() {
-        let inst = &insts[i];
+    let mut from = 0;
+    while let Some((start, end, saved)) = next_section(insts, from) {
+        let (shapes, why) = simulate(&insts[start + 1..end], wave, saved);
+        out.insert(start, Section { end, shapes, why });
+        from = end + 1;
+    }
+    out
+}
+
+/// Whether any block has a whole-wave section, including one with unmodelled steps.
+pub(super) fn has_sections(p: &Program) -> bool {
+    p.blocks.iter().any(|b| next_section(&b.insts, 0).is_some())
+}
+
+/// The next save and restore indices and the saved EXEC value.
+fn next_section(insts: &[Inst], from: usize) -> Option<(usize, usize, Value)> {
+    for (i, inst) in insts.iter().enumerate().skip(from) {
         // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
         let all = match inst.name() {
             "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
@@ -177,21 +191,15 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             _ => None,
         };
         let Some(saved) = saved else {
-            i += 1;
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
-        });
-        let Some(end) = end else {
-            break;
-        };
-        let (shapes, why) = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes, why });
-        i = end + 1;
+        })?;
+        return Some((i, end, saved));
     }
-    out
+    None
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -337,11 +345,18 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static SIMULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn simulate(
     insts: &[Inst],
     wave: u32,
     saved: Value,
 ) -> (HashMap<Value, Shape>, Option<&'static str>) {
+    #[cfg(test)]
+    SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;
     let all = if wave == 64 {
         u64::MAX
