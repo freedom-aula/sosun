@@ -109,11 +109,57 @@ pub fn bind_imports(
     }
     block.seal()?;
     image.write_slots(&slots)?;
-    tracing::info!(
-        hle = report.hle,
-        host = report.host,
-        missing = report.missing.len(),
-        "native imports bound"
-    );
+    if report.missing.is_empty() {
+        tracing::info!(
+            hle = report.hle,
+            host = report.host,
+            missing = 0,
+            "native imports bound"
+        );
+    } else {
+        // Named here, once per image: a late-loaded DLL's missing imports are logged nowhere else.
+        tracing::warn!(
+            hle = report.hle,
+            host = report.host,
+            missing = report.missing.len(),
+            unresolved = %names(&report.missing),
+            "native imports bound"
+        );
+    }
     Ok(report)
+}
+
+/// `dll!symbol` for each import, an ordinal as `dll!#n`, comma separated.
+fn names(missing: &[MissingImport]) -> String {
+    let names: Vec<String> = missing
+        .iter()
+        .map(|m| format!("{}!{}", m.dll, m.symbol))
+        .collect();
+    names.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unresolved_imports_are_named_with_their_dll() {
+        let missing = |dll: &str, symbol: &str| MissingImport {
+            dll: dll.into(),
+            symbol: symbol.into(),
+        };
+        let missing = [
+            missing("api-ms-win-core-debug-l1-1-0.dll", "OutputDebugStringW"),
+            missing(
+                "api-ms-win-crt-math-l1-1-0.dll",
+                &victory_pe::ImportSymbol::Ordinal(42).to_string(),
+            ),
+        ];
+        assert_eq!(
+            names(&missing),
+            "api-ms-win-core-debug-l1-1-0.dll!OutputDebugStringW, \
+             api-ms-win-crt-math-l1-1-0.dll!#42"
+        );
+        assert_eq!(names(&[]), "");
+    }
 }
