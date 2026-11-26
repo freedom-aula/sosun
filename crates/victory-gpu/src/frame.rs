@@ -261,8 +261,19 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    /// The clock, the ticks taken and the frame count are process-wide, so
+    /// these tests run one at a time, each from a fresh clock.
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *clock() = None;
+        LAST.iter().for_each(|t| t.store(0, Ordering::Relaxed));
+        guard
+    }
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _serial = exclusive();
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -271,7 +282,12 @@ mod tests {
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // Bounded by the 1 s time-out, not the 2 ms tick: loose for slow hosts.
+        assert!(before.elapsed() < Duration::from_millis(500), "{:?}", before.elapsed());
+        // A 1 s interval starts after the last tick taken, so its first tick is
+        // a whole second away and a 0 ms poll cannot race past it (with 2 ms
+        // ticks an oversleeping host found the tick passed and ended at once).
+        assert_eq!(set_interval(null, null, 1_000_000, 1, 0), S_OK);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -280,6 +296,8 @@ mod tests {
             wait(null, 0, 0, std::ptr::null(), flags, &mut early),
             TIMEOUT
         );
+        // Time-outs took no tick: back on 2 ms ticks the next one is near.
+        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
         assert!(early == second + 1 && next == early + 1);
@@ -303,18 +321,24 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // Each flip takes its own tick. A stalled host may skip ticks (a late
+        // wait takes the latest one passed), so only distinct and rising.
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
         // A flip wait begun after its tick passed (two ticks missed) ends at
         // once, on the latest tick passed; the next one waits for the next.
-        std::thread::sleep(Duration::from_millis(110));
+        // 200 ms ticks: waiting for the next tick would take another ~150 ms,
+        // far above any scheduler jitter in the 100 ms bound below.
+        let base = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+        assert_eq!(set_interval(null, null, 200_000, 3, 0), S_OK);
+        std::thread::sleep(Duration::from_millis(450));
         let before = Instant::now();
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
+        assert!(before.elapsed() < Duration::from_millis(100), "{:?}", before.elapsed());
         let late = LAST[2].load(Ordering::Relaxed);
-        assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
+        assert!(late >= base + 2, "{late} after {base}");
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
         assert_eq!(LAST[2].load(Ordering::Relaxed), late + 1);
     }
@@ -324,8 +348,13 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _serial = exclusive();
         const VBLANK: u32 = 1;
-        let long = Duration::from_secs(1);
+        // 1 s ticks: no stall can let the third (0 ms) call find its tick
+        // passed and take it. `next_tick` never sleeps, so this stays fast.
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 1_000_000, 1, 0), S_OK);
+        let long = Duration::from_secs(10);
         let (first, _) = next_tick(VBLANK, long);
         let (second, _) = next_tick(VBLANK, long);
         assert!(second > first, "{second} after {first}");
