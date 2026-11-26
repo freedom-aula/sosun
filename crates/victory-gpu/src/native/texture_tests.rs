@@ -676,3 +676,119 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
         t.texture_released(key);
     }
 }
+
+/// A described RTV binds and clears its selected subresource in the named format.
+#[test]
+fn a_render_target_view_selects_its_mip_and_slice() {
+    use std::rc::Rc;
+    use victory_backend::backend::ComputeBackend;
+
+    let pool = pool(9138, 16).expect("Metal device and generated texture pool");
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let other_heap = crate::descriptor::test_heap(false, 4);
+    let next_handle = slot::<extern "system" fn(This) -> u64>(other_heap, 0x48)(other_heap);
+    let grey = [0.5, 0.5, 0.5, 1.0];
+
+    for (case, own_format, layers, array_view, mip, slice) in [
+        ("2D mip", 28, 1, false, 1, 0),
+        ("array slice", 28, 2, true, 0, 1),
+        ("array mip and slice", 28, 2, true, 1, 1),
+        ("plain view of an sRGB array mip and slice", 29, 2, true, 1, 1),
+        ("nonarray view of the first slice", 28, 2, false, 1, 0),
+    ] {
+        let rt = crate::resource::test_texture_array_at(pool.va(0), (8, 8), 2, layers, own_format, Swizzle::LINEAR.0, 1);
+        let key = rt as usize;
+        let subresources: Vec<_> = (0..usize::from(layers))
+            .flat_map(|layer| (0..2).map(move |level| {
+                (level, layer, 8 >> level, [17 + (level * 40 + layer * 80) as u8, 31, 47, 255])
+            }))
+            .collect();
+        with_title(|title| {
+            let texture = title.texture_of(key).expect("realized texture");
+            for &(level, layer, n, sentinel) in &subresources {
+                title.host.backend.upload_texture(&texture, level, layer, &sentinel.repeat(n * n), n * 4, 0);
+            }
+        }).expect("Metal title");
+        let desc = if array_view {
+            [28, 5, mip, slice, 1, 0]
+        } else {
+            [28, 4, mip, 0, 0, 0]
+        };
+        crate::descriptor::create_rtv(std::ptr::null(), rt, &desc, handle);
+        crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), next_handle);
+        let list = crate::list::test_list(false, std::ptr::null());
+        glue::targets(list, &[handle], 0);
+        with_list(list, |title, l| {
+            let (expected, format) = title.target_of(crate::descriptor::rtv_record(handle).unwrap()).unwrap();
+            let (base, base_format) = title.target_of(crate::descriptor::rtv_record(next_handle).unwrap()).unwrap();
+            assert!(l.targets_ready);
+            assert_eq!(l.targets.color, [Format::Rgba8Unorm]);
+            assert_eq!(format, Format::Rgba8Unorm);
+            let [attached] = l.list.color_targets() else { panic!("one attachment was expected") };
+            assert!(Rc::ptr_eq(attached, &expected), "binding reuses the cached attachment");
+            assert!(Rc::ptr_eq(&base, &title.texture_of(key).unwrap()), "default keeps base attachment");
+            assert!(!Rc::ptr_eq(&base, attached));
+            assert_eq!(base_format, if own_format == 29 { Format::Rgba8UnormSrgb } else { Format::Rgba8Unorm });
+            if array_view {
+                for (other_mip, other_slice) in [(1 - mip, slice), (mip, 1 - slice)] {
+                    let other_desc = [28, 5, other_mip, other_slice, 1, 0];
+                    crate::descriptor::create_rtv(std::ptr::null(), rt, &other_desc, next_handle);
+                    let (other, _) = title.target_of(crate::descriptor::rtv_record(next_handle).unwrap()).unwrap();
+                    assert!(!Rc::ptr_eq(attached, &other), "distinct subresources must keep distinct identities");
+                }
+            }
+        }).expect("native command list");
+
+        let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const u8)>(list, 0x1a0);
+        clear(list, handle, &grey, 0, std::ptr::null());
+        with_list(list, |_, l| {
+            let [super::super::list::Cmd::Clear { color: Some((cleared, _)), .. }] = l.list.cmds.as_slice() else {
+                panic!("one clear was expected");
+            };
+            assert!(Rc::ptr_eq(&l.list.color_targets()[0], cleared), "draw binding and clear resolve the same view");
+        }).expect("native command list");
+        if layers == 2 {
+            for invalid in [
+                [28, 5, 2, 0, 1, 0], // Out-of-range mip.
+                [28, 5, 0, 2, 1, 0], // Out-of-range slice.
+                [28, 5, 0, 0, 0, 0], // Empty array view.
+                [28, 5, 0, 0, 2, 0], // Unsupported layered view.
+                [28, 5, 0, 0, 1, 1], // Unsupported plane.
+                [28, 2, 0, 0, 0, 0], // 1D view of a 2D resource.
+                [28, 6, 0, 0, 0, 0], // Multisampled view of a single-sampled resource.
+            ] {
+                crate::descriptor::create_rtv(std::ptr::null(), rt, &invalid, next_handle);
+                glue::targets(list, &[next_handle, handle], 0);
+                clear(list, next_handle, &[1.0, 0.0, 0.0, 1.0], 0, std::ptr::null());
+                with_list(list, |_, l| {
+                    assert!(!l.targets_ready, "{case} accepted {invalid:?}");
+                    assert!(l.list.color_targets().is_empty(), "valid attachment must keep its slot");
+                    assert_eq!(l.list.cmds.len(), 1, "an invalid clear must record no command");
+                }).expect("native command list");
+            }
+        }
+
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        let queue = crate::queue::test_queue(false);
+        let mut fence = std::ptr::null();
+        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(slot::<extern "system" fn(This, This, u64) -> i32>(queue, 0x70)(queue, fence, 1), 0);
+        with_title(|title| {
+            let fence = title.fence(fence as usize, 0).expect("native fence");
+            assert!(title.host.backend.wait(&fence, 1, 2000), "native clear did not finish");
+            let texture = title.texture_of(key).expect("realized texture");
+            let mut pixels = 0;
+            for &(level, layer, n, sentinel) in &subresources {
+                let expected = if (level, layer) == (mip as usize, slice as usize) { [128, 128, 128, 255] } else { sentinel };
+                let mut data = vec![0u8; n * n * 4];
+                title.host.backend.read_texture(&texture, level, layer, &mut data, n * 4, 0);
+                assert!(data.as_chunks::<4>().0.iter().all(|p| *p == expected),
+                        "{case} mip {level} slice {layer}: expected {expected:?}, got {:?}", &data[..4]);
+                pixels += n * n;
+            }
+            println!("{case}: cleared mip {mip} slice {slice}, verified {pixels} texels");
+        }).expect("Metal title");
+    }
+}

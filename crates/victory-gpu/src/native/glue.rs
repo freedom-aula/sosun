@@ -580,19 +580,15 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources, in the views' formats.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let views: Vec<Option<(usize, u32)>> = color
-            .iter()
-            .map(|&h| crate::descriptor::rtv_record(h).map(|r| (r.resource as usize, r.format())))
-            .collect();
-        let keys: Vec<Option<usize>> = views.iter().map(|v| v.map(|(k, _)| k)).collect();
+        let views: Vec<_> = color.iter().map(|&h| crate::descriptor::rtv_record(h)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
-        l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
+        l.target_keys = views.iter().flatten().map(|r| r.resource as usize).chain(depth_key).collect();
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
         let made: Option<Vec<_>> = views
             .iter()
-            .map(|slot| slot.and_then(|(k, named)| t.target_of(k, named)))
+            .map(|slot| slot.and_then(|r| t.target_of(r)))
             .collect();
         let Some(made) = made else {
             l.targets_ready = false;
@@ -617,16 +613,14 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     });
 }
 
-/// `ClearRenderTargetView`. shortcut: the whole target, whatever rectangles the title passes.
+/// `ClearRenderTargetView`. shortcut: the selected attachment, regardless of rectangle arguments.
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
-        if let Some((tex, _)) = crate::descriptor::rtv_record(handle)
-            .and_then(|r| t.target_of(r.resource as usize, r.format()))
+        if let Some(record) = crate::descriptor::rtv_record(handle)
+            && let Some((texture, _)) = t.target_of(record)
         {
-            if let Some(r) = crate::descriptor::rtv_record(handle) {
-                trace_bump(r.resource as usize, 1);
-            }
-            l.list.clear_render_target(&tex, color);
+            trace_bump(record.resource as usize, 1);
+            l.list.clear_render_target(&texture, color);
         }
     });
 }

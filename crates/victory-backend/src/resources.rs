@@ -139,7 +139,7 @@ impl TextureDesc {
 }
 
 /// A view of part of a texture, possibly in another (size-compatible) format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewDesc {
     pub format: Format,
     /// First mip, count.
