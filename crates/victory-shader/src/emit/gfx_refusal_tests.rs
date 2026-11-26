@@ -1464,3 +1464,64 @@ fn normalized_16_bit_packing_lowers_in_pixel_shader() {
         "got `{err}`"
     );
 }
+
+/// What "a computed buffer descriptor used as a view" names: only an image
+/// instruction asks for a view of four computed dwords, as its sampler (told
+/// apart here) or as a 128-bit image descriptor (`r128`, instruction bit 15).
+/// The refusal is reported where the missing result is first needed.
+#[test]
+fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // CBV, root constants in slot 0, live-in s0
+    let head = [
+        0xBE8C_030A, // s_mov_b32 s12, s10
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF40C_0406,
+        0xFA00_0000, // s_load_dwordx8 s[16:23], s[12:13], 0x0
+        0xBE98_03FF,
+        0x0001_2345, // s_mov_b32 s24, 0x12345
+        0xBE99_03FF,
+        0x00FF_F000, // s_mov_b32 s25, 0xfff000
+        0xBE9A_0300, // s_mov_b32 s26, s0
+        0xBE9B_0380, // s_mov_b32 s27, 0
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+        0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+    ];
+    // image_sample_lz v[4:7], v[2:3], s[16:23], s[24:27] dmask:0xf dim:2D
+    let sample = [0xF09C_0F08, 0x00C4_0402];
+    let tail = [
+        0xF800_180F,
+        0x0706_0504, // exp mrt0 v4, v5, v6, v7 done vm
+        0xBF81_0000,
+    ];
+    let options = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    let run = |mid: &[u32]| {
+        let code: Vec<u32> = head.iter().chain(mid).chain(&tail).copied().collect();
+        let c = graphics::container(HwStage::Ps, &bytes_of(&code), &meta).unwrap();
+        translate_with(&c, options)
+    };
+    // Sampler dword 2 from a root constant: refused at the export, 8 bytes on.
+    let at = 4 * head.len() + 8;
+    let err = run(&sample).err().unwrap();
+    assert_eq!(err, ShaderError::Unsupported { offset: at, what: "a sampler built from computed words" });
+    // The same sampler with dword 2 fixed is an immediate sampler.
+    let fixed = [0xBE9A_0380, sample[0], sample[1]]; // s_mov_b32 s26, 0
+    assert_eq!(run(&fixed).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 0, 0]]);
+    // A 128-bit image descriptor of loaded and built dwords.
+    let short = [
+        0xBE93_03FF,
+        0x0001_2345, // s_mov_b32 s19, 0x12345
+        fixed[0],
+        sample[0] | 1 << 15, // ... s[16:19], s[24:27] ... r128
+        sample[1],
+    ];
+    let err = run(&short).err().unwrap();
+    assert_eq!(
+        err,
+        ShaderError::Unsupported { offset: at + 12, what: "a computed buffer descriptor used as a view" }
+    );
+}
