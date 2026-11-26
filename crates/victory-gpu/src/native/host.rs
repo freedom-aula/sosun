@@ -62,6 +62,8 @@ const RETIRED: usize = 8;
 /// submission has been handed over.
 struct Prep<B: GraphicsBackend> {
     root: RootArgs,
+    /// The pixel stage's own arguments.
+    ps_root: Option<RootArgs>,
     bufs: Vec<Rc<B::Buffer>>,
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
@@ -294,8 +296,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         &self,
         root: &[Option<Root<B>>],
         b: &Binding,
+        heap: Option<&Rc<NativeHeap<B>>>,
         p: &mut Prep<B>,
     ) -> Result<(), String> {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
         use victory_shader::RootType;
         let set = |slot: u8| {
             root.get(usize::from(slot))
@@ -314,6 +318,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     (RootType::Table, Root::Table(h, at)) => (*at as u64 * Self::step(h.kind)) as u32,
                     (RootType::Descriptor, Root::View(a)) if u.dword < 2 => {
                         (a >> (32 * u.dword)) as u32
+                    }
+                    // A view of the pool holding the root view, and the address's offset in it.
+                    (RootType::Descriptor, Root::View(a))
+                        if matches!(u.dword, ROOT_SRV_VIEW | ROOT_UAV_VIEW | ROOT_VIEW_OFFSET) =>
+                    {
+                        let heap = match &p.heap {
+                            Some(h) => h.clone(),
+                            None => match heap {
+                                Some(h) => h.clone(),
+                                None => self.host_heap()?,
+                            },
+                        };
+                        p.heap = Some(heap.clone());
+                        let (view, offset) = self.root_view(&heap, *a);
+                        match u.dword {
+                            ROOT_SRV_VIEW => view,
+                            ROOT_UAV_VIEW => view + 1,
+                            _ => offset,
+                        }
                     }
                     (kind, _) => {
                         return Err(format!(
@@ -405,6 +428,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
+    /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
+    fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
+        let maps = self.mapping_list();
+        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
+    }
+
+    /// The pool table as the page table builder reads it.
+    fn mapping_list(&self) -> Vec<Mapping> {
+        self.memory
+            .mappings()
+            .1
+            .iter()
+            .map(|(at, len, pool, offset)| Mapping {
+                at: *at as u64,
+                len: *len as u64,
+                pool: pool.id,
+                base: pool.base,
+                pool_len: pool.len as u64,
+                offset: *offset as u64,
+            })
+            .collect()
+    }
+
     /// What a shader that finds title memory through the page table is given besides its user data:
     /// the table (the last root parameter) and, in the heap it reads, the view pairs.
     fn memory_args(
@@ -465,6 +511,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
+            ps_root: None,
             bufs: vec![],
             vertex: vec![],
             index: None,
@@ -476,9 +523,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 root, pso, heaps, ..
             } => match &pso.binding {
                 Some(b) => {
-                    self.translated_args(root, b, &mut p)?;
+                    self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
                     if b.memory {
                         self.memory_args(heaps.0.as_ref(), &mut p)?;
+                    } else if let Some(h) = p.heap.clone() {
+                        self.write_pairs(&h)?;
                     }
                 }
                 None => self.root_args(root, &mut p)?,
@@ -486,12 +535,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Cmd::Draw {
                 root,
                 binding,
+                heaps,
                 vertex,
                 index,
                 ..
             } => {
                 match binding {
-                    Some(b) => self.translated_args(root, b, &mut p)?,
+                    Some(b) => {
+                        self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        if let Some(ps) = &b.ps {
+                            let vs_args = std::mem::take(&mut p.root);
+                            self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            p.ps_root = Some(std::mem::replace(&mut p.root, vs_args));
+                        }
+                        if let Some(h) = p.heap.clone() {
+                            self.write_pairs(&h)?;
+                        }
+                    }
                     None => self.root_args(root, &mut p)?,
                 }
                 for a in vertex {
@@ -681,7 +741,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     topology: *topology,
                                     state: *state,
                                     root: preps[k].root.clone(),
-                                    heaps: heaps(h),
+                                    fragment_root: preps[k].ps_root.clone(),
+                                    heaps: match &preps[k].heap {
+                                        Some(m) => Heaps {
+                                            resource: Some(&m.heap),
+                                            sampler: h.1.as_ref().map(|s| &s.heap),
+                                        },
+                                        None => heaps(h),
+                                    },
                                     resources: preps[k].bufs.iter().map(|b| &**b).collect(),
                                     vertex_buffers: preps[k]
                                         .vertex

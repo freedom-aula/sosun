@@ -144,6 +144,27 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
     words
 }
 
+/// A root SRV or UAV address as the translator's root views want it (`emit`, "Root SRVs and root
+/// UAVs"): the heap index of the view pair's SRV (the UAV is the next entry) and the byte offset of
+/// the address in the view. An address no mapping shows is the null view at offset 0.
+pub fn root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+    let null = (pair_index(first, 0), 0);
+    let Some(m) = maps.iter().find(|m| address >= m.at && address - m.at < m.len) else {
+        return null;
+    };
+    let pool_at = m.offset + (address - m.at);
+    let key = PairKey {
+        pool: m.pool,
+        base: m.base,
+        len: m.pool_len,
+        chunk: pool_at / CHUNK,
+    };
+    match pairs.pair(key) {
+        Some(pair) => (pair_index(first, pair), (pool_at - key.chunk * CHUNK) as u32),
+        None => null,
+    }
+}
+
 /// What the translated shader does with `words` for the address `va` (the lookup of
 /// `emit::lower::memory_entry`): the heap index of the view and the offset in it, or `None` for the
 /// null view.
@@ -211,6 +232,24 @@ impl<B: ComputeBackend> Drop for Pages<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_view_is_a_pair_and_an_offset_in_it() {
+        let maps = [
+            map(0x10_0000_0000, 3 * CHUNK, 7, 3 * CHUNK, 0),
+            map(0x20_0000_0000, PAGE, 8, PAGE, 0),
+        ];
+        let mut pairs = Pairs::default();
+        let first = 1000;
+        // The second chunk of pool 7, 0x123 bytes in.
+        let a = 0x10_0000_0000 + CHUNK + 0x123;
+        assert_eq!(root_view(&maps, &mut pairs, first, a), (pair_index(first, 1), 0x123));
+        // The same pool and chunk is the same pair; another pool is the next.
+        assert_eq!(root_view(&maps, &mut pairs, first, a + 8), (pair_index(first, 1), 0x12b));
+        assert_eq!(root_view(&maps, &mut pairs, first, 0x20_0000_0010).0, pair_index(first, 2));
+        // Nothing mapped: the null view.
+        assert_eq!(root_view(&maps, &mut pairs, first, 0x30_0000_0000), (pair_index(first, 0), 0));
+    }
 
     /// Where a heap of a thousand title entries has its pairs.
     const FIRST: u32 = 1000;

@@ -423,6 +423,8 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub topology: Topology,
     pub state: DrawState,
     pub root: RootArgs,
+    /// The pixel stage's own argument block, if it has one (else it reads `root`).
+    pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,
     /// `(buffer, title address)` per vertex stream, in `streams` order.

@@ -49,13 +49,6 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.heap {
         return Some("indexes the descriptor heap itself");
     }
-    if shader
-        .user_data
-        .iter()
-        .any(|u| u.root == victory_shader::RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW)
-    {
-        return Some("reads root views as heap views");
-    }
     None
 }
 
@@ -66,10 +59,7 @@ fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
             return Some(why);
         }
     }
-    // One argument block serves both stages (the vertex shader's); a pixel shader with arguments
-    // of its own has none.
-    ps.filter(|p| !p.user_data.is_empty() || !Binding::of(p).views.is_empty())
-        .map(|_| "the pixel stage reads root arguments of its own")
+    None
 }
 
 /// The thread-group size a compute container declares (`PSV0`'s runtime info).
@@ -194,6 +184,8 @@ impl<B: PresentBackend> Title<B> {
         h.update(&vs.dxil);
         h.update(ps.map_or(&[][..], |p| &p.dxil));
         h.update(format!("{graphics:?}").as_bytes());
+        // The arguments are part of the pipeline's binding.
+        h.update(format!("{:?}{:?}", vs.user_data, ps.map(|p| &p.user_data)).as_bytes());
         let key = *h.finalize().as_bytes();
         if let Some(p) = self.libraries.render.get(&key) {
             self.shaders.cached += 1;
@@ -245,7 +237,10 @@ impl<B: PresentBackend> Title<B> {
         match self.host.render_pipeline(&desc) {
             Ok(p) => {
                 self.shaders.pipelines += 1;
-                Pipe::Render(p, Some(Rc::new(Binding::of(vs))))
+                Pipe::Render(p, Some(Rc::new(Binding {
+                    ps: ps.map(Binding::of).filter(|b| b.dwords > 0 || !b.views.is_empty()).map(Rc::new),
+                    ..Binding::of(vs)
+                })))
             }
             Err(e) => {
                 self.shaders.refuse(name, format!("conversion: {e}"));

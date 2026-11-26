@@ -318,14 +318,19 @@ impl Metal {
         &self,
         e: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         root: &RootArgs,
+        fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
     ) {
-        if !root.0.is_empty() {
-            let p = NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap();
-            // SAFETY: setBytes copies `root` before returning; both stages read the same table.
-            unsafe {
+        let fragment = fragment.unwrap_or(root);
+        // SAFETY: setBytes copies the bytes before returning.
+        unsafe {
+            if !root.0.is_empty() {
+                let p = NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap();
                 e.setVertexBytes_length_atIndex(p, root.0.len(), ARGUMENT_BUFFER);
-                e.setFragmentBytes_length_atIndex(p, root.0.len(), ARGUMENT_BUFFER);
+            }
+            if !fragment.0.is_empty() {
+                let p = NonNull::new(fragment.0.as_ptr().cast_mut().cast()).unwrap();
+                e.setFragmentBytes_length_atIndex(p, fragment.0.len(), ARGUMENT_BUFFER);
             }
         }
         for (h, slot) in [
@@ -965,7 +970,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, &d.heaps);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
