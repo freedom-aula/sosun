@@ -75,8 +75,11 @@ fn alloc_tls_block(t: &TlsTemplate) -> (*mut u8, Layout) {
     // SAFETY: a non-zero layout; the template is in a mapped image.
     let block = unsafe { alloc_zeroed(layout) };
     assert!(!block.is_null(), "out of memory for a TLS block");
-    // SAFETY: the template's initial data is `end - start` readable bytes.
-    unsafe { std::ptr::copy_nonoverlapping(t.start as *const u8, block, t.end - t.start) };
+    let init = t.end.saturating_sub(t.start);
+    if init > 0 {
+        // SAFETY: the template's initial data is `init` readable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(t.start as *const u8, block, init) };
+    }
     (block, layout)
 }
 
@@ -313,5 +316,22 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(block, 16) };
         assert_eq!(&bytes[..8], &init);
         assert_eq!(&bytes[8..16], &[0u8; 8]);
+    }
+
+    #[test]
+    fn alloc_tls_block_accepts_zero_init_template_with_null_start() {
+        let template = TlsTemplate {
+            start: 0,
+            end: 0,
+            zero_fill: 16,
+            index_at: 0,
+        };
+        let (block, layout) = alloc_tls_block(&template);
+        assert!(!block.is_null());
+        // SAFETY: `alloc_tls_block` allocated and zeroed `layout.size() >= 16` bytes.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(block, 16), &[0u8; 16]);
+            dealloc(block, layout);
+        }
     }
 }

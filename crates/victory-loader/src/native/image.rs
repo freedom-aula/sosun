@@ -35,7 +35,9 @@ pub struct TlsTemplate {
 impl TlsTemplate {
     /// Bytes of one thread's block.
     pub fn block_len(&self) -> usize {
-        self.end - self.start + self.zero_fill
+        self.end
+            .saturating_sub(self.start)
+            .saturating_add(self.zero_fill)
     }
 }
 
@@ -58,6 +60,9 @@ impl NativeImage {
     /// any free range if that is taken.
     pub fn map(bytes: &[u8], base: Option<usize>) -> Result<NativeImage> {
         let info = ImageInfo::parse(bytes)?;
+        if info.size_of_image == 0 {
+            bail!("image has zero SizeOfImage");
+        }
         let len = (info.size_of_image as usize).next_multiple_of(mem::page_size());
         let preferred = info.image_base as usize;
         let at = base.unwrap_or(preferred);
@@ -76,8 +81,11 @@ impl NativeImage {
             len,
             info,
         };
-        image.copy_sections(bytes)?;
-        image.relocate(bytes)?;
+        if let Err(err) = image.copy_sections(bytes).and_then(|()| image.relocate(bytes)) {
+            // SAFETY: fresh mapping not yet exposed to unwind tables or title code.
+            let _ = unsafe { mem::release(image.base as *mut u8, image.len) };
+            return Err(err);
+        }
         let pdata = layout::data_directory_offset(bytes, dir::EXCEPTION).map(|at| {
             (
                 layout::read_u32(bytes, at).unwrap_or(0),
@@ -178,70 +186,83 @@ impl NativeImage {
         if rva == 0 || size == 0 {
             bail!("image is not at its preferred base and has no relocations");
         }
+        let end = rva
+            .checked_add(size)
+            .filter(|&end| end <= self.len)
+            .with_context(|| format!("relocation directory {rva:#x}+{size:#x} past the image"))?;
         let mut block = rva;
-        while block + 8 <= rva + size {
-            let page = self.read::<u32>(block) as usize;
-            let block_size = self.read::<u32>(block + 4) as usize;
+        while block.checked_add(8).is_some_and(|h| h <= end) {
+            let page = self.checked_read::<u32>(block)? as usize;
+            let block_size = self.checked_read::<u32>(block + 4)? as usize;
             if block_size < 8 {
                 break;
             }
+            let next = block
+                .checked_add(block_size)
+                .filter(|&next| next <= end)
+                .with_context(|| {
+                    format!("relocation block {block:#x}+{block_size:#x} past directory")
+                })?;
             for i in 0..(block_size - 8) / 2 {
-                let entry = self.read::<u16>(block + 8 + i * 2);
-                let target = page + usize::from(entry & 0xFFF);
+                let entry = self.checked_read::<u16>(block + 8 + i * 2)?;
+                let target = page
+                    .checked_add(usize::from(entry & 0xFFF))
+                    .context("relocation target overflows")?;
                 match entry >> 12 {
                     REL_ABSOLUTE => {}
                     REL_DIR64 => {
-                        let v = self.read::<u64>(target).wrapping_add(delta as u64);
-                        self.write(target, v);
+                        let v = self.checked_read::<u64>(target)?.wrapping_add(delta as u64);
+                        self.checked_write(target, v)?;
                     }
                     REL_HIGHLOW => {
-                        let v = self.read::<u32>(target).wrapping_add(delta as u32);
-                        self.write(target, v);
+                        let v = self.checked_read::<u32>(target)?.wrapping_add(delta as u32);
+                        self.checked_write(target, v)?;
                     }
                     other => bail!("unsupported relocation type {other}"),
                 }
             }
-            block += block_size;
+            block = next;
         }
         Ok(())
     }
 
-    fn read<T: Copy>(&self, rva: usize) -> T {
-        assert!(
-            rva + size_of::<T>() <= self.len,
-            "rva {rva:#x} outside the image"
-        );
-        // SAFETY: inside the mapping (asserted); PE data is unaligned.
-        unsafe { ((self.base + rva) as *const T).read_unaligned() }
+    fn checked_read<T: Copy>(&self, rva: usize) -> Result<T> {
+        if rva.checked_add(size_of::<T>()).is_none_or(|end| end > self.len) {
+            bail!("rva {rva:#x} outside the image");
+        }
+        // SAFETY: inside the mapping (checked above); PE data is unaligned.
+        Ok(unsafe { ((self.base + rva) as *const T).read_unaligned() })
     }
 
-    fn write<T>(&self, rva: usize, value: T) {
-        assert!(
-            rva + size_of::<T>() <= self.len,
-            "rva {rva:#x} outside the image"
-        );
-        // SAFETY: inside our writable mapping (asserted).
+    fn checked_write<T>(&self, rva: usize, value: T) -> Result<()> {
+        if rva.checked_add(size_of::<T>()).is_none_or(|end| end > self.len) {
+            bail!("rva {rva:#x} outside the image");
+        }
+        // SAFETY: inside our writable mapping (checked above).
         unsafe { ((self.base + rva) as *mut T).write_unaligned(value) };
+        Ok(())
     }
 
     /// The image's static TLS, if it has any.
     pub fn tls(&self) -> Option<TlsTemplate> {
         let dir = self.info.tls.as_ref()?.directory_rva as usize;
-        Some(TlsTemplate {
-            start: self.read::<u64>(dir) as usize,
-            end: self.read::<u64>(dir + 8) as usize,
-            index_at: self.read::<u64>(dir + 16) as usize,
-            zero_fill: self.read::<u32>(dir + 32) as usize,
+        let start = self.checked_read::<u64>(dir).ok()? as usize;
+        let end = self.checked_read::<u64>(dir + 8).ok()? as usize;
+        let index_at = self.checked_read::<u64>(dir + 16).ok()? as usize;
+        let zero_fill = self.checked_read::<u32>(dir + 32).ok()? as usize;
+        (end >= start).then_some(TlsTemplate {
+            start,
+            end,
+            index_at,
+            zero_fill,
         })
     }
 
     /// Fills IAT slots: `(slot rva, address)` pairs.
     pub fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
         for &(rva, address) in slots {
-            if rva as usize + 8 > self.len {
-                bail!("IAT slot {rva:#x} outside the image");
-            }
-            self.write(rva as usize, address as u64);
+            self.checked_write(rva as usize, address as u64)
+                .with_context(|| format!("IAT slot {rva:#x} outside the image"))?;
         }
         Ok(())
     }
@@ -296,5 +317,111 @@ impl NativeImage {
         seh::unwind::remove_image(self.base);
         // SAFETY: forwarded from the caller.
         unsafe { mem::release(self.base as *mut u8, self.len) }.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_pe(size_of_image: u32, reloc_rva: u32, reloc_size: u32, reloc_body: &[u8]) -> Vec<u8> {
+        let mut pe = vec![0u8; 0x400];
+        let put16 = |d: &mut [u8], at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |d: &mut [u8], at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        pe[0..2].copy_from_slice(b"MZ");
+        put32(&mut pe, 0x3C, 0x40);
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut pe, 0x44, victory_pe::MACHINE_AMD64);
+        put16(&mut pe, 0x46, 1);
+        put16(&mut pe, 0x54, 240);
+        put16(&mut pe, 0x56, 0x2022);
+        let opt = 0x58;
+        put16(&mut pe, opt, 0x20B);
+        put64(&mut pe, opt + 24, 0x1_8000_0000);
+        put32(&mut pe, opt + 32, 0x1000);
+        put32(&mut pe, opt + 36, 0x200);
+        put32(&mut pe, opt + 56, size_of_image);
+        put32(&mut pe, opt + 60, 0x200);
+        put32(&mut pe, opt + 108, 16);
+        put32(&mut pe, opt + 112 + dir::BASERELOC * 8, reloc_rva);
+        put32(&mut pe, opt + 112 + dir::BASERELOC * 8 + 4, reloc_size);
+        let sec = opt + 240;
+        pe[sec..sec + 6].copy_from_slice(b".reloc");
+        put32(&mut pe, sec + 8, 0x200);
+        put32(&mut pe, sec + 12, 0x1000);
+        put32(&mut pe, sec + 16, 0x200);
+        put32(&mut pe, sec + 20, 0x200);
+        put32(&mut pe, sec + 36, SCN_MEM_READ);
+        pe[0x200..0x200 + reloc_body.len()].copy_from_slice(reloc_body);
+        pe
+    }
+
+    #[test]
+    fn malformed_relocations_return_error_and_release_mapping() {
+        let len = 0x2000usize.next_multiple_of(mem::page_size());
+        // Pick a free address so we can check whether a failed map leaked it.
+        // SAFETY: probe and immediately release a fresh anonymous region.
+        let probe = unsafe { mem::alloc(None, len, Protect::READ_WRITE) }.unwrap();
+        let forced = probe as usize;
+        // SAFETY: just allocated.
+        unsafe { mem::release(probe, len) }.unwrap();
+
+        // 1. Relocation block whose size runs past its directory.
+        let mut bad_block = Vec::new();
+        bad_block.extend_from_slice(&0x1000u32.to_le_bytes());
+        bad_block.extend_from_slice(&0x400u32.to_le_bytes());
+        let pe = synthetic_pe(0x2000, 0x1000, 16, &bad_block);
+        assert!(NativeImage::map(&pe, Some(forced)).is_err());
+
+        // 2. Relocation target pointing past the end of the image.
+        let mut bad_target = Vec::new();
+        bad_target.extend_from_slice(&0x20000u32.to_le_bytes());
+        bad_target.extend_from_slice(&10u32.to_le_bytes());
+        bad_target.extend_from_slice(&((REL_DIR64 << 12) | 0x10).to_le_bytes());
+        let pe = synthetic_pe(0x2000, 0x1000, 10, &bad_target);
+        assert!(NativeImage::map(&pe, Some(forced)).is_err());
+
+        // 3. The forced range must still be free (not leaked by either failure).
+        let mut valid_reloc = Vec::new();
+        valid_reloc.extend_from_slice(&0x1000u32.to_le_bytes());
+        valid_reloc.extend_from_slice(&8u32.to_le_bytes());
+        let pe = synthetic_pe(0x2000, 0x1000, 8, &valid_reloc);
+        let ok = NativeImage::map(&pe, Some(forced)).expect("failed maps must release their range");
+        assert_eq!(ok.base(), forced);
+        // SAFETY: no title code ran.
+        unsafe { ok.unmap() };
+
+        // 4. Zero SizeOfImage is rejected before allocation/finalize.
+        let zero = synthetic_pe(0, 0, 0, &[]);
+        assert!(NativeImage::map(&zero, None).is_err());
+    }
+
+    #[test]
+    fn tls_rejects_inverted_bounds_without_panicking() {
+        let mut body = vec![0u8; 40];
+        // start > end in IMAGE_TLS_DIRECTORY64.
+        body[0..8].copy_from_slice(&0x1_8000_2000u64.to_le_bytes());
+        body[8..16].copy_from_slice(&0x1_8000_1000u64.to_le_bytes());
+        body[16..24].copy_from_slice(&0x1_8000_1040u64.to_le_bytes());
+        let mut pe = synthetic_pe(0x2000, 0, 0, &body);
+        let opt = 0x58;
+        // Data directory 9 (TLS): RVA 0x1000, size 40.
+        pe[opt + 112 + 9 * 8..opt + 112 + 9 * 8 + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        pe[opt + 112 + 9 * 8 + 4..opt + 112 + 9 * 8 + 8].copy_from_slice(&40u32.to_le_bytes());
+        // Add a valid empty reloc block so map can place the image anywhere.
+        let mut reloc = [0u8; 8];
+        reloc[0..4].copy_from_slice(&0x1000u32.to_le_bytes());
+        reloc[4..8].copy_from_slice(&8u32.to_le_bytes());
+        pe[0x200 + 64..0x200 + 72].copy_from_slice(&reloc);
+        pe[opt + 112 + dir::BASERELOC * 8..opt + 112 + dir::BASERELOC * 8 + 4]
+            .copy_from_slice(&0x1040u32.to_le_bytes());
+        pe[opt + 112 + dir::BASERELOC * 8 + 4..opt + 112 + dir::BASERELOC * 8 + 8]
+            .copy_from_slice(&8u32.to_le_bytes());
+
+        let image = NativeImage::map(&pe, None).unwrap();
+        assert!(image.tls().is_none());
+        // SAFETY: no title code ran.
+        unsafe { image.unmap() };
     }
 }
