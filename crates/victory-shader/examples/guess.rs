@@ -8,7 +8,7 @@ fn main() {
         _ => victory_shader::HwStage::Vs,
     };
     let c = victory_shader::emit::graphics::container(stage, &read("VICTORY_CODE"), &read("VICTORY_META")).expect("container");
-    let options = victory_shader::emit::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
+    let options = victory_shader::emit::Options { wave32_host: true, zero_copy_memory: true, rect_list: std::env::var_os("VICTORY_RECT").is_some(), ..Default::default() };
     match victory_shader::emit::translate_with(&c, options) {
         Ok(h) => {
             println!("{:?} dxil {} bytes", h.stage, h.dxil.len());

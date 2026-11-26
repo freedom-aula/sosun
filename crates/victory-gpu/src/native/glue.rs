@@ -513,6 +513,16 @@ pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
     )
 }
 
+/// The frame log's line of native draw counters, and the commands dropped by kind (kept out of
+/// `PresentX`, whose frame it would otherwise enlarge).
+#[inline(never)]
+pub(crate) fn log_draw_counts(frame: u64) {
+    let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
+    let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
+    let indirect = crate::list::indirect_dropped();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+}
+
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
 fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
