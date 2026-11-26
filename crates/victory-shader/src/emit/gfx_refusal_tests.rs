@@ -1613,6 +1613,80 @@ fn normalized_16_bit_packing_lowers_in_pixel_shader() {
     );
 }
 
+// =========================================================================
+// "s_pack_ll_b32_b16 / s_bfm_b64 / s_bitreplicate_b64_b32 / v_mad_u32_u16
+// is not supported"
+// =========================================================================
+
+#[test]
+fn scalar_packs_masks_and_16_bit_mads_lower_in_pixel_shader() {
+    // s_mov_b32 s0, 0x12345678
+    // s_mov_b32 s1, 0x9abcdef0
+    // <op>: a scalar result in s2 (s[2:3]), or the mad's in v0
+    // v_mov_b32_e32 v0, s2         (scalar ops)
+    // v_mov_b32_e32 v1, s2 (s3)    (scalar ops)
+    // exp mrt0 v0, v1, v0, v1 done vm
+    // s_endpgm
+    let code = |op: &[u32], wide: bool| {
+        let mut w = vec![0xBE80_03FF, 0x1234_5678, 0xBE81_03FF, 0x9ABC_DEF0];
+        w.extend_from_slice(op);
+        if op.len() == 1 {
+            w.extend([0x7E00_0202, if wide { 0x7E02_0203 } else { 0x7E02_0202 }]);
+        }
+        w.extend([0xF800_180F, 0x0100_0100, 0xBF81_0000]);
+        w
+    };
+    // v_mov_b32_e32 v1, s0; v_mov_b32_e32 v2, s1; then the mad.
+    let mad = |word0: u32, word1: u32| [0x7E02_0200, 0x7E04_0201, word0, word1];
+    for (what, op) in [
+        ("s_pack_ll_b32_b16 s2, s0, s1", code(&[0x9902_0100], false)),
+        ("s_pack_lh_b32_b16 s2, s0, s1", code(&[0x9982_0100], false)),
+        ("s_pack_hh_b32_b16 s2, s0, s1", code(&[0x9A02_0100], false)),
+        ("s_bfm_b64 s[2:3], s0, s1", code(&[0x9282_0100], true)),
+        ("s_bfm_b64 s[2:3], 40, 3", code(&[0x9282_83A8], true)),
+        (
+            "s_bitreplicate_b64_b32 s[2:3], s0",
+            code(&[0xBE82_3B00], true),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1",
+            code(&mad(0xD773_0000, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[1,0,0,0]",
+            code(&mad(0xD773_0800, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[0,1,0,0]",
+            code(&mad(0xD773_1000, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, v1, v2, v1 op_sel:[1,1,0,0]",
+            code(&mad(0xD773_1800, 0x0406_0501), false),
+        ),
+        (
+            "v_mad_u32_u16 v0, s0, 7, v1",
+            code(&mad(0xD773_0000, 0x0405_0E00), false),
+        ),
+    ] {
+        for wave32_host in [false, true] {
+            lower_ps(&op, true, vec![], vec![], 0, 0, vec![], wave32_host)
+                .unwrap_or_else(|e| panic!("{what}, wave32_host={wave32_host}: {e}"));
+        }
+    }
+    // v_mad_u32_u16 v0, v1, v2, v1 op_sel:[0,0,1,0]: op_sel on the 32-bit
+    // addend has no meaning in the manual and stays refused.
+    let opsel2 = code(&mad(0xD773_2000, 0x0406_0501), false);
+    let err = lower_ps(&opsel2, true, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string()
+            .contains("op_sel or modifiers on a 32-bit operand"),
+        "got `{err}`"
+    );
+}
+
 /// What "a computed buffer descriptor used as a view" names: only an image
 /// instruction asks for a view of four computed dwords, as its sampler (told
 /// apart here) or as a 128-bit image descriptor (`r128`, instruction bit 15).

@@ -560,7 +560,18 @@ pub(crate) fn metadata_resources(
             RootType::Constants if constants => 1,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
-            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+            refused => {
+                return Err(ShaderError::FspxRoot {
+                    root: e[5],
+                    what: match refused {
+                        RootType::Constants => "root constants in a compute shader",
+                        RootType::ResourceHeap | RootType::SamplerHeap => {
+                            "a descriptor heap (SM 6.6 dynamic resources)"
+                        }
+                        _ => "an unknown root type",
+                    },
+                });
+            }
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
             layout.push(RootParam {
@@ -1316,16 +1327,34 @@ pub(crate) mod tests {
         assert!(corrupt(8, 0xFF).is_err(), "entry count");
         // The code entry's size no longer matches the metadata's count.
         assert!(corrupt(FSPX_HEADER + 32 + 8, 8).is_err(), "code size");
+        // Each refused root type names itself (after an accepted table).
+        let refusal = |root: u8| {
+            let records = [
+                fspx_resource(0, 3, 0, 0, 4, 0),
+                fspx_resource(2, root, 0, 0, 5, 1),
+            ];
+            native_programs(&fspx(&code, 0, [64, 1, 1], false, &records))
+                .unwrap_err()
+                .to_string()
+        };
+        for (root, what) in [
+            (0, "root constants in a compute shader"),
+            (5, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (6, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (2, "an unknown root type"),
+            (7, "an unknown root type"),
+        ] {
+            assert_eq!(
+                refusal(root),
+                format!("FSPX metadata resource of root type {root}: {what}")
+            );
+        }
         let mut root_constants = fspx(
             &code,
             0,
             [64, 1, 1],
             false,
             &[fspx_resource(2, 0, 0, 0, 4, 0)],
-        );
-        assert!(
-            native_programs(&root_constants).is_err(),
-            "unknown root type"
         );
         root_constants.truncate(40);
         assert!(native_programs(&root_constants).is_err(), "truncated");
