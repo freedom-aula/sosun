@@ -545,8 +545,8 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,
-    /// `(buffer, title address)` per vertex stream, in `streams` order.
-    pub vertex_buffers: Vec<(&'a B::Buffer, *const u8)>,
+    /// `(input slot, buffer, title address)` for each bound vertex stream.
+    pub vertex_buffers: Vec<(usize, &'a B::Buffer, *const u8)>,
     pub index_buffer: Option<(&'a B::Buffer, *const u8)>,
     pub call: DrawCall,
     /// `ExecuteIndirect`: the call's counts are read on the GPU from this title address (the

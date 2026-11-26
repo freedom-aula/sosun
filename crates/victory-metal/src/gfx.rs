@@ -2000,8 +2000,8 @@ impl Metal {
                     first | MTLRenderStages::Fragment,
                 );
             }
-            for (slot, (b, title)) in d.vertex_buffers.iter().enumerate() {
-                let off = *title as usize - b.base as usize;
+            for &(slot, b, title) in &d.vertex_buffers {
+                let off = title as usize - b.base as usize;
                 // SAFETY: the buffer is live and `off` is inside it.
                 unsafe {
                     e.setVertexBuffer_offset_atIndex(Some(&b.buf), off, VERTEX_BUFFERS + slot)

@@ -5,6 +5,7 @@
 //! Title addresses are kept as addresses: they resolve to GPU buffers when the list is submitted, by
 //! which time the pool observer has told us about every mapping the title made.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use victory_backend::backend::{RootLayout, RootParam};
 use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
@@ -278,7 +279,7 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         targets: Targets<B>,
-        vertex: Vec<u64>,
+        vertex: Vec<(usize, u64)>,
         index: Option<(u64, bool)>,
         state: DrawState,
         call: DrawCall,
@@ -364,7 +365,7 @@ struct State<B: GraphicsBackend> {
     graphics_root: Vec<Option<Root<B>>>,
     heaps: Heaps<B>,
     targets: Targets<B>,
-    vertex: Vec<u64>,
+    vertex: BTreeMap<usize, u64>,
     index: Option<(u64, bool)>,
     draw: DrawState,
 }
@@ -396,7 +397,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
                     color: Vec::new(),
                     depth: None,
                 },
-                vertex: Vec::new(),
+                vertex: BTreeMap::new(),
                 index: None,
                 draw: DrawState::default(),
             },
@@ -671,15 +672,16 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
     pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
-        if self.state.vertex.len() <= slot {
-            self.state.vertex.resize(slot + 1, 0);
+        if address == 0 {
+            self.state.vertex.remove(&slot);
+        } else {
+            self.state.vertex.insert(slot, address);
         }
-        self.state.vertex[slot] = address;
     }
 
     /// The address bound as vertex buffer `slot`, if any (for the target trace).
     pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
-        self.state.vertex.get(slot).copied()
+        self.state.vertex.get(&slot).copied()
     }
 
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
@@ -776,7 +778,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.clone(),
+            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
             index: self.state.index,
             state: self.state.draw,
             call,
