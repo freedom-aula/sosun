@@ -10336,8 +10336,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
-    /// it and EXEC (or `s_orn2` of it by EXEC) in `b`, with no lane of edge `n` in that EXEC as the
-    /// edge brings it: those lanes' bits of the result are 0 (1) whatever the mask holds for them.
+    /// it and EXEC (or `s_nand` with EXEC, or `s_orn2` of it by EXEC) in `b`, with no lane of
+    /// edge `n` in that EXEC as the edge brings it: those lanes' bits of the result are 0 (1)
+    /// whatever the mask holds for them.
     fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let block = &p.blocks[b];
@@ -10351,7 +10352,10 @@ impl<'a> Lower<'a> {
                 let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
                     && matches!(&inst.fields, Fields::Sop { src, .. }
                         if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                if bb != b || !(matches!(inst.name(), "s_and_b32" | "s_and_b64") || orn2_of_exec) {
+                // `s_nand` with EXEC sets those bits whatever it holds, as `s_and` clears them.
+                let and =
+                    matches!(inst.name(), "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64");
+                if bb != b || !(and || orn2_of_exec) {
                     return false;
                 }
                 let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
@@ -10366,6 +10370,71 @@ impl<'a> Lower<'a> {
             }
         }
         reads > 0
+    }
+
+    /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
+    /// `depth` deep) whose edge from it needs no value ([`Self::unneeded_arg`]), so the wave can
+    /// hold any bits there.
+    fn never_seen(&self, value: Value, depth: u32) -> bool {
+        let p = self.x.p;
+        depth > 0
+            && !self.read_by_code(value)
+            && p.blocks.iter().enumerate().all(|(e, blk)| {
+                blk.phis.iter().all(|phi| {
+                    phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
+                        self.unneeded_arg(e, phi, k, depth - 1)
+                    })
+                })
+            })
+    }
+
+    /// Whether an instruction (not a join) reads `value`.
+    fn read_by_code(&self, value: Value) -> bool {
+        let reads = |i: &Inst| i.reads.iter().any(|r| r.1 == value);
+        self.x.p.blocks.iter().any(|b| b.insts.iter().any(reads))
+    }
+
+    /// Whether no lane taking edge `n` into IR block `b` sees what that edge brings to `phi`:
+    /// only an AND with an EXEC those lanes are not in reads it ([`Self::anded_off_on_edge`]),
+    /// no lane sees the join at all, or (with nothing reading the join) those lanes leave `b`
+    /// only by edges whose joins do not take it or need no value there either (a register the
+    /// console compiler reuses on a path those lanes skip, as a nested if's else part writes
+    /// it again before any read).
+    fn unneeded_arg(&self, b: usize, phi: &Phi, n: usize, depth: u32) -> bool {
+        let p = self.x.p;
+        if self.anded_off_on_edge(b, phi.value, n) || self.never_seen(phi.value, depth) {
+            return true;
+        }
+        if depth == 0 || self.read_by_code(phi.value) {
+            return false;
+        }
+        let on_n = self.lane_edge(p.blocks[b].preds[n], b);
+        p.blocks.iter().enumerate().all(|(e, blk)| {
+            blk.phis.iter().all(|next| {
+                next.args.iter().enumerate().filter(|&(_, &a)| a == phi.value).all(|(k, _)| {
+                    let taken = || [on_n.clone(), self.lane_edge(b, e)].concat();
+                    (blk.preds[k] == b && !self.x.st.bools.meet(&taken()))
+                        || self.unneeded_arg(e, next, k, depth - 1)
+                })
+            })
+        })
+    }
+
+    /// The lane mask `low` (the low dword's value) as each lane's bit when it is a select in IR
+    /// block `q` of an inline -1 (every lane) or 0 (none) by SCC: SCC, the same for every lane.
+    fn scc_mask(&self, low: Value, q: usize) -> Option<V> {
+        let block = &self.x.p.blocks[q];
+        let op = if self.x.native.wave64 { "s_cselect_b64" } else { "s_cselect_b32" };
+        let (inst, [Operand::Const(a), Operand::Const(b)]) = scalar_def::<2>(block, low, op)? else {
+            return None;
+        };
+        if (crate::resource::inline(a)?, crate::resource::inline(b)?) != (u32::MAX, 0) {
+            return None;
+        }
+        match self.vals.get(&inst.read(Reg::Scc)?) {
+            Some(&Val::Bit(scc)) => Some(scc),
+            _ => None,
+        }
     }
 
     /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
@@ -13597,15 +13666,19 @@ impl<'a> Lower<'a> {
                     (None, _) if !uniform && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
                     }
-                    // Read only ANDed with an EXEC those lanes are not in: any bit will do.
-                    (None, Some(Val::I32(_))) if self.anded_off_on_edge(b, phi.value, n) => {
-                        self.s.m.bool(false)
-                    }
+                    // Read only ANDed with an EXEC those lanes are not in, or not read at all
+                    // but by such joins: any bit will do, so what the edge brings (data, or a
+                    // value not made) is not needed.
+                    // shortcut: the search repeats work along a chain of joins (fine at the
+                    // title's ~10 deep); memoise it if a program's translation gets slow.
+                    (None, _) if self.unneeded_arg(b, phi, n, 16) => self.s.m.bool(false),
                     // No lanes or every lane, moved just before the edge: each lane's bit,
                     // whatever the lane layout and whichever lanes take the edge.
                     (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
                         self.s.m.bool(all)
                     }
+                    // -1 or 0 by SCC: SCC is every lane's bit.
+                    (None, Some(Val::I32(_))) if let Some(scc) = self.scc_mask(arg, q) => scc,
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
                     }
