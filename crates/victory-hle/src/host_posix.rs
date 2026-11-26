@@ -986,6 +986,7 @@ fn exceptions(name: &str) -> Option<usize> {
     match name {
         "RtlCaptureContext" => direct(api::capture_context_address()),
         "RaiseException" => direct(api::raise_exception_address()),
+        "DebugBreak" => direct(api::debug_break_address()),
         "RtlLookupFunctionEntry" => Some(api::lookup_function_entry as *const () as usize),
         "RtlVirtualUnwind" => Some(api::virtual_unwind as *const () as usize),
         "RtlAddFunctionTable" => Some(api::add_function_table as *const () as usize),

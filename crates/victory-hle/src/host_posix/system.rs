@@ -363,6 +363,169 @@ pub extern "system" fn FormatMessageA(
     (text.len() - 1) as u32
 }
 
+/// `FormatMessageW`, the part a library uses (Microsoft Learn): `FROM_SYSTEM`, `FROM_STRING`
+/// with `%1`..`%99` inserts, `IGNORE_INSERTS`, `ARGUMENT_ARRAY`, `ALLOCATE_BUFFER` and
+/// `MAX_WIDTH_MASK` (other widths do not wrap: guess, `docs/native-host.md`). Other sources
+/// (`FROM_HMODULE`) or flags fail with `ERROR_INVALID_PARAMETER`.
+pub extern "system" fn FormatMessageW(
+    flags: u32,
+    source: *const c_void,
+    id: u32,
+    _language: u32,
+    out: *mut u16,
+    size: u32,
+    args: *const c_void,
+) -> u32 {
+    const ALLOCATE_BUFFER: u32 = 0x100;
+    const IGNORE_INSERTS: u32 = 0x200;
+    const FROM_STRING: u32 = 0x400;
+    const FROM_SYSTEM: u32 = 0x1000;
+    const ARGUMENT_ARRAY: u32 = 0x2000;
+    const MAX_WIDTH_MASK: u32 = 0xFF;
+    let known = ALLOCATE_BUFFER | IGNORE_INSERTS | FROM_STRING | FROM_SYSTEM | ARGUMENT_ARRAY;
+    let text = match flags & (FROM_STRING | FROM_SYSTEM) {
+        _ if flags & !(known | MAX_WIDTH_MASK) != 0 || out.is_null() => None,
+        FROM_SYSTEM => {
+            let text = system_message(id);
+            Some(if flags & MAX_WIDTH_MASK == MAX_WIDTH_MASK {
+                text.trim_end_matches("\r\n").to_owned()
+            } else {
+                text
+            })
+        }
+        FROM_STRING if !source.is_null() => {
+            let format = files::wide_str(source.cast());
+            let args = match () {
+                () if flags & IGNORE_INSERTS != 0 => None,
+                () if flags & ARGUMENT_ARRAY != 0 => Some(args.cast::<u64>()),
+                // SAFETY: without `ARGUMENT_ARRAY`, `args` is a `va_list *`.
+                () if !args.is_null() => Some(unsafe { args.cast::<*const u64>().read() }),
+                () => Some(std::ptr::null()),
+            };
+            expand(&format, args)
+        }
+        _ => None,
+    };
+    let Some(text) = text else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let len = (units.len() - 1) as u32;
+    if flags & ALLOCATE_BUFFER != 0 {
+        // shortcut: leaked, as `FormatMessageA`'s, since `LocalFree` keeps nothing to free; give
+        // them a heap if a title formats many messages.
+        let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
+        // SAFETY: with ALLOCATE_BUFFER `out` is a `wchar_t **`.
+        unsafe { out.cast::<*mut u16>().write(leaked.as_mut_ptr()) };
+        return len;
+    }
+    if units.len() > size as usize {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    // SAFETY: the title's buffer of `size` UTF-16 units.
+    unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), out, units.len()) };
+    len
+}
+
+/// `FROM_SYSTEM`'s text for `id`, a Win32 error or the `HRESULT` of one, ending in "\r\n" as
+/// Windows' do: its English text for common errors, else "Error 0x%08X". Guess: Windows fails
+/// with `ERROR_MR_MID_NOT_FOUND` for an id it has no text for; a title that logs it is better
+/// served by the number.
+fn system_message(id: u32) -> String {
+    let code = if id & 0xFFFF_0000 == 0x8007_0000 {
+        id & 0xFFFF
+    } else {
+        id
+    };
+    let text = match code {
+        0 => "The operation completed successfully.",
+        1 => "Incorrect function.",
+        2 => "The system cannot find the file specified.",
+        3 => "The system cannot find the path specified.",
+        4 => "The system cannot open the file.",
+        5 => "Access is denied.",
+        6 => "The handle is invalid.",
+        8 => "Not enough memory resources are available to process this command.",
+        14 => "Not enough memory resources are available to complete this operation.",
+        50 => "The request is not supported.",
+        87 => "The parameter is incorrect.",
+        120 => "This function is not supported on this system.",
+        122 => "The data area passed to a system call is too small.",
+        0x8000_4001 => "Not implemented",
+        0x8000_4002 => "No such interface supported",
+        0x8000_4003 => "Invalid pointer",
+        0x8000_4005 => "Unspecified error",
+        _ => return format!("Error 0x{id:08X}\r\n"),
+    };
+    format!("{text}\r\n")
+}
+
+/// Expands a `FROM_STRING` message: `%1`..`%99` with an optional `!printf!` of `s`, `ls`, `ws`,
+/// `d`, `i`, `u`, `x` or `X` (`!s!` when absent), and the escapes `%0` (ends the text), `%n`,
+/// `%t`, `%%`, `%.`, `%!` and `% `. Arguments are 64-bit slots from `args`; `None` passes the
+/// inserts through (`IGNORE_INSERTS`). `None` back for another `printf` or no arguments.
+fn expand(format: &[u16], args: Option<*const u64>) -> Option<String> {
+    let chars: Vec<char> = String::from_utf16_lossy(format).chars().collect();
+    let mut text = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '%' {
+            text.push(c);
+            continue;
+        }
+        let Some(&next) = chars.get(i) else {
+            text.push('%');
+            break;
+        };
+        i += 1;
+        match next {
+            '0' => return Some(text),
+            'n' => text.push_str("\r\n"),
+            't' => text.push('\t'),
+            '1'..='9' => {
+                let start = i - 2;
+                let mut n = next as usize - '0' as usize;
+                if let Some(d) = chars.get(i).and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d as usize;
+                    i += 1;
+                }
+                let mut spec = String::from("s");
+                if chars.get(i) == Some(&'!') {
+                    let end = chars[i + 1..].iter().position(|&c| c == '!')? + i + 1;
+                    spec = chars[i + 1..end].iter().collect();
+                    i = end + 1;
+                }
+                let Some(args) = args else {
+                    text.extend(&chars[start..i]);
+                    continue;
+                };
+                if args.is_null() {
+                    return None;
+                }
+                // SAFETY: the title passes an argument for each insert it uses.
+                let arg = unsafe { args.add(n - 1).read_unaligned() };
+                match spec.as_str() {
+                    "s" | "ls" | "ws" if arg == 0 => return None,
+                    "s" | "ls" | "ws" => {
+                        text.push_str(&String::from_utf16_lossy(&files::wide_str(arg as _)));
+                    }
+                    "d" | "i" => text.push_str(&(arg as u32 as i32).to_string()),
+                    "u" => text.push_str(&(arg as u32).to_string()),
+                    "x" => text.push_str(&format!("{:x}", arg as u32)),
+                    "X" => text.push_str(&format!("{:X}", arg as u32)),
+                    _ => return None,
+                }
+            }
+            other => text.push(other),
+        }
+    }
+    Some(text)
+}
+
 pub extern "system" fn LocalFree(memory: *mut c_void) -> *mut c_void {
     let _ = memory;
     std::ptr::null_mut()
@@ -2089,6 +2252,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LocaleNameToLCID,
             GetLocaleInfoEx,
             FormatMessageA,
+            FormatMessageW,
             LocalFree,
             GlobalFree,
             EncodePointer,
@@ -2242,6 +2406,115 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `amd_fidelityfx_upscaler_xbox.dll` imports by these names resolves (#123's run).
+    #[test]
+    fn the_upscaler_dll_finds_its_debug_localization_and_math_imports() {
+        for (dll, name) in [
+            ("api-ms-win-core-debug-l1-1-0.dll", "DebugBreak"),
+            ("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW"),
+            ("api-ms-win-crt-math-l1-1-0.dll", "_ldsign"),
+        ] {
+            assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+        }
+    }
+
+    /// `FormatMessageW` as a library logs with it: system texts (from an `HRESULT` too), the
+    /// inserts of a string with an argument array or a `va_list`, an allocated buffer, and the
+    /// documented failures.
+    #[test]
+    fn format_message_w_formats_system_errors_and_inserts() {
+        const SYSTEM: u32 = 0x1000 | 0x200; // FROM_SYSTEM | IGNORE_INSERTS
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let format = |flags, source: &[u16], id, args: *const c_void| {
+            let mut out = [0u16; 128];
+            let n = FormatMessageW(
+                flags,
+                source.as_ptr().cast(),
+                id,
+                0,
+                out.as_mut_ptr(),
+                128,
+                args,
+            );
+            (n, String::from_utf16_lossy(&out[..n as usize]))
+        };
+        assert_eq!(
+            format(SYSTEM, &[0], 5, std::ptr::null()),
+            (19, "Access is denied.\r\n".into())
+        );
+        let missing = format(SYSTEM, &[0], 0x8007_0002, std::ptr::null()).1;
+        assert_eq!(missing, "The system cannot find the file specified.\r\n");
+        assert_eq!(
+            format(SYSTEM, &[0], 0xDEAD, std::ptr::null()).1,
+            "Error 0x0000DEAD\r\n"
+        );
+        assert_eq!(
+            format(SYSTEM | 0xFF, &[0], 5, std::ptr::null()).1,
+            "Access is denied."
+        );
+
+        // %1 is a wide string by default, %2!d! an int; %n, %t, %% and %0 are escapes.
+        let name = wide("dll");
+        let args = [name.as_ptr() as u64, u64::from(-3i32 as u32)];
+        let source = wide("%1%t%2!d!%n100%%%0 never");
+        let expanded = "dll\t-3\r\n100%";
+        assert_eq!(
+            format(0x400 | 0x2000, &source, 0, args.as_ptr().cast()).1,
+            expanded
+        );
+        let list = args.as_ptr();
+        assert_eq!(
+            format(0x400, &source, 0, (&raw const list).cast()).1,
+            expanded,
+            "va_list"
+        );
+        let kept = format(0x400 | 0x200, &wide("%1!x! %n"), 0, std::ptr::null()).1;
+        assert_eq!(kept, "%1!x! \r\n", "IGNORE_INSERTS keeps the inserts");
+
+        let mut allocated: *mut u16 = std::ptr::null_mut();
+        let n = FormatMessageW(
+            SYSTEM | 0x100,
+            std::ptr::null(),
+            6,
+            0,
+            (&raw mut allocated).cast(),
+            0,
+            std::ptr::null(),
+        );
+        // SAFETY: `n` units and a NUL, leaked for good.
+        let text = unsafe { std::slice::from_raw_parts(allocated, n as usize + 1) };
+        assert_eq!(
+            String::from_utf16_lossy(text),
+            "The handle is invalid.\r\n\0"
+        );
+
+        let mut small = [0u16; 4];
+        assert_eq!(
+            FormatMessageW(
+                SYSTEM,
+                std::ptr::null(),
+                5,
+                0,
+                small.as_mut_ptr(),
+                4,
+                std::ptr::null()
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert_eq!(
+            format(0x800, &[0], 5, std::ptr::null()).0,
+            0,
+            "FROM_HMODULE"
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            format(0x400 | 0x2000, &wide("%1!f!"), 0, args.as_ptr().cast()).0,
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
 
     #[test]
     fn environment_variables_are_set_read_and_removed_ignoring_case() {

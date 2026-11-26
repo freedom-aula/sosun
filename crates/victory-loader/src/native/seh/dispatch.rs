@@ -229,6 +229,16 @@ core::arch::global_asm!(
     "mov r9, r13",
     "call {raise}",
     "ud2",
+    // DebugBreak(), Windows ABI: RaiseException(EXCEPTION_BREAKPOINT, 0, 0, NULL), a tail call
+    // so the context captured is the caller's, at the return address.
+    ".p2align 4",
+    ".globl _victory_DebugBreak",
+    "_victory_DebugBreak:",
+    "mov ecx, 0x80000003",
+    "xor edx, edx",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+    "jmp _victory_RaiseException",
     host_tsd = const OFF_HOST_TSD,
     set_gs = const SET_GS_BASE,
     flags = const CONTEXT_FULL,
@@ -241,6 +251,7 @@ unsafe extern "C" {
     fn victory_restore_context(ctx: *const Context, teb: *mut u8) -> !;
     fn victory_RtlCaptureContext();
     fn victory_RaiseException();
+    fn victory_DebugBreak();
 }
 
 /// Where a faulting thread is redirected.
@@ -257,6 +268,16 @@ pub fn capture_context_address() -> usize {
 
 pub fn raise_exception_address() -> usize {
     victory_RaiseException as *const () as usize
+}
+
+/// `DebugBreak` for the title: `EXCEPTION_BREAKPOINT` through `RaiseException`, so a vectored
+/// handler or `__except` takes it and, with none, it is unhandled, as on Windows.
+///
+/// Guess (`docs/native-host.md`): Windows runs an `int3` inside `DbgBreakPoint`, so its record
+/// names that address and has one parameter (0); here the address is the caller's return
+/// address, there are none, and a handler that continues resumes after the call.
+pub fn debug_break_address() -> usize {
+    victory_DebugBreak as *const () as usize
 }
 
 fn stack_bounds() -> Bounds {
@@ -669,7 +690,7 @@ const RAX: usize = super::context::RAX;
 pub mod api {
     use super::*;
 
-    pub use super::{capture_context_address, raise_exception_address};
+    pub use super::{capture_context_address, debug_break_address, raise_exception_address};
 
     pub extern "C" fn lookup_function_entry(
         pc: usize,
