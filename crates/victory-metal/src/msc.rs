@@ -71,8 +71,18 @@ impl Parameter {
     }
 }
 
+/// Logs a slow conversion (and whether the disk cache had it).
+fn note(started: std::time::Instant, dxil: usize, hit: bool) {
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        eprintln!("metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})");
+    }
+}
+
 pub struct Msc {
     h: *mut c_void,
+    /// Which converter this is (its path, size and modification time): part of the library cache's keys.
+    id: String,
 }
 
 // SAFETY: the handle is a dlopen handle; every conversion makes and destroys its own IR objects.
@@ -127,7 +137,10 @@ impl Msc {
             };
             return Err(e);
         }
-        Ok(Msc { h })
+        let id = std::fs::metadata(path)
+            .map(|m| format!("{path} {} {:?}", m.len(), m.modified().ok()))
+            .unwrap_or_else(|_| path.to_owned());
+        Ok(Msc { h, id })
     }
 
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
@@ -138,6 +151,31 @@ impl Msc {
     /// [`Self::convert`] with the top-level argument buffer laid out as `layout` says (for DXIL
     /// that carries no root signature), and out-of-range raw buffer accesses made safe if it asks.
     pub fn convert_with(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+    ) -> Result<(i32, Vec<u8>), ConvError> {
+        let Some(dir) = crate::disk::dir() else {
+            return self.convert_uncached(dxil, entry, layout);
+        };
+        let started = std::time::Instant::now();
+        let layout_text = format!("{layout:?}");
+        let key = crate::disk::key(&[dxil, entry.unwrap_or("").as_bytes(), layout_text.as_bytes(), self.id.as_bytes()]);
+        if let Some((stage, lib)) = crate::disk::read(dir, &key).and_then(|b| {
+            let (stage, lib) = b.split_at_checked(4)?;
+            Some((i32::from_le_bytes(stage.try_into().ok()?), lib.to_vec()))
+        }) {
+            note(started, dxil.len(), true);
+            return Ok((stage, lib));
+        }
+        let (stage, lib) = self.convert_uncached(dxil, entry, layout)?;
+        crate::disk::write(dir, &key, &[&stage.to_le_bytes()[..], &lib].concat());
+        note(started, dxil.len(), false);
+        Ok((stage, lib))
+    }
+
+    fn convert_uncached(
         &self,
         dxil: &[u8],
         entry: Option<&str>,

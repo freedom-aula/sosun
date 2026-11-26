@@ -803,10 +803,13 @@ impl GraphicsBackend for Metal {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
         }
-        let pso = self
-            .dev
-            .newRenderPipelineStateWithDescriptor_error(&pd)
-            .map_err(|e| e.localizedDescription().to_string())?;
+        let pso = match self.archive() {
+            Some(a) => a.render(&self.dev, &pd)?,
+            None => self
+                .dev
+                .newRenderPipelineStateWithDescriptor_error(&pd)
+                .map_err(|e| e.localizedDescription().to_string())?,
+        };
         let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
             let (write, cmp) = d.depth_test.unwrap_or((false, Compare::Always));

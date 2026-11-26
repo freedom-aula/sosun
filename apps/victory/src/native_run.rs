@@ -274,6 +274,7 @@ pub fn run(
     // The manifest names the title and its storage quota; the console's
     // fixed drives are the package as `G:` and temporary files `T:`.
     let cfg = victory_core::Config::load()?;
+    victory_gpu::shader_cache::use_native_cache(cfg.cache_subdir("native-shaders")?);
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);

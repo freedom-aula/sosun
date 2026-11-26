@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-backend.workspace = true
+blake3.workspace = true
 
 # Everything is macOS-only; on other targets the crate builds as an empty binary.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -21,3 +22,6 @@ objc2-quartz-core = "0.3"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -44,6 +44,53 @@ pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
     }
 }
 
+/// The native host's translations: a folder of their own ([`use_native_cache`]).
+static NATIVE: OnceLock<Cache> = OnceLock::new();
+
+/// Keeps the native host's translations in a folder of `dir` from now on (one per translator,
+/// like [`use_shader_cache`]), and the Metal libraries made from them beside it. Does nothing
+/// with `VICTORY_NO_SHADER_CACHE` set. `None` if it is off or the folder cannot be opened.
+pub fn use_native_cache(dir: PathBuf) -> Option<PathBuf> {
+    if std::env::var_os("VICTORY_NO_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0") {
+        tracing::info!("native shader cache off (VICTORY_NO_SHADER_CACHE)");
+        return None;
+    }
+    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
+    match Cache::open(dir.join("translated")) {
+        Ok(cache) => {
+            tracing::info!(dir = %dir.display(), "native shader cache");
+            let _ = NATIVE.set(cache);
+            #[cfg(target_os = "macos")]
+            victory_metal::disk::use_dir(dir.join("metal"));
+            Some(dir)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no native shader cache");
+            None
+        }
+    }
+}
+
+/// A translation for the native host, from the cache when there is one. `settings` is whatever
+/// else the translation depends on besides the container (its options); the closure translates.
+pub fn native_shader(
+    container: &[u8],
+    settings: &str,
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<HostShader, String> {
+    let Some(cache) = NATIVE.get() else {
+        return translate(container);
+    };
+    let started = std::time::Instant::now();
+    let key = *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes();
+    let (made, hit) = cached(cache, &key, container, translate);
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        tracing::info!(ms, hit, size = container.len(), "native shader translation");
+    }
+    made
+}
+
 /// Shaders found in the cache and translated since the start.
 pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
@@ -251,7 +298,7 @@ fn cached(
     ((converter.translate)(container), false)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -313,9 +360,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
-        // Pixel-input splits and table extents belong to the native host path only.
-        splits: _,
-        table_entries: _,
+        splits,
+        table_entries,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -367,6 +413,16 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, splits.len() as u32);
+    for &(a, b) in splits {
+        word(&mut out, a);
+        word(&mut out, b);
+    }
+    word(&mut out, table_entries.len() as u32);
+    for &(slot, n) in table_entries {
+        word(&mut out, u32::from(slot));
+        word(&mut out, n);
+    }
     out
 }
 
@@ -428,9 +484,19 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut splits = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        splits.push((r.word()?, r.word()?));
+    }
+    let n = r.word()? as usize;
+    let mut table_entries = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_entries.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(Ok(HostShader {
-        splits: Vec::new(),
-        table_entries: Vec::new(),
+        splits,
+        table_entries,
         stage,
         dxil,
         user_data,
@@ -454,8 +520,8 @@ mod tests {
 
     fn shader() -> HostShader {
         HostShader {
-            splits: Vec::new(),
-            table_entries: Vec::new(),
+            splits: vec![(3, 9), (4, 10)],
+            table_entries: vec![(1, 7), (5, 130)],
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
@@ -513,7 +579,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
             cached(&cache, &build, container, translate),
@@ -582,7 +648,7 @@ mod tests {
         assert_eq!(decode(&bytes), Some(Ok(shader())));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);

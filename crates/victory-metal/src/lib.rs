@@ -5,6 +5,9 @@
 
 pub use victory_backend::{backend, resources};
 #[cfg(target_os = "macos")]
+mod archive;
+pub mod disk;
+#[cfg(target_os = "macos")]
 pub mod gfx;
 #[cfg(target_os = "macos")]
 pub mod mem;

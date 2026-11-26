@@ -22,6 +22,8 @@ pub struct Metal {
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+    /// Compiled pipelines kept across runs, opened at the first pipeline (when the cache folder is set).
+    pub(crate) archive: std::cell::OnceCell<Option<crate::archive::Archive>>,
 }
 
 /// Counters of residency work.
@@ -103,6 +105,7 @@ impl Metal {
             residency_sets,
             pool_set: Default::default(),
             counts: Default::default(),
+            archive: Default::default(),
         })
     }
 
@@ -118,11 +121,19 @@ impl Metal {
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
-        let p = self
-            .dev
-            .newComputePipelineStateWithFunction_error(&f)
-            .map_err(|e| e.localizedDescription().to_string())?;
+        let p = match self.archive() {
+            Some(a) => a.compute(&self.dev, &f)?,
+            None => self
+                .dev
+                .newComputePipelineStateWithFunction_error(&f)
+                .map_err(|e| e.localizedDescription().to_string())?,
+        };
         Ok(Pipeline(p))
+    }
+
+    /// The pipeline archive, if the cache is on.
+    pub(crate) fn archive(&self) -> Option<&crate::archive::Archive> {
+        self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
     /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
