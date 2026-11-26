@@ -668,6 +668,23 @@ Integer render targets never blend (Metal refuses a pipeline that blends one), w
 
 A render target view whose host texture cannot be made keeps its attachment slot: `glue::targets` binds nothing for that pass and refuses the draws that follow, instead of moving the later targets into earlier slots.
 
+## Whole-wave sections the simulation does not follow
+
+A whole-wave section (`emit::wave`, decision 0003) is simulated on the console's lanes, and a
+value it leaves is lowered by the reduction or prefix it turns out to be. A value without such a
+shape was refused as "a whole-wave section step the simulation does not follow". That text is
+now followed by a colon and the first step of the section the simulation does not model: "an
+EXEC write that is no constant", "a scalar ALU result", "an instruction that is no VALU
+operation", "a v_readlane at a lane it does not know", "a VALU result in an SGPR", "a DPP step
+with lanes off", "a DPP control it does not model", "an operand or result modifier", "a
+v_permlane with computed lane selects" or "a VALU operation it does not model"; or, when it
+models every step, "a value that is no reduction or prefix". The first step not modelled is a
+hint, not proof: the value refused may not depend on it. `pipeline::pieces_tests::
+the_host_refuses_a_whole_wave_section_naming_its_step` (`victory-gpu`) checks the refusal on the
+native host's own path: the container made from the title's pieces, the host's options. The
+story-load log of issue #110 (Series S) has three compute programs refused with the old message;
+nothing is lowered yet.
+
 ## ExecuteIndirect on the native host
 
 The prologue world load (frame ~2112) is the first place the title uses `ExecuteIndirect`. It creates five command signatures, each with one argument and no count buffer, and passes `max` 1 every time:
