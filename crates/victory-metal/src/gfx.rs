@@ -453,11 +453,20 @@ impl ResourceBackend for Metal {
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
         let ty = t.tex.textureType();
+        // A depth texture cannot be viewed as a color format (D3D's R32_FLOAT
+        // over a depth buffer): it keeps its own, and shaders read it as the
+        // float it holds.
+        let source = t.tex.pixelFormat();
+        let format = if is_depth(source) {
+            source
+        } else {
+            pixel_format(v.format)
+        };
         // SAFETY: the ranges are checked by Metal (nil on failure).
         let tex = unsafe {
             t.tex
                 .newTextureViewWithPixelFormat_textureType_levels_slices(
-                    pixel_format(v.format),
+                    format,
                     ty,
                     NSRange::new(v.mips.0, v.mips.1),
                     NSRange::new(v.slices.0, v.slices.1),
@@ -1084,4 +1093,16 @@ fn set_draw_bytes(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, dp: &[u32; 5]
             UNIFORMS,
         );
     }
+}
+
+/// Whether a pixel format is a depth or stencil one.
+fn is_depth(f: MTLPixelFormat) -> bool {
+    [
+        MTLPixelFormat::Depth16Unorm,
+        MTLPixelFormat::Depth32Float,
+        MTLPixelFormat::Stencil8,
+        MTLPixelFormat::Depth24Unorm_Stencil8,
+        MTLPixelFormat::Depth32Float_Stencil8,
+    ]
+    .contains(&f)
 }
