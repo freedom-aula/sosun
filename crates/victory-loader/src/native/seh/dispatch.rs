@@ -371,9 +371,9 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
-            if r.code == 0x8000_0003 {
-                super::super::dump::report_at_break();
-            }
+            // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation
+            // waits for `unhandled`: the title's handlers take some and go on.
+            super::super::dump::report_at_fault(r.code, false);
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
             // the faulting image.
             if let (Ok(list), Some(base)) = (
@@ -541,6 +541,8 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let filter = *UNHANDLED.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: valid for the whole dispatch.
     let (code, address) = unsafe { ((*rec).code, (*rec).address) };
+    // Before the filter, which may end the process.
+    super::super::dump::report_at_fault(code, true);
     if let Some(handler) = filter {
         let mut ptrs = ExceptionPointers {
             record: rec,
