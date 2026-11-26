@@ -1001,6 +1001,26 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
+        // Attachments must agree in size and sample count. Metal renders to the intersection and
+        // does not complain, which hides a title or decoder bug behind a cropped picture; refusing
+        // the pass is also the one refusal a test can build without a device error.
+        let mut shape = None;
+        for t in rp
+            .color
+            .iter()
+            .map(|c| &c.texture.tex)
+            .chain(rp.depth.as_ref().map(|d| &d.texture.tex))
+        {
+            let s = (t.width(), t.height(), t.sampleCount());
+            if let Some(want) = shape
+                && want != s
+            {
+                return Err(format!(
+                    "render targets of different sizes or samples: {want:?} and {s:?}"
+                ));
+            }
+            shape = Some(s);
+        }
         if rp.color.is_empty() && rp.depth.is_none() {
             // The title drew with no render targets. D3D12 runs it (it writes nothing visible);
             // Metal needs an attachment to make an encoder, and Metal refuses one without. The
@@ -1217,9 +1237,16 @@ impl Metal {
                     first_instance,
                     wide,
                 } => {
-                    let (b, title) = d
-                        .index_buffer
-                        .ok_or("indexed draw without an index buffer")?;
+                    // A draw that names no index buffer is dropped, not the pass: returning here
+                    // would leave the render encoder open and, now that a refused pass still
+                    // commits (for its fence signals), Metal would assert on the open encoder.
+                    let Some((b, title)) = d.index_buffer else {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            eprintln!("metal: an indexed draw without an index buffer is dropped")
+                        });
+                        continue;
+                    };
                     let width = if wide { 4 } else { 2 };
                     let off = title as usize - b.base as usize + first_index as usize * width;
                     dp = [
