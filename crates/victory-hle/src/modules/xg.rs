@@ -353,14 +353,29 @@ fn copy_args(
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    if l.desc.dimension == Dimension::Tex3d {
+        if slice != 0 {
+            return None;
+        }
+    } else if slice >= l.slices {
+        return None;
+    }
+    let bytes = (m.width as usize).checked_mul(l.desc.element_bytes as usize)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let slice_bytes = (m.height as usize)
+        .checked_sub(1)?
+        .checked_mul(row as usize)?
+        .checked_add(bytes)?;
+    let linear = depths
+        .checked_sub(1)?
+        .checked_mul(depth as usize)?
+        .checked_add(slice_bytes)?;
+    let tiled = usize::try_from(p.offset.checked_add(l.size)?).ok()?;
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled,
         linear,
     })
 }
@@ -485,6 +500,10 @@ extern "system" fn tiling(
     }
     if l.thick {
         return E_NOTIMPL;
+    }
+    // SAFETY: `count` is null or points to the caller's entry count.
+    if unsafe { count.as_ref() }.is_some_and(|&n| n > 0) && out.is_null() {
+        return E_INVALIDARG;
     }
     let standard = l.first_tail_mip;
     let tail = standard < c.mips;
@@ -782,5 +801,68 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn tiling_guards_null_subresource_array_and_copies_reject_bad_subresources() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let tiling: Tiling = slot(c, 10);
+        let mut tiles = 99;
+        let mut n = 4;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        // Output parameters stay untouched on E_INVALIDARG.
+        assert_eq!((tiles, n), (99, 4));
+        // Zero count with a null subresource array is allowed.
+        n = 0;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!((tiles, n), (2, 0));
+
+        // Out-of-range array slice is rejected before touching buffers.
+        let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
+        let mut tiny = [0u8; 16];
+        assert_eq!(
+            into(c, tiny.as_mut_ptr(), 0, 9, tiny.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            from(c, tiny.as_mut_ptr(), 0, 9, 0, tiny.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(release(c), 0);
     }
 }

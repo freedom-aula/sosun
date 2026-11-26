@@ -163,7 +163,7 @@ type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // SAFETY: the title passes a NUL-terminated path.
@@ -233,6 +233,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -264,6 +267,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -996,18 +1002,6 @@ extern "system" fn close(this: QueueRef) {
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
-    if std::env::var_os("VICTORY_TRACE_DSTORAGE_FILES").is_some() {
-        static SEEN: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
-        let name = source_name(request).to_owned();
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let e = seen.entry(name.clone()).or_default();
-        e.0 += 1;
-        e.1 += u64::from(request.source_size);
-        if e.0 == 1 || e.0.is_power_of_two() {
-            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
-        }
-    }
-
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
             options = format_args!("{options:#x}"),
@@ -1027,6 +1021,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
+    }
+    if std::env::var_os("VICTORY_TRACE_DSTORAGE_FILES").is_some() {
+        static SEEN: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+        let name = source_name(request).to_owned();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.entry(name.clone()).or_default();
+        e.0 += 1;
+        e.1 += u64::from(request.source_size);
+        if e.0 == 1 || e.0.is_power_of_two() {
+            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
+        }
     }
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
@@ -1180,7 +1185,10 @@ fn fill_at(
 ) -> std::io::Result<()> {
     let mut done = 0;
     while done < out.len() {
-        match read(&mut out[done..], offset + done as u64) {
+        let Some(at) = offset.checked_add(done as u64) else {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        match read(&mut out[done..], at) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => done += n,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1276,6 +1284,9 @@ fn into_destination(
 fn source_name(request: &Request) -> &str {
     if request.options & MEMORY_SOURCE != 0 {
         return "memory";
+    }
+    if request.source.is_null() {
+        return "<null>";
     }
     // SAFETY: a file object we created; the title keeps it open.
     &unsafe { &*request.source.cast::<Instance<File>>() }
@@ -2190,5 +2201,74 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn null_out_pointers_fail_without_leaking_lanes_or_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain([0]).collect();
+
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        assert_eq!(
+            open(
+                factory(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let create_array: extern "system" fn(
+            *mut c_void,
+            u32,
+            *const c_char,
+            *const Guid,
+            Out,
+        ) -> HRESULT = call(factory(), 0x28);
+        assert_eq!(
+            create_array(
+                factory(),
+                4,
+                c"null-out".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let before = scheduler().unwrap().lock().next_id;
+        let create_q: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 8,
+            priority: 0,
+            name: c"null-out".as_ptr(),
+            unknown: 1,
+        };
+        assert_eq!(
+            create_q(factory(), &desc, std::ptr::null(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(scheduler().unwrap().lock().next_id, before);
+    }
+
+    #[test]
+    fn null_source_and_overflowing_file_offset_fail_safely() {
+        let mut dst = [0u8; 4];
+        let req = request(0, dst.as_mut_ptr().cast(), 4, std::ptr::null(), 0, 4);
+        assert_eq!(source_name(&req), "<null>");
+        assert_eq!(execute(&req), Err(E_INVALIDARG));
+
+        let err = fill_at(&mut dst, u64::MAX - 1, |buf, _| {
+            buf[0] = 1;
+            Ok(2)
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
