@@ -46,9 +46,10 @@ pub struct Heap {
     count: usize,
     /// What each entry names, kept alive here and made resident with the heap.
     refs: RefCell<std::collections::HashMap<usize, Res>>,
-    /// Reference counts per raw `MTLResource` pointer currently in `set`, so an allocation is
-    /// added once and removed + committed before its last `refs` entry is dropped.
-    alloc_counts: RefCell<std::collections::HashMap<usize, usize>>,
+    /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
+    /// name each: an allocation is added to `set` once and removed + committed before its last
+    /// `refs` entry is dropped, and without a set each is named to an encoder once.
+    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, Res)>>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
@@ -67,6 +68,37 @@ impl Drop for Heap {
 
 pub struct Texture {
     tex: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// What the pixels are as Metal reads them: sizes the CPU transfers' bounds check.
+    format: Format,
+}
+
+/// What a CPU transfer of a `w` x `h` x `d` mip needs of `format`: `(row bytes, total bytes)`, or the
+/// reason the pitches or the `len` bytes cannot hold it. Metal asserts (and may write past the buffer)
+/// when the row pitch is short, so a refused transfer is skipped.
+fn transfer_need(format: Format, [w, h, d]: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> Result<usize, (usize, usize)> {
+    let row = format.row_bytes(w);
+    let rows = h.div_ceil(format.block().0);
+    let image = (rows - 1) * row_pitch + row;
+    let total = if d > 1 { (d - 1) * slice_pitch + image } else { image };
+    if row_pitch < row || (d > 1 && slice_pitch < image) || len < total {
+        return Err((row, total));
+    }
+    Ok(total)
+}
+
+/// Whether the transfer fits; else logs it (the backtrace once) and says to skip it.
+#[allow(clippy::too_many_arguments)]
+fn transfer_fits(what: &str, t: &Texture, mip: usize, dims: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> bool {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    let Err((row, total)) = transfer_need(t.format, dims, row_pitch, slice_pitch, len) else {
+        return true;
+    };
+    tracing::warn!(
+        "{what} skipped: {:?} {:?} mip {mip} region {}x{}x{} row_pitch {row_pitch} slice_pitch {slice_pitch} buffer {len} bytes, needs row {row} total {total}",
+        t.format, t.tex.pixelFormat(), dims[0], dims[1], dims[2]
+    );
+    FIRST.call_once(|| tracing::warn!("first refused transfer, called from:\n{}", std::backtrace::Backtrace::force_capture()));
+    false
 }
 
 impl Texture {
@@ -436,7 +468,7 @@ impl Metal {
             Some(r) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
-                let count = counts.entry(ptr).or_insert(0);
+                let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
                 if *count == 0
                     && let Some(set) = &heap.set
                 {
@@ -453,7 +485,7 @@ impl Metal {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
-                Some(n) if *n > 1 => {
+                Some((n, _)) if *n > 1 => {
                     *n -= 1;
                     false
                 }
@@ -483,17 +515,29 @@ impl Metal {
         }
     }
 
-    /// Residency without sets: every entry's resource is named to the encoder.
+    /// Residency without sets: the heap buffer and each distinct allocation its entries name, once
+    /// per encoder (`named` holds the heaps this encoder was given; residency lasts the encoder).
+    /// Naming every entry at every draw cost a `useResource` per entry per draw, and the title fills
+    /// more entries as the world streams in, so frame time grew with play time.
     fn use_heap_encoder(
         &self,
         heap: &Heap,
+        named: &mut Vec<*const Heap>,
         mut use_res: impl FnMut(&ProtocolObject<dyn MTLResource>),
     ) {
-        if heap.set.is_some() {
+        if heap.set.is_some() || named.contains(&(heap as *const Heap)) {
             return;
         }
+        named.push(heap);
         use_res(ProtocolObject::from_ref(&*heap.buf));
-        heap.refs.borrow().values().for_each(|r| use_res(r));
+        let refs = heap.refs.borrow().len() as u64;
+        let allocations = heap.alloc_counts.borrow();
+        allocations.values().for_each(|(_, r)| use_res(r));
+        self.count(|c| {
+            c.heap_resources += 1 + allocations.len() as u64;
+            c.heap_entries = c.heap_entries.max(refs);
+            c.heap_allocations = c.heap_allocations.max(allocations.len() as u64);
+        });
     }
 
     /// The static samplers of one stage's `layout`, if it declares any.
@@ -575,6 +619,7 @@ impl Metal {
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
         statics: Option<&StaticSamplers>,
+        named: &mut Vec<*const Heap>,
     ) {
         let root = StaticSamplers::args(statics, &root.0);
         if !root.is_empty() {
@@ -597,7 +642,7 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe { e.setBuffer_offset_atIndex(Some(&h.buf), 0, slot) };
-                self.use_heap_encoder(h, |r| {
+                self.use_heap_encoder(h, named, |r| {
                     e.useResource_usage(r, MTLResourceUsage::Read | MTLResourceUsage::Write)
                 });
             }
@@ -611,6 +656,7 @@ impl Metal {
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
         pipeline: &RenderPipeline,
+        named: &mut Vec<*const Heap>,
     ) {
         let fragment = fragment.unwrap_or(root);
         let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
@@ -647,7 +693,7 @@ impl Metal {
                     e.setVertexBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
-                self.use_heap_encoder(h, |r| {
+                self.use_heap_encoder(h, named, |r| {
                     e.useResource_usage_stages(
                         r,
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -758,7 +804,7 @@ impl ResourceBackend for Metal {
             .dev
             .newTextureWithDescriptor(&td)
             .ok_or("newTextureWithDescriptor failed")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: d.format })
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
@@ -772,6 +818,7 @@ impl ResourceBackend for Metal {
         } else {
             pixel_format(v.format)
         };
+        let title_format = if is_depth(source) { t.format } else { v.format };
         // Metal asserts (it does not return nil) on a range past the texture, which a
         // title view asks for over a texture we made with fewer levels or layers (one
         // over title memory has one level): the range is cut to what is there.
@@ -797,7 +844,7 @@ impl ResourceBackend for Metal {
                 .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: title_format })
     }
 
     fn create_texture_over_memory(
@@ -827,7 +874,7 @@ impl ResourceBackend for Metal {
             .buf
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, row_pitch)
             .ok_or("buffer-backed texture refused (offset, pitch or format)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: d.format })
     }
 
     fn linear_alignment(&self, f: Format) -> usize {
@@ -849,6 +896,9 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
+        if !transfer_fits("upload_texture", t, mip, [w, h, d], row_pitch, slice_pitch, data.len()) {
+            return;
+        }
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: size([w, h, d]),
@@ -881,6 +931,9 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
+        if !transfer_fits("read_texture", t, mip, [w, h, d], row_pitch, slice_pitch, out.len()) {
+            return;
+        }
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: size([w, h, d]),
@@ -1450,6 +1503,7 @@ impl Metal {
         {
             e.waitForFence(f);
         }
+        let mut named = Vec::new();
         for d in dispatches {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
@@ -1461,7 +1515,7 @@ impl Metal {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
@@ -1652,6 +1706,7 @@ impl Metal {
             .map(|c| &c.texture.tex)
             .or(rp.depth.as_ref().map(|d| &d.texture.tex))
             .map_or((0, 0), |t| (t.width(), t.height()));
+        let mut named = Vec::new();
         for (k, d) in rp.draws.iter().enumerate() {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -1718,7 +1773,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
@@ -1925,6 +1980,25 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn transfers_are_checked_against_the_format() {
+        // RGBA16Float 4x4: a row is 32 bytes.
+        assert!(transfer_need(Format::Rgba16Float, [4, 4, 1], 16, 0, 1 << 20).is_err());
+        assert_eq!(transfer_need(Format::Rgba16Float, [4, 4, 1], 32, 0, 128), Ok(128));
+        // BC1 8x8: 2 block rows of 16 bytes; the last row needs no padding.
+        assert_eq!(transfer_need(Format::Bc1, [8, 8, 1], 16, 0, 32), Ok(32));
+        assert!(transfer_need(Format::Bc1, [8, 8, 1], 8, 0, 1 << 20).is_err());
+        // Too short a buffer, and a 3D slice pitch below one image.
+        assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 1], 16, 0, 63).is_err());
+        assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 32, 1 << 20).is_err());
+        assert_eq!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 64, 128), Ok(128));
+    }
 }
 
 #[cfg(test)]

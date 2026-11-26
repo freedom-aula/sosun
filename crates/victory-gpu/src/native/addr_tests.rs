@@ -110,6 +110,18 @@ fn shader(words: &[u32], sgprs: u32) -> HostShader {
 }
 
 fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) -> HostShader {
+    translate_io(words, sgprs, 0, 64, options)
+}
+
+/// [`translate`] with more of `COMPUTE_PGM_RSRC2` set (`rsrc2`: LDS, system SGPRs) and `threads` in
+/// a group.
+pub(super) fn translate_io(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    options: victory_shader::emit::Options,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -124,8 +136,8 @@ fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) 
         }],
         used: vec![],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: sgprs << 1,
-            threads: [64, 1, 1],
+            rsrc2: sgprs << 1 | rsrc2,
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -143,7 +155,7 @@ fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) 
     emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
 }
 
-fn title() -> Option<Title<Metal>> {
+pub(super) fn title() -> Option<Title<Metal>> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
         && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
     {
@@ -157,20 +169,20 @@ fn title() -> Option<Title<Metal>> {
 }
 
 /// Title addresses nothing in this process is mapped at.
-const VA_A: u64 = 0x12_3450_0000;
+pub(super) const VA_A: u64 = 0x12_3450_0000;
 const VA_B: u64 = 0x7000_0000;
 const POOL: usize = 0x10_0000;
-const CANARY: u32 = 0xEEEE_EEEE;
+pub(super) const CANARY: u32 = 0xEEEE_EEEE;
 
 /// A pool of 1 MiB filled with a canary, shown at `VA_A` (512 KiB from pool offset 0x2_0000) and
 /// `VA_B` (128 KiB from the pool's start).
-struct Fixture {
+pub(super) struct Fixture {
     mem: Alias,
     info: PoolInfo,
 }
 
 impl Fixture {
-    fn new(t: &Title<Metal>) -> Fixture {
+    pub(super) fn new(t: &Title<Metal>) -> Fixture {
         let mem = Alias::new(POOL).unwrap();
         let info = PoolInfo {
             id: 1,
@@ -187,22 +199,22 @@ impl Fixture {
         f
     }
 
-    fn put<T: Copy>(&self, at: usize, v: &[T]) {
+    pub(super) fn put<T: Copy>(&self, at: usize, v: &[T]) {
         // SAFETY: inside the pool's own mapping; the GPU is idle.
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.mem.primary.add(at).cast(), v.len()) };
     }
 
-    fn get(&self, at: usize, n: usize) -> Vec<u32> {
+    pub(super) fn get(&self, at: usize, n: usize) -> Vec<u32> {
         // SAFETY: inside the pool's own mapping; read after the fence wait.
         unsafe { std::slice::from_raw_parts(self.mem.primary.add(at).cast::<u32>(), n).to_vec() }
     }
 }
 
-fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool) {
+pub(super) fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool) {
     let Pipe::Compute(pso) = t.compute_pipe(shader, "addr") else {
         panic!("not made: {:?}", t.shaders)
     };
-    assert_eq!(pso.threads, [64, 1, 1]);
+    assert_eq!(pso.threads[1..], [1, 1]);
     let mut l = NativeList::default();
     l.set_compute_pipeline(&pso);
     l.set_compute_root_constants(0, root);
@@ -216,7 +228,7 @@ fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool)
     super::run(&t.host, &[&l]);
 }
 
-fn halves(v: u64) -> [u32; 2] {
+pub(super) fn halves(v: u64) -> [u32; 2] {
     [v as u32, (v >> 32) as u32]
 }
 
