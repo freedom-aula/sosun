@@ -841,7 +841,33 @@ impl GraphicsBackend for Metal {
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
-        let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+        if self.trace_fails {
+            report_in_flight();
+            self.trace_enc.borrow_mut().clear();
+        }
+        let cb = if self.trace_fails {
+            let d = MTLCommandBufferDescriptor::new();
+            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+            queue.0.commandBufferWithDescriptor(&d)
+        } else {
+            queue.0.commandBuffer()
+        }
+        .ok_or("no command buffer")?;
+        let mut serial = 0;
+        let mut label = String::new();
+        if self.trace_fails {
+            serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            label = format!(
+                "q{:x} #{} t={:.3} waits={} signals={} passes={}",
+                Retained::as_ptr(&queue.0) as *const u8 as usize,
+                serial,
+                crate::metal::since_start(),
+                work.waits.len(),
+                work.signals.len(),
+                work.passes.len()
+            );
+            cb.setLabel(Some(&objc2_foundation::NSString::from_str(&label)));
+        }
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
@@ -888,14 +914,38 @@ impl GraphicsBackend for Metal {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
-        let failed = block2::RcBlock::new(|done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        let trace = self.trace_fails;
+        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        if let Some((s, l, enc)) = &tinfo {
+            IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
+        }
+        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            if let Some((s, l, enc)) = &tinfo {
+                let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
+                if done.error().is_none()
+                    && let Some(t) = started
+                    && t.elapsed().as_secs_f64() > 1.0
+                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                {
+                    tracing::warn!(
+                        "metal: slow command buffer {l} took {:.3}s (gpu {:.3}s, kernel {:.3}s) | {enc}",
+                        t.elapsed().as_secs_f64(),
+                        done.GPUEndTime() - done.GPUStartTime(),
+                        done.kernelEndTime() - done.kernelStartTime()
+                    );
+                }
+            }
             if let Some(e) = done.error()
-                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
             {
-                eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                if trace {
+                    trace_failure(done, &e);
+                } else {
+                    eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                }
             }
         });
         // SAFETY: the block is retained by Metal until it has run.
@@ -908,7 +958,83 @@ impl GraphicsBackend for Metal {
     }
 }
 
+static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
+static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static REPORTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Slow and in-flight lines printed so far (each capped at 100).
+static TRACE_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FLIGHT_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Logs each command buffer in flight for over 3 s, once (the locks are not held while logging).
+fn report_in_flight() {
+    let old: Vec<(u64, f64, String)> = IN_FLIGHT
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, (t, _))| t.elapsed().as_secs_f64() > 3.0)
+        .map(|(s, (t, d))| (*s, t.elapsed().as_secs_f64(), d.clone()))
+        .collect();
+    for (s, secs, d) in old {
+        if REPORTED.lock().unwrap().insert(s)
+            && FLIGHT_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+        {
+            tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}");
+        }
+    }
+}
+
+/// One `tracing::warn!` line for a failed command buffer: its label and each encoder's state.
+fn trace_failure(cb: &ProtocolObject<dyn MTLCommandBuffer>, e: &objc2_foundation::NSError) {
+    let label = cb.label().map(|l| l.to_string()).unwrap_or_default();
+    let mut encoders = String::new();
+    // SAFETY: the key is a Metal constant; the value is an NSArray of encoder infos.
+    let infos = e.userInfo().objectForKey(unsafe { MTLCommandBufferEncoderInfoErrorKey });
+    if let Some(infos) = infos {
+        // SAFETY: Metal documents the value as an array of `MTLCommandBufferEncoderInfo`.
+        let infos: Retained<objc2_foundation::NSArray<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>> =
+            unsafe { Retained::cast_unchecked(infos) };
+        for i in infos.iter() {
+            let st = match i.errorState() {
+                MTLCommandEncoderErrorState::Completed => "Completed",
+                MTLCommandEncoderErrorState::Pending => "Pending",
+                MTLCommandEncoderErrorState::Faulted => "Faulted",
+                MTLCommandEncoderErrorState::Affected => "Affected",
+                _ => "Unknown",
+            };
+            encoders.push_str(&format!(" | [{st}] {}", i.label()));
+        }
+    }
+    tracing::warn!(
+        "metal: command buffer failed: [{label}] now={:.3} ({}){encoders}",
+        crate::metal::since_start(),
+        e.localizedDescription()
+    );
+}
+
+/// Caps an encoder label.
+fn cap_label_str(mut s: String) -> String {
+    if s.len() > 600 {
+        let mut n = 600;
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        s.truncate(n);
+    }
+    s
+}
+
 impl Metal {
+    /// The capped label for an encoder, kept for the command buffer's description.
+    fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
+        let s = cap_label_str(s);
+        let n = objc2_foundation::NSString::from_str(&s);
+        self.trace_enc.borrow_mut().push(s);
+        n
+    }
+
     fn encode_blit(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -945,6 +1071,10 @@ impl Metal {
         if let Some((f, started)) = order {
             e.updateFence(f);
             started.set(true);
+        }
+        if self.trace_fails {
+            let fills = ops.iter().filter(|o| matches!(o, BlitOp::Fill { .. })).count();
+            e.setLabel(Some(&self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len()))));
         }
         e.endEncoding();
         Ok(())
@@ -1010,6 +1140,19 @@ impl Metal {
         if let Some((f, started)) = order {
             e.updateFence(f);
             started.set(true);
+        }
+        if self.trace_fails {
+            let names = self.pipe_names.borrow();
+            let mut l = String::from("compute: ");
+            for d in dispatches {
+                let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
+                match names.get(&k) {
+                    Some(n) => l.push_str(n),
+                    None => l.push_str(&format!("{k:#x}")),
+                }
+                l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+            }
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())
@@ -1350,6 +1493,9 @@ impl Metal {
         if let Some((f, started)) = order {
             e.updateFence_afterStages(f, MTLRenderStages::Fragment);
             started.set(true);
+        }
+        if self.trace_fails {
+            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
         }
         e.endEncoding();
         Ok(())

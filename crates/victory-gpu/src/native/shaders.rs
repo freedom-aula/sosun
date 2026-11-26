@@ -174,6 +174,7 @@ impl<B: PresentBackend> Title<B> {
         match made {
             Ok(pso) => {
                 self.shaders.pipelines += 1;
+                self.host.backend.name_pipeline(&pso, name);
                 Pipe::Compute(Rc::new(ComputePso {
                     pso,
                     threads,

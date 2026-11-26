@@ -25,6 +25,17 @@ pub struct Metal {
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
     /// Compiled pipelines kept across runs, opened at the first pipeline (when the cache folder is set).
     pub(crate) archive: std::cell::OnceCell<Option<crate::archive::Archive>>,
+    /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
+    pub(crate) trace_fails: bool,
+    /// Pipeline state pointer to name, kept only when tracing.
+    pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
+    pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+}
+
+/// Seconds since the first `Metal::new` (about process start), for the failure trace.
+pub(crate) fn since_start() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 /// Counters of residency work.
@@ -115,6 +126,12 @@ impl Metal {
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
+            trace_fails: {
+                since_start();
+                std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
+            },
+            pipe_names: Default::default(),
+            trace_enc: Default::default(),
         })
     }
 
@@ -249,6 +266,13 @@ impl ComputeBackend for Metal {
 
     fn gpu_address(&self, b: &Buffer, title: *const u8) -> u64 {
         b.buf.gpuAddress() + (title as usize - b.base as usize) as u64
+    }
+
+    fn name_pipeline(&self, p: &Pipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.0) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {

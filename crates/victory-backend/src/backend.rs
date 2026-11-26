@@ -123,6 +123,8 @@ pub trait ComputeBackend {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Self::Pipeline, String>;
+    /// Names a pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_pipeline(&self, _p: &Self::Pipeline, _name: &str) {}
     /// Queue the work and return; never waits for the GPU.
     fn submit(&self, queue: &Self::Queue, work: &Submission<'_, Self>) -> Result<(), String>;
     /// `ID3D12Fence::Signal` from the CPU: queues waiting for `value` go on.
