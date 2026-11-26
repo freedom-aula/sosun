@@ -35,6 +35,12 @@ fn tables() -> MutexGuard<'static, Vec<Table>> {
     TABLES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Holds the tables' lock, as a thread in the middle of a lookup does (for the dump's test).
+#[cfg(test)]
+pub(crate) fn hold_tables() -> impl Sized {
+    tables()
+}
+
 /// Registers a mapped image: `pdata` is its exception directory (RVA and
 /// size in bytes).
 pub fn add_image(base: usize, len: usize, pdata: Option<(u32, u32)>) {
@@ -407,17 +413,17 @@ unsafe fn epilogue(pc: usize, ctx: &mut Context, bounds: Bounds) -> Option<bool>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A fake image: one function `push rbx; sub rsp, 0x20; ...; add rsp,
     /// 0x20; pop rbx; ret` and its unwind info, laid out as the linker does.
-    struct Fake {
+    pub(crate) struct Fake {
         mem: Vec<u8>,
     }
 
     impl Fake {
-        fn new() -> Fake {
+        pub(crate) fn new() -> Fake {
             let mut mem = vec![0u8; 0x1000];
             let code = [
                 0x53, // 0x100 push rbx
@@ -441,7 +447,7 @@ mod tests {
             Fake { mem }
         }
 
-        fn base(&self) -> usize {
+        pub(crate) fn base(&self) -> usize {
             self.mem.as_ptr() as usize
         }
     }
