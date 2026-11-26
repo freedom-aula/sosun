@@ -751,11 +751,20 @@ pub extern "system" fn CreateThread(
             // Before anything of the title's runs: park if suspended.
             move || {
                 lock(&me.state).port = Some(native::threadctl::ThreadPort::current());
-                // A suspension that came in before the thread was up.
-                if lock(&me.state).suspend_count > 0 {
+                // A suspension that came in before the thread was up. The count is read and
+                // `running` set under one lock: a `SuspendThread` in between saw the thread not
+                // running, did not stop it, and it then ran suspended.
+                loop {
+                    let mut state = lock(&me.state);
+                    if state.suspend_count == 0 {
+                        state.running = true;
+                        break;
+                    }
+                    // Set again by the `ResumeThread` that brings the count to 0.
+                    me.gate.reset();
+                    drop(state);
                     me.gate.wait(None);
                 }
-                lock(&me.state).running = true;
             },
             move |code| {
                 if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
