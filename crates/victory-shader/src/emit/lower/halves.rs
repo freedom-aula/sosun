@@ -161,7 +161,7 @@ impl Lower<'_> {
     pub(super) fn halves_reduce(&mut self, op: Op, prefix: bool, arg: V, r: V) -> Result<V, Why> {
         let c = self.cur;
         self.exchange_site(self.cur_ir)?;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let float = matches!(op, Op::AddF | Op::MulF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         // What each half sends: its result, or its total for a prefix.
         let mine = if prefix {
@@ -213,6 +213,7 @@ impl Lower<'_> {
         }
         let both = match op {
             Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::MulF => self.s.m.bin(c, Bin::Mul, lo, hi),
             Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
             Op::And => self.s.m.bin(c, Bin::And, lo, hi),
             Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),

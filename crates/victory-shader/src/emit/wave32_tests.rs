@@ -317,6 +317,25 @@ fn a_whole_wave_sum_combines_the_two_halves() {
     assert_eq!(l.barriers, 2);
 }
 
+/// [`REDUCE`] with `v_mul_f32` and 1.0 in the lanes off: a product, which the
+/// two host waves of a console wave exchange as they do a sum.
+#[test]
+fn a_whole_wave_product_combines_the_two_halves() {
+    let mut words = REDUCE.to_vec();
+    words[2] = 0x000A_00F2; // v_cndmask_b32_e64 v1, 1.0, v0, s[2:3]
+    for w in &mut words {
+        match *w {
+            0x4A02_02FA => *w = 0x1002_02FA, // v_mul_f32_dpp v1, v1, v1
+            0x4A02_0501 => *w = 0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+            0xD525_0003 => *w = 0xD508_0003, // v_mul_f32_e64 v3, s4, s5
+            _ => {}
+        }
+    }
+    let l = host32(&words, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.barriers, 2);
+}
+
 #[test]
 fn permlane16_and_permlanex16_lower_within_host32_half() {
     // v_permlane16_b32 v2, v0, 0, 0 fi:1 (op 0x377, opsel=1 -> 0xD777_0802)
