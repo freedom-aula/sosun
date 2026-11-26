@@ -166,3 +166,55 @@ fn ldexp_scales_by_an_integer_power_of_two() {
         assert_eq!(got, want.to_bits(), "ldexp({a}, {e}) = {}, want {want}", f32::from_bits(got));
     }
 }
+
+/// `v_mov_b32 v1, -1; v_readlane_b32 s7, v1, 0`: a lane read, which fills every thread's exchange
+/// slot with -1.
+const FILL_XCHG: [u32; 3] = [0x7E02_02C1, 0xD760_0007, 0x0201_0101];
+
+#[test]
+fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
+    // Two console waves, the second of 32 lanes: one host wave, no upper half to exchange with.
+    // Each lane stores the count of lanes above 5 in its wave's ballot, plus the -1 of the fill:
+    // the second wave's high dword is no lane's, 0, not the slot the fill left.
+    let mut w = FILL_XCHG.to_vec();
+    w.extend([
+        0x7D82_0085, // v_cmp_lt_u32 vcc, 5, v0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc
+        0x8006_0706, // s_add_u32 s6, s6, s7
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0206, // v_mov_b32 v2, s6
+    ]);
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    let got = run_io(&w, 0, 96, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [57; 64]);
+    assert_eq!(got[64..], [31; 32]);
+
+    // A whole-wave sum of the lanes' indices (the lanes the wave lacks add the 0 of the
+    // v_cndmask), plus the fill's -1: the missing upper half adds nothing.
+    let mut w = FILL_XCHG.to_vec();
+    w.extend([
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x4A02_02FA, 0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA, 0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA, 0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA, 0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xD760_0004, 0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005, 0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD525_0003, 0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x4A06_0607, // v_add_nc_u32_e32 v3, s7, v3
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000, 0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        S_ENDPGM,
+    ]);
+    let got = run_io(&w, 0, 96, 0);
+    assert_eq!(got[..64], [(0..64).sum::<u32>() - 1; 64]);
+    assert_eq!(got[64..], [(64..96).sum::<u32>() - 1; 32]);
+}

@@ -247,6 +247,40 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
     assert_eq!(l.barriers, 1);
 }
 
+#[test]
+fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
+    // `v_readfirstlane` reads each host wave's own first lane (0 and 32 here), so a branch on
+    // what it gives can split the console wave: the halves would not meet at a barrier.
+    const FIRST: [u32; 3] = [
+        0x7E04_0500, // v_readfirstlane_b32 s2, v0
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF84_0003, // s_cbranch_scc0 3
+    ];
+    let mut readlane = FIRST.to_vec();
+    readlane.extend([
+        0xD760_0004,
+        0x0001_5101, // v_readlane_b32 s4, v1, 40
+        0x7E0A_0204, // v_mov_b32_e32 v5, s4
+        S_ENDPGM,
+    ]);
+    let l = host32(&readlane, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
+    // LDS written and read behind such a branch (over 6 words): no barrier fits.
+    let mut lds = FIRST.to_vec();
+    lds[2] = 0xBF84_0006; // s_cbranch_scc0 6
+    lds.extend([
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xD8D8_0004,
+        0x0200_0001, // ds_read_b32 v2, v1 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        S_ENDPGM,
+    ]);
+    let r = lowered(&lds, 64, true, true);
+    assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
+}
+
 /// A sum over the 64 lanes the way a compiler expands `WaveActiveSum`: all
 /// lanes on, butterflies inside each row of 16, then the rows' sums by lane.
 const REDUCE: &[u32] = &[

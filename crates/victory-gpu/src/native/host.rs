@@ -10,7 +10,7 @@ use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
@@ -58,9 +58,6 @@ const NOT_MAPPED: &str = "is not in a mapped pool";
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
     pairs: Pairs,
-    /// Superseded tables, kept while submissions that read them may still run.
-    // shortcut: the GPU is assumed not to be more than `RETIRED` table rebuilds behind.
-    retired: VecDeque<Rc<Pages<B>>>,
     /// The memory the null view (pair 0) has, with size 0.
     null: Option<Rc<Pages<B>>>,
     /// A resource heap of the host's own, for shaders that need the pairs and the title bound none.
@@ -71,14 +68,11 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     fn default() -> Self {
         Contract {
             pairs: Pairs::default(),
-            retired: VecDeque::new(),
             null: None,
             heap: None,
         }
     }
 }
-
-const RETIRED: usize = 8;
 
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
@@ -543,12 +537,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
         table.write(&words);
-        if let Some((_, old)) = heap.table.borrow_mut().replace((generation, table.clone())) {
-            c.retired.push_back(old);
-            while c.retired.len() > RETIRED {
-                c.retired.pop_front();
-            }
-        }
+        // The table it replaces stays with the submissions that read it ([`Pages`]).
+        *heap.table.borrow_mut() = Some((generation, table.clone()));
         Ok(table)
     }
 

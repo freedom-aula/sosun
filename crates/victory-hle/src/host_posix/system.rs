@@ -949,7 +949,12 @@ pub extern "system" fn VirtualQuery(address: *const c_void, out: *mut u8, length
             } else {
                 MEM_COMMIT
             };
-            (r.base, r.base + r.len - at, state, flags)
+            // The allocation: the image or the region of ours around it; the Mach region, a
+            // run of one protection, only for memory that is neither.
+            let base = seh::unwind::image_base_of(at)
+                .or_else(|| super::region_at(at).map(|(base, _)| base))
+                .unwrap_or(r.base);
+            (base, r.base + r.len - at, state, flags)
         }
         next => (
             at,
@@ -1330,8 +1335,14 @@ const FLS_SLOTS: usize = 4096;
 
 static FLS_USED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
 
+/// Bumped each time a slot is handed out: a thread's value from an earlier owner of the slot
+/// reads 0, as Windows clears a freed slot in every thread.
+static FLS_GENERATION: [AtomicU32; FLS_SLOTS] = [const { AtomicU32::new(0) }; FLS_SLOTS];
+
 thread_local! {
-    static FLS_VALUES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Each slot's value and the generation it was set in.
+    static FLS_VALUES: std::cell::RefCell<Vec<(u32, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 // shortcut: the destructor callback is not called (at thread end or `FlsFree`).
@@ -1346,11 +1357,7 @@ pub extern "system" fn FlsAlloc(_callback: usize) -> u32 {
         used.push(true);
     }
     used[free] = true;
-    FLS_VALUES.with(|v| {
-        if let Some(slot) = v.borrow_mut().get_mut(free) {
-            *slot = 0;
-        }
-    });
+    FLS_GENERATION[free].fetch_add(1, Ordering::Relaxed);
     free as u32
 }
 
@@ -1369,7 +1376,14 @@ pub extern "system" fn FlsFree(index: u32) -> i32 {
 
 pub extern "system" fn FlsGetValue(index: u32) -> usize {
     set_error(0);
-    FLS_VALUES.with(|v| v.borrow().get(index as usize).copied().unwrap_or(0))
+    let Some(generation) = FLS_GENERATION.get(index as usize) else {
+        return 0;
+    };
+    let generation = generation.load(Ordering::Relaxed);
+    FLS_VALUES.with(|v| match v.borrow().get(index as usize) {
+        Some(&(set_in, value)) if set_in == generation => value,
+        _ => 0,
+    })
 }
 
 pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
@@ -1380,9 +1394,9 @@ pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
     FLS_VALUES.with(|v| {
         let mut v = v.borrow_mut();
         if v.len() <= index as usize {
-            v.resize(index as usize + 1, 0);
+            v.resize(index as usize + 1, (0, 0));
         }
-        v[index as usize] = value;
+        v[index as usize] = (FLS_GENERATION[index as usize].load(Ordering::Relaxed), value);
     });
     1
 }
@@ -2347,6 +2361,23 @@ mod tests {
         assert!(InterlockedPopEntrySList(head.as_mut_ptr()).is_null());
     }
 
+    /// `AllocationBase` is the base `VirtualAlloc` returned, not where a run of one protection
+    /// starts.
+    #[test]
+    fn virtual_query_names_the_allocation_base() {
+        let g = super::super::GRANULARITY;
+        let p = super::super::VirtualAlloc(std::ptr::null_mut(), 2 * g, 0x3000, 0x04);
+        assert!(!p.is_null());
+        let mut old = 0;
+        let second = p.cast::<u8>().wrapping_add(g).cast();
+        assert_eq!(super::super::VirtualProtect(second, g, 0x02, &mut old), 1);
+        let mut info = [0u8; 48];
+        assert_eq!(VirtualQuery(second, info.as_mut_ptr(), 48), 48);
+        let field = |at: usize| usize::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        assert_eq!((field(0), field(8)), (second as usize, p as usize));
+        assert_eq!(super::super::VirtualFree(p, 0, 0x8000), 1);
+    }
+
     #[test]
     fn fiber_local_storage_is_per_thread() {
         let slot = FlsAlloc(0);
@@ -2358,6 +2389,27 @@ mod tests {
         assert_eq!((FlsGetValue(slot), other), (7, 0));
         assert_eq!(FlsFree(slot), 1);
         assert_eq!(FlsSetValue(slot, 1), 0);
+    }
+
+    /// An FLS slot freed and handed out again reads 0 in every thread, not what it held before.
+    #[test]
+    fn a_reused_fls_slot_reads_zero_in_every_thread() {
+        let slot = FlsAlloc(0);
+        assert_ne!(slot, FLS_OUT_OF_INDEXES);
+        let (set, go) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<u32>());
+        let (set_tx, go_rx) = (set.0, go.1);
+        let other = std::thread::spawn(move || {
+            assert_eq!(FlsSetValue(slot, 5), 1);
+            set_tx.send(()).unwrap();
+            FlsGetValue(go_rx.recv().unwrap())
+        });
+        set.1.recv().unwrap();
+        assert_eq!(FlsFree(slot), 1);
+        let again = FlsAlloc(0);
+        assert_ne!(again, FLS_OUT_OF_INDEXES);
+        go.0.send(again).unwrap();
+        assert_eq!(other.join().unwrap(), 0);
+        assert_eq!(FlsFree(again), 1);
     }
 
     #[test]

@@ -304,7 +304,8 @@ struct Lower<'a> {
     /// cross-lane operations: lanes are `flat & 63`, and what reaches across
     /// the halves goes through group-shared memory (`lower/halves.rs`).
     halves: bool,
-    /// Blocks each lane runs exactly once ([`once_blocks`]), with `halves`.
+    /// With `halves`, blocks where both halves of a console wave arrive
+    /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
@@ -715,7 +716,7 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                 }
                 if halves {
-                    once = once_blocks(p);
+                    once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
                     s.xchg_dwords = lanes.next_multiple_of(64);
                 }
             } else if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
@@ -13316,11 +13317,38 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
         .collect()
 }
 
+/// SCC values that can differ between the host waves of one console wave:
+/// those computed from a `v_readfirstlane_b32` result, which each host wave
+/// reads of its own first lane.
+fn split_scc(p: &Program) -> Set<Value> {
+    let mut from = Set::default();
+    loop {
+        let n = from.len();
+        for b in &p.blocks {
+            for phi in &b.phis {
+                if phi.args.iter().any(|a| from.contains(a)) {
+                    from.insert(phi.value);
+                }
+            }
+            for i in &b.insts {
+                if i.name() == "v_readfirstlane_b32" || i.reads.iter().any(|r| from.contains(&r.1)) {
+                    from.extend(i.writes.iter().map(|w| w.1));
+                }
+            }
+        }
+        if from.len() == n {
+            return from;
+        }
+    }
+}
+
 /// Blocks every lane of a one-wave group runs together, at most once: those
 /// of [`once_blocks`], and those outside any cycle reached by uniform (SCC)
-/// branches alone, which the whole console wave takes or skips at once.
-fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+/// branches alone, which the whole console wave takes or skips at once (and
+/// so do its host waves: no SCC from [`split_scc`]).
+pub(crate) fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
     let n = p.blocks.len();
+    let split = split_scc(p);
     let mut once = once_blocks(p);
     for (b, once) in once.iter_mut().enumerate() {
         let mut seen = vec![false; n];
@@ -13333,7 +13361,11 @@ fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
             }
         }
         *once |= !cycle
-            && st.bools.support(st.reach[b]).iter().all(|a| matches!(a, Atom::Uniform(_)));
+            && st
+                .bools
+                .support(st.reach[b])
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(v) if !split.contains(v)));
     }
     once
 }
