@@ -53,14 +53,18 @@ impl Inner {
     fn cut(&mut self, at: usize, len: usize) {
         self.generation += 1;
         let end = at + len;
-        let hit: Vec<usize> = self
+        // Only the immediate predecessor can overlap the start of the cut.
+        let mut preceding = self
             .maps
-            .range(..end)
+            .range(..at)
+            .next_back()
             .filter(|&(&a, m)| a + m.len > at)
-            .map(|(&a, _)| a)
-            .collect();
-        for a in hit {
-            let m = self.maps.remove(&a).expect("listed above");
+            .map(|(&a, _)| a);
+        while let Some(a) = preceding
+            .take()
+            .or_else(|| self.maps.range(at..end).next().map(|(&a, _)| a))
+        {
+            let m = self.maps.remove(&a).expect("overlapping mapping");
             if a < at {
                 self.maps.insert(a, Map { len: at - a, ..m });
             }
@@ -74,6 +78,7 @@ impl Inner {
                         ..m
                     },
                 );
+                break;
             }
         }
     }
@@ -202,5 +207,22 @@ mod tests {
         t.pool_released(&p);
         assert!(t.resolve(0x7000_1000, 1).is_none());
         assert_eq!(t.take_released(), vec![1]);
+    }
+
+    #[test]
+    fn cut_spans_multiple_mappings_and_keeps_their_edges() {
+        let t = PoolTable::default();
+        let p = pool(1);
+        for (base, offset) in [(0x1000, 0), (0x3000, 0x4000), (0x6000, 0x8000)] {
+            t.mapped(base, 0x2000, &p, offset);
+        }
+        let before = t.generation();
+        t.unmapped(0x2000, 0x5000);
+        assert_eq!(t.generation(), before + 1);
+        assert_eq!(t.resolve(0x1fff, 1).unwrap().1 as usize, p.base + 0xfff);
+        for addr in [0x2000, 0x3000, 0x6000, 0x6fff] {
+            assert!(t.resolve(addr, 1).is_none());
+        }
+        assert_eq!(t.resolve(0x7000, 1).unwrap().1 as usize, p.base + 0x9000);
     }
 }
