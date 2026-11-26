@@ -241,7 +241,7 @@ impl Inner {
 
 /// A table of methods as the title calls them: stubs, which swap GS and the
 /// ABI, except in tests, which call the methods themselves.
-fn table(methods: &[usize]) -> Vec<usize> {
+pub(super) fn table(methods: &[usize]) -> Vec<usize> {
     if cfg!(test) {
         return methods.to_vec();
     }
@@ -494,7 +494,7 @@ extern "win64" fn set_debug_configuration(
 
 /// `WAVEFORMATEX` (or its extensible form) as a mixer format; PCM and float
 /// only.
-fn parse_format(wave: *const u8) -> Option<Format> {
+pub(super) fn parse_format(wave: *const u8) -> Option<Format> {
     if wave.is_null() {
         return None;
     }
