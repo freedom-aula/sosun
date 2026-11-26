@@ -9,9 +9,7 @@
 use std::ffi::{CStr, c_void};
 use std::sync::OnceLock;
 
-use crate::object::{
-    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid,
-};
+use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
@@ -60,8 +58,8 @@ impl Desc {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VersionedDesc {
-    version: u32,
-    desc: Desc,
+    pub(crate) version: u32,
+    pub(crate) desc: Desc,
 }
 
 type Serialize =
@@ -164,7 +162,8 @@ type Deserialize =
 /// `d3d12_xs!D3D12CreateRootSignatureDeserializer`: our blobs are the
 /// host's serialization, so the host's deserializer reads them, and its
 /// object (IUnknown, then the description getter) is laid out as the
-/// console's. Grand Theft Auto VI's upscaler asks with the PC interface id.
+/// console's; without a host `d3d12.dll` (macOS) `rootser` reads them.
+/// Grand Theft Auto VI's upscaler asks with the PC interface id.
 pub extern "system" fn create_deserializer(
     blob: *const u8,
     size: usize,
@@ -179,8 +178,9 @@ pub extern "system" fn create_deserializer(
     }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
-        tracing::warn!("no host d3d12.dll to deserialize root signatures");
-        return E_NOTIMPL;
+        // SAFETY: the title passes `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(blob, size) };
+        return crate::rootser::deserialize_to(bytes, iid, out);
     };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
@@ -235,7 +235,7 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
+    use crate::object::{E_NOINTERFACE, E_NOTIMPL, E_POINTER, S_FALSE, S_OK, slot};
 
     /// An interface we do not implement.
     const OTHER_IID: Iid = guid(0x5a5a_5a5a, 0x5a5a, 0x5a5a, [0x5a; 8]);
