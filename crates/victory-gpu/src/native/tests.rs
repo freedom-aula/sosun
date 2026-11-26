@@ -240,6 +240,56 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     drop(slots);
 }
 
+/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
+/// naming each entry at each draw made frame time grow with the entries the title fills. Two
+/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
+#[test]
+fn a_heap_is_named_once_per_encoder() {
+    let Some(h) = host() else { return };
+    if h.backend.residency_sets() {
+        return;
+    }
+    let pool = Pool::new(&h, 4);
+    let (src, dst) = (0, 16384);
+    pool.write(src, &(0..64u32).collect::<Vec<_>>());
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        (d[1], d[6], d[8]) = (1, 64, 1); // raw buffer view of 64 elements
+        d[10] = pool.va(at) as u32;
+        d[11] = (pool.va(at) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap() && h.mirror(start + 32).unwrap());
+
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let named = |dispatches: u32| {
+        let before = h.backend.residency_counts().heap_resources;
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        for _ in 0..dispatches {
+            l.dispatch(1, 1, 1).unwrap();
+        }
+        run(&h, &[&l]);
+        h.backend.residency_counts().heap_resources - before
+    };
+    assert_eq!(named(1), 2, "the heap buffer and the one pool buffer");
+    assert_eq!(named(5), 2, "five dispatches in one encoder");
+    assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    drop(slots);
+}
+
 type Vertex = [f32; 8];
 
 /// Issue #15 (writes that land elsewhere): a descriptor the title reuses for a buffer the host

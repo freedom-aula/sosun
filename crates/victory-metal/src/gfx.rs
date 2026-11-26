@@ -46,9 +46,10 @@ pub struct Heap {
     count: usize,
     /// What each entry names, kept alive here and made resident with the heap.
     refs: RefCell<std::collections::HashMap<usize, Res>>,
-    /// Reference counts per raw `MTLResource` pointer currently in `set`, so an allocation is
-    /// added once and removed + committed before its last `refs` entry is dropped.
-    alloc_counts: RefCell<std::collections::HashMap<usize, usize>>,
+    /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
+    /// name each: an allocation is added to `set` once and removed + committed before its last
+    /// `refs` entry is dropped, and without a set each is named to an encoder once.
+    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, Res)>>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
@@ -467,7 +468,7 @@ impl Metal {
             Some(r) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
-                let count = counts.entry(ptr).or_insert(0);
+                let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
                 if *count == 0
                     && let Some(set) = &heap.set
                 {
@@ -484,7 +485,7 @@ impl Metal {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
-                Some(n) if *n > 1 => {
+                Some((n, _)) if *n > 1 => {
                     *n -= 1;
                     false
                 }
@@ -514,23 +515,28 @@ impl Metal {
         }
     }
 
-    /// Residency without sets: every entry's resource is named to the encoder.
+    /// Residency without sets: the heap buffer and each distinct allocation its entries name, once
+    /// per encoder (`named` holds the heaps this encoder was given; residency lasts the encoder).
+    /// Naming every entry at every draw cost a `useResource` per entry per draw, and the title fills
+    /// more entries as the world streams in, so frame time grew with play time.
     fn use_heap_encoder(
         &self,
         heap: &Heap,
+        named: &mut Vec<*const Heap>,
         mut use_res: impl FnMut(&ProtocolObject<dyn MTLResource>),
     ) {
-        if heap.set.is_some() {
+        if heap.set.is_some() || named.contains(&(heap as *const Heap)) {
             return;
         }
+        named.push(heap);
         use_res(ProtocolObject::from_ref(&*heap.buf));
-        let refs = heap.refs.borrow();
-        refs.values().for_each(|r| use_res(r));
-        let allocations = heap.alloc_counts.borrow().len() as u64;
+        let refs = heap.refs.borrow().len() as u64;
+        let allocations = heap.alloc_counts.borrow();
+        allocations.values().for_each(|(_, r)| use_res(r));
         self.count(|c| {
-            c.heap_resources += 1 + refs.len() as u64;
-            c.heap_entries = c.heap_entries.max(refs.len() as u64);
-            c.heap_allocations = c.heap_allocations.max(allocations);
+            c.heap_resources += 1 + allocations.len() as u64;
+            c.heap_entries = c.heap_entries.max(refs);
+            c.heap_allocations = c.heap_allocations.max(allocations.len() as u64);
         });
     }
 
@@ -613,6 +619,7 @@ impl Metal {
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
         statics: Option<&StaticSamplers>,
+        named: &mut Vec<*const Heap>,
     ) {
         let root = StaticSamplers::args(statics, &root.0);
         if !root.is_empty() {
@@ -635,7 +642,7 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe { e.setBuffer_offset_atIndex(Some(&h.buf), 0, slot) };
-                self.use_heap_encoder(h, |r| {
+                self.use_heap_encoder(h, named, |r| {
                     e.useResource_usage(r, MTLResourceUsage::Read | MTLResourceUsage::Write)
                 });
             }
@@ -649,6 +656,7 @@ impl Metal {
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
         pipeline: &RenderPipeline,
+        named: &mut Vec<*const Heap>,
     ) {
         let fragment = fragment.unwrap_or(root);
         let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
@@ -685,7 +693,7 @@ impl Metal {
                     e.setVertexBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
-                self.use_heap_encoder(h, |r| {
+                self.use_heap_encoder(h, named, |r| {
                     e.useResource_usage_stages(
                         r,
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -1495,6 +1503,7 @@ impl Metal {
         {
             e.waitForFence(f);
         }
+        let mut named = Vec::new();
         for d in dispatches {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
@@ -1506,7 +1515,7 @@ impl Metal {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
@@ -1697,6 +1706,7 @@ impl Metal {
             .map(|c| &c.texture.tex)
             .or(rp.depth.as_ref().map(|d| &d.texture.tex))
             .map_or((0, 0), |t| (t.width(), t.height()));
+        let mut named = Vec::new();
         for (k, d) in rp.draws.iter().enumerate() {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -1763,7 +1773,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
