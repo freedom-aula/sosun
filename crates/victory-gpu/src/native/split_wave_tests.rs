@@ -355,3 +355,31 @@ fn a_mask_moved_to_every_lane_before_a_branch_to_a_join_holds_their_lanes() {
     assert_eq!(got[..50], [1; 50]);
     assert_eq!(got[50..], [0; 14]);
 }
+
+#[test]
+fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
+    // `s[8:9]` holds an address (data) until lanes 0..39 make it the lanes below 10 or outside
+    // EXEC (`s_orn2`, which sets lanes 40..63); lanes 40..63 skip that and join holding the
+    // address, but the join's only read is an AND with an EXEC they are not in, so each reads a 0
+    // there (was refused: "data, ...").
+    let w = [
+        0xBE88_0402, // s_mov_b64 s[8:9], s[2:3]
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(2),
+        0x7D88_008A, // v_cmp_gt_u32 vcc, 10, v0
+        0x8B88_7E6A, // s_orn2_b64 s[8:9], vcc, exec: lanes 40..63 set too
+        0x8788_7E08, // join: s_and_b64 s[8:9], s[8:9], exec
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..], [0; 54]);
+}
