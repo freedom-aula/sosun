@@ -363,6 +363,22 @@ The first-chance log (`seh::dispatch`) shows a breakpoint's `rip` as the `int3` 
 
 Instructions Rosetta does not run are skipped or emulated by the SIGILL path in `seh::signal`: `clwb`/`clflushopt` (skipped; a whole `clwb [p]; add p, 0x40; cmp p, limit; jbe/jb` flush loop is skipped in one signal, since the title flushes buffers of many megabytes a line at a time), `clzero` (zeroes the line, or the whole clearing loop), `monitorx`/`mwaitx` (skipped, the latter yields), and the SSE4a `insertq`/`extrq` (run on the saved XMM registers; the title uses `insertq` once its world loads).
 
+## Lane masks joined with data
+
+A lane mask joined at a block entry with a register that holds data on one edge (the BVH walks
+pop masks from memory) is, in a lane, that lane's bit of the number the edge brings: bit `i` of a
+mask is lane `i` (RDNA2 ISA, EXEC and VCC). It is taken only where the wave takes one edge (a
+uniform join) and with the console's lanes. Wave64 programs now take it too, the low dword for
+lanes below 32 and the high dword above, from the high register's join on the same edge; they
+were refused as "a lane-mask join of an untracked mask". What stays refused says why, after that
+text and a colon: "data, on the host's lanes", "data, at a join of several edges", "data whose
+high dword is not known", "a value the translation could not make", "an SCC or lane bit" or "no
+value on that edge". `addr_tests::a_wave64_mask_joined_with_data_takes_each_lanes_bit_on_the_gpu`
+(`victory-gpu`) runs such a loop on Metal with the host's options (a console wave as two host
+waves): lanes 32 to 35 take their bit from the high dword. The story-load log of issue #110
+(Series S) has three compute programs refused with the old message; whether they are this wave64
+form is not known.
+
 ## Console pipeline descriptions (device slots 0x1c8 and 0x218)
 
 Observed at run time (`VICTORY_DUMP_DESC=1` dumps the first descriptions and the bytes behind every pointer and size pair). Grand Theft Auto VI creates most of its pipelines through these two device methods, `(this, desc, iid, out)` with the pipeline state's IID.

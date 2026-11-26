@@ -65,6 +65,30 @@ const MISSES: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// A wave64 lane mask joined with data at a uniform loop's header: lanes below 40, then on each
+/// back edge that number shifted right by 4 and passed through VGPRs (data). Every lane stores its
+/// bit of the last pass's number to `s[0:1]`: lane < 36, the low dword's for lanes below 32 and
+/// the high dword's above.
+const MASK_DATA_JOIN: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x7D88_00A8, // v_cmp_gt_u32_e32 vcc, 40, v0
+    0x8786_7E6A, // s_and_b64 s[6:7], vcc, exec
+    0xBE88_0380, // s_mov_b32 s8, 0
+    0xD501_0004,
+    0x0019_0280, // header: v_cndmask_b32_e64 v4, 0, 1, s[6:7]
+    0x9086_8406, // s_lshr_b64 s[6:7], s[6:7], 4
+    0x7E0A_0206, // v_mov_b32_e32 v5, s6
+    0x7E0C_0207, // v_mov_b32_e32 v6, s7
+    0x7E0C_0505, // v_readfirstlane_b32 s6, v5
+    0x7E0E_0506, // v_readfirstlane_b32 s7, v6
+    0x8008_8108, // s_add_u32 s8, s8, 1
+    0xBF0A_8208, // s_cmp_lt_u32 s8, 2
+    0xBF85_FFF6, // s_cbranch_scc1 header
+    0xDC70_8000,
+    0x0000_0401, // global_store_dword v1, v4, s[0:1]
+    0xBF81_0000, // s_endpgm
+];
+
 /// A 64-lane compute shader whose user SGPRs `s0..s<sgprs>` are root constants, translated the way
 /// the host translates, from machine code of our own in a container of no parts.
 fn shader(words: &[u32], sgprs: u32) -> HostShader {
@@ -368,4 +392,15 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
     let host = shader(COMPUTED, 4);
     assert!(host.memory && !host.memory_writes);
     assert_ne!(d3d12.dxil, host.dxil);
+}
+
+#[test]
+fn a_wave64_mask_joined_with_data_takes_each_lanes_bit_on_the_gpu() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(MASK_DATA_JOIN, 2);
+    dispatch(&mut t, &cs, &halves(VA_A), false);
+    let want: Vec<u32> = (0..64).map(|lane| u32::from(lane < 36)).collect();
+    assert_eq!(f.get(0x2_0000, 64), want);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
