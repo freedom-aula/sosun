@@ -30,11 +30,30 @@ const CONSOLE_FLAGS: u32 = 0xff00_0000;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Desc {
-    parameter_count: u32,
-    parameters: *const c_void,
-    sampler_count: u32,
-    samplers: *const c_void,
-    flags: u32,
+    pub(crate) parameter_count: u32,
+    pub(crate) parameters: *const c_void,
+    pub(crate) sampler_count: u32,
+    pub(crate) samplers: *const c_void,
+    pub(crate) flags: u32,
+}
+
+#[cfg(test)]
+impl Desc {
+    pub(crate) fn new(
+        parameter_count: u32,
+        parameters: *const c_void,
+        sampler_count: u32,
+        samplers: *const c_void,
+        flags: u32,
+    ) -> Self {
+        Desc {
+            parameter_count,
+            parameters,
+            sampler_count,
+            samplers,
+            flags,
+        }
+    }
 }
 
 /// Every version's description starts with the fields of [`Desc`].
@@ -104,8 +123,7 @@ pub extern "system" fn serialize(
     };
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
+        return crate::rootser::serialize_to(version, &without_console_flags(desc), blob, error);
     };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe {
@@ -129,13 +147,12 @@ pub extern "system" fn serialize_versioned(
         return E_INVALIDARG;
     };
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
-    };
     let desc = VersionedDesc {
         desc: without_console_flags(desc.desc),
         ..desc
+    };
+    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
+        return crate::rootser::serialize_to(desc.version, &desc.desc, blob, error);
     };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
@@ -571,7 +588,10 @@ mod tests {
         // SAFETY: ntdll is always loaded; both names end with a NUL.
         let wine = unsafe {
             use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-            GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"wine_get_version".as_ptr().cast())
+            GetProcAddress(
+                GetModuleHandleA(c"ntdll.dll".as_ptr().cast()),
+                c"wine_get_version".as_ptr().cast(),
+            )
         }
         .is_some();
         if wine {

@@ -58,6 +58,7 @@ pub mod queue;
 mod ranges;
 pub mod resource;
 pub mod root;
+mod rootser;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
