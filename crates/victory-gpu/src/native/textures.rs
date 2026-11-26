@@ -190,39 +190,66 @@ pub struct Tracked<B: ResourceBackend> {
     /// Uploads of its memory so far.
     pub uploads: u64,
     /// Submissions left in which its memory is probed at submission rather than left to the
-    /// scanner (0: cold), and what the last probe read.
+    /// scanner (0: cold), and the hash of what the last probe read.
     hot: u32,
-    probe: Vec<u8>,
+    probe: Option<blake3::Hash>,
 }
 
 /// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
 /// further change.
 const HOT: u32 = 600;
+/// Maximum hot textures probed synchronously on a single submission. Boot movies and UI glyph
+/// caches have ~12 hot textures (all checked every submission); when world streaming realizes
+/// thousands of blank textures at once, this bounds per-submission probing to O(1) while the
+/// background scanner thread catches the rest off the host lock.
+///
+/// shortcut: a title write to a hot texture can take up to `ceil(hot / MAX_SYNC_HOT)`
+/// submissions to be noticed synchronously (unless the scanner catches it first); raise this if
+/// more than 32 textures need same-submission updates (e.g. many simultaneous streaming UI atlases).
+const MAX_SYNC_HOT: usize = 32;
 /// Pages of a large hot texture's memory a probe reads, spread over it.
 const PROBE_PAGES: usize = 8;
+/// Bytes sampled per page when probing a large hot texture.
+const PROBE_SAMPLE: usize = 256;
 /// Hot textures up to this size that changed more than once are probed whole (a glyph cache gets
 /// a few glyphs at a time). Textures written once after a blank upload (streaming) are sampled:
 /// probing all of them whole looked about 15% slower in one run.
 const PROBE_WHOLE: usize = 4 << 20;
 
-/// The bytes a probe of `size` bytes at `at` compares: all of them if `whole`, else `PROBE_PAGES`
-/// pages spread over them.
+/// Hash of the bytes a probe of `size` bytes at `at` reads: all of them if `whole`, else
+/// `PROBE_PAGES` samples of `PROBE_SAMPLE` bytes spread across the texture, reusing `scratch`.
 ///
-/// shortcut: when sampled, a write that misses every sampled page goes unseen until the scanner's
-/// next round; a texture the title rewrites whole (a movie's planes) is caught at once.
-fn probe(at: usize, size: usize, whole: bool) -> Vec<u8> {
-    if whole || size <= PROBE_PAGES * 4096 {
-        return read_memory(at as *const u8, size);
+/// shortcut: when sampled, a write that misses every sampled window goes unseen until the
+/// scanner's next round; a texture the title rewrites whole (a movie's planes) is caught at once.
+fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    if whole || size <= PROBE_PAGES * PROBE_SAMPLE {
+        const CHUNK: usize = 1 << 20;
+        let cap = size.min(CHUNK);
+        if scratch.len() < cap {
+            scratch.resize(cap, 0);
+        }
+        for off in (0..size).step_by(CHUNK) {
+            let n = CHUNK.min(size - off);
+            scratch[..n].fill(0);
+            let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+            hasher.update(&scratch[..n]);
+        }
+        return hasher.finalize();
     }
     const PAGE: usize = 4096;
     let pages = size.div_ceil(PAGE);
-    let mut out = vec![0u8; PROBE_PAGES * PAGE];
-    for (k, page) in out.chunks_mut(PAGE).enumerate() {
-        let off = k * pages / PROBE_PAGES * PAGE;
-        let n = PAGE.min(size - off);
-        let _ = super::safe_read((at + off) as *const u8, &mut page[..n]);
+    if scratch.len() < PROBE_SAMPLE {
+        scratch.resize(PROBE_SAMPLE, 0);
     }
-    out
+    for k in 0..PROBE_PAGES {
+        let off = k * pages / PROBE_PAGES * PAGE;
+        let n = PROBE_SAMPLE.min(size - off);
+        scratch[..n].fill(0);
+        let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+        hasher.update(&scratch[..n]);
+    }
+    hasher.finalize()
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -287,6 +314,9 @@ impl<B: PresentBackend> Title<B> {
             let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
             self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
         }
+        if !info.render_target() {
+            self.unloaded.insert(key);
+        }
         self.textures.insert(
             key,
             Tracked {
@@ -295,7 +325,7 @@ impl<B: PresentBackend> Title<B> {
                 last: None,
                 uploads: 0,
                 hot: 0,
-                probe: Vec::new(),
+                probe: None,
             },
         );
         true
@@ -320,6 +350,8 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_released(&mut self, key: usize) {
         self.textures.remove(&key);
         self.pending.remove(&key);
+        self.unloaded.remove(&key);
+        self.hot_keys.retain(|&k| k != key);
         watch(|w| {
             w.entries.remove(&key);
             w.dirty.remove(&key);
@@ -329,37 +361,75 @@ impl<B: PresentBackend> Title<B> {
     /// Brings the textures the host samples up to date with title memory: those whose memory
     /// changed since their last upload are detiled again.
     pub fn sync_textures(&mut self) {
-        self.sync_where(|_, t| !t.info.render_target());
+        let keys: Vec<usize> = self
+            .textures
+            .iter()
+            .filter(|(_, t)| !t.info.render_target())
+            .map(|(&k, _)| k)
+            .collect();
+        self.sync_keys(keys);
     }
 
-    /// What a submission does: the textures not uploaded yet, and those the scanner found
-    /// changed since.
+    /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
+    /// found changed since.
     pub fn sync_dirty(&mut self) {
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
-        // Hot textures (a movie's planes, a glyph cache) are probed now: the scanner's round over
-        // every texture is seconds long by the menus, and a movie frame sampled before its planes
-        // were seen showed their blank first upload (solid green) or an old frame.
-        for (&key, t) in self.textures.iter_mut().filter(|(_, t)| t.hot > 0) {
-            let now = probe(t.info.memory as usize, t.info.size, t.uploads >= 2 && t.info.size <= PROBE_WHOLE);
-            let before = std::mem::replace(&mut t.probe, now);
-            if before != t.probe {
+        // Hot textures (a movie's planes, a glyph cache) are probed synchronously in O(1) bounded
+        // batches so world streaming (thousands of blank textures) never stalls submissions.
+        let mut budget = self.hot_keys.len().min(MAX_SYNC_HOT);
+        while budget > 0 && !self.hot_keys.is_empty() {
+            budget -= 1;
+            let idx = self.hot_cursor % self.hot_keys.len();
+            let key = self.hot_keys[idx];
+            let Some(t) = self.textures.get_mut(&key) else {
+                self.hot_keys.swap_remove(idx);
+                continue;
+            };
+            if t.hot == 0 {
+                self.hot_keys.swap_remove(idx);
+                continue;
+            }
+            let whole = t.uploads >= 2 && t.info.size <= PROBE_WHOLE;
+            let now = probe_hash(t.info.memory as usize, t.info.size, whole, &mut self.probe_buf);
+            let before = t.probe.replace(now);
+            if before != Some(now) {
                 dirty.insert(key);
+                self.hot_cursor = idx + 1;
             } else {
                 t.hot -= 1;
+                if t.hot == 0 {
+                    t.probe = None;
+                    self.hot_keys.swap_remove(idx);
+                } else {
+                    self.hot_cursor = idx + 1;
+                }
             }
         }
-        self.sync_where(|key, t| (t.last.is_none() && !t.info.render_target()) || dirty.contains(&key));
+        let unloaded = std::mem::take(&mut self.unloaded);
+        if unloaded.is_empty() && dirty.is_empty() {
+            return;
+        }
+        let mut todo: Vec<usize> = unloaded.into_iter().collect();
+        for key in dirty {
+            if !todo.contains(&key) {
+                todo.push(key);
+            }
+        }
+        self.sync_keys(todo);
     }
 
-    fn sync_where(&mut self, wanted: impl Fn(usize, &Tracked<B>) -> bool) {
+    fn sync_keys(&mut self, keys: Vec<usize>) {
         let Title {
             host,
             textures,
+            hot_keys,
             stats,
             ..
         } = self;
-        for (key, t) in textures.iter_mut().filter(|(k, t)| wanted(**k, t)) {
-            let key = &key;
+        for key in keys {
+            let Some(t) = textures.get_mut(&key) else {
+                continue;
+            };
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
@@ -367,6 +437,9 @@ impl<B: PresentBackend> Title<B> {
             }
             // Written again after its first upload, or blank at it (written later): hot.
             if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
+                if t.hot == 0 {
+                    hot_keys.push(key);
+                }
                 t.hot = HOT;
             }
             match upload(&host.backend, &t.texture, &t.info, &tiled) {
@@ -387,3 +460,26 @@ impl<B: PresentBackend> Title<B> {
 
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_hash_detects_writes_in_sampled_and_whole_modes() {
+        let mut mem = vec![0u8; 16 * 4096];
+        let mut scratch = Vec::new();
+        let h0_sampled = probe_hash(mem.as_ptr() as usize, mem.len(), false, &mut scratch);
+        let h0_whole = probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch);
+        // Flip a byte in the first sampled window.
+        mem[42] = 0xAB;
+        let h1_sampled = probe_hash(mem.as_ptr() as usize, mem.len(), false, &mut scratch);
+        let h1_whole = probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch);
+        assert_ne!(h0_sampled, h1_sampled);
+        assert_ne!(h0_whole, h1_whole);
+        // Flip a byte outside sampled windows: whole mode catches it.
+        mem[42] = 0;
+        mem[1000] = 0xCD;
+        assert_ne!(h0_whole, probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch));
+    }
+}
