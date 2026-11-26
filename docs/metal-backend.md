@@ -588,7 +588,9 @@ and raises fence values.
     0 and its writes are dropped. Each heap has a table of its own, since the table holds its view indices
     (heaps must have room below the translator's clamp of heap indices, 2^21 entries);
   - the table is built from `PoolTable::mappings()` into a buffer of its own whenever the pool table's
-    generation changed (never rewritten in place: the GPU may be reading the old one; the last 8 are kept)
+    generation changed (never rewritten in place: the GPU may be reading the old one, which is a buffer of
+    the backend's own that the submissions made with it keep until they have run; the host used to free a
+    table 8 rebuilds after it was replaced, and work a queue held meanwhile then wrote through freed memory)
     and bound as the last root parameter. shortcut: rebuilt whole, not incrementally (8 bytes a page: 2 MiB
     for 16 GiB of mappings); a 64 KiB title page not wholly inside one mapping of one pool is a null page;
     at most 255 view pairs;

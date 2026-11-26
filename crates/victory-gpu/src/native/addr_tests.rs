@@ -399,6 +399,44 @@ fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
     assert_eq!(t.shaders.pipelines, 1);
 }
 
+/// Work the GPU has not run yet reads the page table it was submitted with, however often the pool
+/// table changes meanwhile: a dispatch waits for a fence while the title moves a view twelve times,
+/// with a dispatch (and so a new table) each time. The host freed a table eight rebuilds after it
+/// was replaced, so the waiting dispatch read freed memory, or a later table's words in it, and
+/// wrote wherever those sent it (Grand Theft Auto VI's first world frame: its BVH builder's empty
+/// nodes over streamed resources, with a compute queue held for seconds).
+#[test]
+fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(COMPUTED, 4);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "addr") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let mut waiting = NativeList::default();
+    waiting.set_compute_pipeline(&pso);
+    waiting.set_compute_root_constants(0, &[a, b, c, d]);
+    waiting.dispatch(1, 1, 1).unwrap();
+    use victory_metal::backend::ComputeBackend;
+    let backend = &t.host.backend;
+    let (q, gate, done) = (backend.create_queue().unwrap(), backend.create_fence(0).unwrap(), backend.create_fence(0).unwrap());
+    t.host.execute(&q, &[&waiting], &[(&gate, 1)], &[(&done, 1)]).unwrap();
+
+    // Dispatches of memory no pool shows (nothing written), each after VA_A moved in the pool.
+    let [e, g] = halves(0x55_0000_0000);
+    for k in 0..12 {
+        let offset = if k % 2 == 0 { 0x4_0000 } else { 0 };
+        t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, offset);
+        dispatch(&mut t, &cs, &[e, g, e, g], false);
+    }
+    t.host.backend.signal(&gate, 1);
+    assert!(t.host.backend.wait(&done, 1, 10_000), "GPU did not finish");
+    check_computed(&f, 0x2_0000, 0x6_0000);
+}
+
 /// Memory no pool shows reads as zero and its writes are dropped, in a page past a mapping, in a
 /// 256 MiB region with no mapping at all and in the pool's own range below it; none of it lands in
 /// the pool where a naive offset from the mapping would put it.

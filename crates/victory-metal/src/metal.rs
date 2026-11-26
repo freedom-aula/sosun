@@ -245,6 +245,20 @@ impl ComputeBackend for Metal {
         })
     }
 
+    fn host_buffer(&self, len: usize) -> Result<(Buffer, *mut u8), String> {
+        let buf = self
+            .dev
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or("no host buffer")?;
+        let base = buf.contents().as_ptr().cast::<u8>();
+        let buffer = Buffer {
+            buf,
+            base,
+            resident: Default::default(),
+        };
+        Ok((buffer, base))
+    }
+
     fn make_resident(&self, queue: &Queue, buffers: &[&Buffer]) -> Result<(), String> {
         if !self.residency_sets {
             return Ok(());
