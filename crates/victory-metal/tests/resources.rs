@@ -8,6 +8,7 @@ mod common;
 
 use common::*;
 use victory_metal::backend::{ComputeBackend, Dispatch, RootArgs};
+use victory_metal::mem::page_size;
 use victory_metal::metal::Metal;
 use victory_metal::resources::*;
 
@@ -17,7 +18,9 @@ const N: usize = 4096;
 fn srv_and_uav_through_a_descriptor_table() {
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, 2);
+        // Two 16 KiB buffers = 32 KiB total; pages = ceil(32 KiB / page_size()).
+        let pages = (2usize * 16 * 1024).div_ceil(page_size());
+        let a = Arena::new(&m, pages);
         let half = a.region.len / 2;
         a.write(0, &(0..N as u32).collect::<Vec<_>>());
         let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
@@ -390,7 +393,8 @@ fn texture_views_and_sampler_filters() {
 #[test]
 fn texture_over_zero_copy_memory() {
     let Some(m) = backend() else { return };
-    let a = Arena::new(&m, 2);
+    // Small texture: 4x4 RGBA8Unorm with aligned pitch.
+    let a = Arena::new(&m, 1);
     let align = m.linear_alignment(Format::Rgba8Unorm);
     let pitch = 16usize.next_multiple_of(align);
     // The texture starts one alignment unit into the arena, like a title resource at an offset.
