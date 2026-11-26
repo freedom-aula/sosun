@@ -949,7 +949,12 @@ pub extern "system" fn VirtualQuery(address: *const c_void, out: *mut u8, length
             } else {
                 MEM_COMMIT
             };
-            (r.base, r.base + r.len - at, state, flags)
+            // The allocation: the image or the region of ours around it; the Mach region, a
+            // run of one protection, only for memory that is neither.
+            let base = seh::unwind::image_base_of(at)
+                .or_else(|| super::region_at(at).map(|(base, _)| base))
+                .unwrap_or(r.base);
+            (base, r.base + r.len - at, state, flags)
         }
         next => (
             at,
@@ -2354,6 +2359,23 @@ mod tests {
         assert_eq!(InterlockedPopEntrySList(head.as_mut_ptr()), b.as_mut_ptr());
         assert_eq!(InterlockedFlushSList(head.as_mut_ptr()), a.as_mut_ptr());
         assert!(InterlockedPopEntrySList(head.as_mut_ptr()).is_null());
+    }
+
+    /// `AllocationBase` is the base `VirtualAlloc` returned, not where a run of one protection
+    /// starts.
+    #[test]
+    fn virtual_query_names_the_allocation_base() {
+        let g = super::super::GRANULARITY;
+        let p = super::super::VirtualAlloc(std::ptr::null_mut(), 2 * g, 0x3000, 0x04);
+        assert!(!p.is_null());
+        let mut old = 0;
+        let second = p.cast::<u8>().wrapping_add(g).cast();
+        assert_eq!(super::super::VirtualProtect(second, g, 0x02, &mut old), 1);
+        let mut info = [0u8; 48];
+        assert_eq!(VirtualQuery(second, info.as_mut_ptr(), 48), 48);
+        let field = |at: usize| usize::from_le_bytes(info[at..at + 8].try_into().unwrap());
+        assert_eq!((field(0), field(8)), (second as usize, p as usize));
+        assert_eq!(super::super::VirtualFree(p, 0, 0x8000), 1);
     }
 
     #[test]

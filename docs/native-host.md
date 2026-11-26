@@ -313,6 +313,7 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.
 - `host_posix` (kernel32 side) is a few dozen functions, enough for the probe, not a title; the C runtime is complete enough for a title that links it dynamically.
+- `VirtualQuery` reports as `AllocationBase` the image or the region of ours (`VirtualAlloc`, `XMemVirtualAlloc`) holding the address, as `XMemVirtualQuery` does; only other memory gets the Mach region's base, which is where a run of one protection starts.
 - `VirtualAlloc` reserves 64 KiB granules at 64 KiB boundaries (also for `MEM_COMMIT` alone with no address, as Windows does); `VirtualFree(MEM_RELEASE)` takes a base from `VirtualAlloc` only.
 - `VirtualFree(MEM_DECOMMIT)` decommits the pages holding any byte of the range, and with size 0 the rest of the region (all of it from the base), as Windows does. A range that is not inside one region `VirtualAlloc` or `XMemVirtualAlloc` made fails with `ERROR_INVALID_ADDRESS`: it used to decommit whatever the host had there, and size 0 decommitted nothing.
 - `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory, or of a range `XMemMapPhysicalPages` mapped into, gives its physical-page views back too (`xmem_posix::forget_physical`, as `XMemFreeDefault` does). It used to give back only the address space, so the freed pool stayed in the GPU's pool table and the aliases at an address the next allocation was given: two memories at one title address (issue #15).
