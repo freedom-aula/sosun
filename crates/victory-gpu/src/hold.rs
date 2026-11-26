@@ -42,12 +42,15 @@ const ALWAYS: u32 = 8;
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
+    /// and `Some(false)` for memory that cannot be read (taken as not holding).
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        let Some(raw) = read(self.address, self.bytes) else {
+            return Some(false);
+        };
+        let value = raw & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -326,7 +329,31 @@ mod tests {
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
-        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), Some(false), "unreadable memory");
+    }
+
+    #[test]
+    fn unreadable_memory_holds_the_queue_without_counting_unknown() {
+        let mut held = Held::default();
+        let wait = ge(0x100, 1);
+        held.push(2, Item::Segment("waiter", vec![wait]));
+        let mut ran = Vec::new();
+        let read = |_, _| None;
+        let fence = |_| 0;
+        let mut run = |q, segs: Vec<&'static str>| ran.push((q, segs));
+        let mut signal = |_, _| true;
+        let p = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert_eq!((p.pieces, p.segments, p.unknown), (0, 0, 0));
+        assert!(ran.is_empty());
+        assert!(held.holds_work(2));
+        let blocked = held.blocked(&read);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].3, vec![wait]);
     }
 
     /// The compute queue's list waits for a value the graphics queue's list
