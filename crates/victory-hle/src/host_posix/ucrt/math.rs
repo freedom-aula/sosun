@@ -57,7 +57,8 @@ macro_rules! unary {
         }
         pub extern "win64" fn $f(x: f32) -> f32 {
             let g: fn(f64) -> f64 = $e;
-            check(&[f64::from(x)], g(f64::from(x))) as f32
+            // Checked as the float it returns: a double can be finite where the float is not.
+            check(&[f64::from(x)], f64::from(g(f64::from(x)) as f32)) as f32
         }
     )*};
 }
@@ -84,7 +85,8 @@ macro_rules! binary {
         }
         pub extern "win64" fn $f(x: f32, y: f32) -> f32 {
             let g: fn(f64, f64) -> f64 = $e;
-            check(&[f64::from(x), f64::from(y)], g(f64::from(x), f64::from(y))) as f32
+            let r = g(f64::from(x), f64::from(y)) as f32;
+            check(&[f64::from(x), f64::from(y)], f64::from(r)) as f32
         }
     )*};
 }
@@ -220,7 +222,7 @@ pub extern "win64" fn ldexp(x: f64, e: i32) -> f64 {
 }
 
 pub extern "win64" fn ldexpf(x: f32, e: i32) -> f32 {
-    check(&[f64::from(x)], scalbn_(f64::from(x), e)) as f32
+    check(&[f64::from(x)], f64::from(scalbn_(f64::from(x), e) as f32)) as f32
 }
 
 fn scalbn_(x: f64, e: i32) -> f64 {
@@ -682,6 +684,24 @@ mod tests {
         set_errno(0);
         assert!(sin(f64::NAN).is_nan());
         assert!(exp(f64::INFINITY).is_infinite());
+        assert_eq!(errno(), 0);
+    }
+
+    #[test]
+    fn a_float_that_overflows_sets_erange() {
+        // Finite as a double, infinite once rounded to a float.
+        fn overflows(what: &str, call: impl Fn() -> f32) {
+            set_errno(0);
+            assert!(call().is_infinite(), "{what}");
+            assert_eq!(errno(), ERANGE, "{what}");
+        }
+        overflows("expf(100)", || expf(100.0));
+        overflows("coshf(100)", || coshf(100.0));
+        overflows("powf(10, 50)", || powf(10.0, 50.0));
+        overflows("hypotf(3e38, 3e38)", || hypotf(3e38, 3e38));
+        overflows("ldexpf(1, 200)", || ldexpf(1.0, 200));
+        set_errno(0);
+        assert_eq!(expf(10.0), 10f32.exp());
         assert_eq!(errno(), 0);
     }
 
