@@ -302,7 +302,8 @@ fn remquo_(x: f64, y: f64) -> (f64, i32) {
     } else {
         ax
     };
-    let q = ((m - libm::remainder(m, ay)) / ay).round() as u64 & 7;
+    // Divided before subtracting: m - remainder(m, |y|) itself can overflow near DBL_MAX.
+    let q = (m / ay - libm::remainder(m, ay) / ay).round() as u64 & 7;
     (
         r,
         if (x < 0.0) != (y < 0.0) {
@@ -686,6 +687,9 @@ mod tests {
         assert_eq!((q, q & 7), (4, 4));
         remquo(-7.324363029649866e218, 1.232635503059459e62, &mut q);
         assert_eq!(q, -4);
+        // Near DBL_MAX: |x| - r would overflow, the quotient is 2.
+        remquo(f64::MAX, 1.0e308, &mut q);
+        assert_eq!(q, 2);
         // Every exponent: the sign and the low three bits of the magnitude, as C asks.
         let mut s = 0x1234_5678_9abc_def1u64;
         let mut next = || {
