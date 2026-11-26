@@ -424,3 +424,78 @@ fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
     assert_eq!(got[..10], [1; 10]);
     assert_eq!(got[10..], [0; 54]);
 }
+
+/// [`run_io`] of a wave64 group of 64, `dwords` read back from `dst`.
+fn run_lockstep(words: &[u32], lds: u32, dwords: usize) -> Vec<u32> {
+    let Some(mut t) = title() else { return Vec::new() };
+    let f = Fixture::new(&t);
+    let cs = translate_io(words, 5, lds << 15, 64, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.get(DST, dwords)
+}
+
+#[test]
+fn a_lane_read_behind_an_exec_branch_runs_in_lockstep() {
+    // Lanes 0..39 read lane 35's `v3` (1035) and `exec_hi` as data (lanes 32..39: 0xff) behind
+    // `s_cbranch_execz`: refused on the fast path (the halves split), run in lockstep.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        LANES_BELOW_40[0],
+        LANES_BELOW_40[1],
+        skip_execz(8),
+        0xD760_0006,
+        0x0001_4703, // v_readlane_b32 s6, v3, 35
+        0x7E04_0206, // v_mov_b32 v2, s6
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        0x7E04_027F, // v_mov_b32 v2, exec_hi
+        0xDC70_8100,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:256
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ];
+    let got = run_lockstep(&w, 0, 128);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [1035; 40]);
+    assert_eq!(got[40..64], [CANARY; 24]);
+    assert_eq!(got[64..104], [0xff; 40]);
+    assert_eq!(got[104..], [CANARY; 24]);
+}
+
+#[test]
+fn a_first_lane_read_in_lockstep_is_the_console_waves_first_lane() {
+    // Lanes 10..63 read the first lane EXEC leaves on (10: `v3` 1010), not each host wave's own
+    // (32 in the upper one); with the lane read behind the branch the program runs in lockstep.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7D82_0089, // v_cmp_lt_u32 vcc, 9, v0
+        LANES_BELOW_40[1],
+        skip_execz(9),
+        0x7E0C_0503, // v_readfirstlane_b32 s6, v3
+        0xD760_0007,
+        0x0001_4703, // v_readlane_b32 s7, v3, 35
+        0x7E04_0206, // v_mov_b32 v2, s6
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        0x7E04_0207, // v_mov_b32 v2, s7
+        0xDC70_8100,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:256
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ];
+    let got = run_lockstep(&w, 0, 128);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [CANARY; 10]);
+    assert_eq!(got[10..64], [1010; 54]);
+    assert_eq!(got[74..], [1035; 54]);
+}

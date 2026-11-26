@@ -727,7 +727,7 @@ impl<'a> Lower<'a> {
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
                 let sections = (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty());
-                halves = lanes > 32 && (console_lanes || sections);
+                halves = lanes > 32 && (console_lanes || sections || x.st.lockstep);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
@@ -8687,6 +8687,13 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.x.st.lockstep => {
+                // Lockstep: every thread runs, so the first lane is the wide EXEC's.
+                let a = s(self, 0)?;
+                let lane = self.lockstep_first_lane(inst)?;
+                let r = self.wide_read_lane(a, lane)?;
+                int(self, r)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;

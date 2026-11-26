@@ -2472,3 +2472,56 @@ fn whole_wave_float_products_lower() {
         panic!("{e}");
     }
 }
+
+/// A wave64 compute program of `threads` lanes with five root-constant SGPRs (`s[2:3]` an
+/// address), through `emit_with` as `translate_with` runs it on a 32-lane host.
+fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![root_const(0, 5)],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo { rsrc2: u32::from(lds) << 15 | 5 << 1, threads: [threads, 1, 1] }),
+        code: bytes_of(words),
+    };
+    let p = ir::build(&native.code, true, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty)?;
+    super::emit_with(&c, &native, &p, &st, &io, &res, Options { wave32_host: true, ..Options::default() })
+}
+
+/// Lanes below 40 read lane 35 and `exec_hi` as data behind an EXEC branch (`lockstep.rs`): the
+/// halves no longer meet at the exchange on the fast path, so the lockstep one translates it.
+pub(crate) const LOCKSTEP_READLANE: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+    0xBF88_0008, // s_cbranch_execz 8
+    0xD760_0006,
+    0x0001_4703, // v_readlane_b32 s6, v3, 35
+    0x7E04_0206, // v_mov_b32 v2, s6
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0x7E04_027F, // v_mov_b32 v2, exec_hi
+    0xDC70_8100,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:256
+    0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_lane_read_behind_an_exec_branch_translates_in_lockstep() {
+    if let Err(e) = emit_wave64_cs(LOCKSTEP_READLANE, 64, false) {
+        panic!("{e}");
+    }
+}
