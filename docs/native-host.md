@@ -129,7 +129,7 @@ Known Rosetta constraint, from `docs/macos.md`: a fault inside a masked or `vcvt
 | Win32 | Where | macOS |
 |-------|-------|-------|
 | Static TLS (`gs:[0x58]` array, `_tls_index`, TLS directory, TLS callbacks) | `victory-loader/src/tls.rs` redirects exe loads; `victory-pe` reads the directory | `native::teb` builds the array and per-thread blocks from each image's TLS directory and assigns each image its own index, so the redirect is not needed |
-| `TlsAlloc`, `TlsGetValue`, `TlsSetValue`, `TlsFree`, `FlsAlloc`... | title and C runtime | `host_posix.rs`: 64 slots at `TEB+0x1480`. `Fls*` and the expansion slots are not done |
+| `TlsAlloc`, `TlsGetValue`, `TlsSetValue`, `TlsFree`, `FlsAlloc`... | title and C runtime | `host_posix.rs`: 64 slots at `TEB+0x1480`; `TlsFree` zeroes the slot in every live TEB (`teb::clear_tls_slot`), so a slot handed out again reads 0. `Fls*` (`host_posix/system.rs`) is per host thread, with a generation per slot so a reused slot reads 0 too; its destructor callbacks and the expansion slots are not done |
 | `GetLastError`, `SetLastError` | everywhere | `TEB+0x68` |
 
 ### Time

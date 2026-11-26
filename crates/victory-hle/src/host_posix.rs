@@ -392,6 +392,8 @@ pub extern "system" fn TlsFree(index: u32) -> i32 {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // Zeroed before the slot can be handed out again.
+    teb::clear_tls_slot(index as usize);
     TLS_USED.fetch_and(!(1 << index), Ordering::AcqRel);
     1
 }
@@ -1117,6 +1119,28 @@ mod clock_tests {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
+
+    /// A TLS slot freed and handed out again reads 0 in every thread, not what it held before.
+    #[test]
+    fn a_reused_tls_slot_reads_zero_in_every_thread() {
+        let slot = TlsAlloc();
+        assert_ne!(slot, TLS_OUT_OF_INDEXES);
+        let (set, go) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<u32>());
+        let (set_tx, go_rx) = (set.0, go.1);
+        let other = std::thread::spawn(move || {
+            assert_eq!(TlsSetValue(slot, 5 as *mut c_void), 1);
+            set_tx.send(()).unwrap();
+            TlsGetValue(go_rx.recv().unwrap()) as usize
+        });
+        set.1.recv().unwrap();
+        assert_eq!(TlsSetValue(slot, 6 as *mut c_void), 1);
+        assert_eq!(TlsFree(slot), 1);
+        let again = TlsAlloc();
+        assert_ne!(again, TLS_OUT_OF_INDEXES);
+        go.0.send(again).unwrap();
+        assert_eq!((TlsGetValue(again) as usize, other.join().unwrap()), (0, 0));
+        assert_eq!(TlsFree(again), 1);
+    }
 
     #[test]
     fn reservations_start_on_64_kib_and_take_whole_granules() {
