@@ -41,10 +41,25 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Heap entries cleared because the texture they showed was released.
+    cleared: std::cell::Cell<u64>,
     /// Commands dropped because the host could not prepare them for another reason.
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+}
+
+/// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
+/// list (or this queue's next segment) may wait for with no other way to go on.
+fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
+    // Once per page: a title writes the same unmapped words every frame.
+    static PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if let Cmd::Fill { dst, len, value } = c {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pages.len() < 50 && pages.insert(dst >> 12) {
+            tracing::warn!("native host drops a value write: byte {value:#x} x{len} at {dst:#x}: {why}");
+        }
+    }
 }
 
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
@@ -134,6 +149,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
         }
@@ -247,6 +263,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
+        // The entries cleared when the texture last at this address was released are checked
+        // again: the record the title writes for the new one may equal the old one's.
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_gone(key) {
+                heap.mirrored.borrow_mut().remove(&index);
+            }
+        }
     }
 
     /// A shader-visible heap over the title's descriptor memory at `start` (zeroed memory the title
@@ -278,6 +301,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -313,6 +337,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);
+    }
+
+    /// The title released texture `key` for good (its object's last reference, or the pool it was
+    /// placed in): besides [`Self::forget_resource`], the heap entries that show it are cleared.
+    /// Left as they were, they kept the host texture alive and resident until the title happened
+    /// to write another view there, so the memory the GPU holds wired grew with play time.
+    /// A cleared entry is written again when the title writes another record there, or makes a
+    /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
+    /// name the next object at this address, of a format the view cannot be made over.
+    pub fn release_resource(&self, key: usize) {
+        let texture = matches!(self.resources.borrow_mut().remove(&key), Some(Res::Texture(_)));
+        if !texture {
+            return;
+        }
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_entries(key) {
+                self.backend.clear_entry(&heap.heap, index);
+                self.cleared.set(self.cleared.get() + 1);
+            }
+        }
+    }
+
+    /// Heap entries cleared so far because the texture they showed was released.
+    pub fn cleared(&self) -> u64 {
+        self.cleared.get()
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -370,6 +419,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                heap.shows(index, None);
             }
             Decoded::Image {
                 resource,
@@ -395,10 +445,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.shows(index, None);
             }
         }
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
@@ -648,6 +700,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1090,6 +1143,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
                 // Anything else the host cannot give one command (arguments that are not what the
@@ -1102,6 +1156,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
             }

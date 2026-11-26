@@ -170,6 +170,14 @@ fn residency_mode(asked: Option<&str>, supported: bool, memory: u64) -> (bool, b
     }
 }
 
+impl Queue {
+    /// The value the queue's order event has reached and the number of command buffers encoded
+    /// with it: equal when every one of them has finished (0 and 0 when the host does not order).
+    pub fn order_state(&self) -> (u64, u64) {
+        (self.2.signaledValue(), self.3.get())
+    }
+}
+
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
