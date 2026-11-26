@@ -508,6 +508,63 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
+    /// `VICTORY_TRACE_TARGETS=1`: the root parameters of the first draws that have vertex buffers,
+    /// and the title memory they name (descriptor words, then the first 64 bytes at the address a
+    /// constant buffer descriptor holds).
+    fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, dispatch: bool) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
+            return;
+        }
+        let read = |at: u64, n: usize| {
+            let mut b = vec![0u8; n];
+            let ok = super::safe_read(at as *const u8, &mut b);
+            let words: Vec<String> = b.chunks(4).map(|w| format!("{:08x}", u32::from_le_bytes(w.try_into().unwrap()))).collect();
+            format!("{}{}", if ok { "" } else { "UNREADABLE " }, words.join(" "))
+        };
+        for (i, r) in root.iter().enumerate() {
+            match r {
+                Some(Root::Constants(w)) => tracing::info!(slot = i, ?w, "draw root constants"),
+                Some(Root::View(a)) => tracing::info!(slot = i, addr = format!("{a:#x}"), mem = read(*a, 64), "draw root view"),
+                Some(Root::Table(h, at)) => {
+                    let base = h.start + *at as u64 * Self::step(h.kind);
+                    let d = read(base, 32 * 4);
+                    tracing::info!(slot = i, heap_start = format!("{:#x}", h.start), index = at, kind = ?h.kind, descriptors = d, "draw root table");
+                    for k in 0..4u64 {
+                        let handle = base + k * Self::step(h.kind);
+                        match crate::descriptor::view(handle) {
+                            Some(crate::descriptor::View::Constant(a, n)) => tracing::info!(entry = k, addr = format!("{a:#x}"), size = n, mem = read(a, 64), "table constant buffer"),
+                            Some(crate::descriptor::View::Shader(r, d)) => {
+                                let info = texture_info_of(r);
+                                let (nz, total) = info.as_ref().map_or((0, 0), |i| {
+                                    let m = super::textures::read_memory(i.memory, i.size.min(1 << 22));
+                                    (m.iter().filter(|&&b| b != 0).count(), m.len())
+                                });
+                                tracing::info!(entry = k, resource = format!("{r:#x}"), desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), nonzero_bytes = nz, of = total, "table texture");
+                            }
+                            Some(crate::descriptor::View::Unordered(r, counter, d)) => {
+                                let info = texture_info_of(r);
+                                let buffer = self.resources.borrow().get(&r).map(|b| match b {
+                                    Res::Buffer(a, n) => (*a, *n),
+                                    _ => (0, 0),
+                                });
+                                tracing::info!(entry = k, resource = format!("{r:#x}"), counter, desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), buffer = ?buffer, "table unordered view");
+                            }
+                            Some(crate::descriptor::View::Placed(_, res, d)) => tracing::info!(entry = k, ?res, ?d, "table placed view"),
+                            Some(v) => tracing::info!(entry = k, ?v, "table view"),
+                            None => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(b) = binding {
+            tracing::info!(dwords = b.dwords, user_data = ?b.user_data, views = ?b.views, ps = ?b.ps.as_ref().map(|p| p.user_data.clone()), "draw binding");
+        }
+    }
+
     fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
         let mut p = Prep {
             root: RootArgs::default(),
@@ -520,8 +577,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, ..
-            } => match &pso.binding {
+                root, pso, heaps, groups, ..
+            } => {
+                tracing::debug!(?groups, "dispatch");
+                if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
+                    static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                        tracing::info!(?groups, threads = ?pso.threads, "dispatch");
+                    }
+                }
+                self.trace_draw(root, pso.binding.as_ref(), true);
+                match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
                     if b.memory {
@@ -531,7 +597,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 None => self.root_args(root, &mut p)?,
-            },
+            }},
             Cmd::Draw {
                 root,
                 binding,
@@ -540,6 +606,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 index,
                 ..
             } => {
+                if !vertex.is_empty() {
+                    self.trace_draw(root, binding.as_deref(), false);
+                }
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
@@ -773,4 +842,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             },
         )
     }
+}
+
+/// The title texture a view names (macOS only; the target trace's).
+#[cfg(target_os = "macos")]
+fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
+    crate::resource::texture_info(r as crate::object::This)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
+    None
 }

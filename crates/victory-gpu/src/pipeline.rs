@@ -73,6 +73,9 @@ pub(crate) struct Shader {
     /// Its translation for the native host (container let go once made).
     #[cfg(target_os = "macos")]
     native: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
+    /// Its translation for rectangle lists (guessed vertex shaders; made at the first such draw).
+    #[cfg(target_os = "macos")]
+    rect: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -107,6 +110,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(target_os = "macos")]
             native: std::sync::OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            rect: std::sync::OnceLock::new(),
         }
     }
 
@@ -117,8 +122,25 @@ impl Shader {
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
-                *container = Vec::new();
+                // A vertex shader keeps its container: a rectangle-list draw translates it again.
+                if self.stage != "vertex" {
+                    *container = Vec::new();
+                }
                 made
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Shader {
+    /// The translation for rectangle-list draws, made on first use.
+    pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.rect
+            .get_or_init(|| {
+                let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                crate::native::shaders::translate_rect(&container).map(Arc::new)
             })
             .as_ref()
             .map_err(String::as_str)
@@ -278,10 +300,23 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static BINDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let n = BINDS[usize::from(p.graphics.is_some())].fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(with_state = p.graphics.is_some(), binds = n, "pipeline binds so far");
+        }
+    }
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = ?this, frame, with_state = p.graphics.is_some(), shaders = p.shaders.len(), "bound for the first time");
+    }
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
@@ -435,6 +470,24 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// A new pipeline with `base`'s shaders and `graphics` (device method 0x1b8, see
+/// `native::console_state`).
+#[cfg(target_os = "macos")]
+pub(crate) fn derive(
+    base: This,
+    graphics: impl FnOnce(Option<&crate::native::state::Graphics>) -> crate::native::state::Graphics,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if base.is_null() {
+        return E_INVALIDARG;
+    }
+    let from = pipeline(base);
+    let shaders = from.shaders.clone();
+    let graphics = graphics(from.graphics.as_deref());
+    hand_out(shaders, Some(Box::new(graphics)), iid, out)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,
@@ -491,7 +544,68 @@ pub(crate) extern "system" fn create_unread_1c8(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // `VICTORY_GUESS_GRAPHICS=1`: a pipeline from the pieces of the first slot, with the
+    // inferred state of `victory_shader::emit::graphics` and `native::state::Graphics::guessed`.
+    #[cfg(target_os = "macos")]
+    if !desc.is_null()
+        && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some()
+        // SAFETY: the title passes a description of this layout.
+        && let Some(stages) = unsafe { graphics_containers(desc.add(8)) }
+    {
+        return hand_out(
+            stages,
+            Some(Box::new(crate::native::state::Graphics::guess_base())),
+            iid,
+            out,
+        );
+    }
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() && !desc.is_null() {
+        static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+            // SAFETY: a debugging read of the title's description.
+            let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
+            tracing::info!(?words, "a graphics description with no vertex shader piece");
+        }
+    }
     create_unread_at(0x1c8, desc, iid, out)
+}
+
+/// The vertex and pixel shader containers of the slot at `slot` of a graphics description (pairs
+/// 4/5 and 2/3: code and metadata) as guessed pipelines have them; `None` when the slot lacks a
+/// vertex shader or a piece does not make a container.
+///
+/// # Safety
+/// `slot` points at a slot of eight (pointer, size) pairs.
+#[cfg(target_os = "macos")]
+unsafe fn graphics_containers(slot: *const u8) -> Option<Vec<Arc<Shader>>> {
+    use victory_shader::HwStage;
+    let piece = |pair: usize| -> Option<&[u8]> {
+        // SAFETY: as the caller says; the pieces are the title's, of the size it gives.
+        unsafe {
+            let ptr = slot.add(16 * pair).cast::<usize>().read_unaligned();
+            let size = slot.add(16 * pair + 8).cast::<usize>().read_unaligned();
+            (ptr != 0 && size != 0 && size <= 1 << 22)
+                .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
+        }
+    };
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
+        Ok(c) => Some(shader(name, &c)),
+        Err(e) => {
+            tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
+            None
+        }
+    };
+    // The vertex shader is pair 4/5, or pair 6/7 when that is empty (observed; the pairs vary).
+    let (code, meta) = match (piece(4), piece(5)) {
+        (Some(code), Some(meta)) => (code, meta),
+        _ => (piece(6)?, piece(7)?),
+    };
+    let vs = make(HwStage::Vs, "vertex", code, meta)?;
+    let mut shaders = vec![vs];
+    if let (Some(code), Some(meta)) = (piece(2), piece(3)) {
+        shaders.push(make(HwStage::Ps, "pixel", code, meta)?);
+    }
+    Some(shaders)
 }
 
 /// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
@@ -577,6 +691,20 @@ fn dump_description(slot: usize, desc: *const u8) {
         for (i, w) in words.chunks(4).enumerate() {
             eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
         }
+        if std::env::var_os("VICTORY_DUMP_STATE").is_some() && n < 6 {
+            // The block of host pointers at the end of each stage slot: what each points at.
+            for w in [0x110usize, 0x118, 0x128, 0x130] {
+                let p = words[(8 + w) / 8];
+                let q = p & 0xffff_ffff;
+                for (tag, p) in [("full", p), ("low32", q)] {
+                    if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) || (tag == "low32" && p > 0x10000) {
+                        let bytes = std::slice::from_raw_parts(p as *const u8, 0x100);
+                        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!("  STATEPTR slot0+{w:#x} {tag} {p:#x} {hex}");
+                    }
+                }
+            }
+        }
         for i in 0..191 {
             let (p, len) = (words[i], words[i + 1]);
             if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
@@ -603,6 +731,9 @@ fn create_unread_at(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
+        tracing::info!(slot, "a pipeline created without shaders");
+    }
     if std::env::var_os("VICTORY_DUMP_DESC").is_some() && !_desc.is_null() {
         dump_description(slot, _desc);
     }
@@ -685,6 +816,9 @@ pub(crate) extern "system" fn create_stream(
     }
     // SAFETY: the title passes a whole stream.
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
+    if std::env::var_os("VICTORY_TRACE_STREAM").is_some() {
+        trace_stream(stream);
+    }
     #[allow(unused_variables)]
     let (shaders, graphics) = read_stream(stream, copy);
     hand_out(
@@ -696,6 +830,28 @@ pub(crate) extern "system" fn create_stream(
         iid,
         out,
     )
+}
+
+/// Debugging (`VICTORY_TRACE_STREAM=1`): each distinct sequence of subobject types, with the
+/// first stream that had it in full.
+fn trace_stream(stream: &[u8]) {
+    static SEEN: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+    let mut kinds = Vec::new();
+    let mut at = 0;
+    while at + 8 <= stream.len() {
+        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+        kinds.push(kind);
+        match subobject(kind) {
+            Some((size, _)) => at += size,
+            None => break,
+        }
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 40 && !seen.contains(&kinds) {
+        let hex: String = stream.iter().take(0x300).map(|b| format!("{b:02x}")).collect();
+        eprintln!("STREAM kinds={kinds:?} size={:#x} {hex}", stream.len());
+        seen.push(kinds);
+    }
 }
 
 #[cfg(windows)]

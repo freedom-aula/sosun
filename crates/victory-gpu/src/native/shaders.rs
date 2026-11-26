@@ -34,6 +34,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
 }
 
+/// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
+pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute shaders).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
@@ -207,11 +212,18 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.refuse(name, "no input signature".into());
             return Pipe::Refused;
         };
-        let Some((attributes, streams)) = g.vertex_layout(&reads) else {
+        let Some((mut attributes, streams)) = g.vertex_layout(&reads) else {
             self.shaders
                 .refuse(name, "the vertex shader reads an input the layout lacks".into());
             return Pipe::Refused;
         };
+        // A system value ahead of the attributes takes an attribute number: described as the
+        // attribute after it, which the converter's function ignores.
+        for at in state::system_gaps(&vs.dxil) {
+            if let Some(next) = attributes.get(at).copied() {
+                attributes.insert(at, next);
+            }
+        }
         let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
             self.shaders.refuse(name, "a target format the host does not know".into());
             return Pipe::Refused;

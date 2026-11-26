@@ -9,7 +9,8 @@
 //! work and fence values along.
 
 use super::memory::{PoolObserver, PoolTable};
-use super::title::{Pipe, Title, TitleList, Wait};
+use super::state::Graphics;
+use super::title::{Guessed, Pipe, TargetFormats, Title, TitleList, Wait};
 use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,8 +225,147 @@ pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::presen
     with_title(|t| t.host.backend.create_layer(width, height)).ok_or_else(|| "no native host GPU".into())
 }
 
+/// `VICTORY_TRACE_TARGETS=1`: per frame, what drew into or cleared which title texture, and what
+/// was presented (logged at each present).
+fn tracing_targets() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_TARGETS").is_some())
+}
+
+/// Draws and clears by title texture since the last present, and dropped texture operations.
+static TRACE: Mutex<Option<std::collections::HashMap<usize, [u32; 2]>>> = Mutex::new(None);
+static DROPPED_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn trace_bump(key: usize, which: usize) {
+    if tracing_targets() {
+        TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().entry(key).or_default()[which] += 1;
+    }
+}
+
+/// `VICTORY_DUMP_TITLE=<dir>,<seconds>,<seconds>...`: at the first present after each time, the
+/// title memory behind every 8-bit colour target drawn to since the last present is read whole,
+/// the fraction of non-zero bytes logged, and the memory detiled into a scratch texture and
+/// written as `<dir>/m<time>_<n>.ppm`: what the title (CPU, DMA) put there, whatever the GPU did.
+#[inline(never)]
+fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static DONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let start = START.get_or_init(std::time::Instant::now);
+    let Ok(v) = std::env::var("VICTORY_DUMP_TITLE") else { return };
+    let mut parts = v.split(',');
+    let dir = parts.next().unwrap_or(".").to_owned();
+    let now = start.elapsed().as_secs();
+    let Some(time) = parts
+        .filter_map(|p| p.parse::<u64>().ok())
+        .find(|&t| now >= t && !DONE.lock().unwrap_or_else(|e| e.into_inner()).contains(&t))
+    else {
+        return;
+    };
+    DONE.lock().unwrap_or_else(|e| e.into_inner()).push(time);
+    with_title(|t| {
+        for (n, key) in stats.keys().enumerate() {
+            let Some(info) = crate::resource::texture_info(*key as This) else { continue };
+            if !matches!(info.format, 28 | 87 | 91 | 29) {
+                continue;
+            }
+            let tiled = super::textures::read_memory(info.memory, info.size);
+            let nz = tiled.iter().filter(|&&b| b != 0).count();
+            tracing::info!(time, n, key = format!("{key:#x}"), at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, "title memory of a colour target");
+            let Some(desc) = info.desc() else { continue };
+            let Ok(tex) = t.host.texture(&desc) else { continue };
+            if super::textures::upload(&t.host.backend, &tex, &info, &tiled).is_err() {
+                continue;
+            }
+            let (w, h) = (info.width as usize, info.height as usize);
+            let mut px = vec![0u8; w * h * 4];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
+            let bgra = matches!(info.format, 87 | 91);
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{time}_{n}.ppm")), out);
+        }
+    });
+}
+
+/// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
+/// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`.
+fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let Some((dir, secs)) = std::env::var("VICTORY_DUMP_TARGETS")
+        .ok()
+        .and_then(|v| v.rsplit_once(',').map(|(d, s)| (d.to_owned(), s.parse::<u64>().unwrap_or(25))))
+    else {
+        return;
+    };
+    if start.elapsed().as_secs() < secs || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    with_title(|t| {
+        for (n, key) in stats.keys().enumerate() {
+            let Some(info) = crate::resource::texture_info(*key as This) else { continue };
+            if !matches!(info.format, 28 | 87 | 91 | 29) {
+                continue;
+            }
+            let Some(tex) = t.texture_of(*key) else { continue };
+            let (w, h) = (info.width as usize, info.height as usize);
+            let mut px = vec![0u8; w * h * 4];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
+            let bgra = matches!(info.format, 87 | 91);
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}.ppm")), out);
+            tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
+        }
+    });
+}
+
+/// A texture operation the native host does not do (copies, resolves), counted by the trace.
+pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
+    crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
+    if tracing_targets() {
+        DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
+    }
+}
+
+#[inline(never)]
+fn trace_present(resource: This) {
+        let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
+        let described: Vec<String> = with_title(|t| {
+            stats
+                .iter()
+                .map(|(k, [d, c])| {
+                    let i = crate::resource::texture_info(*k as This);
+                    let (f, w, h, a) = i.map_or((0, 0, 0, 0), |i| (i.format, i.width, i.height, i.memory as usize));
+                    let mark = if *k == resource as usize { " PRESENTED" } else { "" };
+                    let _ = &t;
+                    format!("{k:#x} fmt {f} {w}x{h} at {a:#x} draws {d} clears {c}{mark}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+        dump_targets(&stats);
+        dump_title_memory(&stats);
+        let pi = crate::resource::texture_info(resource);
+        tracing::info!(
+            present = ?resource,
+            at = pi.as_ref().map_or(0, |i| i.memory as usize),
+            fmt = pi.as_ref().map_or(0, |i| i.format),
+            targets = ?described,
+            dropped_ops = ?ops.iter().take(8).collect::<Vec<_>>(),
+            dropped = ops.len(),
+            "frame targets"
+        );
+}
+
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    if tracing_targets() {
+        trace_present(resource);
+    }
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
@@ -274,12 +414,19 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let color: Vec<_> = color
+        let colors: Vec<usize> = color
             .iter()
             .filter_map(|&h| crate::descriptor::rtv_record(h))
-            .filter_map(|r| t.texture_of(r.resource as usize))
+            .map(|r| r.resource as usize)
             .collect();
-        let depth = crate::descriptor::dsv_record(depth).and_then(|r| t.texture_of(r.resource as usize));
+        let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
+        let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
+        let depth = depth_key.and_then(|k| t.texture_of(k));
+        l.target_keys = colors.iter().copied().chain(depth_key).collect();
+        l.targets = TargetFormats {
+            color: colors.iter().filter_map(|&k| t.format_of(k)).collect(),
+            depth: depth_key.and_then(|k| t.format_of(k)),
+        };
         l.list.set_render_targets(&color, depth.as_ref());
     });
 }
@@ -288,6 +435,9 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
         if let Some(tex) = crate::descriptor::rtv_record(handle).and_then(|r| t.texture_of(r.resource as usize)) {
+            if let Some(r) = crate::descriptor::rtv_record(handle) {
+                trace_bump(r.resource as usize, 1);
+            }
             l.list.clear_render_target(&tex, color);
         }
     });
@@ -392,13 +542,22 @@ pub(crate) fn set_pipeline(this: This, pipeline: This) {
     with_list(this, |_, l| l.pipeline = pipeline as usize);
 }
 
-/// The host pipeline of title pipeline `key`, made at first use.
-fn pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The host pipeline of title pipeline `key` for a draw into `targets`, made at first use. A
+/// console pipeline's state names no target formats, so it is made again for each set of targets.
+fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> {
     if let Some(p) = t.pipelines.get(&key) {
         return p.clone();
     }
-    let made = make_pipe(t, key);
-    t.pipelines.insert(key, made.clone());
+    let console_key = (key, targets.clone());
+    if let Some(p) = t.console_pipes.get(&console_key) {
+        return p.clone();
+    }
+    let (made, console) = make_pipe(t, key, targets);
+    if console {
+        t.console_pipes.insert(console_key, made.clone());
+    } else {
+        t.pipelines.insert(key, made.clone());
+    }
     made
 }
 
@@ -426,11 +585,42 @@ pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
     )
 }
 
+/// The frame log's line of native draw counters, and the commands dropped by kind (kept out of
+/// `PresentX`, whose frame it would otherwise enlarge).
+#[inline(never)]
+pub(crate) fn log_draw_counts(frame: u64) {
+    let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
+    let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
+    let indirect = crate::list::indirect_dropped();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+}
+
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
-fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The second result says the pipeline depends on the draw's targets.
+fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
-        return Pipe::Refused;
+        return (Pipe::Refused, false);
     };
+    let graphics = graphics.map(|g| {
+        if g.names_targets() {
+            (g, false)
+        } else {
+            (super::console_state::graphics_state_for(&g, targets.color.clone(), targets.depth), true)
+        }
+    });
+    let console = graphics.as_ref().is_some_and(|g| g.1);
+    if console && std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = key, ?targets, state = ?graphics.as_ref().map(|g| &g.0), "console pipeline state at its draw");
+    }
+    let graphics = graphics.map(|g| g.0);
+    (make_host_pipe(t, stages, graphics), console)
+}
+
+fn make_host_pipe(
+    t: &mut MetalTitle,
+    stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
+    graphics: Option<super::state::Graphics>,
+) -> Pipe<Metal> {
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -450,6 +640,17 @@ fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     match graphics {
         None => match find("compute") {
             Some(cs) => t.compute_pipe(cs, &name),
+            None => Pipe::Refused,
+        },
+        Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
+            Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
+                vs_source: stages.iter().find(|s| s.0 == "vertex").expect("a vertex stage").1.clone(),
+                vs: vs.clone(),
+                ps: hosts.iter().find(|h| h.0 == "pixel").map(|h| h.1.clone()),
+                name,
+                state: g.clone(),
+                made: Default::default(),
+            })),
             None => Pipe::Refused,
         },
         Some(g) => match find("vertex") {
@@ -479,7 +680,7 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
 }
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
-    with_list(this, |t, l| match pipe(t, l.pipeline) {
+    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
@@ -497,6 +698,12 @@ pub(crate) fn topology(this: This, topology: u32) {
 
 /// `RSSetViewports`: the first one.
 pub(crate) fn viewports(this: This, first: Option<[f32; 6]>) {
+    if tracing_targets() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(?first, "viewport set");
+        }
+    }
     with_list(this, |_, l| {
         l.list.set_viewport(first.map(|v| victory_backend::resources::Viewport {
             x: v[0],
@@ -531,37 +738,102 @@ pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
 }
 
 /// `IASetVertexBuffers`: the addresses of the streams from `start`.
-pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64]) {
+pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides: &[u32]) {
     with_list(this, |_, l| {
         for (i, a) in addresses.iter().enumerate() {
             l.list.set_vertex_buffer(start as usize + i, *a);
+            let slot = start as usize + i;
+            if l.strides.len() <= slot {
+                l.strides.resize(slot + 1, 0);
+            }
+            l.strides[slot] = strides.get(i).copied().unwrap_or(0);
         }
     });
 }
 
+/// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
+fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> Pipe<Metal> {
+    let key = format!("{:?}{rect}", l.strides);
+    let rect_vs = if rect {
+        match g.vs_source.native_rect() {
+            Ok(h) => Some(h.clone()),
+            Err(e) => {
+                t.refused_translation(&g.name, format!("rectangle list: {e}"));
+                return Pipe::Refused;
+            }
+        }
+    } else {
+        None
+    };
+    let vs = rect_vs.as_deref().unwrap_or(&g.vs);
+    if let Some(p) = g.made.borrow().get(&key) {
+        return p.clone();
+    }
+    let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
+    tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
+    let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
+    let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
+    g.made.borrow_mut().insert(key, made.clone());
+    made
+}
+
 /// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
 /// counted) when there is nothing to draw with.
-fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
-    let Pipe::Render(pso, binding) = pipe(t, l.pipeline) else {
-        dropped();
-        return false;
+fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+    // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
+    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
+    let rect = l.topology == 17;
+    let targets = l.targets.clone();
+    let made = match pipe(t, l.pipeline, &targets) {
+        Pipe::Guess(g) => guess(t, l, &g, rect),
+        p => p,
     };
-    let Some(topology) = super::state::topology(l.topology) else {
+    let Pipe::Render(pso, binding) = made else {
         dropped();
-        return false;
+        return None;
+    };
+    let topology = if rect {
+        Some(victory_backend::resources::Topology::TriangleStrip)
+    } else {
+        super::state::topology(l.topology)
+    };
+    let Some(topology) = topology else {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if l.topology < 64 && SEEN.fetch_or(1 << l.topology, Ordering::Relaxed) >> l.topology & 1 == 0 {
+            tracing::info!(topology = l.topology, "a draw dropped for its primitive topology");
+        }
+        dropped();
+        return None;
     };
     l.list.set_graphics_pipeline(&pso, topology);
     l.list.set_graphics_binding(binding);
-    true
+    Some(rect)
 }
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    if tracing_targets() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            with_list(this, |_, l| {
+                let mut head = [0u8; 48];
+                let at = l.list.vertex_buffer_address(0);
+                let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
+                tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.targets, "draw");
+            });
+        }
+    }
     with_list(this, |t, l| {
-        if graphics(t, l) {
-            match l.list.draw_instanced(vertices, instances, first, first_instance) {
+        if let Some(rect) = graphics(t, l) {
+            let call = if rect {
+                l.list.draw_instanced(4, vertices / 3, 0, first / 3)
+            } else {
+                l.list.draw_instanced(vertices, instances, first, first_instance)
+            };
+            match call {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
             }
@@ -572,10 +844,16 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if graphics(t, l) {
+        if let Some(rect) = graphics(t, l) {
+            if rect {
+                // shortcut: indexed rectangle lists are not drawn.
+                dropped();
+                return;
+            }
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
             }

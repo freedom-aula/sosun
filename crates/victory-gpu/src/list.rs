@@ -742,6 +742,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         crate::resource::buffer_bytes(src),
     ) {
         crate::native::glue::copy_memory(this, to as u64, from as u64, a.min(b));
+    } else {
+        #[cfg(target_os = "macos")]
+        crate::native::glue::dropped_op("CopyResource", dst, src);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, dst, src);
@@ -773,6 +776,11 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(target_os = "macos")]
+    // SAFETY: the title passes both locations (null is tolerated).
+    if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1068,6 +1076,8 @@ extern "system" fn resolve(
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::native::glue::dropped_op("ResolveSubresource", dst, src);
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
@@ -1790,7 +1800,8 @@ mod state {
         views: *const (u64, u32, u32),
     ) {
         let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
-        glue::vertex_buffers(this, start, &addresses);
+        let strides: Vec<u32> = items(views, count).iter().map(|v| v.2).collect();
+        glue::vertex_buffers(this, start, &addresses, &strides);
     }
 
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
@@ -1844,8 +1855,8 @@ mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
+    pub(super) use super::dropped_mesh as dispatch_mesh;
+    pub(super) use super::dropped_mesh_x as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
@@ -1877,6 +1888,41 @@ fn count_draw() {
 #[cfg(not(windows))]
 extern "system" fn draw(_: This) {
     count_draw();
+}
+
+/// Commands the native host drops, by kind: mesh dispatches, indirect mesh dispatches, indirect
+/// executions, texture copies and resolves.
+#[cfg(target_os = "macos")]
+pub(crate) static DROPPED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The totals of [`DROPPED_KINDS`].
+#[cfg(target_os = "macos")]
+pub(crate) fn dropped_kinds() -> (u64, u64, u64, u64, u64) {
+    let n = |i: usize| DROPPED_KINDS[i].load(std::sync::atomic::Ordering::Relaxed);
+    (n(0), n(1), n(2), n(3), n(4))
+}
+
+/// Indirect executions dropped so far.
+#[cfg(target_os = "macos")]
+pub(crate) fn indirect_dropped() -> u64 {
+    INDIRECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+fn drop_kind(kind: usize) {
+    DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
+    drop_kind(0);
+    draw(this);
+}
+
+#[cfg(target_os = "macos")]
+extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u64, _payload: u64) {
+    drop_kind(if indirect != 0 { 1 } else { 0 });
+    draw(this);
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,

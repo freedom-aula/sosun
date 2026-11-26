@@ -345,7 +345,41 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+    let pending = status_result(this, index) == E_PENDING;
+    if pending {
+        // Debugging: a request polled this long is stuck; say where its queue's requests are.
+        static POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 5000 == 0 {
+            log_pending(this, index, n);
+        }
+    }
+    !pending
+}
+
+/// Logs the state of every lane (the scheduler's queue) for a status entry still pending.
+#[inline(never)]
+fn log_pending(this: Array, index: u32, polls: u64) {
+    let Some(s) = scheduler() else { return };
+    let lanes = s.lock();
+    let state: Vec<String> = lanes
+        .lanes
+        .iter()
+        .filter(|(_, l)| l.entries() > 0)
+        .map(|(id, l)| {
+            format!(
+                "lane {id}: unsubmitted {} held {} reads {} statuses {} running {} failures {} capacity {}",
+                l.unsubmitted.len(),
+                l.held.len(),
+                l.reads.len(),
+                l.statuses.len(),
+                l.running.len(),
+                l.failures.len(),
+                l.capacity
+            )
+        })
+        .collect();
+    tracing::warn!(array = ?this, index, polls, staged = lanes.staged, ?state, "dstorage: a status entry is still pending");
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -562,7 +596,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
+            tracing::info!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),

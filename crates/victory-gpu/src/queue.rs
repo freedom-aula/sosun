@@ -696,8 +696,7 @@ extern "system" fn present(
     }
     #[cfg(target_os = "macos")]
     if frame % 64 == 0 {
-        let (recorded, encoded, no_pipeline, no_texture) = crate::native::glue::draw_counts();
-        tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, "native draws so far");
+        crate::native::glue::log_draw_counts(frame);
     }
     #[cfg(windows)]
     account_frame(frame);

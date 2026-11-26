@@ -124,8 +124,9 @@ pub fn upload<B: ResourceBackend>(
 /// for a few frames; a per-page write test would make that exact.
 #[derive(Default)]
 struct Watch {
-    /// Title texture key to (address, bytes).
-    entries: HashMap<usize, (usize, usize)>,
+    /// Title texture key to (address, bytes, whether it is a render target: its first sight is
+    /// its baseline, not a change).
+    entries: HashMap<usize, (usize, usize, bool)>,
     dirty: std::collections::HashSet<usize>,
 }
 
@@ -142,10 +143,10 @@ fn start_scanner() {
             let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                let list: Vec<(usize, (usize, usize))> =
+                let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
                 seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for (key, (at, size)) in list {
+                for (key, (at, size, target)) in list {
                     let mut h = blake3::Hasher::new();
                     for off in (0..size).step_by(buf.len()) {
                         let n = buf.len().min(size - off);
@@ -154,7 +155,8 @@ fn start_scanner() {
                         h.update(&buf[..n]);
                     }
                     let h = h.finalize();
-                    if seen.insert(key, h) != Some(h) {
+                    let before = seen.insert(key, h);
+                    if before != Some(h) && !(target && before.is_none()) {
                         watch(|w| w.dirty.insert(key));
                     }
                 }
@@ -216,10 +218,10 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
-        if !info.render_target() {
-            watch(|w| w.entries.insert(key, (info.memory as usize, info.size)));
-            start_scanner();
-        }
+        // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
+        // it changes, as it is not otherwise seen (a GPU write never changes title memory).
+        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
+        start_scanner();
         // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
         // was never drawn into, and a black one was drawn black.
         if info.render_target() && std::env::var_os("VICTORY_MAGENTA").is_some() {
@@ -240,6 +242,11 @@ impl<B: PresentBackend> Title<B> {
             },
         );
         true
+    }
+
+    /// The format of the host texture of title texture `key`.
+    pub fn format_of(&self, key: usize) -> Option<Format> {
+        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
     }
 
     /// The host texture of title texture `key`.
@@ -265,14 +272,14 @@ impl<B: PresentBackend> Title<B> {
     /// Brings the textures the host samples up to date with title memory: those whose memory
     /// changed since their last upload are detiled again.
     pub fn sync_textures(&mut self) {
-        self.sync_where(|_, _| true);
+        self.sync_where(|_, t| !t.info.render_target());
     }
 
     /// What a submission does: the textures not uploaded yet, and those the scanner found
     /// changed since.
     pub fn sync_dirty(&mut self) {
         let dirty = watch(|w| std::mem::take(&mut w.dirty));
-        self.sync_where(|key, t| t.last.is_none() || dirty.contains(&key));
+        self.sync_where(|key, t| (t.last.is_none() && !t.info.render_target()) || dirty.contains(&key));
     }
 
     fn sync_where(&mut self, wanted: impl Fn(usize, &Tracked<B>) -> bool) {
@@ -282,7 +289,7 @@ impl<B: PresentBackend> Title<B> {
             stats,
             ..
         } = self;
-        for (key, t) in textures.iter_mut().filter(|(k, t)| !t.info.render_target() && wanted(**k, t)) {
+        for (key, t) in textures.iter_mut().filter(|(k, t)| wanted(**k, t)) {
             let key = &key;
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);

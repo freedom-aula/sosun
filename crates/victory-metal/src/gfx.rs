@@ -199,6 +199,7 @@ fn vertex_format(f: VertexFormat) -> MTLVertexFormat {
         VertexFormat::Float4 => MTLVertexFormat::Float4,
         VertexFormat::Uint => MTLVertexFormat::UInt,
         VertexFormat::Unorm8x4 => MTLVertexFormat::UChar4Normalized,
+        VertexFormat::Unorm8 => MTLVertexFormat::UCharNormalized,
     }
 }
 

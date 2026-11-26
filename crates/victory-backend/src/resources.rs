@@ -13,7 +13,7 @@ pub enum HeapKind {
 }
 
 /// The DXGI formats the title's textures use.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
@@ -205,6 +205,7 @@ pub enum VertexFormat {
     Float4,
     Uint,
     Unorm8x4,
+    Unorm8,
 }
 
 /// One input element (`D3D12_INPUT_ELEMENT_DESC`), in the order of the vertex shader's input signature.
