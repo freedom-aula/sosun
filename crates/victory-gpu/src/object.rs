@@ -361,7 +361,15 @@ static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
 /// Logged once per slot, with the caller's offset in its module (the title
 /// image for title calls). Wrong for a slot that returns a value instead of
 /// an `HRESULT`.
-extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+extern "system" fn missing<const KIND: usize, const SLOT: usize>(
+    this: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> HRESULT {
+    trace_missing(KIND, SLOT, [this, a1, a2, a3, a4, a5]);
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
         tracing::warn!(
             object = KINDS[KIND],
@@ -371,6 +379,32 @@ extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
         );
     }
     E_NOTIMPL
+}
+
+/// Debugging (`VICTORY_TRACE_MISSING=1`): the first calls of each unwritten slot, with their
+/// arguments and the first 0x40 bytes behind each argument that looks like a pointer.
+fn trace_missing(kind: usize, slot: usize, args: [usize; 6]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static COUNTS: [[AtomicU32; MAX_SLOTS]; KINDS.len()] =
+        [const { [const { AtomicU32::new(0) }; MAX_SLOTS] }; KINDS.len()];
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_MISSING").is_some()) {
+        return;
+    }
+    if COUNTS[kind][slot].fetch_add(1, Ordering::Relaxed) >= std::env::var("VICTORY_TRACE_MISSING_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(12) {
+        return;
+    }
+    let len = std::env::var("VICTORY_TRACE_MISSING").ok().and_then(|v| v.parse().ok()).unwrap_or(0x40);
+    let mut text = String::new();
+    for (i, a) in args.iter().enumerate().skip(1) {
+        text += &format!(" a{i}={a:#x}");
+        if (0x1_0000_0000..0x7fff_ffff_ffff).contains(a) {
+            // SAFETY: a debugging read of what the title passed; may fault on a stale pointer.
+            let bytes = unsafe { std::slice::from_raw_parts(*a as *const u8, if i == 3 { len } else { 0x10 }) };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            text += &format!(" [{hex}]");
+        }
+    }
+    tracing::info!("MISSING {} slot {:#x}{text}", KINDS[kind], slot * 8);
 }
 
 /// The return address of whoever called our caller, as `+offset` into its

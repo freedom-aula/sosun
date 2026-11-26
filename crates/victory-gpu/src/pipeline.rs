@@ -300,10 +300,23 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static BINDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        let n = BINDS[usize::from(p.graphics.is_some())].fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(with_state = p.graphics.is_some(), binds = n, "pipeline binds so far");
+        }
+    }
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let frame = crate::frame::current();
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = ?this, frame, with_state = p.graphics.is_some(), shaders = p.shaders.len(), "bound for the first time");
+    }
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
@@ -457,6 +470,24 @@ fn hand_out(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// A new pipeline with `base`'s shaders and `graphics` (device method 0x1b8, see
+/// `native::console_state`).
+#[cfg(target_os = "macos")]
+pub(crate) fn derive(
+    base: This,
+    graphics: impl FnOnce(Option<&crate::native::state::Graphics>) -> crate::native::state::Graphics,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if base.is_null() {
+        return E_INVALIDARG;
+    }
+    let from = pipeline(base);
+    let shaders = from.shaders.clone();
+    let graphics = graphics(from.graphics.as_deref());
+    hand_out(shaders, Some(Box::new(graphics)), iid, out)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,
@@ -523,7 +554,7 @@ pub(crate) extern "system" fn create_unread_1c8(
     {
         return hand_out(
             stages,
-            Some(Box::new(crate::native::state::Graphics::guessed(Vec::new(), None, Vec::new(), &[], false))),
+            Some(Box::new(crate::native::state::Graphics::guess_base())),
             iid,
             out,
         );
@@ -660,6 +691,20 @@ fn dump_description(slot: usize, desc: *const u8) {
         for (i, w) in words.chunks(4).enumerate() {
             eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
         }
+        if std::env::var_os("VICTORY_DUMP_STATE").is_some() && n < 6 {
+            // The block of host pointers at the end of each stage slot: what each points at.
+            for w in [0x110usize, 0x118, 0x128, 0x130] {
+                let p = words[(8 + w) / 8];
+                let q = p & 0xffff_ffff;
+                for (tag, p) in [("full", p), ("low32", q)] {
+                    if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) || (tag == "low32" && p > 0x10000) {
+                        let bytes = std::slice::from_raw_parts(p as *const u8, 0x100);
+                        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!("  STATEPTR slot0+{w:#x} {tag} {p:#x} {hex}");
+                    }
+                }
+            }
+        }
         for i in 0..191 {
             let (p, len) = (words[i], words[i + 1]);
             if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
@@ -771,6 +816,9 @@ pub(crate) extern "system" fn create_stream(
     }
     // SAFETY: the title passes a whole stream.
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
+    if std::env::var_os("VICTORY_TRACE_STREAM").is_some() {
+        trace_stream(stream);
+    }
     #[allow(unused_variables)]
     let (shaders, graphics) = read_stream(stream, copy);
     hand_out(
@@ -782,6 +830,28 @@ pub(crate) extern "system" fn create_stream(
         iid,
         out,
     )
+}
+
+/// Debugging (`VICTORY_TRACE_STREAM=1`): each distinct sequence of subobject types, with the
+/// first stream that had it in full.
+fn trace_stream(stream: &[u8]) {
+    static SEEN: std::sync::Mutex<Vec<Vec<u32>>> = std::sync::Mutex::new(Vec::new());
+    let mut kinds = Vec::new();
+    let mut at = 0;
+    while at + 8 <= stream.len() {
+        let kind = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+        kinds.push(kind);
+        match subobject(kind) {
+            Some((size, _)) => at += size,
+            None => break,
+        }
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 40 && !seen.contains(&kinds) {
+        let hex: String = stream.iter().take(0x300).map(|b| format!("{b:02x}")).collect();
+        eprintln!("STREAM kinds={kinds:?} size={:#x} {hex}", stream.len());
+        seen.push(kinds);
+    }
 }
 
 #[cfg(windows)]

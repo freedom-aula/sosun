@@ -70,16 +70,17 @@ pub struct Graphics {
     rt_formats: Vec<u32>,
     depth_format: u32,
     pub samples: u32,
-    /// A guessed pipeline (`VICTORY_GUESS_GRAPHICS`, [`Graphics::guessed`]): the formats of the
-    /// targets bound at the draw, and the strides of the vertex buffers bound.
+    /// The formats of the targets bound at the draw, for pipelines whose description has none
+    /// (the console's; see [`Graphics::with_targets`]).
+    bound: Option<(Vec<Format>, Option<Format>)>,
+    /// A guessed pipeline (`VICTORY_GUESS_GRAPHICS`, [`Graphics::guess_base`]): its vertex layout
+    /// and strides come from the draw ([`Graphics::for_draw`]).
     guess: Option<Guess>,
 }
 
 /// What a draw gives a guessed pipeline that the description does not.
 #[derive(Clone, Debug, PartialEq, Default)]
 struct Guess {
-    colors: Vec<Format>,
-    depth: Option<Format>,
     strides: Vec<u32>,
     /// A rectangle-list draw: every attribute is read for three corners, one instance a rectangle.
     rect: bool,
@@ -106,6 +107,7 @@ impl Default for Graphics {
             rt_formats: Vec::new(),
             depth_format: 0,
             samples: 1,
+            bound: None,
             guess: None,
         }
     }
@@ -223,19 +225,26 @@ impl Graphics {
         }
     }
 
-    /// The state of a pipeline whose description has none (device slot 0x1c8; docs/native-host.md,
-    /// "Guessed graphics pipelines"): no blend, no culling, depth test less-equal with writes, the
-    /// formats of the targets bound, and the vertex buffer slots and strides the draw has. The
-    /// input elements are the vertex shader's `VB<kind><n>` semantics (`reads`, as
-    /// [`vertex_inputs`] gives them; index: slot << 16 | byte offset).
-    pub fn guessed(
+    /// The state of a pipeline made by device slot 0x1c8, whose description has none
+    /// (docs/native-host.md, "Guessed graphics pipelines"): no blend, no culling, depth test
+    /// less-equal with writes. Variants made by slot 0x1b8 apply their records over it.
+    pub fn guess_base() -> Graphics {
+        Graphics { cull: 1, depth_func: 4, guess: Some(Guess::default()), ..Graphics::default() }
+    }
+
+    /// This guessed state for a draw: the targets and vertex strides bound, and the input
+    /// elements the vertex shader's `VB<kind><n>` semantics are (`reads`, as [`vertex_inputs`]
+    /// gives them; index: corner << 28 | slot << 16 | byte offset, corner 0 unless `rect`).
+    pub fn for_draw(
+        &self,
         colors: Vec<Format>,
         depth: Option<Format>,
         strides: Vec<u32>,
         reads: &[(String, u32)],
         rect: bool,
     ) -> Graphics {
-        let mut g = Graphics { cull: 1, depth_func: 4, ..Graphics::default() };
+        let mut g = self.clone().with_targets(colors, depth);
+        g.inputs.clear();
         for (name, index) in reads {
             // F float, U uint, N unorm8x4 (DXGI 41/16/6/2, 42, 28).
             let format = match (name.as_bytes().get(2), name.as_bytes().get(3)) {
@@ -247,7 +256,6 @@ impl Graphics {
                 (Some(b'N'), _) => 28,
                 _ => continue,
             };
-            // Index: corner << 28 | slot << 16 | byte offset (corner 0 unless a rectangle list).
             let (corner, slot) = (index >> 28, (index >> 16 & 0xfff).min(31));
             let stride = strides.get(slot as usize).copied().unwrap_or(0);
             g.inputs.push(Input {
@@ -259,13 +267,25 @@ impl Graphics {
                 per_instance: rect,
             });
         }
-        g.guess = Some(Guess { colors, depth, strides, rect });
+        g.guess = Some(Guess { strides, rect });
         g
     }
 
-    /// Whether this is [`Graphics::guessed`]'s state, to be made at the first draw.
+    /// Whether this is a guessed state, to be made at the first draw.
     pub fn is_guessed(&self) -> bool {
         self.guess.is_some()
+    }
+
+    /// Whether the state names the targets' formats (a stream's does, the console's does not).
+    pub fn names_targets(&self) -> bool {
+        !self.rt_formats.is_empty() || self.depth_format != 0
+    }
+
+    /// This state for a draw into the given targets: the console's pipelines name no formats, the
+    /// draw's bound targets do.
+    pub fn with_targets(mut self, color: Vec<Format>, depth: Option<Format>) -> Self {
+        self.bound = Some((color, depth));
+        self
     }
 
     /// The input elements, in the title's order.
@@ -275,16 +295,16 @@ impl Graphics {
 
     /// The colour target formats the host knows; `None` if one is not (the pipeline is refused).
     pub fn color_formats(&self) -> Option<Vec<Format>> {
-        if let Some(g) = &self.guess {
-            return Some(g.colors.clone());
+        if let Some((color, _)) = &self.bound {
+            return Some(color.clone());
         }
         self.rt_formats.iter().map(|&f| format(f)).collect()
     }
 
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
     pub fn depth_format(&self) -> Result<Option<Format>, u32> {
-        if let Some(g) = &self.guess {
-            return Ok(g.depth);
+        if let Some((_, depth)) = &self.bound {
+            return Ok(*depth);
         }
         match self.depth_format {
             0 => Ok(None),
@@ -340,7 +360,7 @@ impl Graphics {
     /// Blend and write mask of each colour target (target 0's description for all when the blend
     /// description is not independent).
     pub fn color_state(&self) -> Vec<ColorState> {
-        let targets = self.guess.as_ref().map_or(self.rt_formats.len(), |g| g.colors.len());
+        let targets = self.bound.as_ref().map_or(self.rt_formats.len(), |b| b.0.len());
         (0..targets.max(1))
             .map(|i| {
                 let t = &self.blend[if self.independent { i } else { 0 }];

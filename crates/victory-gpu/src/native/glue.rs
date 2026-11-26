@@ -10,7 +10,7 @@
 
 use super::memory::{PoolObserver, PoolTable};
 use super::state::Graphics;
-use super::title::{Guessed, Pipe, Title, TitleList, Wait};
+use super::title::{Guessed, Pipe, TargetFormats, Title, TitleList, Wait};
 use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -360,10 +360,10 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
         l.target_keys = colors.iter().copied().chain(depth_key).collect();
-        l.target_formats = (
-            colors.iter().filter_map(|&k| t.format_of(k)).collect(),
-            depth_key.and_then(|k| t.format_of(k)),
-        );
+        l.targets = TargetFormats {
+            color: colors.iter().filter_map(|&k| t.format_of(k)).collect(),
+            depth: depth_key.and_then(|k| t.format_of(k)),
+        };
         l.list.set_render_targets(&color, depth.as_ref());
     });
 }
@@ -479,13 +479,22 @@ pub(crate) fn set_pipeline(this: This, pipeline: This) {
     with_list(this, |_, l| l.pipeline = pipeline as usize);
 }
 
-/// The host pipeline of title pipeline `key`, made at first use.
-fn pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The host pipeline of title pipeline `key` for a draw into `targets`, made at first use. A
+/// console pipeline's state names no target formats, so it is made again for each set of targets.
+fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> {
     if let Some(p) = t.pipelines.get(&key) {
         return p.clone();
     }
-    let made = make_pipe(t, key);
-    t.pipelines.insert(key, made.clone());
+    let console_key = (key, targets.clone());
+    if let Some(p) = t.console_pipes.get(&console_key) {
+        return p.clone();
+    }
+    let (made, console) = make_pipe(t, key, targets);
+    if console {
+        t.console_pipes.insert(console_key, made.clone());
+    } else {
+        t.pipelines.insert(key, made.clone());
+    }
     made
 }
 
@@ -524,10 +533,31 @@ pub(crate) fn log_draw_counts(frame: u64) {
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
-fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The second result says the pipeline depends on the draw's targets.
+fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
-        return Pipe::Refused;
+        return (Pipe::Refused, false);
     };
+    let graphics = graphics.map(|g| {
+        if g.names_targets() {
+            (g, false)
+        } else {
+            (super::console_state::graphics_state_for(&g, targets.color.clone(), targets.depth), true)
+        }
+    });
+    let console = graphics.as_ref().is_some_and(|g| g.1);
+    if console && std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = key, ?targets, state = ?graphics.as_ref().map(|g| &g.0), "console pipeline state at its draw");
+    }
+    let graphics = graphics.map(|g| g.0);
+    (make_host_pipe(t, stages, graphics), console)
+}
+
+fn make_host_pipe(
+    t: &mut MetalTitle,
+    stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
+    graphics: Option<super::state::Graphics>,
+) -> Pipe<Metal> {
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -555,6 +585,7 @@ fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
                 vs: vs.clone(),
                 ps: hosts.iter().find(|h| h.0 == "pixel").map(|h| h.1.clone()),
                 name,
+                state: g.clone(),
                 made: Default::default(),
             })),
             None => Pipe::Refused,
@@ -586,7 +617,7 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
 }
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
-    with_list(this, |t, l| match pipe(t, l.pipeline) {
+    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
@@ -659,7 +690,7 @@ pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides:
 
 /// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
 fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> Pipe<Metal> {
-    let key = format!("{:?}{:?}{rect}", l.target_formats, l.strides);
+    let key = format!("{:?}{rect}", l.strides);
     let rect_vs = if rect {
         match g.vs_source.native_rect() {
             Ok(h) => Some(h.clone()),
@@ -676,9 +707,8 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
         return p.clone();
     }
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
-    let (colors, depth) = l.target_formats.clone();
-    tracing::info!(name = %g.name, ?reads, ?colors, ?depth, strides = ?l.strides, "guessed pipeline");
-    let state = Graphics::guessed(colors, depth, l.strides.clone(), &reads, rect);
+    tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
+    let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
     g.made.borrow_mut().insert(key, made.clone());
     made
@@ -690,7 +720,8 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
     // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
     let rect = l.topology == 17;
-    let made = match pipe(t, l.pipeline) {
+    let targets = l.targets.clone();
+    let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
         p => p,
     };
@@ -725,7 +756,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
                 let mut head = [0u8; 48];
                 let at = l.list.vertex_buffer_address(0);
                 let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
-                tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.target_formats, "draw");
+                tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.targets, "draw");
             });
         }
     }

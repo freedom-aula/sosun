@@ -55,12 +55,19 @@ pub struct TitleList<B: GraphicsBackend> {
     /// topology set (the console's `D3D_PRIMITIVE_TOPOLOGY`).
     pub pipeline: usize,
     pub topology: u32,
-    /// The formats of the bound targets (colour, depth) and the strides of the bound vertex
-    /// buffers by slot, which a guessed pipeline is made from at its draw.
-    pub target_formats: (Vec<Format>, Option<Format>),
+    /// The formats of the targets `OMSetRenderTargets` bound last.
+    pub targets: TargetFormats,
+    /// The strides of the bound vertex buffers by slot, which a guessed pipeline is made from at
+    /// its draw, and the title resources bound as targets (for the target trace).
     pub strides: Vec<u32>,
-    /// The title resources bound as targets (colour, then depth), for the target trace.
     pub target_keys: Vec<usize>,
+}
+
+/// The formats of a draw's bound colour and depth targets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TargetFormats {
+    pub color: Vec<Format>,
+    pub depth: Option<Format>,
 }
 
 impl<B: GraphicsBackend> Default for TitleList<B> {
@@ -72,7 +79,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             cuts: 0,
             pipeline: 0,
             topology: 0,
-            target_formats: (Vec::new(), None),
+            targets: TargetFormats::default(),
             strides: Vec::new(),
             target_keys: Vec::new(),
         }
@@ -154,6 +161,8 @@ pub struct Guessed<B: GraphicsBackend> {
     pub vs: Arc<victory_shader::emit::HostShader>,
     pub ps: Option<Arc<victory_shader::emit::HostShader>>,
     pub name: String,
+    /// The pipeline's state with the targets of its draw ([`Graphics::for_draw`] completes it).
+    pub state: super::state::Graphics,
     /// The vertex shader's container, translated again for rectangle lists at the first such draw.
     pub vs_source: Arc<crate::pipeline::Shader>,
     /// By the formats and strides they were made for.
@@ -164,6 +173,9 @@ pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
+    /// Host pipelines of the console's pipelines (whose state names no target formats) by title
+    /// pipeline object and the targets of the draw ([`super::console_state`]).
+    pub console_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
@@ -186,6 +198,7 @@ impl<B: PresentBackend> Title<B> {
         Title {
             host: NativeHost::with_memory(backend, memory),
             pipelines: HashMap::new(),
+            console_pipes: HashMap::new(),
             shaders: Default::default(),
             libraries: Default::default(),
             textures: Default::default(),

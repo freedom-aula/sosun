@@ -187,6 +187,11 @@ impl<B: PresentBackend> Title<B> {
         true
     }
 
+    /// The format of the host texture of title texture `key`.
+    pub fn format_of(&self, key: usize) -> Option<Format> {
+        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
@@ -196,12 +201,6 @@ impl<B: PresentBackend> Title<B> {
     /// How many times title texture `key`'s memory was detiled into its host texture.
     pub fn uploads_of(&self, key: usize) -> u64 {
         self.textures.get(&key).map_or(0, |t| t.uploads)
-    }
-
-    /// The host format of title texture `key` (a depth target's is its depth format).
-    pub fn format_of(&mut self, key: usize) -> Option<Format> {
-        self.realize(key);
-        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
     }
 
     pub fn texture_released(&mut self, key: usize) {

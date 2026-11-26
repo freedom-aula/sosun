@@ -66,6 +66,8 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 mod switch;
+#[cfg(target_os = "macos")]
+mod variant;
 pub mod native;
 #[cfg(windows)]
 mod tdr;
