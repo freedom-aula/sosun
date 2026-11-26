@@ -486,6 +486,12 @@ waves): lanes 32 to 35 take their bit from the high dword. The story-load log of
 (Series S) has three compute programs refused with the old message; whether they are this wave64
 form is not known.
 
+In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
+vector compare result. At the join each mesh thread uses its group index modulo the console
+wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
+A branch or operand that depends on a first-lane read can differ between the host waves and
+stays refused.
+
 ## Console pipeline descriptions (device slots 0x1c8 and 0x218)
 
 Observed at run time (`VICTORY_DUMP_DESC=1` dumps the first descriptions and the bytes behind every pointer and size pair). Grand Theft Auto VI creates most of its pipelines through these two device methods, `(this, desc, iid, out)` with the pipeline state's IID.
