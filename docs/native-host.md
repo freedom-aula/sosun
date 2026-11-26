@@ -16,6 +16,13 @@ same Cargo configuration when building and launching; a one-off build with
 launching. The launcher needs Cargo available and reports configuration errors
 rather than falling back to a possibly stale default binary.
 
+Both scripts also find rustup when it is installed but not on PATH yet: in
+`$CARGO_HOME/bin` (default `~/.cargo/bin`), where the rustup.rs installer puts
+it before a new terminal opens, and in `$HOMEBREW_PREFIX/opt/rustup/bin`, since
+Homebrew's rustup formula is keg-only. Setup warns and uses it. The launcher
+uses it only when no `cargo` is on PATH, and says so plainly when there is
+neither.
+
 Game-free regressions use real Cargo resolution and fixture executables under
 stock macOS Bash 3.2: `/bin/bash tools/macos/tests/target-directory.sh`.
 Setup prerequisites and its build are stubbed; no game or SDK files are needed.
