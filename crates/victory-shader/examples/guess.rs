@@ -7,7 +7,11 @@ fn main() {
         Ok("ps") => victory_shader::HwStage::Ps,
         _ => victory_shader::HwStage::Vs,
     };
-    let c = victory_shader::emit::graphics::container(stage, &read("VICTORY_CODE"), &read("VICTORY_META")).expect("container");
+    let c = if std::env::var_os("VICTORY_CONTAINER").is_some() {
+        read("VICTORY_CONTAINER")
+    } else {
+        victory_shader::emit::graphics::container(stage, &read("VICTORY_CODE"), &read("VICTORY_META")).expect("container")
+    };
     let options = victory_shader::emit::Options { wave32_host: true, zero_copy_memory: true, rect_list: std::env::var_os("VICTORY_RECT").is_some(), ..Default::default() };
     match victory_shader::emit::translate_with(&c, options) {
         Ok(h) => {

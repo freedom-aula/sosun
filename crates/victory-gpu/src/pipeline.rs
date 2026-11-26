@@ -122,6 +122,11 @@ impl Shader {
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
+                if made.is_err()
+                    && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
+                {
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
+                }
                 // A vertex shader keeps its container: a rectangle-list draw translates it again.
                 if self.stage != "vertex" {
                     *container = Vec::new();

@@ -200,6 +200,7 @@ fn vertex_format(f: VertexFormat) -> MTLVertexFormat {
         VertexFormat::Uint => MTLVertexFormat::UInt,
         VertexFormat::Unorm8x4 => MTLVertexFormat::UChar4Normalized,
         VertexFormat::Unorm8 => MTLVertexFormat::UCharNormalized,
+        VertexFormat::Unorm8x2 => MTLVertexFormat::UChar2Normalized,
     }
 }
 

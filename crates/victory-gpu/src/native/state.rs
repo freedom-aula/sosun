@@ -253,7 +253,8 @@ impl Graphics {
                 (Some(b'F'), Some(b'3')) => 6,
                 (Some(b'F'), Some(b'4')) => 2,
                 (Some(b'U'), _) => 42,
-                (Some(b'R'), _) => 61,
+                (Some(b'N'), Some(b'1')) => 61,
+                (Some(b'N'), Some(b'2')) => 49,
                 (Some(b'N'), _) => 28,
                 _ => continue,
             };
@@ -490,6 +491,7 @@ pub fn vertex_format(dxgi: u32) -> Option<VertexFormat> {
         42 => VertexFormat::Uint,
         28 => VertexFormat::Unorm8x4,
         61 => VertexFormat::Unorm8,
+        49 => VertexFormat::Unorm8x2,
         _ => return None,
     })
 }

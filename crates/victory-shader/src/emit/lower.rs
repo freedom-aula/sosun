@@ -9672,12 +9672,20 @@ impl<'a> Lower<'a> {
         let (kind, comp) = match (typed, format.and_then(buffer_format)) {
             (false, _) => (if count == 1 { 'U' } else { 'F' }, if count == 1 { 5 } else { 9 }),
             // The element is the whole format; the load reads its first `count` channels.
-            (true, Some(([8, 8, 8, 8], Numeric::Unorm))) => ('N', 9),
-            (true, Some(([8], Numeric::Unorm))) if count == 1 => ('R', 9),
+            (true, Some((w, Numeric::Unorm))) if w.iter().all(|&b| b == 8) && w.len() <= 4 && count as usize <= w.len() => ('N', 9),
             (true, Some((w, Numeric::Float))) if w.iter().all(|&b| b == 32) && w.len() == count as usize => ('F', 9),
-            _ => return Err("a vertex fetch format the host's vertex layout lacks"),
+            (typed, f) => {
+                let why = format!("a vertex fetch format the host's vertex layout lacks (typed {typed}, {count} channels, format {f:?})");
+                // shortcut: a leaked message, for a refusal logged once per shader.
+                return Err(Box::leak(why.into_boxed_str()));
+            }
         };
-        let name = format!("VB{kind}{count}");
+        // The element is the whole format (n channels of it for unorm8), the load reads `count`.
+        let width = match (typed, format.and_then(buffer_format)) {
+            (true, Some((w, Numeric::Unorm))) if kind == 'N' => w.len() as u32,
+            _ => count,
+        };
+        let name = format!("VB{kind}{width}");
         let corners = if self.x.rect_list { 3 } else { 1 };
         let mut ids = Vec::new();
         for corner in 0..corners {
@@ -9701,6 +9709,8 @@ impl<'a> Lower<'a> {
                 self.s.inputs.len() - 1
             }
         };
+        let cols = &mut self.s.inputs[id].cols;
+        *cols = (*cols).max(count as u8);
         ids.push(id);
         }
         for k in 0..count {

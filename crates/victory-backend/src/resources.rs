@@ -206,6 +206,7 @@ pub enum VertexFormat {
     Uint,
     Unorm8x4,
     Unorm8,
+    Unorm8x2,
 }
 
 /// One input element (`D3D12_INPUT_ELEMENT_DESC`), in the order of the vertex shader's input signature.
