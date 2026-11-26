@@ -201,24 +201,35 @@ impl<B: PresentBackend> Default for Back<B> {
 }
 
 impl<B: PresentBackend> Back<B> {
-    /// Work of title queue `key` just went to `queue`: if it wrote textures, our fence follows it.
-    pub(super) fn submitted(&mut self, host: &NativeHost<B>, queue: &B::Queue, key: usize) {
-        let written = host.take_written();
-        if written.is_empty() {
-            return;
+    /// The signal the next work of title queue `key` carries (`None` with copy-back off): in the
+    /// work's own command buffer, so it does not hang on the order command buffers complete in.
+    pub(super) fn next(&mut self, host: &NativeHost<B>, key: usize) -> Option<(Rc<B::Fence>, u64)> {
+        if !host.collecting_written() {
+            return None;
         }
         let (fence, value) = match self.fences.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => match host.backend.create_fence(0) {
                 Ok(f) => e.insert((Rc::new(f), 0)),
-                Err(error) => return tracing::warn!(%error, "no fence to copy textures back by"),
+                Err(error) => {
+                    tracing::warn!(%error, "no fence to copy textures back by");
+                    return None;
+                }
             },
         };
         *value += 1;
-        if let Err(error) = host.execute(queue, &[], &[], &[(&**fence, *value)]) {
-            return tracing::warn!(%error, "textures will not be copied back");
+        Some((fence.clone(), *value))
+    }
+
+    /// That work went to the GPU: if it wrote textures, they are copied back once `signal` is
+    /// reached.
+    pub(super) fn submitted(&mut self, host: &NativeHost<B>, signal: Option<(Rc<B::Fence>, u64)>) {
+        let written = host.take_written();
+        if let Some((fence, value)) = signal
+            && !written.is_empty()
+        {
+            self.pending.push((fence, value, written));
         }
-        self.pending.push((fence.clone(), *value, written));
     }
 }
 

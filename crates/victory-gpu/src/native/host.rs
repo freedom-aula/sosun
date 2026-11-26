@@ -418,6 +418,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         *self.written.borrow_mut() = on.then(Default::default);
     }
 
+    pub(super) fn collecting_written(&self) -> bool {
+        self.written.borrow().is_some()
+    }
+
     /// The keys collected since the last call.
     pub(super) fn take_written(&self) -> Vec<usize> {
         self.written.borrow_mut().as_mut().map_or_else(Vec::new, |w| w.drain().collect())

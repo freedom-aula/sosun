@@ -417,11 +417,13 @@ impl<B: PresentBackend> Title<B> {
                 return;
             };
             let refs: Vec<&NativeList<B>> = lists.iter().map(|l| &**l).collect();
-            if let Err(e) = host.execute(&q, &refs, &[], &[]) {
+            let ours = back.next(host, queue);
+            let signals: Vec<(&B::Fence, u64)> = ours.iter().map(|(f, v)| (&**f, *v)).collect();
+            if let Err(e) = host.execute(&q, &refs, &[], &signals) {
                 stats.refused += 1;
                 tracing::warn!(error = %e, "a piece of title work was refused");
             }
-            back.submitted(host, &q, queue);
+            back.submitted(host, ours);
         };
         let mut signal = |n: usize, _: u64| {
             match actions.get(&n) {
