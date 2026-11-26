@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 # Homebrew's rustup is keg-only, so another cargo, such as Homebrew's rust,
 # can come first on PATH. That one has no gnullvm standard library, and the
-# first build below fails. victory.sh puts rustup first in the same way.
+# first build below fails.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 WINE="${WINE:-$(command -v wine || true)}"
 [ -x "$WINE" ] || { echo "set WINE to a wine binary" >&2; exit 1; }

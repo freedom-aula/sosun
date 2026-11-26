@@ -2,6 +2,8 @@
 
 This file tracks the work to run VIctory on Apple Silicon Macs. No game files are used or needed for any step that is marked as done.
 
+The Wine route below (Route A) is retired: the game now runs natively (`tools/macos/native-setup.sh`, `tools/macos/run-native.sh`, `docs/native-host.md`). Its setup and run scripts (`setup.sh`, `tools/macos/victory.sh`, `build-crossover-wine.sh`, `build-deps.sh`, `native-build-tools.sh`) and the test fleet (`tools/fleet`) were removed; this file keeps what was learned. `tools/macos/test-wine.sh` still runs the Windows tests under a Wine you supply.
+
 ## Done on 24 November 2026
 
 The whole workspace builds natively on macOS (aarch64, Homebrew Rust 1.100). The Windows-only parts are gated with `cfg(windows)`, and a few small stubs stand in for them. The text entry dialog is cancelled on other hosts, a relaunch request stops the process, and the `translate` command reports that it needs Windows. On a Mac M4 the test suite gives 162 passed, 0 failed and 10 ignored. The ignored tests read their own test binary as a PE file or use Windows paths, so they only run on Windows.
@@ -35,7 +37,7 @@ WINE="/Applications/Game Porting Toolkit.app/Contents/Resources/wine/bin/wine64"
 
 ## CrossOver Wine with D3DMetal, 24 November 2026
 
-`tools/macos/build-crossover-wine.sh` builds CodeWeavers' CrossOver 26.3 Wine (Wine 11.0) from its published source into `target/wine-cx`, using x86_64 FreeType and GnuTLS from `DEPS`. Copy the `redist/lib` folder of Apple's "Evaluation environment for Windows games" over `target/wine-cx/lib`, and run the tests with this command.
+`tools/macos/build-crossover-wine.sh` (since removed) built CodeWeavers' CrossOver 26.3 Wine (Wine 11.0) from its published source into `target/wine-cx`, using x86_64 FreeType and GnuTLS from `DEPS`. Copy the `redist/lib` folder of Apple's "Evaluation environment for Windows games" over `target/wine-cx/lib`, and run the tests with this command.
 
 ```sh
 WINE="$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine" WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=b" tools/macos/test-wine.sh --workspace --no-fail-fast
@@ -83,7 +85,7 @@ Later work replaces the Windows host underneath the title. That needs a Rosetta 
 
 ## Running VIctory on a Mac
 
-Run `./setup.sh` from the top of the repository. It checks the Mac, installs the Homebrew tools, builds checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, builds CrossOver Wine, adds D3DMetal from the Game Porting Toolkit in Downloads, and builds VIctory. The only manual step is downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
+`./setup.sh` (since removed) checked the Mac, installed the Homebrew tools, built checksum-verified x86_64 GMP, Nettle, GnuTLS and FreeType, built CrossOver Wine, added D3DMetal from the Game Porting Toolkit in Downloads, and built VIctory. The only manual step was downloading the toolkit from Apple. A clean run on an M4 on 24 November 2026 finished without help, and the full suite then passed (343 passed, 0 failed).
 
 ## Use D3DMetal 4.0 beta 3
 
