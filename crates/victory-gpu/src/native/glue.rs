@@ -231,7 +231,7 @@ pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::presen
 /// was presented (logged at each present).
 fn tracing_targets() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_TARGETS").is_some())
+    *ON.get_or_init(|| env_set!("VICTORY_TRACE_TARGETS"))
 }
 
 /// Draws and clears by title texture since the last present, and dropped texture operations.
@@ -521,7 +521,7 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
         // Debugging: no depth attachment at all.
-        let drop_depth = std::env::var_os("VICTORY_DEBUG_NO_DEPTH_ATTACH").is_some();
+        let drop_depth = env_set!("VICTORY_DEBUG_NO_DEPTH_ATTACH");
         if drop_depth {
             l.targets.depth = None;
         }
@@ -640,7 +640,9 @@ pub(crate) fn mirror(handle: u64) {
                 let key = super::textures::placed_key(address, &res);
                 if !t.host.knows(key)
                     && let Some(info) = crate::resource::placed_info(address, &res)
+                    && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
+                    t.texture_placed(address, key, pool.id);
                     t.texture_created(key, info);
                     t.realize(key);
                 }
@@ -749,7 +751,7 @@ fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<M
         }
     });
     let console = graphics.as_ref().is_some_and(|g| g.1);
-    if console && std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+    if console && env_set!("VICTORY_TRACE_BIND") {
         tracing::info!(pipeline = key, ?targets, state = ?graphics.as_ref().map(|g| &g.0), "console pipeline state at its draw");
     }
     let graphics = graphics.map(|g| g.0);
@@ -960,7 +962,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
         p if rect => {
-            if std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+            if env_set!("VICTORY_TRACE_RECTS") {
                 tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
             }
             warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
@@ -1011,12 +1013,12 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         }
     }
     // Debugging: only indexed draws (the content), not the boot passes.
-    if std::env::var_os("VICTORY_DEBUG_ONLY_INDEXED").is_some() {
+    if env_set!("VICTORY_DEBUG_ONLY_INDEXED") {
         return;
     }
     with_list(this, |t, l| {
         if let Some(rect) = graphics(t, l) {
-            if rect && std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+            if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
                 if seen.iter().filter(|&&p| p == l.pipeline as usize).count() < 3 {
@@ -1212,7 +1214,7 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
-    if std::env::var_os("VICTORY_TRACE_WRITES").is_some() {
+    if env_set!("VICTORY_TRACE_WRITES") {
         let inside = pools().resolve(address, bytes as u64).is_some();
         tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
     }

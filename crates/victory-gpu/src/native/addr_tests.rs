@@ -183,9 +183,13 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) fn new(t: &Title<Metal>) -> Fixture {
+        Fixture::with_id(t, 1)
+    }
+
+    fn with_id(t: &Title<Metal>, id: usize) -> Fixture {
         let mem = Alias::new(POOL).unwrap();
         let info = PoolInfo {
-            id: 1,
+            id,
             base: mem.primary as usize,
             len: POOL,
             memory_entry: None,
@@ -375,6 +379,70 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255]);
 }
 
+/// A guessed vertex shader reads its positions through a buffer descriptor built around the address
+/// in its root constants: the page table is bound for the vertex stage. Read as zeros (no table),
+/// the triangle would have no area and nothing would be drawn.
+#[test]
+fn guessed_vertex_buffer_reads_the_pool() {
+    let vertex = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8805_FF05, 0x0008_0000, // s_or_b32 s5, s5, 0x80000 (stride 8)
+        0xBE86_0383, // s_mov_b32 s6, 3
+        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0xE034_2000, 0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02F2, // v_mov_b32 v4, 1.0
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let pixel = [
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |stage, words: &[u32], meta: &[u8]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container(stage, &bytes, meta).unwrap();
+        shaders::translate(&c).unwrap()
+    };
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0.
+    let vs = translate(HwStage::Vs, &vertex, &meta);
+    assert!(vs.memory && !vs.memory_writes);
+    let ps = translate(HwStage::Ps, &pixel, &[0; 0x10]);
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    // VA_B + 16: a triangle over the whole target.
+    f.put(16, &[-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0]);
+
+    let state = Graphics::guess_base()
+        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed vertex") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.set_graphics_root_constants(0, &[VA_B as u32]);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    for p in pixels.chunks(4) {
+        assert_eq!(p, [255, 128, 128, 255]);
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
 /// The table follows the title's maps: the same dispatch, the same title addresses, after the title
 /// mapped the pages somewhere else.
 #[test]
@@ -435,6 +503,26 @@ fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
     t.host.backend.signal(&gate, 1);
     assert!(t.host.backend.wait(&done, 1, 10_000), "GPU did not finish");
     check_computed(&f, 0x2_0000, 0x6_0000);
+}
+
+/// A released pool's view pair goes to the next pool, and a heap that wrote the old pair (the
+/// host's own) writes it again: the same title addresses reach the new pool.
+#[test]
+fn a_released_pools_pair_serves_the_next_pool() {
+    let Some(mut t) = title() else { return };
+    let cs = shader(COMPUTED, 4);
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let f = Fixture::new(&t);
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x2_0000, 0x6_0000);
+    t.host.memory().pool_released(&f.info);
+    drop(f);
+    let g = Fixture::with_id(&t, 2);
+    prepare_computed(&g, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&g, 0x2_0000, 0x6_0000);
 }
 
 /// Memory no pool shows reads as zero and its writes are dropped, in a page past a mapping, in a

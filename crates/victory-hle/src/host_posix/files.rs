@@ -82,7 +82,6 @@ pub fn mount(root: &Path) -> Option<char> {
 }
 
 /// Gives `root` the letter the console fixes (`G`, `T`).
-#[allow(dead_code)] // for the loader integration that mounts the title's drives
 pub fn mount_at(letter: char, root: &Path) {
     let Ok(letter) = u8::try_from(letter.to_ascii_uppercase()) else {
         return;

@@ -214,6 +214,8 @@ pub struct Title<B: PresentBackend> {
     pub(super) surface: Option<Rc<B::Surface>>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
+    /// Textures placed in title memory (no resource object), by address: their key and pool.
+    pub(super) placed: HashMap<u64, (usize, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
@@ -244,6 +246,7 @@ impl<B: PresentBackend> Title<B> {
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
+            placed: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
