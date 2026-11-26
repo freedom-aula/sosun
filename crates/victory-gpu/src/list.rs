@@ -1910,7 +1910,9 @@ pub(crate) fn indirect_dropped() -> u64 {
 #[cfg(target_os = "macos")]
 fn drop_kind(kind: usize) {
     DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::native::glue::warn_once(["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)]);
+    let what = ["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)];
+    crate::native::glue::warn_once(what);
+    crate::native::glue::trace_reason(what);
 }
 
 #[cfg(target_os = "macos")]
@@ -1990,6 +1992,12 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    crate::native::glue::trace_reason("an indirect execution of a signature the host does not run");
+    #[cfg(target_os = "macos")]
+    if crate::native::glue::tracing_targets() {
+        crate::native::glue::trace_drop_pipe(format!("indirect {args:?} under {:?}", bound_pipeline(this)));
+    }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
@@ -2000,9 +2008,26 @@ extern "system" fn execute_indirect(
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
+            bound = ?bound_pipeline(this),
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+/// The shaders of the pipeline list `this` has bound (native host), for the drop warning.
+#[cfg(target_os = "macos")]
+fn bound_pipeline(this: This) -> Option<Vec<String>> {
+    let p = crate::native::glue::with_list(this, |_, l| l.pipeline)?;
+    crate::pipeline::native_stages(p as This).map(|(s, g)| {
+        let mut v: Vec<String> = s.iter().map(|(st, sh)| format!("{st} {}", sh.hash)).collect();
+        v.push(format!("graphics state: {}", g.is_some()));
+        v
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bound_pipeline(_: This) -> Option<Vec<String>> {
+    None
 }
 
 /// Indirect executions dropped since the last call.
