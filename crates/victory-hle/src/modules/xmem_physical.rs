@@ -444,7 +444,7 @@ thread_local! {
 }
 
 /// The pool of a page (tests compare pools, not addresses other tests may reuse).
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 pub(crate) fn pool_of(page: usize) -> usize {
     physical().pages[&page].pool.info.id
 }
@@ -1845,6 +1845,7 @@ mod tests {
     }
 
     /// The conflicts of `case` this thread logged: the pools of both sides.
+    #[cfg(not(windows))]
     fn trips(case: &str) -> Vec<(usize, usize)> {
         TRIPS.with(|t| {
             t.borrow()
@@ -1855,6 +1856,8 @@ mod tests {
         })
     }
 
+    // Windows maps only over a placeholder: a view over another fails there before any bookkeeping.
+    #[cfg(not(windows))]
     #[test]
     fn owners_name_a_view_mapped_over_another() {
         let p = reserve(2) as usize;
