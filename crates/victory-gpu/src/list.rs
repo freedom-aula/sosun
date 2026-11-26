@@ -1225,8 +1225,8 @@ fn clear_dsv_impl(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (stencil, count, rects);
-        crate::native::glue::clear_dsv(this, handle, flags, depth);
+        let _ = (count, rects);
+        crate::native::glue::clear_dsv(this, handle, flags, depth, stencil);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, flags, depth, stencil, count, rects);

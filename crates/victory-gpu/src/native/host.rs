@@ -969,9 +969,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 clear: Some(*c),
                             })
                             .collect(),
-                        depth: depth.as_ref().map(|(t, d)| DepthTarget {
+                        depth: depth.as_ref().map(|(t, d, s)| DepthTarget {
                             texture: &**t,
-                            clear: Some(*d),
+                            clear: *d,
+                            clear_stencil: *s,
                         }),
                         draws: vec![],
                     })
@@ -995,6 +996,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         depth: depth.as_ref().map(|t| DepthTarget {
                             texture: &**t,
                             clear: None,
+                            clear_stencil: None,
                         }),
                         draws: (*a..*b)
                             .map(|k| {

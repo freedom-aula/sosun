@@ -128,7 +128,7 @@ impl Rig {
         l.set_render_targets(std::slice::from_ref(color), depth);
         l.clear_render_target(color, clear);
         if let Some(d) = depth {
-            l.clear_depth(d, 1.0);
+            l.clear_depth_stencil(d, Some(1.0), Some(0));
         }
         l.set_heaps(Some(&self.vheap), Some(&self.sheap));
         l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
@@ -300,6 +300,95 @@ fn stencil_test_and_reference_are_applied() {
     assert_eq!(px(&out, 8, 8), [0, 255, 0, 255], "stencil equal: painted");
     assert_eq!(px(&out, 1, 8), [0, 0, 255, 255], "stencil zero: left alone");
     assert_eq!(px(&out, 14, 14), [0, 0, 255, 255], "stencil zero: left alone");
+}
+
+/// Clearing depth must preserve stencil written by an earlier draw.
+#[test]
+fn depth_only_clear_preserves_stencil() {
+    let Some(r) = Rig::new() else { return };
+    let color = r.target(Format::Rgba8Unorm, false);
+    let depth = r.target(Format::D32FloatS8, true);
+    let stencil = |compare, pass| {
+        let face = StencilFace {
+            fail: StencilOp::Keep,
+            depth_fail: StencilOp::Keep,
+            pass,
+            compare,
+        };
+        StencilState {
+            read_mask: 0xff,
+            write_mask: 0xff,
+            front: face,
+            back: face,
+        }
+    };
+    let write = r.pipeline(Some(Format::D32FloatS8), &[], |d| {
+        d.stencil = Some(stencil(Compare::Always, StencilOp::Replace));
+        d.depth_test = Some((true, Compare::Always));
+    });
+    let test = r.pipeline(Some(Format::D32FloatS8), &[], |d| {
+        d.stencil = Some(stencil(Compare::Equal, StencilOp::Keep));
+        d.depth_test = Some((false, Compare::Less));
+    });
+    let mut l = r.list(&color, Some(&depth), [0.0, 0.0, 1.0, 1.0]);
+    l.set_stencil_ref(37);
+    r.draw(&mut l, &write, 0, &triangle([1.0, 0.0, 0.0, 1.0]));
+    l.clear_depth(&depth, 1.0);
+    r.draw(&mut l, &test, 4096, &triangle([0.0, 1.0, 0.0, 1.0]));
+    run(&r.h, &[&l]);
+    assert_eq!(
+        px(&r.read(&color), 8, 8),
+        [0, 255, 0, 255],
+        "depth-only clear erased stencil"
+    );
+}
+
+/// Nonzero and zero clears, either stencil alone or both planes. The draw checks the exact
+/// depth and stencil together, then mismatching draws must be rejected by each test in turn.
+#[test]
+fn stencil_clears_select_the_requested_planes_and_value() {
+    let Some(r) = Rig::new() else { return };
+    let color = r.target(Format::Rgba8Unorm, false);
+    let depth = r.target(Format::D32FloatS8, true);
+    let pso = r.pipeline(Some(Format::D32FloatS8), &[], |d| {
+        let face = StencilFace {
+            fail: StencilOp::Keep,
+            depth_fail: StencilOp::Keep,
+            pass: StencilOp::Keep,
+            compare: Compare::Equal,
+        };
+        d.stencil = Some(StencilState {
+            read_mask: 0xff,
+            write_mask: 0xff,
+            front: face,
+            back: face,
+        });
+        d.depth_test = Some((false, Compare::Equal));
+    });
+    for clear_depth in [None, Some(0.75f32)] {
+        for value in [0u8, 173, 255] {
+            let mut l = r.list(&color, Some(&depth), [0.0, 0.0, 1.0, 1.0]);
+            l.clear_depth_stencil(&depth, Some(0.25), Some(!value));
+            l.clear_depth_stencil(&depth, clear_depth, Some(value));
+            let expected_depth = clear_depth.unwrap_or(0.25);
+            l.set_graphics_root_constants(0, &[expected_depth.to_bits(), 0, 0, 0]);
+            l.set_stencil_ref(u32::from(value));
+            r.draw(&mut l, &pso, 0, &triangle([0.0, 1.0, 0.0, 1.0]));
+            l.set_stencil_ref(u32::from(!value));
+            r.draw(&mut l, &pso, 4096, &triangle([1.0, 0.0, 0.0, 1.0]));
+            l.set_stencil_ref(u32::from(value));
+            l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+            r.draw(&mut l, &pso, 8192, &triangle([0.0, 0.0, 1.0, 1.0]));
+            // Submission snapshots copy commands, not the mutable recording state.
+            let snapshot = l.snapshot();
+            run(&r.h, &[&snapshot]);
+            assert_eq!(
+                px(&r.read(&color), 8, 8),
+                [0, 255, 0, 255],
+                "depth={clear_depth:?}, stencil={value}"
+            );
+        }
+    }
 }
 
 /// Culling and winding: the triangle's vertices run counter-clockwise on screen; back-face

@@ -476,6 +476,8 @@ pub struct ColorTarget<'a, B: GraphicsBackend + ?Sized> {
 pub struct DepthTarget<'a, B: GraphicsBackend + ?Sized> {
     pub texture: &'a B::Texture,
     pub clear: Option<f32>,
+    /// Independent stencil load action; `None` preserves the existing plane.
+    pub clear_stencil: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]

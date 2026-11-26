@@ -1018,10 +1018,10 @@ impl Metal {
                 let a = desc.stencilAttachment();
                 a.setTexture(Some(&dp.texture.tex));
                 a.setStoreAction(MTLStoreAction::Store);
-                match dp.clear {
-                    Some(_) => {
+                match dp.clear_stencil {
+                    Some(v) => {
                         a.setLoadAction(MTLLoadAction::Clear);
-                        a.setClearStencil(0);
+                        a.setClearStencil(u32::from(v));
                     }
                     None => a.setLoadAction(MTLLoadAction::Load),
                 }

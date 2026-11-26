@@ -138,6 +138,7 @@ impl<'a> Scene<'a> {
             depth: Some(DepthTarget {
                 texture: &self.depth,
                 clear: Some(1.0),
+                clear_stencil: Some(0),
             }),
             draws,
         })
