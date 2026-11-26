@@ -152,6 +152,7 @@ binary! {
     fmod, fmodf => libm::fmod;
     hypot, hypotf => f64::hypot;
     remainder, remainderf => libm::remainder;
+    fdim, fdimf => |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else if x > y { x - y } else { 0.0 };
 }
 
 macro_rules! simple2 {
@@ -171,11 +172,14 @@ simple2! {
     copysign, copysignf => f64::copysign;
     fmax, fmaxf => f64::max;
     fmin, fminf => f64::min;
-    fdim, fdimf => |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else if x > y { x - y } else { 0.0 };
 }
 
 pub extern "win64" fn nextafter(x: f64, y: f64) -> f64 {
-    libm::nextafter(x, y)
+    let r = libm::nextafter(x, y);
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 /// `long double` is `double` on this ABI.
@@ -184,7 +188,11 @@ pub extern "win64" fn nexttoward(x: f64, y: f64) -> f64 {
 }
 
 pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
-    libm::nextafterf(x, y)
+    let r = libm::nextafterf(x, y);
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
@@ -751,6 +759,35 @@ mod tests {
         assert!(scalbn(f64::INFINITY, 1).is_infinite());
         assert_eq!(scalbn(1.0, -2000), 0.0);
         assert_eq!(scalbnf(1.0, -200), 0.0);
+        assert_eq!(errno(), 7);
+    }
+
+    #[test]
+    fn fdim_and_nextafter_set_erange_on_overflow() {
+        fn overflows(what: &str, call: impl Fn() -> f64) {
+            set_errno(0);
+            assert!(call().is_infinite(), "{what}");
+            assert_eq!(errno(), ERANGE, "{what}");
+        }
+        overflows("fdim", || fdim(f64::MAX, -f64::MAX));
+        overflows("fdimf", || f64::from(fdimf(f32::MAX, -f32::MAX)));
+        overflows("nextafter +", || nextafter(f64::MAX, f64::INFINITY));
+        overflows("nextafter -", || nextafter(-f64::MAX, f64::NEG_INFINITY));
+        overflows("nexttoward +", || nexttoward(f64::MAX, f64::INFINITY));
+        overflows("nextafterf +", || {
+            f64::from(nextafterf(f32::MAX, f32::INFINITY))
+        });
+        overflows("nextafterf -", || {
+            f64::from(nextafterf(-f32::MAX, f32::NEG_INFINITY))
+        });
+        set_errno(7);
+        assert_eq!(fdim(5.0, 2.0), 3.0);
+        assert_eq!(fdim(1.0, 5.0), 0.0);
+        assert_eq!(fdimf(5.0, 2.0), 3.0);
+        assert!(fdim(f64::INFINITY, 1.0).is_infinite());
+        assert!(fdim(f64::NAN, 1.0).is_nan());
+        assert_eq!(nextafter(f64::INFINITY, f64::INFINITY), f64::INFINITY);
+        assert_eq!(nextafterf(f32::INFINITY, f32::INFINITY), f32::INFINITY);
         assert_eq!(errno(), 7);
     }
 
