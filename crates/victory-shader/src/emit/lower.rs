@@ -650,6 +650,9 @@ impl<'a> Lower<'a> {
                         || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        // One atomic per console wave; addresses by console lane.
+                        || matches!(n, "ds_append" | "ds_consume")
+                        || n.contains("addtid")
                         || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                         || reads_mask_as_data(x.st, i)
                 })
@@ -4387,7 +4390,16 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
-        let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        if matches!(name, "ds_append" | "ds_consume" | "ds_read_addtid_b32" | "ds_write_addtid_b32")
+        {
+            return self.ds_by_m0(inst, guard, offset, dst_reg);
+        }
+        // The `ds_gws` group's address is M0's too (GDS); refused by name.
+        let no_address = || match name {
+            n if n.starts_with("ds_gws") => "an LDS address: a ds_gws instruction has none (M0)",
+            _ => "an LDS address",
+        };
+        let a = self.vgprs(inst, addr.as_ref().ok_or_else(no_address)?, 1)?[0];
         // shortcut: LDS addresses are taken as aligned to what they access
         // and in bounds (out-of-bounds console accesses read 0 and drop
         // writes).
@@ -4573,6 +4585,104 @@ impl<'a> Lower<'a> {
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
+        Ok(())
+    }
+
+    /// The DS instructions whose LDS address comes from M0 (RDNA2 ISA 12.13, LDS only):
+    /// * `ds_append` (`ds_consume`): one atomic add (subtract) of the count of the valid lanes at
+    ///   M0 + offset, by the first valid lane, its pre-op value returned to every valid lane. M0
+    ///   holds the byte address, as LLVM sets it (`SelectDSAppendConsume` copies the pointer to M0
+    ///   unchanged; the ISA's "M0.base").
+    /// * `ds_read_addtid_b32` (`ds_write_addtid_b32`): the dword at offset + M0[15:0] + 4 × the
+    ///   lane's id in the wave (ISA 10.4, 12.13).
+    // shortcut: like other LDS accesses, addresses are taken as aligned and in bounds (the ISA
+    // clamps append and consume by M0's size).
+    fn ds_by_m0(
+        &mut self,
+        inst: &Inst,
+        guard: Option<V>,
+        offset: u32,
+        dst_reg: Option<u8>,
+    ) -> Result<(), Why> {
+        use super::bitcode::Rmw;
+        let name = inst.name();
+        let m0 = inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?;
+        let m0 = self.i32_of(m0)?;
+        let c = self.cur;
+        let dword = |l: &mut Self, at: V| -> V {
+            let c = l.cur;
+            let two = l.s.m.i32(2);
+            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let lds = l.s.lds();
+            l.s.m.element(c, lds, index)
+        };
+        if name.contains("addtid") {
+            let low = self.s.m.i32(0xFFFF);
+            let base = self.s.m.bin(c, Bin::And, m0, low);
+            let o = self.s.m.i32(offset);
+            let base = self.s.m.bin(c, Bin::Add, base, o);
+            // The lane's id in the console's wave, also where a host wave is half of it.
+            let lane = if self.host32 {
+                let f = self.console_flat();
+                let k63 = self.s.m.i32(63);
+                self.s.m.bin(c, Bin::And, f, k63)
+            } else {
+                self.lane_index_at(c)
+            };
+            let four = self.s.m.i32(4);
+            let at = self.s.m.bin(c, Bin::Mul, lane, four);
+            let at = self.s.m.bin(c, Bin::Add, base, at);
+            let Fields::Ds { data, .. } = &inst.fields else { unreachable!() };
+            if name == "ds_write_addtid_b32" {
+                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let g = self.begin_guarded(guard);
+                let p = dword(self, at);
+                self.s.m.store(self.cur, p, x);
+                self.end_guarded(g, &[]);
+            } else {
+                let reg = dst_reg.ok_or("an LDS read")?;
+                let p = dword(self, at);
+                let x = self.s.m.load(c, p);
+                self.write(inst, Reg::V(reg), x, guard);
+            }
+            return Ok(());
+        }
+        // One atomic for the console's wave: a host wave must be all of it.
+        let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.halves || self.host32 && lanes > 32 {
+            return Err("ds_append or ds_consume in a console wave the host splits");
+        }
+        let reg = dst_reg.ok_or("an append result")?;
+        let outside = match inst.read(Reg::V(reg)) {
+            Some(v) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
+            None => self.s.m.i32(0),
+        };
+        let g = self.begin_guarded(guard);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // The valid lanes: those running here.
+        let on = self.s.m.bool(true);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let (x, y) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let nx = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[x]);
+        let ny = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[y]);
+        let n = self.s.m.bin(c, Bin::Add, nx, ny);
+        let i1 = self.s.t.i1;
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let o = self.s.m.i32(offset);
+        let at = self.s.m.bin(c, Bin::Add, m0, o);
+        let lead = self.begin_guarded(Some(first));
+        let p = dword(self, at);
+        let op = if name == "ds_append" { Rmw::Add } else { Rmw::Sub };
+        let old = self.s.m.atomic(self.cur, op, p, n);
+        let zero = self.s.m.i32(0);
+        let old = self.end_guarded(lead, &[(old, zero)])[0];
+        let c = self.cur;
+        let r = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let r = self.end_guarded(g, &[(r, outside)])[0];
+        self.write(inst, Reg::V(reg), r, None);
         Ok(())
     }
 

@@ -365,6 +365,25 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
+## LDS instructions addressed by M0
+
+`ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address
+operand and were refused as "an LDS address" (three compute programs in the story-load log of
+issue #123). They are now lowered as the RDNA2 ISA gives them (12.13, 10.4):
+- `ds_append` (`ds_consume`): one atomic add (subtract) of the count of the lanes running at the
+  LDS byte address M0 + offset, done by the first of them, and its old value returned to all of
+  them. The ISA calls the address "M0.base"; for LDS, M0 is the byte address itself, as LLVM sets
+  it (`AMDGPUDAGToDAGISel::SelectDSAppendConsume` copies the pointer to M0 unchanged).
+- `ds_read_addtid_b32` (`ds_write_addtid_b32`): the dword at offset + M0[15:0] + 4 × the lane's id
+  in the console's wave.
+They make the program use the console's lanes (`console_lanes`). Where the host splits a console
+wave (wave64 on 32-lane host waves, a group of more than 32 lanes) an append or consume is still
+refused, "ds_append or ds_consume in a console wave the host splits": the console makes one atomic
+for the whole wave. As for other LDS accesses, addresses are taken as aligned and in bounds (the
+ISA clamps append and consume by M0's size). The `ds_gws` group (GDS) stays refused, by name.
+`addr_tests::lds_append_consume_and_addtid_follow_m0_on_the_gpu` (`victory-gpu`) runs them on
+Metal, wave32 and wave64.
+
 ## Scalar absolute difference
 
 `s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in
