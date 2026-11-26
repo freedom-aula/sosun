@@ -7,8 +7,13 @@
 //! were made. A list segment that waits for a memory value another queue's list writes stays on
 //! the CPU side until the value is there (`hold.rs`; the GPU's own writes into title memory are
 //! visible to the CPU as they land, there is no copy); everything else goes to the GPU at once and
-//! is never waited for. Fence signals and waits that need no CPU decision are encoded on the GPU
-//! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order.
+//! is never waited for. Fence signals that need no CPU decision are encoded on the GPU
+//! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order. A fence
+//! wait is encoded on the GPU only when a signal that reaches its value is already there: Metal
+//! ends a command buffer whose event wait lasts about 5 s (`kIOGPUCommandBufferCallbackErrorTimeout`)
+//! and drops its work and signals, while D3D12 lets a wait last as long as its signal takes. A wait
+//! for a value no queued signal reaches yet (a later CPU Signal, a signal behind held work) holds
+//! the queue's later work on the CPU instead.
 
 use super::host::NativeHost;
 use super::list::{Binding, ComputePso, NativeList};
@@ -206,6 +211,8 @@ pub struct Title<B: PresentBackend> {
     next_signal: usize,
     /// The highest value each fence was told to reach, and when that changed (diagnostics).
     requested: HashMap<usize, (u64, std::time::Instant)>,
+    /// The highest value a signal already given to the GPU will set each fence to.
+    on_gpu: HashMap<usize, u64>,
     pub stats: Stats,
 }
 
@@ -227,6 +234,7 @@ impl<B: PresentBackend> Title<B> {
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
+            on_gpu: HashMap::new(),
             held: Held::new(),
             signals: HashMap::new(),
             next_signal: 0,
@@ -256,6 +264,7 @@ impl<B: PresentBackend> Title<B> {
     /// The title released fence `key`.
     pub fn forget_fence(&mut self, key: usize) {
         self.fences.remove(&key);
+        self.on_gpu.remove(&key);
     }
 
     /// The title released queue `key`; held work stays held (the title does not do it).
@@ -284,6 +293,10 @@ impl<B: PresentBackend> Title<B> {
     pub fn signal_cpu(&mut self, key: usize, initial: u64, value: u64) {
         if let Ok(f) = self.fence(key, initial) {
             self.host.backend.signal(&f, value);
+        }
+        // A lower value may leave no queued signal above it; later waits then hold on the CPU.
+        if self.on_gpu.get(&key).is_some_and(|&v| value < v) {
+            self.on_gpu.remove(&key);
         }
         self.pump();
     }
@@ -331,17 +344,23 @@ impl<B: PresentBackend> Title<B> {
         let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else {
             return;
         };
-        if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
-            tracing::warn!(error = %e, "a fence signal was not queued");
+        match self.host.execute(&q, &[], &[], &[(&*f, value)]) {
+            Ok(_) => note_on_gpu(&mut self.on_gpu, fence, value),
+            Err(e) => tracing::warn!(error = %e, "a fence signal was not queued"),
         }
     }
 
-    /// `ID3D12CommandQueue::Wait`: later work on the queue starts once the fence has the value.
+    /// `ID3D12CommandQueue::Wait`: later work on the queue starts once the fence has the value. On
+    /// the GPU when a signal already given to it reaches the value, else held on the CPU (see the
+    /// module notes: Metal ends event waits after about 5 s).
     pub fn wait_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
-        if self.held.holds_work(queue) {
+        let reached = self.fence_value(fence, initial) >= value;
+        let signal_queued = self.on_gpu.get(&fence).is_some_and(|&v| v >= value);
+        if self.held.holds_work(queue) || !(reached || signal_queued) {
             let _ = self.fence(fence, initial);
             self.held.push(queue, Item::FenceWait(fence, value));
-        } else if let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial))
+        } else if !reached
+            && let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial))
             && let Err(e) = self.host.execute(&q, &[], &[(&*f, value)], &[])
         {
             tracing::warn!(error = %e, "a fence wait was not queued");
@@ -360,6 +379,7 @@ impl<B: PresentBackend> Title<B> {
             fences,
             held,
             signals,
+            on_gpu,
             stats,
             ..
         } = self;
@@ -385,10 +405,11 @@ impl<B: PresentBackend> Title<B> {
             let Some((queue, fence, value)) = signals.remove(&n) else {
                 return;
             };
-            if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence))
-                && let Err(e) = host.execute(q, &[], &[], &[(&**f, value)])
-            {
-                tracing::warn!(error = %e, "a held fence signal was not queued");
+            if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence)) {
+                match host.execute(q, &[], &[], &[(&**f, value)]) {
+                    Ok(_) => note_on_gpu(on_gpu, fence, value),
+                    Err(e) => tracing::warn!(error = %e, "a held fence signal was not queued"),
+                }
             }
         };
         let done = held.pump(&mut World {
@@ -478,6 +499,12 @@ impl<B: PresentBackend> Title<B> {
     pub fn ensure_queue(&mut self, key: usize) -> Result<(), String> {
         self.queue(key).map(|_| ())
     }
+}
+
+/// Records that a signal of `value` on `fence` has been given to the GPU.
+fn note_on_gpu(on_gpu: &mut HashMap<usize, u64>, fence: usize, value: u64) {
+    let v = on_gpu.entry(fence).or_insert(value);
+    *v = (*v).max(value);
 }
 
 /// The value a wait tests: from the pool when the address lies in one, else read from the
