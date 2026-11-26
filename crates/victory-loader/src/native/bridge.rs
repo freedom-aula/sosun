@@ -23,6 +23,7 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use victory_platform::mem::{self, Protect};
@@ -45,7 +46,7 @@ core::arch::global_asm!(
     "push r12",
     "push r13",
     "push r14",
-    "sub rsp, 0xF0",
+    "sub rsp, 0x100",
     // The four register arguments, then the registers Windows keeps for us.
     "mov [rsp + 0x30], rcx",
     "mov [rsp + 0x38], rdx",
@@ -70,6 +71,14 @@ core::arch::global_asm!(
     "mov [r12 + {in_host_ctx}], r14",
     "mov [r12 + {in_host_rbp}], rbp",
     "mov [r12 + {in_host}], r13",
+    // VICTORY_PROFILE: the time stamp counter at entry, for traced stubs.
+    "test r14, 1",
+    "jz 9f",
+    "rdtsc",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "mov [rsp + 0xF0], rax",
+    "9:",
     "mov rbx, [r12 + {host_tsd}]",
     "mov rdi, rbx",
     "mov eax, {set_gs}",
@@ -112,6 +121,7 @@ core::arch::global_asm!(
     "mov esi, r13d",
     "mov rdx, [rsp + 0x30]",
     "mov rcx, [rbp + 8]",
+    "mov r8, [rsp + 0xF0]",
     "call {trace_ret}",
     "8:",
     "mov rdi, r12",
@@ -128,7 +138,7 @@ core::arch::global_asm!(
     "movaps xmm13, [rsp + 0xC0]",
     "movaps xmm14, [rsp + 0xD0]",
     "movaps xmm15, [rsp + 0xE0]",
-    "add rsp, 0xF0",
+    "add rsp, 0x100",
     "pop r14",
     "pop r13",
     "pop r12",
@@ -289,17 +299,78 @@ struct Traced {
     slot: usize,
     /// An import's symbol (the area is its DLL); those log every call.
     name: &'static str,
+    /// VICTORY_PROFILE: calls, total and longest time in the call (TSC ticks).
+    calls: AtomicU64,
+    ticks: AtomicU64,
+    longest: AtomicU64,
+}
+
+/// Every `Traced` record, for the profile dump.
+static TRACED: Mutex<Vec<&'static Traced>> = Mutex::new(Vec::new());
+
+fn new_traced(area: &'static str, slot: usize, name: &'static str) -> &'static Traced {
+    let t: &'static Traced = Box::leak(Box::new(Traced {
+        area,
+        slot,
+        name,
+        calls: Default::default(),
+        ticks: Default::default(),
+        longest: Default::default(),
+    }));
+    TRACED.lock().unwrap_or_else(|e| e.into_inner()).push(t);
+    t
+}
+
+/// `VICTORY_PROFILE=<seconds>`: every title-to-host call is timed (count, total, longest) and the
+/// table is logged, longest total first, every that many seconds.
+pub(crate) fn profile_seconds() -> Option<u64> {
+    static SECS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| std::env::var("VICTORY_PROFILE").ok()?.parse().ok())
+}
+
+fn tsc() -> u64 {
+    // SAFETY: rdtsc has no preconditions.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// Starts the thread that logs the profile.
+pub(crate) fn start_profile() {
+    let Some(secs) = profile_seconds() else { return };
+    std::thread::spawn(move || {
+        let (t0, c0) = (std::time::Instant::now(), tsc());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let per_ms = (tsc() - c0) as f64 / t0.elapsed().as_secs_f64() / 1000.0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let mut rows: Vec<_> = TRACED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|t| (t.ticks.load(Ordering::Relaxed), *t))
+                .filter(|(_, t)| t.calls.load(Ordering::Relaxed) > 0)
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+            tracing::warn!("profile at {:.1}s: {} methods", t0.elapsed().as_secs_f64(), rows.len());
+            for (ticks, t) in rows.iter().take(40) {
+                tracing::warn!(
+                    "profile {}!{}{:#x} calls {} total {:.1} ms max {:.2} ms",
+                    t.area,
+                    t.name,
+                    t.slot * 8,
+                    t.calls.load(Ordering::Relaxed),
+                    *ticks as f64 / per_ms,
+                    t.longest.load(Ordering::Relaxed) as f64 / per_ms
+                );
+            }
+        }
+    });
 }
 
 /// The context word that makes a stub log its results: `area!name` imports
 /// when `VICTORY_TRACE_IMPORTS` is set (see [`trace_imports`]).
 pub(crate) fn traced_import(dll: &str, symbol: &str) -> usize {
     let leak = |s: &str| &*Box::leak(s.to_string().into_boxed_str());
-    let info = Box::leak(Box::new(Traced {
-        area: leak(dll),
-        slot: 0,
-        name: leak(symbol),
-    }));
+    let info = new_traced(leak(dll), 0, leak(symbol));
     info as *const Traced as usize | 1
 }
 
@@ -319,8 +390,14 @@ pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str,
     Some((info.area, info.name, info.slot * 8))
 }
 
-extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
-    if if info.name.is_empty() { hr < 0 || trace_level() == 2 } else { trace_imports() } {
+extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: u64) {
+    if profile_seconds().is_some() {
+        let d = tsc().wrapping_sub(start);
+        info.calls.fetch_add(1, Ordering::Relaxed);
+        info.ticks.fetch_add(d, Ordering::Relaxed);
+        info.longest.fetch_max(d, Ordering::Relaxed);
+    }
+    if if info.name.is_empty() { trace_level() > 0 && (hr < 0 || trace_level() == 2) } else { trace_imports() } {
         tracing::warn!(
             area = info.area,
             name = info.name,
@@ -490,7 +567,7 @@ pub unsafe fn bridged_table(
     let mut unique: Vec<(usize, bool)> = targets.clone();
     unique.sort_unstable();
     unique.dedup();
-    let tracing_on = trace_level() > 0;
+    let tracing_on = trace_level() > 0 || profile_seconds().is_some();
     let mut block = StubBlock::new(unique.len() + len + SPARE_SLOTS)?;
     let mut stub_of = std::collections::HashMap::new();
     let mut copy: Vec<usize> = Vec::with_capacity(len + SPARE_SLOTS);
@@ -501,11 +578,7 @@ pub unsafe fn bridged_table(
                 copy.push(0);
                 continue;
             }
-            let info = Box::leak(Box::new(Traced {
-                area,
-                slot,
-                name: "",
-            }));
+            let info = new_traced(area, slot, "");
             let ctx = info as *const Traced as usize | 1;
             let win64 = is_win64(s as usize);
             // win64 targets skip the remapping and cannot be traced.

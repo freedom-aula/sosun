@@ -212,6 +212,7 @@ pub unsafe fn run_entry_with(
         .max(1 << 20);
     teb::set_image_base(image.base());
     super::dump::start();
+    super::bridge::start_profile();
     let dlls = dlls.to_vec();
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));
     let failed = failure.clone();

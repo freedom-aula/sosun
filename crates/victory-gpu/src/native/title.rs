@@ -278,7 +278,7 @@ impl<B: PresentBackend> Title<B> {
     /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
-        self.sync_textures();
+        self.sync_dirty();
         for (list, waits) in segments {
             self.stats.segments += 1;
             let waits: Vec<ValueWait> = waits.into_iter().map(Into::into).collect();
