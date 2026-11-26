@@ -8,6 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
+// No binding crate links AppKit, so its classes would not be registered without this.
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {}
+
 use anyhow::{Context, Result};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool};
