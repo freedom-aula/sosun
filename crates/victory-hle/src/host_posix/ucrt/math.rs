@@ -261,7 +261,8 @@ pub extern "win64" fn _scalb(x: f64, e: i32) -> f64 {
 }
 
 pub extern "win64" fn ilogb(x: f64) -> i32 {
-    libm::ilogb(x)
+    // The CRT's FP_ILOGBNAN is INT_MAX, as for an infinity; macOS gives a NaN FP_ILOGB0, INT_MIN.
+    if x.is_nan() { i32::MAX } else { libm::ilogb(x) }
 }
 
 pub extern "win64" fn ilogbf(x: f32) -> i32 {
@@ -631,6 +632,17 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::host_posix::ucrt::errno;
+
+    #[test]
+    fn ilogb_gives_the_crts_special_values() {
+        // FP_ILOGBNAN (INT_MAX) for NaNs and infinities, FP_ILOGB0 (INT_MIN) for zeros.
+        for x in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ilogb(x), i32::MAX, "{x}");
+        }
+        assert_eq!((ilogb(0.0), ilogb(-0.0)), (i32::MIN, i32::MIN));
+        assert_eq!((ilogb(8.0), ilogb(0.75), ilogb(f64::from_bits(1))), (3, -1, -1074));
+        assert_eq!((ilogbf(f32::NAN), ilogbf(1024.0)), (i32::MAX, 10));
+    }
 
     #[test]
     fn functions_match_libm() {
