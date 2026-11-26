@@ -419,9 +419,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let Some(Root::Table(h, at)) = r else { continue };
             let check = table_check_count(slot, binding, Self::TABLE_CHECK);
             let (mut checked, mut changed) = (0, 0);
-            for index in *at..(*at + check).min(h.count) {
-                let handle = h.start + index as u64 * Self::step(h.kind);
-                let record = record_at(handle);
+            let step = Self::step(h.kind) as usize;
+            let end = (*at + check).min(h.count);
+            // The whole span in one read (a system call each); entry by entry only if part of it
+            // cannot be read.
+            let mut span = vec![0u8; end.saturating_sub(*at) * step];
+            let whole = super::safe_read((h.start + (*at * step) as u64) as *const u8, &mut span);
+            for index in *at..end {
+                let handle = h.start + (index * step) as u64;
+                let record = if whole {
+                    span[(index - *at) * step..][..12].try_into().expect("12 bytes")
+                } else {
+                    record_at(handle)
+                };
                 checked += 1;
                 if h.mirrored.borrow().get(&index) == Some(&record) {
                     continue;
