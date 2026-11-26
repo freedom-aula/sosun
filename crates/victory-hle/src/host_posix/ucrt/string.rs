@@ -95,10 +95,18 @@ pub extern "system" fn memcpy_s(dst: *mut u8, dst_size: usize, src: *const u8, n
 }
 
 pub extern "system" fn memmove_s(dst: *mut u8, dst_size: usize, src: *const u8, n: usize) -> i32 {
-    if n != 0 && (dst.is_null() || src.is_null() || dst_size < n) {
-        return memcpy_s(dst, dst_size, src, n);
+    if n == 0 {
+        return 0;
     }
-    memcpy_s(dst, dst_size, src, n)
+    // Unlike memcpy_s, a failed memmove_s leaves the destination as it was.
+    if dst.is_null() || src.is_null() {
+        return bad_param(EINVAL);
+    }
+    if dst_size < n {
+        return bad_param(ERANGE);
+    }
+    memmove(dst, src, n);
+    0
 }
 
 pub extern "system" fn _memccpy(dst: *mut u8, src: *const u8, c: i32, n: usize) -> *mut u8 {
@@ -1408,6 +1416,25 @@ exports!(pub(super) fn lookup;
 mod tests {
     use super::*;
     use victory_platform::mem::{self, Protect};
+
+    #[test]
+    fn memmove_s_leaves_the_destination_alone_on_error_and_memcpy_s_zeroes_it() {
+        let (src, null) = (*b"abcd", std::ptr::null::<u8>());
+        let mut dst = *b"xxxx";
+        assert_eq!(memmove_s(dst.as_mut_ptr(), 4, null, 2), EINVAL);
+        assert_eq!(super::super::errno(), EINVAL);
+        assert_eq!(memmove_s(dst.as_mut_ptr(), 2, src.as_ptr(), 3), ERANGE);
+        assert_eq!(super::super::errno(), ERANGE);
+        assert_eq!(dst, *b"xxxx");
+        assert_eq!(memmove_s(std::ptr::null_mut(), 4, src.as_ptr(), 2), EINVAL);
+        assert_eq!(memmove_s(std::ptr::null_mut(), 0, null, 0), 0);
+        // Overlapping, as memmove.
+        let mut both = *b"abcdef";
+        assert_eq!(memmove_s(both.as_mut_ptr().wrapping_add(2), 4, both.as_ptr(), 4), 0);
+        assert_eq!(both, *b"ababcd");
+        assert_eq!(memcpy_s(dst.as_mut_ptr(), 2, src.as_ptr(), 3), ERANGE);
+        assert_eq!(dst, *b"\0\0xx");
+    }
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
