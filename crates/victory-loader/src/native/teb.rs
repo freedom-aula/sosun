@@ -44,21 +44,46 @@ pub const MAX_TLS_MODULES: usize = 64;
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
 
-/// Every live thread with a TEB: block address, Mach port, thread id.
-static LIVE: Mutex<Vec<(usize, super::threadctl::ThreadPort, u32)>> = Mutex::new(Vec::new());
+struct LiveThread {
+    teb: usize,
+    port: super::threadctl::ThreadPort,
+    tid: u32,
+    tls_array: usize,
+    /// TLS blocks allocated after this thread started (for late-loaded DLLs),
+    /// freed when its TEB is dropped.
+    late_blocks: Vec<(usize, Layout)>,
+}
+
+/// Every live thread with a TEB. Lock order with `TLS_MODULES`: always lock
+/// `TLS_MODULES` before `LIVE`.
+static LIVE: Mutex<Vec<LiveThread>> = Mutex::new(Vec::new());
 
 /// The threads that have a TEB now (for the thread dump).
 pub fn live_threads() -> Vec<(usize, super::threadctl::ThreadPort, u32)> {
-    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    LIVE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|t| (t.teb, t.port, t.tid))
+        .collect()
 }
 
 static TLS_MODULES: Mutex<Vec<TlsTemplate>> = Mutex::new(Vec::new());
 static PEB: AtomicUsize = AtomicUsize::new(0);
 
+fn alloc_tls_block(t: &TlsTemplate) -> (*mut u8, Layout) {
+    let layout = Layout::from_size_align(t.block_len().max(1), 64).expect("layout");
+    // SAFETY: a non-zero layout; the template is in a mapped image.
+    let block = unsafe { alloc_zeroed(layout) };
+    assert!(!block.is_null(), "out of memory for a TLS block");
+    // SAFETY: the template's initial data is `end - start` readable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(t.start as *const u8, block, t.end - t.start) };
+    (block, layout)
+}
+
 /// Gives a mapped image its TLS index, writes it where the image reads
-/// `_tls_index`, and arranges for every thread started from now on to get a
-/// block. Call before [`super::NativeImage::finalize`] makes that word
-/// read-only, and before any thread runs title code.
+/// `_tls_index`, populates a block in every already-live thread's TLS array,
+/// and arranges for every thread started from now on to get a block. Call
+/// before [`super::NativeImage::finalize`] makes that word read-only.
 pub fn register_tls(template: TlsTemplate) -> u32 {
     let mut modules = TLS_MODULES.lock().unwrap_or_else(|e| e.into_inner());
     let index = modules.len();
@@ -66,6 +91,17 @@ pub fn register_tls(template: TlsTemplate) -> u32 {
     modules.push(template);
     // SAFETY: the template's index word is in the image the caller mapped.
     unsafe { (template.index_at as *mut u32).write(index as u32) };
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    for thread in live.iter_mut() {
+        let (block, layout) = alloc_tls_block(&template);
+        // SAFETY: `tls_array` has `MAX_TLS_MODULES` entries and stays alive until
+        // `ThreadTeb::drop` removes this entry under `LIVE`.
+        unsafe {
+            let slot = (thread.tls_array as *const AtomicUsize).add(index);
+            (*slot).store(block as usize, Ordering::Release);
+        }
+        thread.late_blocks.push((block as usize, layout));
+    }
     index as u32
 }
 
@@ -95,7 +131,7 @@ pub fn set_image_base(base: usize) {
 
 struct ThreadTeb {
     teb: *mut u8,
-    tls_array: Box<[usize; MAX_TLS_MODULES]>,
+    tls_array: Box<[AtomicUsize; MAX_TLS_MODULES]>,
     blocks: Vec<(*mut u8, Layout)>,
 }
 
@@ -107,20 +143,13 @@ impl ThreadTeb {
         // SAFETY: a non-zero layout.
         let teb = unsafe { alloc_zeroed(layout) };
         assert!(!teb.is_null(), "out of memory for a TEB");
-        let mut tls_array = Box::new([0usize; MAX_TLS_MODULES]);
+        let tls_array: Box<[AtomicUsize; MAX_TLS_MODULES]> =
+            Box::new(std::array::from_fn(|_| AtomicUsize::new(0)));
         let mut blocks = Vec::new();
-        for (i, t) in TLS_MODULES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .enumerate()
-        {
-            let layout = Layout::from_size_align(t.block_len().max(1), 64).expect("layout");
-            // SAFETY: a non-zero layout; the template is in a mapped image.
-            let block = unsafe { alloc_zeroed(layout) };
-            // SAFETY: the template's initial data is `end - start` readable bytes.
-            unsafe { std::ptr::copy_nonoverlapping(t.start as *const u8, block, t.end - t.start) };
-            tls_array[i] = block as usize;
+        let modules = TLS_MODULES.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, t) in modules.iter().enumerate() {
+            let (block, layout) = alloc_tls_block(t);
+            tls_array[i].store(block as usize, Ordering::Relaxed);
             blocks.push((block, layout));
         }
         let (top, size) = stack_bounds();
@@ -139,11 +168,16 @@ impl ThreadTeb {
         put(OFF_TLS_ARRAY, tls_array.as_ptr() as usize);
         put(OFF_PEB, peb());
         put(OFF_HOST_TSD, host_tsd_base());
-        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((
-            teb as usize,
-            super::threadctl::ThreadPort::current(),
-            victory_platform::thread::current_id(),
-        ));
+        LIVE.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(LiveThread {
+                teb: teb as usize,
+                port: super::threadctl::ThreadPort::current(),
+                tid: victory_platform::thread::current_id(),
+                tls_array: tls_array.as_ptr() as usize,
+                late_blocks: Vec::new(),
+            });
+        drop(modules);
         ThreadTeb {
             teb,
             tls_array,
@@ -155,7 +189,18 @@ impl ThreadTeb {
 impl Drop for ThreadTeb {
     fn drop(&mut self) {
         let _ = &self.tls_array;
-        LIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.0 != self.teb as usize);
+        let late_blocks = {
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = live.iter().position(|t| t.teb == self.teb as usize) {
+                live.swap_remove(pos).late_blocks
+            } else {
+                Vec::new()
+            }
+        };
+        for (block, layout) in late_blocks {
+            // SAFETY: allocated by `alloc_tls_block` in `register_tls`.
+            unsafe { dealloc(block as *mut u8, layout) };
+        }
         for (block, layout) in self.blocks.drain(..) {
             // SAFETY: allocated in `new` with this layout.
             unsafe { dealloc(block, layout) };
@@ -227,4 +272,35 @@ fn host_tsd_base() -> usize {
         // SAFETY: inside the pthread structure, which is larger than 0x400 bytes.
         .find(|&p| (0..12).all(|i| unsafe { (p as *const usize).add(i).read() } == gs_slot(i)))
         .expect("cannot locate the pthread TSD base")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_register_tls_populates_already_live_threads() {
+        let teb = current();
+        let init: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut tls_index: u32 = u32::MAX;
+        let template = TlsTemplate {
+            start: init.as_ptr() as usize,
+            end: init.as_ptr() as usize + init.len(),
+            zero_fill: 8,
+            index_at: (&mut tls_index as *mut u32) as usize,
+        };
+        let index = register_tls(template);
+        assert_eq!(tls_index, index);
+
+        // SAFETY: `teb` is this thread's live TEB and `OFF_TLS_ARRAY` points to its TLS array.
+        let block = unsafe {
+            let array = *(teb.add(OFF_TLS_ARRAY) as *const *const AtomicUsize);
+            (*array.add(index as usize)).load(Ordering::Acquire) as *const u8
+        };
+        assert!(!block.is_null(), "live thread must receive a TLS block for late-loaded DLL");
+        // SAFETY: `block` has `init.len() + zero_fill` bytes allocated by `alloc_tls_block`.
+        let bytes = unsafe { std::slice::from_raw_parts(block, 16) };
+        assert_eq!(&bytes[..8], &init);
+        assert_eq!(&bytes[8..16], &[0u8; 8]);
+    }
 }
