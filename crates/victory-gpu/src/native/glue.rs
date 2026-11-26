@@ -592,6 +592,12 @@ pub(crate) fn topology(this: This, topology: u32) {
 
 /// `RSSetViewports`: the first one.
 pub(crate) fn viewports(this: This, first: Option<[f32; 6]>) {
+    if tracing_targets() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(?first, "viewport set");
+        }
+    }
     with_list(this, |_, l| {
         l.list.set_viewport(first.map(|v| victory_backend::resources::Viewport {
             x: v[0],
@@ -689,6 +695,17 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    if tracing_targets() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            with_list(this, |_, l| {
+                let mut head = [0u8; 48];
+                let at = l.list.vertex_buffer_address(0);
+                let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
+                tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.target_formats, "draw");
+            });
+        }
+    }
     with_list(this, |t, l| {
         if graphics(t, l) {
             match l.list.draw_instanced(vertices, instances, first, first_instance) {

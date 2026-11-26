@@ -1746,6 +1746,11 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The vertex id input (debugging).
+    fn get_input_vertex_id(&mut self) -> Result<Val, Why> {
+        Ok(self.input(Input::VertexId))
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -10444,6 +10449,7 @@ impl<'a> Lower<'a> {
                 x = self.as_int(f);
             }
             let el = &mut elements(self, primitive)[id];
+            let el_kind = el.kind;
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
@@ -10455,6 +10461,27 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            let x = if !self.s.pixel && !mesh && el_kind == 3 && col < 2 && std::env::var_os("VICTORY_DEBUG_VS_TRI").is_some() {
+                // Debug: a triangle covering the target, from the vertex id.
+                let Ok(Val::I32(vid)) = self.get_input_vertex_id() else { return Err("a vertex id") };
+                let c = self.cur;
+                let sh = self.s.m.i32(u32::from(col));
+                let bit = self.s.m.bin(c, Bin::LShr, vid, sh);
+                let one = self.s.m.i32(1);
+                let bit = self.s.m.bin(c, Bin::And, bit, one);
+                let z = self.s.m.i32(0);
+                let on = self.s.m.cmp(c, pred::NE, bit, z);
+                let (hi, lo) = (self.s.m.i32(3.0f32.to_bits()), self.s.m.i32((-1.0f32).to_bits()));
+                let b = self.s.m.select(c, on, hi, lo);
+                self.as_float(b)
+            } else {
+                x
+            };
+            let x = if self.s.pixel && std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() && suffix == ".f32" {
+                self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
+            } else {
+                x
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),

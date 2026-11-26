@@ -505,6 +505,11 @@ impl<B: GraphicsBackend> NativeList<B> {
         self.state.vertex[slot] = address;
     }
 
+    /// The address bound as vertex buffer `slot`, if any (for the target trace).
+    pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
+        self.state.vertex.get(slot).copied()
+    }
+
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
         self.state.index = Some((address, wide));
     }
