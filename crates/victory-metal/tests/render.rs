@@ -543,6 +543,7 @@ fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
             index_buffer: None,
             call,
             indirect: None,
+            count: None,
         };
         let second = Pass::Render(RenderPass {
             color: vec![ColorTarget {
@@ -659,6 +660,7 @@ fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4
         index_buffer: None,
         call,
         indirect: None,
+        count: None,
     };
     let second = Pass::Render(RenderPass {
         color: vec![ColorTarget {
