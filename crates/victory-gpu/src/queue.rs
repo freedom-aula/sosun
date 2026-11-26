@@ -250,6 +250,7 @@ fn pump(held: &mut Holding, why: Why) {
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);
         crate::fence::let_go(f as This);
+        true
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,

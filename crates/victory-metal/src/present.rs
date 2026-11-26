@@ -40,9 +40,26 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+// CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
+// worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
+struct AcquisitionLayer(Retained<CAMetalLayer>);
+// SAFETY: the retained layer is used only for thread-safe drawable acquisition on the worker.
+unsafe impl Send for AcquisitionLayer {}
+struct Drawable(Retained<ProtocolObject<dyn CAMetalDrawable>>);
+// SAFETY: Metal drawables may cross rendering threads; the channel transfers ownership.
+unsafe impl Send for Drawable {}
+
+impl AcquisitionLayer {
+    fn next(&self) -> Option<Drawable> {
+        self.0.nextDrawable().map(Drawable)
+    }
+}
+
 /// A `CAMetalLayer` presented to.
 pub struct Surface {
-    layer: Retained<CAMetalLayer>,
+    acquisition: std::sync::mpsc::Sender<()>,
+    drawables: std::sync::mpsc::Receiver<Option<Drawable>>,
+    acquiring: std::cell::Cell<bool>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// The copy pipeline for each drawable format seen.
     pipelines: RefCell<HashMap<usize, Pipeline>>,
@@ -161,8 +178,21 @@ impl PresentBackend for Metal {
             .dev
             .newLibraryWithSource_options_error(&NSString::from_str(SHADER), None)
             .map_err(|e| e.localizedDescription().to_string())?;
+        let (acquisition, requests) = std::sync::mpsc::channel();
+        let (results, drawables) = std::sync::mpsc::sync_channel(1);
+        let layer = AcquisitionLayer(layer);
+        std::thread::Builder::new().name("victory drawables".into()).spawn(move || {
+            while requests.recv().is_ok() {
+                let drawable = objc2::rc::autoreleasepool(|_| layer.next());
+                if results.send(drawable).is_err() {
+                    break;
+                }
+            }
+        }).map_err(|e| e.to_string())?;
         Ok(Surface {
-            layer,
+            acquisition,
+            drawables,
+            acquiring: std::cell::Cell::new(false),
             library,
             pipelines: RefCell::default(),
             last: RefCell::default(),
@@ -176,34 +206,55 @@ impl PresentBackend for Metal {
         surface: &Surface,
         source: &Texture,
     ) -> Result<(), String> {
-        let drawable = surface.layer.nextDrawable().ok_or("no drawable")?;
-        let target = drawable.texture();
-        // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
-        // swap chain holds display values).
-        let src = source.view_without_srgb(self);
-        let pass = MTLRenderPassDescriptor::new();
-        // SAFETY: colour attachment 0 always exists.
-        let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-        a.setTexture(Some(&target));
-        a.setLoadAction(MTLLoadAction::DontCare);
-        a.setStoreAction(MTLStoreAction::Store);
-        let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
-        let e = cb
-            .renderCommandEncoderWithDescriptor(&pass)
-            .ok_or("no render encoder")?;
-        let state = pipeline(self, surface, target.pixelFormat())?;
-        e.setRenderPipelineState(&state);
-        // SAFETY: slot 0 of the fragment stage takes the source texture.
-        unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
-        // SAFETY: three vertices, no buffers.
-        unsafe {
-            e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+        loop {
+            if self.try_present(queue, surface, source)? {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn try_present(&self, queue: &Queue, surface: &Surface, source: &Texture) -> Result<bool, String> {
+        if !surface.acquiring.replace(true) {
+            surface.acquisition.send(()).map_err(|_| "drawable worker stopped")?;
+        }
+        let drawable = match surface.drawables.try_recv() {
+            Ok(drawable) => {
+                surface.acquiring.set(false);
+                drawable.ok_or("no drawable")?.0
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(_) => return Err("drawable worker stopped".into()),
         };
-        e.endEncoding();
-        cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        cb.commit();
-        *surface.last.borrow_mut() = Some(target);
-        surface.frames.set(surface.frames.get() + 1);
-        Ok(())
+        objc2::rc::autoreleasepool(|_| {
+            let target = drawable.texture();
+            // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
+            // swap chain holds display values).
+            let src = source.view_without_srgb(self);
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: colour attachment 0 always exists.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&target));
+            a.setLoadAction(MTLLoadAction::DontCare);
+            a.setStoreAction(MTLStoreAction::Store);
+            let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+            let e = cb
+                .renderCommandEncoderWithDescriptor(&pass)
+                .ok_or("no render encoder")?;
+            let state = pipeline(self, surface, target.pixelFormat())?;
+            e.setRenderPipelineState(&state);
+            // SAFETY: slot 0 of the fragment stage takes the source texture.
+            unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
+            // SAFETY: three vertices, no buffers.
+            unsafe {
+                e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+            };
+            e.endEncoding();
+            cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            cb.commit();
+            *surface.last.borrow_mut() = Some(target);
+            surface.frames.set(surface.frames.get() + 1);
+            Ok(true)
+        })
     }
 }

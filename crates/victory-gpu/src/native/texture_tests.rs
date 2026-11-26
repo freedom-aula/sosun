@@ -259,7 +259,7 @@ fn present_draws_the_back_buffer_over_the_apps_layer() {
 }
 
 fn check_present_order(held: bool) {
-    let Some(pool) = pool(if held { 9116 } else { 9106 }, 4) else { return };
+    let Some(pool) = pool(if held { 9116 } else { 9106 }, 8) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_S.0, 1);
     let heap = crate::descriptor::test_heap(false, 4);
     let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
@@ -311,7 +311,10 @@ fn check_present_order(held: bool) {
     };
     let before = glue::frames_presented();
     let present = slot::<extern "system" fn(This, u32, *const Plane, *const u8) -> i32>(q, 0xf0);
-    assert_eq!(present(q, 1, &plane, std::ptr::null()), 0);
+    let frames = if held { 6 } else { 1 };
+    for _ in 0..frames {
+        assert_eq!(present(q, 1, &plane, std::ptr::null()), 0);
+    }
     // A signal after the present must also stay behind it.
     slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
     if held {
@@ -319,9 +322,19 @@ fn check_present_order(held: bool) {
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert_eq!(glue::frames_presented(), before, "present bypassed the fence wait");
         assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 0);
-        glue::fence_signal(gate, 1);
+        // Signal the backend directly so only the timer worker drains the deferred presents.
+        glue::with_title(|t| {
+            use victory_backend::backend::ComputeBackend;
+            let f = t.fence(gate as usize, 0).unwrap();
+            t.host.backend.signal(&f, 1);
+        });
     }
-    assert_eq!(glue::frames_presented(), before + 1);
+    let start = std::time::Instant::now();
+    while glue::frames_presented() < before + frames {
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "worker failed to drain presents");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(glue::frames_presented(), before + frames);
     // The frame is drawn when the fence is reached.
     assert_eq!(
         slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(f, 1, std::ptr::null_mut()),
