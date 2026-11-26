@@ -194,6 +194,7 @@ fn program() -> HostShader {
         wave32_host: false,
         zero_copy_memory: false,
         view_marks: false,
+        rect_list: false,
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
@@ -428,6 +429,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         wave32_host: false,
         zero_copy_memory: false,
         view_marks: false,
+        rect_list: false,
     })
     .expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
@@ -575,6 +577,7 @@ fn writes_through_views_mark_their_pages() {
         wave32_host: false,
         zero_copy_memory: false,
         view_marks: true,
+        rect_list: false,
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
@@ -696,6 +699,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             narrow_waves: false,
             wave32_host: false,
             zero_copy_memory: false,
+            rect_list: false,
         })
         .expect("lower")
     };

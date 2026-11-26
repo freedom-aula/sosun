@@ -204,6 +204,7 @@ fn build(
         wave32_host: false,
         zero_copy_memory: false,
         view_marks: false,
+        rect_list: false,
     })
     .expect("lower");
     let shader = HostShader {

@@ -142,6 +142,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         wave32_host: false,
         zero_copy_memory: false,
         view_marks: false,
+        rect_list: false,
     })
 }
 

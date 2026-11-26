@@ -136,6 +136,7 @@ fn lowered(
         wave32_host,
         zero_copy_memory: false,
         view_marks: false,
+        rect_list: false,
     })?;
     // VICTORY_DUMP_DXIL=<dir>: keep the containers, to run Apple's converter on.
     if let (Some(dir), true) = (std::env::var_os("VICTORY_DUMP_DXIL"), wave32_host) {
