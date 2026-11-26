@@ -218,36 +218,46 @@ pub extern "win64" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
 }
 
 pub extern "win64" fn ldexp(x: f64, e: i32) -> f64 {
-    check(&[x], scalbn_(x, e))
+    scalbn_checked(x, e)
 }
 
 pub extern "win64" fn ldexpf(x: f32, e: i32) -> f32 {
-    check(&[f64::from(x)], f64::from(scalbn_(f64::from(x), e) as f32)) as f32
+    scalbnf_checked(x, e)
 }
 
 fn scalbn_(x: f64, e: i32) -> f64 {
     libm::scalbn(x, e)
 }
 
+/// `scalbn` with `ERANGE` on overflow, as the CRT documents.
+fn scalbn_checked(x: f64, e: i32) -> f64 {
+    check(&[x], scalbn_(x, e))
+}
+
+/// The float form, checked after rounding to the float it returns.
+fn scalbnf_checked(x: f32, e: i32) -> f32 {
+    check(&[f64::from(x)], f64::from(scalbn_(f64::from(x), e) as f32)) as f32
+}
+
 pub extern "win64" fn scalbn(x: f64, e: i32) -> f64 {
-    scalbn_(x, e)
+    scalbn_checked(x, e)
 }
 
 pub extern "win64" fn scalbnf(x: f32, e: i32) -> f32 {
-    scalbn_(f64::from(x), e) as f32
+    scalbnf_checked(x, e)
 }
 
 /// `scalbln`'s exponent is a 32-bit `long` here.
 pub extern "win64" fn scalbln(x: f64, e: i32) -> f64 {
-    scalbn_(x, e)
+    scalbn_checked(x, e)
 }
 
 pub extern "win64" fn scalblnf(x: f32, e: i32) -> f32 {
-    scalbn_(f64::from(x), e) as f32
+    scalbnf_checked(x, e)
 }
 
 pub extern "win64" fn _scalb(x: f64, e: i32) -> f64 {
-    scalbn_(x, e)
+    scalbn_checked(x, e)
 }
 
 pub extern "win64" fn ilogb(x: f64) -> i32 {
@@ -707,6 +717,28 @@ mod tests {
         assert_eq!(expf(f32::INFINITY), f32::INFINITY);
         assert_eq!(powf(f32::INFINITY, 2.0), f32::INFINITY);
         assert_eq!(ldexpf(f32::INFINITY, 1), f32::INFINITY);
+        assert_eq!(errno(), 7);
+    }
+
+    #[test]
+    fn scalbn_and_its_relatives_set_erange_on_overflow() {
+        fn overflows(what: &str, call: impl Fn() -> f64) {
+            set_errno(0);
+            assert!(call().is_infinite(), "{what}");
+            assert_eq!(errno(), ERANGE, "{what}");
+        }
+        overflows("scalbn(1, 2000)", || scalbn(1.0, 2000));
+        overflows("scalbln(-1, 2000)", || scalbln(-1.0, 2000));
+        overflows("_scalb(1, 2000)", || _scalb(1.0, 2000));
+        overflows("scalbnf(1, 200)", || f64::from(scalbnf(1.0, 200)));
+        overflows("scalblnf(1, 200)", || f64::from(scalblnf(1.0, 200)));
+        // In range, an infinity in, or an underflow to zero: errno stays as it was.
+        set_errno(7);
+        assert_eq!(scalbn(1.5, 4), 24.0);
+        assert_eq!(scalbnf(1.5, 4), 24.0);
+        assert!(scalbn(f64::INFINITY, 1).is_infinite());
+        assert_eq!(scalbn(1.0, -2000), 0.0);
+        assert_eq!(scalbnf(1.0, -200), 0.0);
         assert_eq!(errno(), 7);
     }
 
