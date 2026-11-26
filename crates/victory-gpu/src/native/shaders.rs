@@ -207,11 +207,18 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.refuse(name, "no input signature".into());
             return Pipe::Refused;
         };
-        let Some((attributes, streams)) = g.vertex_layout(&reads) else {
+        let Some((mut attributes, streams)) = g.vertex_layout(&reads) else {
             self.shaders
                 .refuse(name, "the vertex shader reads an input the layout lacks".into());
             return Pipe::Refused;
         };
+        // A system value ahead of the attributes takes an attribute number: described as the
+        // attribute after it, which the converter's function ignores.
+        for at in state::system_gaps(&vs.dxil) {
+            if let Some(next) = attributes.get(at).copied() {
+                attributes.insert(at, next);
+            }
+        }
         let (Some(color), Ok(depth)) = (g.color_formats(), g.depth_format()) else {
             self.shaders.refuse(name, "a target format the host does not know".into());
             return Pipe::Refused;

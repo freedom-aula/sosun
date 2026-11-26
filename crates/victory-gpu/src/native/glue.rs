@@ -9,7 +9,8 @@
 //! work and fence values along.
 
 use super::memory::{PoolObserver, PoolTable};
-use super::title::{Pipe, Title, TitleList, Wait};
+use super::state::Graphics;
+use super::title::{Guessed, Pipe, Title, TitleList, Wait};
 use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,12 +263,18 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let color: Vec<_> = color
+        let colors: Vec<usize> = color
             .iter()
             .filter_map(|&h| crate::descriptor::rtv_record(h))
-            .filter_map(|r| t.texture_of(r.resource as usize))
+            .map(|r| r.resource as usize)
             .collect();
-        let depth = crate::descriptor::dsv_record(depth).and_then(|r| t.texture_of(r.resource as usize));
+        let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
+        let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
+        let depth = depth_key.and_then(|k| t.texture_of(k));
+        l.target_formats = (
+            colors.iter().filter_map(|&k| t.format_of(k)).collect(),
+            depth_key.and_then(|k| t.format_of(k)),
+        );
         l.list.set_render_targets(&color, depth.as_ref());
     });
 }
@@ -440,6 +447,15 @@ fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
             Some(cs) => t.compute_pipe(cs, &name),
             None => Pipe::Refused,
         },
+        Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
+            Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
+                vs: vs.clone(),
+                ps: hosts.iter().find(|h| h.0 == "pixel").map(|h| h.1.clone()),
+                name,
+                made: Default::default(),
+            })),
+            None => Pipe::Refused,
+        },
         Some(g) => match find("vertex") {
             Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
             None => {
@@ -519,22 +535,59 @@ pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
 }
 
 /// `IASetVertexBuffers`: the addresses of the streams from `start`.
-pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64]) {
+pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides: &[u32]) {
     with_list(this, |_, l| {
         for (i, a) in addresses.iter().enumerate() {
             l.list.set_vertex_buffer(start as usize + i, *a);
+            let slot = start as usize + i;
+            if l.strides.len() <= slot {
+                l.strides.resize(slot + 1, 0);
+            }
+            l.strides[slot] = strides.get(i).copied().unwrap_or(0);
         }
     });
+}
+
+/// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
+fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>) -> Pipe<Metal> {
+    let key = format!("{:?}{:?}", l.target_formats, l.strides);
+    if let Some(p) = g.made.borrow().get(&key) {
+        return p.clone();
+    }
+    let reads = super::state::vertex_inputs(&g.vs.dxil).unwrap_or_default();
+    let (colors, depth) = l.target_formats.clone();
+    tracing::info!(name = %g.name, ?reads, ?colors, ?depth, strides = ?l.strides, "guessed pipeline");
+    let state = Graphics::guessed(colors, depth, l.strides.clone(), &reads);
+    let made = t.render_pipe(&g.vs, g.ps.as_deref(), &state, &g.name);
+    g.made.borrow_mut().insert(key, made.clone());
+    made
 }
 
 /// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
 /// counted) when there is nothing to draw with.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
-    let Pipe::Render(pso, binding) = pipe(t, l.pipeline) else {
+    let mut rects = false;
+    let made = match pipe(t, l.pipeline) {
+        Pipe::Guess(g) => {
+            rects = true;
+            guess(t, l, &g)
+        }
+        p => p,
+    };
+    let Pipe::Render(pso, binding) = made else {
         dropped();
         return false;
     };
-    let Some(topology) = super::state::topology(l.topology) else {
+    // shortcut: a guessed pipeline's rectangle list (topology 17, three corners a rectangle) is
+    // drawn as the triangle its corners make, half the rectangle; the fourth corner needs a
+    // geometry stage the host lacks.
+    let topology = super::state::topology(l.topology)
+        .or_else(|| (rects && l.topology == 17).then_some(victory_backend::resources::Topology::Triangles));
+    let Some(topology) = topology else {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if l.topology < 64 && SEEN.fetch_or(1 << l.topology, Ordering::Relaxed) >> l.topology & 1 == 0 {
+            tracing::info!(topology = l.topology, "a draw dropped for its primitive topology");
+        }
         dropped();
         return false;
     };

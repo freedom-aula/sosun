@@ -1790,7 +1790,8 @@ mod state {
         views: *const (u64, u32, u32),
     ) {
         let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
-        glue::vertex_buffers(this, start, &addresses);
+        let strides: Vec<u32> = items(views, count).iter().map(|v| v.2).collect();
+        glue::vertex_buffers(this, start, &addresses, &strides);
     }
 
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {

@@ -70,6 +70,17 @@ pub struct Graphics {
     rt_formats: Vec<u32>,
     depth_format: u32,
     pub samples: u32,
+    /// A guessed pipeline (`VICTORY_GUESS_GRAPHICS`, [`Graphics::guessed`]): the formats of the
+    /// targets bound at the draw, and the strides of the vertex buffers bound.
+    guess: Option<Guess>,
+}
+
+/// What a draw gives a guessed pipeline that the description does not.
+#[derive(Clone, Debug, PartialEq, Default)]
+struct Guess {
+    colors: Vec<Format>,
+    depth: Option<Format>,
+    strides: Vec<u32>,
 }
 
 impl Default for Graphics {
@@ -93,6 +104,7 @@ impl Default for Graphics {
             rt_formats: Vec::new(),
             depth_format: 0,
             samples: 1,
+            guess: None,
         }
     }
 }
@@ -209,6 +221,47 @@ impl Graphics {
         }
     }
 
+    /// The state of a pipeline whose description has none (device slot 0x1c8; docs/native-host.md,
+    /// "Guessed graphics pipelines"): no blend, no culling, depth test less-equal with writes, the
+    /// formats of the targets bound, and the vertex buffer slots and strides the draw has. The
+    /// input elements are the vertex shader's `VB<kind><n>` semantics (`reads`, as
+    /// [`vertex_inputs`] gives them; index: slot << 16 | byte offset).
+    pub fn guessed(
+        colors: Vec<Format>,
+        depth: Option<Format>,
+        strides: Vec<u32>,
+        reads: &[(String, u32)],
+    ) -> Graphics {
+        let mut g = Graphics { cull: 1, depth_func: 4, ..Graphics::default() };
+        for (name, index) in reads {
+            // F float, U uint, N unorm8x4 (DXGI 41/16/6/2, 42, 28).
+            let format = match (name.as_bytes().get(2), name.as_bytes().get(3)) {
+                (Some(b'F'), Some(b'1')) => 41,
+                (Some(b'F'), Some(b'2')) => 16,
+                (Some(b'F'), Some(b'3')) => 6,
+                (Some(b'F'), Some(b'4')) => 2,
+                (Some(b'U'), _) => 42,
+                (Some(b'N'), _) => 28,
+                _ => continue,
+            };
+            g.inputs.push(Input {
+                name: name.clone(),
+                index: *index,
+                format,
+                slot: (index >> 16).min(31),
+                offset: index & 0xffff,
+                per_instance: false,
+            });
+        }
+        g.guess = Some(Guess { colors, depth, strides });
+        g
+    }
+
+    /// Whether this is [`Graphics::guessed`]'s state, to be made at the first draw.
+    pub fn is_guessed(&self) -> bool {
+        self.guess.is_some()
+    }
+
     /// The input elements, in the title's order.
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
@@ -216,11 +269,17 @@ impl Graphics {
 
     /// The colour target formats the host knows; `None` if one is not (the pipeline is refused).
     pub fn color_formats(&self) -> Option<Vec<Format>> {
+        if let Some(g) = &self.guess {
+            return Some(g.colors.clone());
+        }
         self.rt_formats.iter().map(|&f| format(f)).collect()
     }
 
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
     pub fn depth_format(&self) -> Result<Option<Format>, u32> {
+        if let Some(g) = &self.guess {
+            return Ok(g.depth);
+        }
         match self.depth_format {
             0 => Ok(None),
             f => format(f).map(Some).ok_or(f),
@@ -260,6 +319,10 @@ impl Graphics {
         }
         for s in &mut streams {
             s.stride = s.stride.next_multiple_of(4);
+            // A guessed pipeline's streams have the strides of the buffers bound.
+            if let Some(&bound) = self.guess.as_ref().and_then(|g| g.strides.get(s.slot)) {
+                s.stride = s.stride.max(bound as usize);
+            }
         }
         Some((attributes, streams))
     }
@@ -267,7 +330,8 @@ impl Graphics {
     /// Blend and write mask of each colour target (target 0's description for all when the blend
     /// description is not independent).
     pub fn color_state(&self) -> Vec<ColorState> {
-        (0..self.rt_formats.len().max(1))
+        let targets = self.guess.as_ref().map_or(self.rt_formats.len(), |g| g.colors.len());
+        (0..targets.max(1))
             .map(|i| {
                 let t = &self.blend[if self.independent { i } else { 0 }];
                 ColorState {
@@ -432,6 +496,22 @@ pub fn vertex_inputs(dxil: &[u8]) -> Option<Vec<(String, u32)>> {
         reads.push((String::from_utf8_lossy(&tail[..end]).into_owned(), index));
     }
     Some(reads)
+}
+
+/// The positions of the system values in a vertex shader's input signature that come before its
+/// last attribute. The converter numbers the stage-in attributes by signature position, system
+/// values included, so these positions are attribute slots no element fills.
+pub fn system_gaps(dxil: &[u8]) -> Vec<usize> {
+    use victory_shader::{Container, FourCC};
+    let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(FourCC::ISG1).map(|p| p.data.to_vec())) else {
+        return Vec::new();
+    };
+    let count = part.get(..4).map_or(0, |c| u32::from_le_bytes(c.try_into().unwrap()) as usize);
+    let system: Vec<bool> = (0..count)
+        .map(|i| part.get(8 + 32 * i + 12..8 + 32 * i + 16).is_some_and(|w| w != [0; 4]))
+        .collect();
+    let last = system.iter().rposition(|s| !s).unwrap_or(0);
+    (0..last).filter(|&i| system[i]).collect()
 }
 
 #[cfg(test)]

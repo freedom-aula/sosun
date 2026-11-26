@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
+use super::graphics;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -9500,6 +9501,77 @@ impl<'a> Lower<'a> {
         Some(r && never_nan)
     }
 
+    /// The vertex buffer slot (the 16-byte descriptor's index) a descriptor is, when it is loaded
+    /// from a guessed graphics description's vertex buffer table ([`graphics::VERTEX_TABLE`]).
+    fn vertex_table_slot(&self, src: &Source) -> Option<u32> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let param = self.x.native.layout.get(a.param)?;
+        (param.slot == graphics::VERTEX_TABLE && a.dynamic.is_none())
+            .then(|| (a.offset + 4 * u32::from(*first)) / 16)
+    }
+
+    /// A buffer load through a vertex buffer table descriptor, as the vertex attribute it is:
+    /// a stage-in element `VB<kind><n>` of index `slot << 16 | offset` (kind F float, U uint, N
+    /// unorm8; n channels) the host maps to the stream of that slot ([`graphics`]).
+    /// shortcut: one index per vertex (the load's index is not examined), so no per-instance
+    /// streams; formats are those the host's vertex layout has.
+    #[allow(clippy::too_many_arguments)]
+    fn vertex_fetch(
+        &mut self,
+        inst: &Inst,
+        slot: u32,
+        typed: bool,
+        count: u32,
+        format: Option<u8>,
+        offset: u16,
+        by_index: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Fields::Buffer { data: Some(Operand::Vector { reg, .. }), .. } = &inst.fields else {
+            return Err("a vertex fetch without a result");
+        };
+        if !by_index || offset >= 0x1000 {
+            return Err("a vertex fetch that is not indexed or has a large offset");
+        }
+        let (kind, comp) = match (typed, format.and_then(buffer_format)) {
+            (false, _) => (if count == 1 { 'U' } else { 'F' }, if count == 1 { 5 } else { 9 }),
+            (true, Some(([8, 8, 8, 8], Numeric::Unorm))) if count == 4 => ('N', 9),
+            (true, Some((w, Numeric::Float))) if w.iter().all(|&b| b == 32) && w.len() == count as usize => ('F', 9),
+            _ => return Err("a vertex fetch format the host's vertex layout lacks"),
+        };
+        let name = format!("VB{kind}{count}");
+        let index = slot << 16 | u32::from(offset);
+        let id = match self.s.inputs.iter().position(|e| e.name == name && e.index == index) {
+            Some(id) => id,
+            None => {
+                let row = self.s.inputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+                self.s.inputs.push(SigElement {
+                    name,
+                    index,
+                    kind: 0,
+                    comp,
+                    interp: 0,
+                    row: Some(row),
+                    col: 0,
+                    cols: count as u8,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        for k in 0..count {
+            let Val::I32(x) = self.load_any_input(id, k as u8) else {
+                return Err("a vertex input");
+            };
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -9612,6 +9684,9 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
+        if let Some(slot) = self.vertex_table_slot(src) {
+            return self.vertex_fetch(inst, slot, typed, count, *format, *offset, index.is_some() && !*offen, guard);
+        }
         let used = self.used_kind(src);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
@@ -10060,7 +10135,9 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // Compressed exports are two 16-bit values per dword (FP16_ABGR, the colour format a
+        // graphics description's pixel shader is guessed to export), the halves path below.
+        if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -10132,11 +10209,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if let (true, Target::Color(n)) = (e.compressed, e.target) {
+            let id = outputs.iter().position(|o| o.kind == 16 && o.row == Some(u32::from(n)));
+            for ch in 0..4u8 {
+                if let (Some(id), Some(value)) = (id, e.values[usize::from(ch)]) {
+                    stores.push((id, ch, value, Some(ch & 1 == 1)));
+                }
+            }
+        }
         for ch in 0..4u8 {
             let Some(value) = e.values[usize::from(ch)] else {
                 continue;
             };
-            if halves.is_some() {
+            if halves.is_some() || e.compressed {
                 break;
             }
             let found = match e.target {

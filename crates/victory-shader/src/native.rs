@@ -427,6 +427,9 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.starts_with(b"FSPX") {
         return Ok(vec![fspx_program(part)?]);
     }
+    if part.starts_with(crate::emit::graphics::MAGIC) {
+        return Ok(vec![crate::emit::graphics::program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -501,14 +504,30 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let (layout, used) = metadata_resources(meta, FSPX_RECORDS)?;
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// The root layout and used resources of the tagged records of an FSPX metadata blob, from byte
+/// `first` (compute: 0x18; graphics, whose header is 0x10 bytes: [`crate::emit::graphics`]).
+pub(crate) fn metadata_resources(
+    meta: &[u8],
+    first: usize,
+) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
-    for e in meta
-        .get(FSPX_RECORDS..)
-        .unwrap_or(&[])
-        .as_chunks::<FSPX_RECORD>()
-        .0
-    {
+    for e in meta.get(first..).unwrap_or(&[]).as_chunks::<FSPX_RECORD>().0 {
         match e[0] {
             0x41 => {}
             0x42 => continue,
@@ -535,6 +554,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         let sgprs = match root {
             RootType::Table => 1,
             RootType::Descriptor => 2,
+            // Root constants: one dword per record (graphics, observed: the sampler index, b500).
+            RootType::Constants => 1,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
@@ -551,18 +572,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
-        layout,
-        used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
-        code: code.to_vec(),
-    })
+    Ok((layout, used))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {

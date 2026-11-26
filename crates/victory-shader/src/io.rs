@@ -311,6 +311,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            // A guessed graphics description's vertex shader (`emit::graphics`): s0/s1 are the
+            // vertex buffer table, and the base vertex and instance after them read 0.
+            StageIo::Vs { .. }
+                if native.layout.iter().any(|p| p.slot == crate::emit::graphics::VERTEX_TABLE) =>
+            {
+                Some(2)
+            }
             StageIo::Ps { .. } => {
                 let user = native
                     .layout

@@ -491,7 +491,68 @@ pub(crate) extern "system" fn create_unread_1c8(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // `VICTORY_GUESS_GRAPHICS=1`: a pipeline from the pieces of the first slot, with the
+    // inferred state of `victory_shader::emit::graphics` and `native::state::Graphics::guessed`.
+    #[cfg(target_os = "macos")]
+    if !desc.is_null()
+        && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some()
+        // SAFETY: the title passes a description of this layout.
+        && let Some(stages) = unsafe { graphics_containers(desc.add(8)) }
+    {
+        return hand_out(
+            stages,
+            Some(Box::new(crate::native::state::Graphics::guessed(Vec::new(), None, Vec::new(), &[]))),
+            iid,
+            out,
+        );
+    }
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() && !desc.is_null() {
+        static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+            // SAFETY: a debugging read of the title's description.
+            let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
+            tracing::info!(?words, "a graphics description with no vertex shader piece");
+        }
+    }
     create_unread_at(0x1c8, desc, iid, out)
+}
+
+/// The vertex and pixel shader containers of the slot at `slot` of a graphics description (pairs
+/// 4/5 and 2/3: code and metadata) as guessed pipelines have them; `None` when the slot lacks a
+/// vertex shader or a piece does not make a container.
+///
+/// # Safety
+/// `slot` points at a slot of eight (pointer, size) pairs.
+#[cfg(target_os = "macos")]
+unsafe fn graphics_containers(slot: *const u8) -> Option<Vec<Arc<Shader>>> {
+    use victory_shader::HwStage;
+    let piece = |pair: usize| -> Option<&[u8]> {
+        // SAFETY: as the caller says; the pieces are the title's, of the size it gives.
+        unsafe {
+            let ptr = slot.add(16 * pair).cast::<usize>().read_unaligned();
+            let size = slot.add(16 * pair + 8).cast::<usize>().read_unaligned();
+            (ptr != 0 && size != 0 && size <= 1 << 22)
+                .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
+        }
+    };
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
+        Ok(c) => Some(shader(name, &c)),
+        Err(e) => {
+            tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
+            None
+        }
+    };
+    // The vertex shader is pair 4/5, or pair 6/7 when that is empty (observed; the pairs vary).
+    let (code, meta) = match (piece(4), piece(5)) {
+        (Some(code), Some(meta)) => (code, meta),
+        _ => (piece(6)?, piece(7)?),
+    };
+    let vs = make(HwStage::Vs, "vertex", code, meta)?;
+    let mut shaders = vec![vs];
+    if let (Some(code), Some(meta)) = (piece(2), piece(3)) {
+        shaders.push(make(HwStage::Ps, "pixel", code, meta)?);
+    }
+    Some(shaders)
 }
 
 /// Device method 0x218: a compute pipeline. The description is a root signature pointer and one
@@ -603,6 +664,9 @@ fn create_unread_at(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
+        tracing::info!(slot, "a pipeline created without shaders");
+    }
     if std::env::var_os("VICTORY_DUMP_DESC").is_some() && !_desc.is_null() {
         dump_description(slot, _desc);
     }

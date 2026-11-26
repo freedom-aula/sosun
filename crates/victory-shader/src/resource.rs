@@ -947,6 +947,9 @@ impl<'a> Tracer<'a> {
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
+            // The high half cut to a 40-bit address (`s_bfe_u32 hi, hi, 8 bits from 0`).
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_bfe_u32"])
+                .is_some_and(|(_, [a, b])| a == want && b == Term::Const(0x8_0000)))
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))

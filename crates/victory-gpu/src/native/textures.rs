@@ -198,6 +198,12 @@ impl<B: PresentBackend> Title<B> {
         self.textures.get(&key).map_or(0, |t| t.uploads)
     }
 
+    /// The host format of title texture `key` (a depth target's is its depth format).
+    pub fn format_of(&mut self, key: usize) -> Option<Format> {
+        self.realize(key);
+        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
     pub fn texture_released(&mut self, key: usize) {
         self.textures.remove(&key);
         self.pending.remove(&key);
