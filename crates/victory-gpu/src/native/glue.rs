@@ -91,9 +91,7 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Ok(mut g) = TITLE.try_lock()
-                    && let Some(t) = g.as_mut()
-                {
+                if let Some(t) = lock().as_mut() {
                     refresh(&mut t.0);
                 }
             }
@@ -102,6 +100,17 @@ fn start_timer() {
 
 fn refresh(t: &mut MetalTitle) {
     t.pump();
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|l| l.elapsed().as_secs() >= 5) {
+            let stuck = t.stuck(std::time::Duration::from_secs(2));
+            if !stuck.is_empty() {
+                *last = Some(std::time::Instant::now());
+                tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+            }
+        }
+    }
     for (fence, value) in t.completed() {
         crate::fence::raise(fence as This, value);
     }
@@ -362,6 +371,15 @@ fn trace_present(resource: This) {
 
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
+    // frames from one that follows time.
+    static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *DELAY.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     if tracing_targets() {
         trace_present(resource);
     }
@@ -994,6 +1012,10 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
+    if std::env::var_os("VICTORY_TRACE_WRITES").is_some() {
+        let inside = pools().resolve(address, bytes as u64).is_some();
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+    }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 

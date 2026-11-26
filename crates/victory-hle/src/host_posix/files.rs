@@ -195,6 +195,9 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
         set_error(ERROR_PATH_NOT_FOUND);
         return invalid_handle();
     };
+    if std::env::var_os("VICTORY_TRACE_FILES").is_some() {
+        tracing::info!(path = %path.display(), access = format_args!("{access:#x}"), "CreateFile");
+    }
     let all = access & GENERIC_ALL != 0;
     let read = all || access & (GENERIC_READ | FILE_READ_DATA) != 0;
     let write = all || access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
@@ -302,6 +305,9 @@ pub extern "system" fn ReadFile(
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    if std::env::var_os("VICTORY_TRACE_FILES").is_some() {
+        trace_read(&f.file, len);
+    }
     // SAFETY: the title's buffer of `len` bytes.
     let out = unsafe { std::slice::from_raw_parts_mut(buffer, len as usize) };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
@@ -825,5 +831,29 @@ mod tests {
         assert!(m("a?c", "abc"));
         assert!(!m("a?c", "ac"));
         assert!(!m("*.bin", "a.txt"));
+    }
+}
+
+/// `VICTORY_TRACE_FILES=1`: reads per file (first and every power of two).
+fn trace_read(file: &File, len: u32) {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    static SEEN: Mutex<std::collections::BTreeMap<String, (u64, u64)>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    let mut buf = [0u8; 1024];
+    // SAFETY: F_GETPATH (50) fills a PATH_MAX buffer.
+    if unsafe { fcntl(file.as_raw_fd(), 50, buf.as_mut_ptr()) } < 0 {
+        return;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    let path = String::from_utf8_lossy(&buf[..end]).into_owned();
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let e = seen.entry(path.clone()).or_default();
+    e.0 += 1;
+    e.1 += u64::from(len);
+    if e.0.is_power_of_two() {
+        tracing::info!(path, reads = e.0, bytes = e.1, "ReadFile of a file so far");
     }
 }

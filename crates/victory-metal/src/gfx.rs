@@ -504,15 +504,29 @@ impl ResourceBackend for Metal {
         } else {
             pixel_format(v.format)
         };
-        // SAFETY: the ranges are checked by Metal (nil on failure).
+        // Metal asserts (it does not return nil) on a range past the texture, which a
+        // title view asks for over a texture we made with fewer levels or layers (one
+        // over title memory has one level): the range is cut to what is there.
+        let fit = |(start, len): (usize, usize), count: usize| {
+            (start < count).then(|| NSRange::new(start, len.min(count - start)))
+        };
+        let slices = if ty == MTLTextureType::Type2DArray {
+            t.tex.arrayLength()
+        } else {
+            1
+        };
+        let (Some(levels), Some(layers)) =
+            (fit(v.mips, t.tex.mipmapLevelCount()), fit(v.slices, slices))
+        else {
+            return Err(format!(
+                "view {:?} {:?} is past the texture",
+                v.mips, v.slices
+            ));
+        };
+        // SAFETY: the ranges are inside the texture.
         let tex = unsafe {
             t.tex
-                .newTextureViewWithPixelFormat_textureType_levels_slices(
-                    format,
-                    ty,
-                    NSRange::new(v.mips.0, v.mips.1),
-                    NSRange::new(v.slices.0, v.slices.1),
-                )
+                .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
         Ok(Texture { tex })

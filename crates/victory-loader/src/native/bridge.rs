@@ -123,6 +123,7 @@ core::arch::global_asm!(
     "mov rdx, [rsp + 0x30]",
     "mov rcx, [rbp + 8]",
     "mov r8, [rsp + 0xF0]",
+    "lea r9, [rsp + 0x30]",
     "call {trace_ret}",
     "8:",
     "mov rdi, r12",
@@ -403,7 +404,10 @@ pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str,
     Some((info.area, info.name, info.slot * 8))
 }
 
-extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: u64) {
+extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: u64, args: *const u64) {
+    if callbacks_enabled() {
+        note_callbacks(info, args);
+    }
     if profile_seconds().is_some() {
         let d = tsc().wrapping_sub(start);
         info.calls.fetch_add(1, Ordering::Relaxed);
@@ -460,6 +464,9 @@ pub const MAX_ARGS: usize = 12;
 /// `f` must be a Windows x64 function taking `args.len()` such arguments,
 /// in an image whose imports are bound.
 pub unsafe fn call_win64(f: usize, args: &[u64]) -> u64 {
+    if callbacks_enabled() {
+        CALLED.lock().unwrap_or_else(|e| e.into_inner()).insert(f);
+    }
     assert!(args.len() <= MAX_ARGS, "too many arguments");
     let mut padded = [0u64; MAX_ARGS];
     padded[..args.len()].copy_from_slice(args);
@@ -638,7 +645,7 @@ pub unsafe fn bridged_table(
     let mut unique: Vec<(usize, bool)> = targets.clone();
     unique.sort_unstable();
     unique.dedup();
-    let tracing_on = trace_level() > 0 || profile_seconds().is_some();
+    let tracing_on = trace_level() > 0 || profile_seconds().is_some() || callbacks_enabled();
     let mut block = StubBlock::new(unique.len() + len + SPARE_SLOTS)?;
     let mut stub_of = std::collections::HashMap::new();
     let mut copy: Vec<usize> = Vec::with_capacity(len + SPARE_SLOTS);
@@ -790,4 +797,80 @@ pub fn stub_for(address: usize) -> Result<usize> {
     let stub = block.emit(address, 0, is_win64(address))?;
     block.seal()?;
     Ok(stub)
+}
+
+// `VICTORY_TRACE_CALLBACKS=1`: every title code address passed to a host import or method (as an
+// argument, or in the first 16 qwords an argument points at) is remembered with the import's
+// name, and the host's calls into the title are remembered too; `report_callbacks` lists what was
+// registered and never called.
+
+/// Whether callbacks are being recorded.
+pub(crate) fn callbacks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_CALLBACKS").is_some())
+}
+
+/// Title code addresses the host has called.
+static CALLED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Registered title code addresses: (import or method, argument, offset behind it, times seen).
+static REGISTERED: Mutex<std::collections::BTreeMap<usize, (String, usize, usize, u64)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn in_text(v: usize) -> bool {
+    (0x1_4000_1000..0x1_45f0_0000).contains(&v)
+}
+
+fn note_callbacks(info: &Traced, args: *const u64) {
+    // SAFETY: the bridge's saved register arguments, four words.
+    let args = unsafe { std::slice::from_raw_parts(args, 4) };
+    let name = if info.name.is_empty() {
+        format!("{} method {:#x}", info.area, info.slot * 8)
+    } else {
+        format!("{}!{}", info.area, info.name)
+    };
+    let mut found = Vec::new();
+    for (i, &a) in args.iter().enumerate() {
+        let a = a as usize;
+        if in_text(a) {
+            found.push((a, i, 0));
+        } else if a >= 0x10000 && a < 0x7fff_ffff_0000 && a & 7 == 0 && !info.area.contains("-crt-") {
+            for k in 0..16 {
+                match super::dump::read_checked(a + 8 * k) {
+                    Some(v) if in_text(v) => found.push((v, i, 8 * k)),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let mut map = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
+    for (target, arg, off) in found {
+        let e = map.entry(target).or_insert((name.clone(), arg, off, 0));
+        e.3 += 1;
+    }
+}
+
+/// Logs what was registered and never called by the host.
+pub fn report_callbacks() {
+    if !callbacks_enabled() {
+        return;
+    }
+    let called = CALLED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let map = REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut never, mut yes) = (Vec::new(), 0);
+    for (&t, (name, arg, off, n)) in map.iter() {
+        if called.contains(&t) {
+            yes += 1;
+        } else {
+            never.push(format!("{name} arg{arg}+{off:#x} x{n} -> {:#x}", t - 0x1_4000_0000));
+        }
+    }
+    tracing::warn!("callbacks: {} registered, {yes} called by the host, {} never", map.len(), never.len());
+    for line in never {
+        tracing::warn!("never called: {line}");
+    }
 }

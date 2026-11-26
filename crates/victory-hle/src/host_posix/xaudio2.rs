@@ -378,6 +378,7 @@ fn create_with(out: *mut *mut Engine, opener: Opener) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    tracing::info!("XAudio2: engine created");
     let engine = new_engine(opener);
     // SAFETY: the title's out parameter.
     unsafe { out.write(engine) };
@@ -882,6 +883,7 @@ extern "win64" fn destroy_voice(this: *mut Voice) {
 // IXAudio2SourceVoice and IXAudio2MasteringVoice.
 
 extern "win64" fn source_start(this: *mut Voice, _flags: u32, _set: u32) -> HRESULT {
+    tracing::info!("XAudio2: source voice started");
     with_voice(this, |_| (), |_| (), |s| s.running = true);
     S_OK
 }
@@ -892,6 +894,11 @@ extern "win64" fn source_stop(this: *mut Voice, _flags: u32, _set: u32) -> HRESU
 }
 
 extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *const c_void) -> HRESULT {
+    static SUBMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, "XAudio2: buffers submitted");
+    }
     if buffer.is_null() {
         return E_INVALIDARG;
     }

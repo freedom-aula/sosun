@@ -557,6 +557,45 @@ impl State {
     }
 }
 
+/// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+/// 0.2 s that long after input starts, with or without focus. A key is a
+/// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+#[cfg(any(not(windows), feature = "diagnostics"))]
+fn scripted() -> Vec<u8> {
+    static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        let keys = list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                vk,
+            ))
+        });
+        (Instant::now(), keys.collect())
+    });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        .map(|&(_, vk)| vk)
+        .collect()
+}
+
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
@@ -569,8 +608,15 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
+        /// Only the scripted keys: this host has no input of its own yet.
         fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
+            scripted()
+                .into_iter()
+                .map(|vk| KeyState {
+                    virtual_key: vk,
+                    ..Default::default()
+                })
+                .collect()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
@@ -1256,45 +1302,6 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
-    }
-
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

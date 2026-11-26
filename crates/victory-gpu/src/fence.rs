@@ -104,9 +104,9 @@ pub(crate) fn initial(this: This) -> u64 {
 /// Raises the value to what the GPU has reached (never lowers it) and wakes the events waiting.
 #[cfg(target_os = "macos")]
 pub(crate) fn raise(this: This, value: u64) {
-    if fence(this).value.load(Ordering::Acquire) < value {
-        set(this, value);
-    }
+    // The test and the store are one step under the waiters' lock: two raisers (the host's timer
+    // and a title thread) must not store out of order, which would lower the value.
+    set_if(this, |now| now < value, value);
 }
 
 extern "system" fn completed(this: This) -> u64 {
@@ -160,8 +160,15 @@ extern "system" fn signal(this: This, value: u64) -> HRESULT {
 /// Moves a fence to `value` and wakes the events waiting for it (a queue's
 /// Signal, when the work before it has run).
 pub(crate) fn set(this: This, value: u64) -> HRESULT {
+    set_if(this, |_| true, value)
+}
+
+fn set_if(this: This, wanted: impl Fn(u64) -> bool, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    if !wanted(fence.value.load(Ordering::Acquire)) {
+        return S_OK;
+    }
     fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
