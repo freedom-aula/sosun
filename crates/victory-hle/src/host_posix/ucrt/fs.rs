@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use super::runtime::bad_param;
 use super::stdio::win_errno;
 use super::{
-    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, leak_cstr, set_errno, units,
+    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units,
 };
 use crate::host_posix::files;
 
@@ -296,17 +296,33 @@ fn put_str(dst: *mut u8, size: usize, s: &str) -> i32 {
     0
 }
 
+/// `s` and a NUL in a `malloc` block of at least `min` bytes, which the title may `free`.
+fn malloc_str(s: &str, min: usize) -> *mut u8 {
+    let p: *mut u8 = heap::malloc((s.len() + 1).max(min)).cast();
+    if !p.is_null() {
+        // SAFETY: a fresh block of at least `s.len() + 1` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
+            p.add(s.len()).write(0);
+        }
+    }
+    p
+}
+
 pub extern "system" fn _getcwd(buf: *mut u8, max: i32) -> *mut u8 {
+    if !buf.is_null() && max <= 0 {
+        bad_param(EINVAL);
+        return std::ptr::null_mut();
+    }
     let Ok(cwd) = std::env::current_dir() else {
         return std::ptr::null_mut();
     };
     let s = cwd.to_string_lossy().into_owned();
-    let buf = if buf.is_null() {
-        leak_cstr(s.as_bytes())
-    } else {
-        buf
-    };
-    if put_str(buf, max.max(0) as usize, &s) != 0 {
+    // No buffer: a malloc block of at least `max` bytes, as `_wgetcwd` makes.
+    if buf.is_null() {
+        return malloc_str(&s, max.max(0) as usize);
+    }
+    if put_str(buf, max as usize, &s) != 0 {
         std::ptr::null_mut()
     } else {
         buf
@@ -366,11 +382,10 @@ pub extern "system" fn _fullpath(buf: *mut u8, path: *const u8, max: usize) -> *
     let Some(f) = full(&String::from_utf8_lossy(unsafe { super::bytes(path) })) else {
         return std::ptr::null_mut();
     };
-    let buf = if buf.is_null() {
-        leak_cstr(f.as_bytes())
-    } else {
-        buf
-    };
+    // No buffer: a malloc block the title frees, whatever `max` says.
+    if buf.is_null() {
+        return malloc_str(&f, 0);
+    }
     if put_str(buf, max, &f) != 0 {
         std::ptr::null_mut()
     } else {
@@ -826,6 +841,27 @@ mod tests {
             assert!(heap::_msize(allocated.cast()) >= max as usize * size_of::<u16>());
             heap::free(allocated.cast());
         }
+    }
+
+    #[test]
+    fn getcwd_and_fullpath_malloc_when_given_no_buffer() {
+        let mut narrow = [0u8; 4096];
+        assert_eq!(_getcwd(narrow.as_mut_ptr(), 4096), narrow.as_mut_ptr());
+        let cwd = text(&narrow);
+        // `_getcwd(NULL, 0)`, then `free`, is Microsoft's own example.
+        for max in [0, 1, 4096] {
+            let p = _getcwd(std::ptr::null_mut(), max);
+            assert!(!p.is_null());
+            assert_eq!(unsafe { super::super::bytes(p) }, cwd.as_bytes());
+            assert!(heap::_msize(p.cast()) >= max as usize);
+            heap::free(p.cast());
+        }
+        assert!(_getcwd(narrow.as_mut_ptr(), 0).is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+        let p = _fullpath(std::ptr::null_mut(), c("x").as_ptr(), 0);
+        assert!(!p.is_null());
+        assert_eq!(unsafe { super::super::bytes(p) }, format!("{cwd}/x").as_bytes());
+        heap::free(p.cast());
     }
 
     fn c(s: &str) -> Vec<u8> {
