@@ -844,6 +844,25 @@ fn refusal2_pixel_system_inputs_lower_when_declared() {
     }
 }
 
+/// `s_absdiff_i32` translates (values: `victory-gpu` `addr_tests`).
+#[test]
+fn absdiff_translates() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x9606_0504, // s_absdiff_i32 s6, s4, s5
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [

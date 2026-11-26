@@ -343,6 +343,14 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
+## Scalar absolute difference
+
+`s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in
+the story-load log of issue #123). It is lowered as the RDNA2 ISA gives it (SOP2): the 32-bit
+difference `S0 - S1`, wrapping, negated when negative as a signed number, and SCC set when the
+result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
+(`victory-gpu`) runs it on Metal, wrapping cases included.
+
 ## Bring-up diagnostics (native path)
 
 Off by default, environment variables of the host process:

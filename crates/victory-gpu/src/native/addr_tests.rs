@@ -49,6 +49,20 @@ const COMPUTED: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// `s_absdiff_i32 s4, s2, s3` and its SCC, stored by every lane to `s[0:1]` and 256 bytes on.
+const ABSDIFF: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x9604_0302, // s_absdiff_i32 s4, s2, s3
+    0x8505_8081, // s_cselect_b32 s5, 1, 0
+    0x7E04_0204, // v_mov_b32_e32 v2, s4
+    0x7E06_0205, // v_mov_b32_e32 v3, s5
+    0xDC70_8000,
+    0x0000_0201, // global_store_dword v1, v2, s[0:1]
+    0xDC70_8100,
+    0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
+    0xBF81_0000, // s_endpgm
+];
+
 /// `dst[tid] = src[tid] + 0x55` stored to `s[2:3]`, and the same value stored to `s[4:5]`, where
 /// the pointers may point at memory no pool shows.
 const MISSES: &[u32] = &[
@@ -243,6 +257,32 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// `s_absdiff_i32` on the GPU: |S0 - S1| of the 32-bit (wrapping) difference read as signed,
+/// SCC whether it is not 0 (RDNA2 ISA, SOP2).
+#[test]
+fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(ABSDIFF, 4);
+    let [lo, hi] = halves(VA_A);
+    for (a, b, want) in [
+        (5i32, 9i32, 4u32),
+        (9, 5, 4),
+        (-3, 4, 7),
+        (7, 7, 0),
+        // The difference wraps: i32::MIN - 1 is i32::MAX; 1 - i32::MIN is 0x8000_0001, negative,
+        // whose magnitude is i32::MAX again.
+        (i32::MIN, 1, i32::MAX as u32),
+        (1, i32::MIN, i32::MAX as u32),
+        (i32::MIN, 0, 0x8000_0000),
+    ] {
+        dispatch(&mut t, &cs, &[lo, hi, a as u32, b as u32], false);
+        assert_eq!(f.get(0x2_0000, 64), vec![want; 64], "|{a} - {b}|");
+        assert_eq!(f.get(0x2_0100, 64), vec![u32::from(want != 0); 64], "SCC of |{a} - {b}|");
+    }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
