@@ -206,3 +206,46 @@ fn packed_half_parameters_reach_the_pixel_program() {
     super::run(&t.host, &[&list]);
     assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 191, 64]), "{:?}", pixels(&t, &color));
 }
+
+/// The uniform-mask SCC rule on the GPU (`Lower::uniform_and_exec`): inside an EXEC region of
+/// lanes 0-2 (`v_cmpx`), the triangle program compares the root constant (s8) with 0, ANDs the
+/// mask with EXEC and keeps SCC in s20; only when it is set does it keep the triangle's size
+/// (else it scales the corners by 0 and draws nothing). s8 = 1.0 colours the target, -1.0
+/// leaves it black.
+#[test]
+fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x7E1A_0280, // v_mov_b32 v13, 0
+        0x7DA8_0283, // v_cmpx_gt_u32 3, v1
+        0xBF88_0007, // s_cbranch_execz 7
+        0xD406_006A, 0x0001_0008, // v_cmp_ge_f32 vcc, s8, 0
+        0x8796_7E6A, // s_and_b64 s[22:23], vcc, exec
+        0xBE94_03FD, // s_mov_b32 s20, src_scc
+        0xBF01_8014, // s_cmp_lg_i32 s20, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x1004_050D, // v_mul_f32 v2, v13, v2
+        0x1006_070D, // v_mul_f32 v3, v13, v3
+    ]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0, user data dword 0.
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    for (s8, want) in [(1.0f32, [255, 128, 128, 255]), (-1.0, [0; 4])] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_root_constants(0, &[s8.to_bits()]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "s8 = {s8}: {:?}", pixels(&t, &color));
+    }
+}
