@@ -1688,35 +1688,86 @@ pub extern "system" fn PropVariantClear(variant: *mut u8) -> i32 {
     0
 }
 
-// Registry: no keys.
+// Registry: no keys, but the one the title reads its device type from (see
+// `modules::xsystem`).
+
+const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+const OEM_KEY: &str = r"Software\Microsoft\Windows NT\CurrentVersion\OEM";
+/// Stands for the opened OEM key.
+static OEM: u8 = 0;
+
+fn wide_is(text: *const u16, expected: &str) -> bool {
+    if text.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes a NUL-terminated string.
+    let text = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    };
+    text.eq_ignore_ascii_case(expected)
+}
+
+fn open_key(key: isize, sub: *const u16, result: *mut *mut c_void) -> i32 {
+    if key == HKEY_LOCAL_MACHINE && wide_is(sub, OEM_KEY) && !result.is_null() {
+        // SAFETY: the title passes room for a key.
+        unsafe { result.write((&raw const OEM).cast_mut().cast()) };
+        return 0;
+    }
+    ERROR_FILE_NOT_FOUND as i32
+}
 
 pub extern "system" fn RegOpenKeyExW(
-    _key: isize,
-    _sub_key: *const u16,
+    key: isize,
+    sub_key: *const u16,
     _options: u32,
     _access: u32,
-    _result: *mut *mut c_void,
+    result: *mut *mut c_void,
 ) -> i32 {
-    ERROR_FILE_NOT_FOUND as i32
+    open_key(key, sub_key, result)
 }
 
 pub extern "system" fn RegOpenKeyW(
-    _key: isize,
-    _sub_key: *const u16,
-    _result: *mut *mut c_void,
+    key: isize,
+    sub_key: *const u16,
+    result: *mut *mut c_void,
 ) -> i32 {
-    ERROR_FILE_NOT_FOUND as i32
+    open_key(key, sub_key, result)
 }
 
 pub extern "system" fn RegQueryValueExW(
-    _key: isize,
-    _name: *const u16,
+    key: isize,
+    name: *const u16,
     _reserved: *const u32,
-    _kind: *mut u32,
-    _data: *mut u8,
-    _size: *mut u32,
+    kind: *mut u32,
+    data: *mut u8,
+    size: *mut u32,
 ) -> i32 {
-    ERROR_FILE_NOT_FOUND as i32
+    if key != (&raw const OEM) as isize || !wide_is(name, "ConsoleMode") {
+        return ERROR_FILE_NOT_FOUND as i32;
+    }
+    const ERROR_MORE_DATA: i32 = 234;
+    // SAFETY: the title passes valid or null pointers, sized by `size`.
+    unsafe {
+        if !kind.is_null() {
+            kind.write(4); // REG_DWORD
+        }
+        if size.is_null() {
+            return 0;
+        }
+        let room = size.read();
+        size.write(4);
+        if data.is_null() {
+            return 0;
+        }
+        if room < 4 {
+            return ERROR_MORE_DATA;
+        }
+        data.cast::<u32>().write_unaligned(crate::modules::xsystem::console_mode(
+            victory_gpu::console::current(),
+        ));
+    }
+    0
 }
 
 pub extern "system" fn RegCloseKey(_key: isize) -> i32 {
@@ -2155,5 +2206,29 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(CancelWaitableTimer(timer), 1);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod console_mode_tests {
+    use super::*;
+
+    #[test]
+    fn device_type_key_answers_console_mode() {
+        let w = |s: &str| -> Vec<u16> { s.encode_utf16().chain([0]).collect() };
+        let mut key = std::ptr::null_mut();
+        assert_eq!(RegOpenKeyW(HKEY_LOCAL_MACHINE, w("software\\other").as_ptr(), &mut key), 2);
+        assert_eq!(RegOpenKeyW(HKEY_LOCAL_MACHINE, w(OEM_KEY).as_ptr(), &mut key), 0);
+        let (mut kind, mut value, mut size) = (0u32, 0u32, 4u32);
+        let got = RegQueryValueExW(
+            key as isize,
+            w("ConsoleMode").as_ptr(),
+            std::ptr::null(),
+            &mut kind,
+            (&raw mut value).cast(),
+            &mut size,
+        );
+        assert_eq!((got, kind, size), (0, 4, 4));
+        assert_eq!(value, crate::modules::xsystem::console_mode(victory_gpu::console::current()));
     }
 }

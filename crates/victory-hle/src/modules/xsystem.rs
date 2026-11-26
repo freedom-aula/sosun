@@ -130,6 +130,15 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
     analytics_info as *const (), // 0x18
 ]);
 
+/// What the title's code maps to each model's device type.
+pub(crate) fn console_mode(console: victory_gpu::console::Console) -> u32 {
+    use victory_gpu::console::Console;
+    match console {
+        Console::SeriesX => 0x64,
+        Console::SeriesS => 0x60,
+    }
+}
+
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
 /// takes a missing value for a PC.
@@ -139,7 +148,8 @@ mod device_type {
 
     use std::ffi::c_void;
 
-    use victory_gpu::console::{self, Console};
+    use victory_gpu::console;
+    use super::console_mode;
 
     use crate::modules::files::host;
     use crate::{HleModule, hle_export};
@@ -158,14 +168,6 @@ mod device_type {
     static OEM: u8 = 0;
     fn oem() -> Key {
         (&raw const OEM).cast_mut().cast()
-    }
-
-    /// What the title's code maps to each model's device type.
-    pub(super) fn console_mode(console: Console) -> u32 {
-        match console {
-            Console::SeriesX => 0x64,
-            Console::SeriesS => 0x60,
-        }
     }
 
     fn is(text: *const u16, expected: &str) -> bool {
