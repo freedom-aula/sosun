@@ -128,7 +128,7 @@ fn wide_str(p: *const u16) -> Vec<u16> {
     unsafe { std::slice::from_raw_parts(p, (0..).take_while(|&i| *p.add(i) != 0).count()) }.to_vec()
 }
 
-fn wide_path(p: *const u16) -> Option<PathBuf> {
+pub(crate) fn wide_path(p: *const u16) -> Option<PathBuf> {
     if p.is_null() {
         return None;
     }
@@ -145,7 +145,7 @@ fn narrow_path(p: *const c_char) -> Option<PathBuf> {
 }
 
 /// The Win32 error for an I/O failure.
-fn win32_error(e: &io::Error, path: &Path) -> u32 {
+pub(crate) fn win32_error(e: &io::Error, path: &Path) -> u32 {
     match e.kind() {
         io::ErrorKind::NotFound => {
             if path
@@ -172,6 +172,11 @@ fn win32_error(e: &io::Error, path: &Path) -> u32 {
 pub(crate) struct FileObject {
     file: File,
     position: AtomicU64,
+}
+
+/// The host's metadata of the open file `handle`.
+pub(crate) fn metadata_of(handle: *mut c_void) -> Option<std::fs::Metadata> {
+    file_of(handle)?.file.metadata().ok()
 }
 
 fn file_of(handle: *mut c_void) -> Option<Arc<FileObject>> {
@@ -481,7 +486,7 @@ pub extern "system" fn FlushFileBuffers(handle: *mut c_void) -> i32 {
 
 // Attributes and directories.
 
-fn attributes_of(m: &std::fs::Metadata) -> u32 {
+pub(crate) fn attributes_of(m: &std::fs::Metadata) -> u32 {
     let mut a = if m.is_dir() {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
@@ -494,7 +499,7 @@ fn attributes_of(m: &std::fs::Metadata) -> u32 {
     a
 }
 
-fn filetime(t: io::Result<SystemTime>) -> u64 {
+pub(crate) fn filetime(t: io::Result<SystemTime>) -> u64 {
     let since = t
         .ok()
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())

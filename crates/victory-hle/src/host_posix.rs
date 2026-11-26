@@ -25,6 +25,7 @@ use victory_platform::thread;
 
 pub(crate) mod files;
 mod sync;
+mod system;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
@@ -319,6 +320,8 @@ pub(crate) enum Object {
     Thread(Arc<ThreadObject>),
     File(Arc<files::FileObject>),
     Find(Arc<Mutex<files::Find>>),
+    Mutex(Arc<system::MutexObject>),
+    Timer(Arc<system::TimerObject>),
 }
 
 /// A title thread: its end, its suspension count and its Mach port.
@@ -440,6 +443,7 @@ pub extern "system" fn ReleaseSemaphore(
 pub(crate) enum Waitable {
     Event(Arc<Event>),
     Semaphore(Arc<Semaphore>),
+    Mutex(Arc<system::MutexObject>),
 }
 
 impl Waitable {
@@ -448,6 +452,8 @@ impl Waitable {
             Some(Object::Event(e)) => Some(Waitable::Event(e.clone())),
             Some(Object::Thread(t)) => Some(Waitable::Event(t.done.clone())),
             Some(Object::Semaphore(s)) => Some(Waitable::Semaphore(s.clone())),
+            Some(Object::Mutex(m)) => Some(Waitable::Mutex(m.clone())),
+            Some(Object::Timer(t)) => Some(Waitable::Event(t.event.clone())),
             _ => None,
         }
     }
@@ -456,6 +462,7 @@ impl Waitable {
         match self {
             Waitable::Event(e) => e.wait(timeout),
             Waitable::Semaphore(s) => s.wait(timeout),
+            Waitable::Mutex(m) => m.acquire(timeout),
         }
     }
 
@@ -472,6 +479,9 @@ impl Waitable {
             Waitable::Event(e) => e.set(),
             Waitable::Semaphore(s) => {
                 s.release(1);
+            }
+            Waitable::Mutex(m) => {
+                m.release();
             }
         }
     }
@@ -712,6 +722,9 @@ pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) ->
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
+    if let Some(address) = system::lookup(&dll, name) {
+        return Some(address);
+    }
     // The API sets and kernelbase forward to kernel32's functions; the
     // exception functions are ntdll's (and `__C_specific_handler` the C
     // runtime's).
