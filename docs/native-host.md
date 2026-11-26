@@ -45,7 +45,8 @@ WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tes
 The native probe's waits check must run as `x86_64-apple-darwin` (under Rosetta
 on Apple Silicon); the arm64 binary only runs its two image-mapping tests.
 Its critical-section try check holds the lock on the calling thread until the
-competing thread finishes, rather than assuming it runs within an 80 ms sleep.
+competing thread finishes, rather than assuming it runs within an 80 ms sleep,
+then requires a successful try after release.
 Under contention, an SRW acquisition CAS can fail and then observe the previous
 owner's release. The POSIX host retries acquisition if that observed state is
 available to the caller; sleeping on an unlocked word can strand a waiter with
