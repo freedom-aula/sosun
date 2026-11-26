@@ -788,3 +788,99 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+#[test]
+fn computed_buffer_subword_loads_preserve_values_and_bounds() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // Two separately backed pages across a 4 GiB boundary. A halfword at
+    // PAGE + 0xffff must use both page-table entries, carrying into address_hi.
+    const PAGE: u64 = 0x12_FFFF_0000;
+    let first = vec![0xFF80_7F01u32; 0x1_0000 / 4];
+    let second = vec![0x017F_FF80u32; 0x1_0000 / 4];
+    let data: Vec<u8> = first.iter().chain(&second).flat_map(|w| w.to_le_bytes()).collect();
+    let mut table = vec![0u32; 4096];
+    for _ in 0..3 * 4096 {
+        table.extend([5, 0]); // null pair
+    }
+    for (page, block, view) in [(PAGE, 1, 1), (PAGE + 0x1_0000, 2, 3)] {
+        table[(page >> 28) as usize] = block;
+        let entry = 4096 + 2 * (block as usize * 4096 + (page as usize >> 16 & 0xFFF));
+        table[entry..entry + 2].copy_from_slice(&[view, page as u32]);
+    }
+    // Explicit acceptance masks (bit = OOB_SELECT), reviewed against RDNA2
+    // table 35, rather than repeating the emitter's bounds expressions.
+    // Mode 0 checks the start offset: a halfword starting at stride-1 is
+    // accepted. Mode 3 checks the payload end and rejects that halfword.
+    // (base byte, stride, records, index, vector offset, scalar offset,
+    //  byte acceptance mask, halfword acceptance mask)
+    let cases = [
+        (0, 4, 4, 0, 0, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 1, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 2, 0, 0b1111, 0b1111),
+        (0, 4, 4, 0, 3, 0, 0b1111, 0b0111),
+        (0, 4, 4, 0, 4, 0, 0b0110, 0b0110),
+        (0, 4, 4, 1, 0, 0, 0b0111, 0b0111),
+        (0, 4, 4, 4, 0, 0, 0b0100, 0b0100),
+        (0, 4, 0, 0, 0, 0, 0b0000, 0b0000),
+        (0, 4, 1, 0, 0, 0, 0b1111, 0b0111),
+        // Scalar offsets are excluded, as documented by LLVM's buffer intrinsics.
+        (0, 4, 4, 0, 0, 3, 0b1111, 0b1111),
+        (0xFFFC, 4, 4, 0, 3, 0, 0b1111, 0b0111),
+        (0xFFFC, 4, 8, 1, 0, 0, 0b1111, 0b1111),
+        (0x1_FFFC, 4, 4, 0, 3, 0, 0b1111, 0b0111),
+    ];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for op in 8..=11 {
+            for bounds in 0..4 {
+                let shader = super::gfx_refusal_tests::computed_subword_test_shader(op, bounds);
+                if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                    v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+                }
+                let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+                for (base, stride, records, index, offset, scalar, byte_modes, half_modes) in cases {
+                    let address = PAGE + u64::from(base);
+                    let constants = [address as u32, (address >> 32) as u32 | stride << 16,
+                        records, index, offset, scalar];
+                    let mut ud = vec![0; shader.user_data_dwords() as usize];
+                    for u in &shader.user_data {
+                        if u.root == RootType::Constants {
+                            ud[u.index as usize] = constants[u.dword as usize];
+                        }
+                    }
+                    let out = host.dispatch(&root, &pso, &Dispatch {
+                        roots: vec![(0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: table.clone() })],
+                        views: &[View::RawUav(1), View::Memory(&first), View::Pair,
+                            View::Memory(&second), View::Pair, View::NullPair, View::Pair],
+                        samplers: &[], groups: [1, 1, 1],
+                    }).unwrap_or_else(|e| panic!("{label}: {e}"));
+                    let byte_offset = index * stride + offset;
+                    let modes = if op < 10 { byte_modes } else { half_modes };
+                    let valid = modes & (1 << bounds) != 0;
+                    let mut expected = 0u32;
+                    if valid {
+                        let at = (base + scalar + byte_offset) as usize;
+                        let low = data.get(at).copied().unwrap_or(0);
+                        let high = data.get(at + 1).copied().unwrap_or(0);
+                        expected = match op {
+                            8 => u32::from(low),
+                            9 => i32::from(low as i8) as u32,
+                            10 => u32::from(u16::from_le_bytes([low, high])),
+                            11 => i32::from(i16::from_le_bytes([low, high])) as u32,
+                            _ => unreachable!(),
+                        };
+                    }
+                    assert_eq!(out[0][0], expected,
+                        "{label}: op={op} bounds={bounds} base={base:#x} index={index} offset={offset} scalar={scalar}");
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
