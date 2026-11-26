@@ -9671,7 +9671,9 @@ impl<'a> Lower<'a> {
         }
         let (kind, comp) = match (typed, format.and_then(buffer_format)) {
             (false, _) => (if count == 1 { 'U' } else { 'F' }, if count == 1 { 5 } else { 9 }),
-            (true, Some(([8, 8, 8, 8], Numeric::Unorm))) if count == 4 => ('N', 9),
+            // The element is the whole format; the load reads its first `count` channels.
+            (true, Some(([8, 8, 8, 8], Numeric::Unorm))) => ('N', 9),
+            (true, Some(([8], Numeric::Unorm))) if count == 1 => ('R', 9),
             (true, Some((w, Numeric::Float))) if w.iter().all(|&b| b == 32) && w.len() == count as usize => ('F', 9),
             _ => return Err("a vertex fetch format the host's vertex layout lacks"),
         };
