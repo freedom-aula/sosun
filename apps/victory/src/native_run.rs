@@ -188,8 +188,7 @@ fn load_late(
         for d in &new {
             note(d);
             if d.image.tls().is_some() {
-                // Threads that already run have no block for it.
-                tracing::warn!(dll = d.name, "a DLL with static TLS loaded late");
+                tracing::info!(dll = d.name, "populated static TLS for late-loaded DLL");
             }
             bind(&d.name, &d.image, &resolver, policy, false)?;
         }
