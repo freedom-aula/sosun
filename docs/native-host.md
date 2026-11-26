@@ -16,6 +16,13 @@ same Cargo configuration when building and launching; a one-off build with
 launching. The launcher needs Cargo available and reports configuration errors
 rather than falling back to a possibly stale default binary.
 
+Both scripts also find rustup when it is installed but not on PATH yet: in
+`$CARGO_HOME/bin` (default `~/.cargo/bin`), where the rustup.rs installer puts
+it before a new terminal opens, and in `$HOMEBREW_PREFIX/opt/rustup/bin`, since
+Homebrew's rustup formula is keg-only. Setup warns and uses it. The launcher
+uses it only when no `cargo` is on PATH, and says so plainly when there is
+neither.
+
 Game-free regressions use real Cargo resolution and fixture executables under
 stock macOS Bash 3.2: `/bin/bash tools/macos/tests/target-directory.sh`.
 Setup prerequisites and its build are stubbed; no game or SDK files are needed.
@@ -218,7 +225,7 @@ Title to host (`victory_bridge_to_host`, reached through a 32-byte stub per impo
 
 The bridge covers up to 12 integer or pointer arguments. A function with `float` or `double` arguments cannot be remapped without its signature, because the two ABIs number the float registers differently once an integer comes first. Those are written `extern "win64"` and registered with `declare_win64(address)`; they go through `victory_bridge_win64`, which swaps GS and nothing else (up to 8 arguments; floats stay in `xmm0..3`). The probe does this with `ProbeScale(double, int)`. A float return needs nothing.
 
-An unresolved import gets a stub whose context word is its `ImportSite`; the bridge hands the site to the handler in place of the first argument, which logs (`ReturnZero`) or aborts (`Trap`), the same policies as the Wine path. The probe checks the names reach the report and that `ReturnZero` returns 0.
+An unresolved import gets a stub whose context word is its `ImportSite`; the bridge hands the site to the handler in place of the first argument, which logs (`ReturnZero`) or aborts (`Trap`), the same policies as the Wine path. The probe checks the names reach the report and that `ReturnZero` returns 0. Once per bound image (late-loaded DLLs included), `native imports bound` names them at warn level as `dll!symbol` (`dll!#n` for an ordinal) in its `unresolved` field, so a log shows what a DLL lacks before any of it is called; with nothing missing the line stays at info.
 
 Host to title (`call_win64(fn, &[u64])`): four register arguments, the rest on the stack above 32 bytes of shadow space, 16-byte alignment, GS to the thread's TEB, call, GS back. Used for TLS callbacks, entry points, thread start routines and every callback title code hands the host. It nests: title, host, title again, with an explicit base each time rather than a toggle. A test (`the_bridge_preserves_windows_callee_saved_registers`) runs hand-assembled Windows-ABI code that sets `rdi`, `rsi` and `xmm6`, calls a host function that clobbers all three, and checks they survive.
 
@@ -274,6 +281,8 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 **dstorage on files.** `open_for_reading` calls `host_posix::files::translate`. dstorage signals no Win32 events today (completion is the status array; the fence methods are not implemented), so nothing there needs `sync::signalled`; when fences are added, a host event set by them must be followed by `sync::signalled` so waits on several objects see it. Still open: `FileExt::read_at` on the worker pool, no `kernel_will_write` once the GPU shares memory, `mmap` paths through `victory-platform`.
 
+**dstorage read errors.** A file read goes on through short reads and tries `EINTR` again, as `read_exact` does (`fill_at`; this process takes many signals), so a signal no longer fails a request. A failed request's log line (`dstorage: request failed`) gives the host's error with its `errno` and kind. Host errors reach the title as the Win32 codes Windows gives for them, the inverse of the UCRT's `_dosmaperr` table: `EBADF` is `ERROR_INVALID_HANDLE`, `EMFILE` and `ENFILE` `ERROR_TOO_MANY_OPEN_FILES`, `ENOMEM` `ERROR_NOT_ENOUGH_MEMORY`, `EINVAL` `ERROR_INVALID_PARAMETER`, `ENOSPC` `ERROR_DISK_FULL`, `ENOENT` and `EACCES` or `EPERM` as before, and `EIO` and the rest `ERROR_READ_FAULT`. Before, everything but the last two was `ERROR_READ_FAULT` and the log dropped the `errno`, so the 179 `hr=0x8007001e` failures before a crash on #110 could not be told apart.
+
 ## Running a title natively (`victory run` on macOS)
 
 `victory run [--unimplemented trap|zero] [--strict] <exe>` maps the PE with `native::NativeImage`, registers its TLS, sets `runtime::set_main_image`/`set_image_path`, binds imports (unresolved ones get logging stubs that act on `UnimplementedPolicy` when *called*; loading never stops, and a per-DLL summary is printed), and stops. `--list-imports` also prints every import as `native (hle|host|title)` or `STUB`; `--execute` mounts `G:` (the title's folder) and `T:` (temp under the data dir), sets the title and console, and starts the main thread with `native::run_entry`. `--list-imports` and no-flag runs never execute title code. The host executable is linked with `-pagezero_size 0x1000` (`apps/victory/build.rs`): the default 4 GiB `__PAGEZERO` is the whole range 32-bit `XMemAlloc` results must come from. Not done: the title's own DLLs (`load_title_dlls` equivalent), the window, GPU and audio.
@@ -309,6 +318,21 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C locale's). A failed invalid-parameter check calls the title's handler if it set one and returns the error; it does not terminate. `_endthread(ex)` is not served (it needs an exit primitive in the loader's thread spawn); `_get_osfhandle`/`_open_osfhandle`, `_ecvt`/`_fcvt`/`_gcvt`, positional `%1$d` formats and the `_mbs*` multibyte-string family are not either. `ucrt::tests::every_ucrt_import_of_a_dry_run_is_served` checks a `--list-imports` output when `VICTORY_UCRT_IMPORTS` names it. The probe (`probe_ucrt` in `tests/fixtures/native-probe/probe.c`) links `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll` and runs 17 checks under Rosetta.
 
+## Descriptors changed after loading
+
+A buffer or image descriptor whose dwords are not one load's consecutive dwords, though one of
+them is loaded, was refused as "a descriptor changed after loading" (34 compute programs in the
+story-load log of issue #123). The forms the translator reads stay as they were (a descriptor made
+raw for byte accesses, `made_raw`). Any other is now refused naming the first dword that is not the
+load's next one and what made it (`Tracer::changed`), after that text and a colon: "dword N is a
+constant", "comes from another load or place in it", "masked or merged (s_and, s_or, s_bfi...)",
+"added to (s_add, s_sub...)", "shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)",
+"chosen by a select or a join", "is a program input" or "computed otherwise". Nothing new is
+lowered: the next tester log tells which forms to lower (a V# base address moved by an offset in
+dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
+`pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
+path: the container made from the title's pieces, the host's options.
+
 ## Known limits of this slice
 
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.
@@ -316,6 +340,7 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - `VirtualAlloc` reserves 64 KiB granules at 64 KiB boundaries; `VirtualFree(MEM_RELEASE)` takes a base from `VirtualAlloc` only.
 - `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory, or of a range `XMemMapPhysicalPages` mapped into, gives its physical-page views back too (`xmem_posix::forget_physical`, as `XMemFreeDefault` does). It used to give back only the address space, so the freed pool stayed in the GPU's pool table and the aliases at an address the next allocation was given: two memories at one title address (issue #15).
 - `VirtualFree(MEM_DECOMMIT)` over physical-page views (`XMemVirtualAlloc`'s pool backing, `XMemMapPhysicalPages`) keeps the views and makes them no access, instead of decommitting them (`xmem_physical::decommit`); the rest of the range is decommitted as before. Decommitting put anonymous pages in place of the pool's while the views and the GPU's pool table still showed the pool, so after a recommit the title wrote one memory and the GPU and aliases read another (issue #15). Windows only promises that a recommitted page reads zeros, so a page is zeroed when it is `XMemVirtualAlloc`'s pool backing and no other address shows it: no one else can read it. Other pages keep their bytes, since a page shown at other addresses (aliases, `map_alias`) is still read there, and pages `XMemAllocatePhysicalPages` made outlive their mappings (the title may map them again). Guess: the console keeps those pages' contents too; what it does is unknown, and `VICTORY_TRACE_OWNERS` names such a decommit. Zeroing touches every page it zeroes, also those never written.
+- File calls (`CreateFileW` and the rest, `host_posix::files::win32_error`) report host errors as Windows does, from one table shared with other callers (`win32_errors::code`, the UCRT's `_dosmaperr` read backwards): `EMFILE` and `ENFILE` are `ERROR_TOO_MANY_OPEN_FILES`, `EBADF` `ERROR_INVALID_HANDLE`, `ENOMEM` `ERROR_NOT_ENOUGH_MEMORY`, `EXDEV` `ERROR_NOT_SAME_DEVICE`, `EINVAL` `ERROR_INVALID_PARAMETER`, `ENOSPC` `ERROR_DISK_FULL`, and as before `ENOENT` (`ERROR_PATH_NOT_FOUND` when the parent folder is missing too), `EACCES`, `EEXIST` and `ENOTEMPTY`. Any other host error is still `ERROR_ACCESS_DENIED`; those above used to be too.
 - TLS images must be registered before the threads that use them; thread notices go to every registered image on every title thread.
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
@@ -347,6 +372,25 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
+## LDS instructions addressed by M0
+
+`ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address
+operand and were refused as "an LDS address" (three compute programs in the story-load log of
+issue #123). They are now lowered as the RDNA2 ISA gives them (12.13, 10.4):
+- `ds_append` (`ds_consume`): one atomic add (subtract) of the count of the lanes running at the
+  LDS byte address M0 + offset, done by the first of them, and its old value returned to all of
+  them. The ISA calls the address "M0.base"; for LDS, M0 is the byte address itself, as LLVM sets
+  it (`AMDGPUDAGToDAGISel::SelectDSAppendConsume` copies the pointer to M0 unchanged).
+- `ds_read_addtid_b32` (`ds_write_addtid_b32`): the dword at offset + M0[15:0] + 4 × the lane's id
+  in the console's wave.
+They make the program use the console's lanes (`console_lanes`). Where the host splits a console
+wave (wave64 on 32-lane host waves, a group of more than 32 lanes) an append or consume is still
+refused, "ds_append or ds_consume in a console wave the host splits": the console makes one atomic
+for the whole wave. As for other LDS accesses, addresses are taken as aligned and in bounds (the
+ISA clamps append and consume by M0's size). The `ds_gws` group (GDS) stays refused, by name.
+`addr_tests::lds_append_consume_and_addtid_follow_m0_on_the_gpu` (`victory-gpu`) runs them on
+Metal, wave32 and wave64.
+
 ## Scalar absolute difference
 
 `s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in
@@ -354,6 +398,16 @@ the story-load log of issue #123). It is lowered as the RDNA2 ISA gives it (SOP2
 difference `S0 - S1`, wrapping, negated when negative as a signed number, and SCC set when the
 result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
 (`victory-gpu`) runs it on Metal, wrapping cases included.
+
+## 16-bit reads of inputs not marked 16-bit
+
+A pixel shader that interpolates an attribute with `v_interp_p1ll_f16`/`v_interp_p2_f16`, or
+reads its high half, when the stage data does not mark that input 16-bit (input flag bit 3) was
+refused as "a 16-bit read of a 32-bit input" (three guessed pipelines in the story-load log of
+issue #123). The refusal now says which, after a colon: "an f16 interpolation of an input not
+marked 16-bit" or "the high half of an input not marked 16-bit". Nothing is lowered: what such a
+read returns from a 32-bit attribute is not documented, and in a guessed pipeline the missing mark
+may be the stage data's (guessed) rather than the program's.
 
 ## Bring-up diagnostics (native path)
 
@@ -422,7 +476,7 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 
 * **Pixel primitive mask.** Scalar masks, shifts and unsigned bit-field extraction (`s_bfe_u32`) may feed M0 for interpolation. When the resulting value and SCC have no other use, the inferred primitive-mask SGPR anchors the existing POPS collision-id mapping in the next SGPR. A hand-assembled regression covers extraction and rejects exports of either the original or extracted mask, as well as observable SCC. This extends the guessed-path heuristic; it has not been verified against the seven remaining title shaders in issue #4.
 * **Sample and gather variants.** Each `image_sample*` and `image_gather4*` suffix adds address VGPRs in the order of the RDNA2 ISA (section 8.2.5, "VGPR Usage"; LLVM's `AMDGPUSampleVariant` agrees): offset, bias, z-compare, derivatives, then the coordinates and the level or clamp. The offset word holds three 6-bit signed offsets (x in bits 0-5, y 8-13, z 16-21). So `_o` is accepted on every sample the translator takes (`sampleLevel`, `sampleBias`, `sampleCmp`, `sampleCmpLevelZero`, `sampleGrad`): the offsets must be constant and within DXIL's -8..7, and a cube sample with offsets is refused. `image_gather4_c_lz` and `_c_lz_o` become `textureGatherCmp` (DXIL op 74). Guess: a comparison gather compares the channel its dmask picks, as a plain gather gathers it; DXIL compares red only, so any other channel is refused. Still refused: comparisons at an explicit level or with bias or gradients (`image_sample_c_l`, `_c_b`, `_c_d`: DXIL 1.7 and 1.8 operations), and comparison gathers at a computed level (`image_gather4_c`, `_c_l`, `_c_b`).
-* **Computed pixel buffers.** Scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for the fragment stage, as for compute. The translator requires proof that the descriptor's swizzle flags are clear. Vector byte/halfword loads (`buffer_load_ubyte`, `sbyte`, `ushort`, `sshort`) also use this path, with zero/sign extension and bounds checked at the element width. Each byte is resolved separately, so halfwords can cross dword/page boundaries and carry into the address high word. Bounds mode 0 checks each component's starting offset against the stride; mode 3 checks its end. Bounds mode 2 skips range checks but still treats a zero record count as out of bounds. Alignment is a guess: these subword reads assume `SH_MEM_CONFIG.alignment_mode = UNALIGNED`; the register is not yet decoded, so DWORD/strict modes are not emulated. See the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture), sections 8.1.5 and 8.1.7 and the MUBUF opcode table. Hand-assembled translation tests and Windows GPU/WARP value tests cover this extension; it is not evidence that any of issue #4's seven title shaders now works. Any four SGPR dwords the translator cannot trace (last dword constant) are classed this way, so an image instruction can meet one too: as its sampler it is refused with "a sampler built from computed words" (all 17 such shaders of a story-load run, 27 November, built a constant sampler with `s_bfm_b64` and a 64-bit literal move; the descriptor tracer now folds `s_bfm_b64` of inline constants as it did `s_bfm_b32`, so those samplers are immediate ones), as a 128-bit image descriptor with "a computed buffer descriptor used as a view". Buffer accesses never give the second message. A refusal of an instruction without side effects is reported at the first instruction that needs its result, not at the image instruction.
+* **Computed pixel and vertex buffers.** In a guessed pixel or vertex shader, scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for both render stages, as for compute: each stage's root arguments get the table's address (`memory_args` in `native/host.rs`), and the heap and the pool buffers are made resident for the vertex and fragment stages (`bind_root_render` in `victory-metal`'s `gfx.rs`). Vertex shaders were refused ("a buffer descriptor built around a computed address") until the tester log in #123 showed four guessed ones; `addr_tests::guessed_vertex_buffer_reads_the_pool` draws with positions read this way. The translator requires proof that the descriptor's swizzle flags are clear. Vector byte/halfword loads (`buffer_load_ubyte`, `sbyte`, `ushort`, `sshort`) also use this path, with zero/sign extension and bounds checked at the element width. Each byte is resolved separately, so halfwords can cross dword/page boundaries and carry into the address high word. Bounds mode 0 checks each component's starting offset against the stride; mode 3 checks its end. Bounds mode 2 skips range checks but still treats a zero record count as out of bounds. Alignment is a guess: these subword reads assume `SH_MEM_CONFIG.alignment_mode = UNALIGNED`; the register is not yet decoded, so DWORD/strict modes are not emulated. See the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture), sections 8.1.5 and 8.1.7 and the MUBUF opcode table. Hand-assembled translation tests and Windows GPU/WARP value tests cover this extension; it is not evidence that any of issue #4's seven title shaders now works. Any four SGPR dwords the translator cannot trace (last dword constant) are classed this way, so an image instruction can meet one too: as its sampler it is refused with "a sampler built from computed words" (all 17 such shaders of a story-load run, 27 November, built a constant sampler with `s_bfm_b64` and a 64-bit literal move; the descriptor tracer now folds `s_bfm_b64` of inline constants as it did `s_bfm_b32`, so those samplers are immediate ones), as a 128-bit image descriptor with "a computed buffer descriptor used as a view". Buffer accesses never give the second message. A refusal of an instruction without side effects is reported at the first instruction that needs its result, not at the image instruction.
 * **Thread-group info SGPR.** The compute system SGPR `COMPUTE_PGM_RSRC2` bit 10 enables (`TG_SIZE`) is synthesised: bits 0-5 the group's console wave count, bits 6-11 the console wave's index in the group (from the console-lane flat id when lanes are relabelled), the rest 0. Guess: the bit layout is RADV's reading of the register (`ac_unpack_param(tg_size, 6, 6)` for the wave index); the title's shaders only mask bits 6-11 and add `v_mbcnt` to get the thread's index. Before, these were refused as "the thread-group info SGPR" (5 unique shaders in a story-load run, 27 November). Tested on the GPU: `split_wave_tests::the_thread_group_info_sgpr_numbers_the_console_waves`.
 * **Computed compute buffers.** A compute shader's buffer descriptor built around an address it computes (loaded from memory or passed in root constants) is treated like the pixel case above (same limits: loads only, linear, no swizzle) when the host uses title memory (`zero_copy_memory`). Before, such a load was refused ("a buffer descriptor built around a computed address"). Guess: compute shaders get the same subword alignment assumption (UNALIGNED). Only translation is tested (a hand-assembled shader in `gfx_refusal_tests.rs`); no value test runs it on a GPU. Stores, atomics and typed access through such a descriptor stay refused. Root constants in FSPX compute metadata (root type 0) are accepted as in graphics; a trailing block fills the user SGPRs up to the count `COMPUTE_PGM_RSRC2` declares (guess, see `native::constants_to_the_end`: the words after the first were read as "a hardware SGPR input", 19 unique shaders in a story-load run of 27 November, all past it now).
 * **Indexed table buffers without a stride.** FSPX metadata gives a used resource no stride (0). A structured access by `idxen` through a buffer loaded from a descriptor table, with stride 0, used to be refused ("a structured buffer of unknown stride"). It now takes the element size from the view-stride table, as a buffer loaded from the resource heap does (the table entry's heap index is its table offset plus the load's, in the same heap). Guess: the host's view-stride table has an entry for every view slot, table entries included, and the views are raw (`descriptor/host.rs`). Only translation is tested (`gfx_refusal_tests.rs`); no GPU value test. A stride the metadata gives is kept.
@@ -594,12 +648,21 @@ have written, and 30 s later the title's own watchdog killed the process.
 
 Now: `submit_passes` records what the submission owes (`gfx::Owed`: the order event and its value,
 each `(fence, value)` signal, each fill's buffer, offset, length and byte). When the completed
-handler sees an error it raises those events (never lowers one; the order event is an
-`MTLSharedEvent` for this) and writes the fills on the CPU, in order, and warns for the first few
+handler sees an error it writes the fills on the CPU, in order, then raises those events (never
+lowers one; the order event is an `MTLSharedEvent` for this), so a waiter that sees its fence
+reached also sees the fills before it, and warns for the first few
 times. Draws and dispatches of the failed buffer are lost, and its copies are not replayed (one may
 have partly run, and its source may have changed since). Guess: the console has no equivalent of a
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
 policy, not console behaviour.
+
+#### A pass refused mid-encoding ends its encoder
+
+`submit_passes` refuses a pass it cannot encode and still encodes the passes after it. A refusal after the pass's encoder was opened (a counted record whose gate fails, an indexed indirect draw without an index buffer) now ends that encoder first; it used to leave it open, and Metal aborted the process (`A command encoder is already encoding to this command buffer`) when the next pass opened its own.
+
+#### Heap samplers live as long as the backend
+
+A sampler heap entry holds only the sampler's resource ID. The host used to drop its `MTLSamplerState` right after writing the entry, and Metal gives a freed sampler's ID to the next sampler made, so an older entry then sampled with a newer descriptor's filter and address modes. `create_sampler` now keeps every sampler it makes, one per distinct `SamplerDesc` (few exist), and hands the same one back for the same descriptor.
 
 #### CPU texture transfers are bounds-checked
 

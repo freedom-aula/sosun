@@ -98,6 +98,41 @@ fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     assert!(err.to_string().contains("computed buffer descriptor with swizzling"), "{err}");
 }
 
+/// A guessed vertex shader's buffer descriptor built around a computed address reads title
+/// memory through the page table too: the Metal host binds the table for the vertex stage.
+#[test]
+fn guessed_vertex_computed_buffer_loads_use_title_memory() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // CBV, root constants in slot 0, live-in s0
+    let code = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8705_FF05,
+        0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0x8F06_9090, // s_lshl_b32 s6, 16, 16
+        0x8805_0605, // s_or_b32 s5, s5, s6
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x00014fac
+        0xE034_3004,
+        0x8001_0200, // buffer_load_dwordx2 v[2:3], v[0:1], s[4:7], 0 idxen offen offset:4
+        0xF420_0202,
+        0xFA00_000C, // s_buffer_load_dword s8, s[4:7], 12
+        0x7E08_0208, // v_mov_b32 v4, s8
+        0xF800_08CF,
+        0x0404_0302, // exp pos0 v2, v3, v4, v4 done
+        0xBF81_0000,
+    ];
+    let container = graphics::container(HwStage::Vs, &bytes_of(&code), &meta).unwrap();
+    let options = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    let shader = translate_with(&container, options).unwrap();
+    assert!(shader.memory);
+    assert!(!shader.memory_writes && !shader.heap);
+    assert!(translate_with(&container, Options::default()).is_err());
+}
+
 #[test]
 fn guessed_pixel_computed_subword_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
@@ -861,6 +896,49 @@ fn absdiff_translates() {
     let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
     let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
     translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
+}
+
+/// The DS instructions whose LDS address is M0's (and the lane's) translate (values:
+/// `victory-gpu` `addr_tests`), except an append or consume where the host splits the console's
+/// wave (wave64 on 32-lane host waves), which needs one atomic for both halves.
+#[test]
+fn lds_instructions_addressed_by_m0_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |ds: [u32; 2], wave32: bool, threads: u16| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            ds[0],
+            ds[1],
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // Five user SGPRs and 512 bytes of LDS.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let rsrc2 = 1 << 15 | 5 << 1;
+        let part = fspx(&bytes_of(&code), rsrc2, [threads, 1, 1], wave32, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let append = [0xD8F8_0000, 0x0100_0000]; // ds_append v1
+    for ds in [
+        append,
+        [0xD8F4_0004, 0x0100_0000], // ds_consume v1 offset:4
+        [0xDAC4_0000, 0x0100_0000], // ds_read_addtid_b32 v1
+    ] {
+        translate_with(&program(ds, true, 32), Options::default()).unwrap();
+    }
+    let host32 = Options { wave32_host: true, ..Options::default() };
+    translate_with(&program(append, false, 32), host32).unwrap();
+    let err = translate_with(&program(append, false, 64), host32).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what == "ds_append or ds_consume in a console wave the host splits"),
+        "{err:?}"
+    );
 }
 
 #[test]

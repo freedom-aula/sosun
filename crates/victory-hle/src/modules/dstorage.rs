@@ -111,16 +111,37 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
         .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
 }
 
-/// The Win32 error a POSIX one stands for (`ERROR_FILE_NOT_FOUND`,
-/// `ERROR_ACCESS_DENIED`, `ERROR_READ_FAULT` for the rest), as an `HRESULT`.
+/// The Win32 error a POSIX one stands for, as an `HRESULT`: the inverse of the UCRT's
+/// `_dosmaperr` table (Win32 error to `errno`), with `ERROR_READ_FAULT` for `EIO` and the rest.
 #[cfg(not(windows))]
 fn from_win32(error: &std::io::Error) -> HRESULT {
-    let code: u32 = match error.kind() {
-        std::io::ErrorKind::NotFound => 2,
-        std::io::ErrorKind::PermissionDenied => 5,
-        _ => 30,
+    use std::io::ErrorKind;
+    // `errno` values below 35 are the same on every Unix.
+    let code: u32 = match (error.raw_os_error(), error.kind()) {
+        (Some(9), _) => 6,                     // EBADF: ERROR_INVALID_HANDLE
+        (Some(23 | 24), _) => 4,               // ENFILE, EMFILE: ERROR_TOO_MANY_OPEN_FILES
+        (Some(28), _) => 112,                  // ENOSPC: ERROR_DISK_FULL
+        (_, ErrorKind::NotFound) => 2,         // ENOENT: ERROR_FILE_NOT_FOUND
+        (_, ErrorKind::PermissionDenied) => 5, // EACCES, EPERM: ERROR_ACCESS_DENIED
+        (_, ErrorKind::OutOfMemory) => 8,      // ENOMEM: ERROR_NOT_ENOUGH_MEMORY
+        (_, ErrorKind::InvalidInput) => 87,    // EINVAL: ERROR_INVALID_PARAMETER
+        _ => 30,                               // EIO and the rest: ERROR_READ_FAULT
     };
     (0x8007_0000 | code) as i32
+}
+
+/// The `HRESULT` of a failed read: `END_OF_FILE` past the end, else the host's error.
+fn read_hresult(error: &std::io::Error) -> HRESULT {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        END_OF_FILE
+    } else {
+        from_win32(error)
+    }
+}
+
+/// A host error for the log: its text (with the OS error number) and kind.
+fn host_error(error: &std::io::Error) -> String {
+    format!("{error} ({:?})", error.kind())
 }
 
 /// Reads at `offset` without moving a file position (`ReadFile` with an
@@ -1014,15 +1035,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        let mut read = None;
+        return into_destination(request, size, |out| {
+            read_into(request, out).map(|()| size).map_err(|error| {
+                let hr = read_hresult(&error);
+                read = Some(error);
+                hr
+            })
+        })
+        .map_err(|hr| match &read {
+            Some(error) => fail(hr, &format!("copying: {}", host_error(error))),
+            None => fail(hr, "copying"),
+        });
     }
     let tables = if bc != 0 {
         Some(bcpack_tables()?)
     } else {
         None
     };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request).map_err(|error| {
+        let why = format!("reading the source: {}", host_error(&error));
+        fail(read_hresult(&error), &why)
+    })?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1102,7 +1136,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> std::io::Result<Cow<'static, [u8]>> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1118,7 +1152,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 static READING: AtomicU64 = AtomicU64::new(0);
 
 /// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+fn read_into(request: &Request, out: &mut [u8]) -> std::io::Result<()> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe {
@@ -1131,19 +1165,29 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match read_at(file, &mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = fill_at(out, request.offset, |buf, at| read_at(file, buf, at));
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+/// Fills `out` with `read(buf, offset)` from `offset` on, as `read_exact` does: short reads go
+/// on, `Interrupted` (EINTR: this process takes many signals) is tried again, and the end of
+/// the file is `UnexpectedEof`.
+fn fill_at(
+    out: &mut [u8],
+    offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let mut done = 0;
+    while done < out.len() {
+        match read(&mut out[done..], offset + done as u64) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1278,6 +1322,52 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// A read interrupted by a signal is tried again, and short reads go on, until `out` is full.
+    #[test]
+    fn reads_go_on_past_signals_and_short_reads() {
+        let file: Vec<u8> = (0..10).collect();
+        let mut calls = Vec::new();
+        let mut out = [0; 6];
+        let result = fill_at(&mut out, 3, |buf, at| {
+            calls.push(at);
+            if calls.len() == 1 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = buf.len().min(2);
+            buf[..n].copy_from_slice(&file[at as usize..at as usize + n]);
+            Ok(n)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(out, [3, 4, 5, 6, 7, 8]);
+        assert_eq!(calls, [3, 3, 5, 7]);
+        let short = fill_at(&mut [0; 4], 0, |_, _| Ok(0)).unwrap_err();
+        assert_eq!(read_hresult(&short), END_OF_FILE);
+    }
+
+    /// Host errors reach the title as the Win32 errors Windows would give (`_dosmaperr`).
+    #[cfg(not(windows))]
+    #[test]
+    fn host_errors_map_to_their_win32_codes() {
+        let hr = |errno| from_win32(&std::io::Error::from_raw_os_error(errno)) as u32;
+        for (errno, win32) in [
+            (2, 2),    // ENOENT: ERROR_FILE_NOT_FOUND
+            (1, 5),    // EPERM: ERROR_ACCESS_DENIED
+            (13, 5),   // EACCES
+            (12, 8),   // ENOMEM: ERROR_NOT_ENOUGH_MEMORY
+            (9, 6),    // EBADF: ERROR_INVALID_HANDLE
+            (24, 4),   // EMFILE: ERROR_TOO_MANY_OPEN_FILES
+            (23, 4),   // ENFILE
+            (22, 87),  // EINVAL: ERROR_INVALID_PARAMETER
+            (28, 112), // ENOSPC: ERROR_DISK_FULL
+            (5, 30),   // EIO: ERROR_READ_FAULT
+            (35, 30),  // anything else
+        ] {
+            assert_eq!(hr(errno), 0x8007_0000 | win32, "errno {errno}");
+        }
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(read_hresult(&eof), END_OF_FILE);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

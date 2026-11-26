@@ -20,8 +20,12 @@ else fail "Rosetta 2 is missing: run  softwareupdate --install-rosetta --agree-t
 if xcode-select -p >/dev/null 2>&1; then ok "Xcode command line tools"
 else fail "Xcode command line tools are missing: run  xcode-select --install"; fi
 
-if command -v rustup >/dev/null 2>&1; then ok "rustup"
-else fail "rustup is missing: install it from https://rustup.rs (Homebrew's plain 'rust' package will not work)"; fi
+source tools/macos/native-binary.sh
+if ! find_rustup; then
+  fail "rustup is missing: install it from https://rustup.rs (Homebrew's plain 'rust' package will not work)"
+elif [[ -n "$rustup_found" ]]; then
+  warn "rustup is in $rustup_found but not on your PATH; using it. Open a new terminal, or add that folder to your PATH"
+else ok "rustup"; fi
 
 MSC="${VICTORY_MSC_DYLIB:-/usr/local/lib/libmetalirconverter.dylib}"
 if [[ -f "$MSC" ]]; then ok "Metal Shader Converter ($MSC)"
@@ -41,7 +45,6 @@ echo
 echo "Building victory (release, x86_64, runs under Rosetta). The first build takes a few minutes."
 # The toolchain's own bin first: a Homebrew rustc earlier on PATH has no x86_64 std.
 export PATH="$(rustup run 1.98.1 rustc --print sysroot)/bin:$PATH"
-source tools/macos/native-binary.sh
 bin=$(native_binary) || fail "could not locate the Cargo build output"
 cargo build --release --target x86_64-apple-darwin -p victory
 ok "built $bin"
