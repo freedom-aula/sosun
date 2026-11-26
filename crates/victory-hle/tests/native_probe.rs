@@ -275,6 +275,22 @@ mod run {
     }
 
     #[test]
+    fn the_c_runtime_serves_a_title_that_links_it() {
+        // The probe imports `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll`:
+        // strings, math (doubles in xmm registers), printf and scanf over a
+        // `va_list`, qsort with a title comparator, files, heap, time,
+        // initializer and exit tables, signals, threads and errno.
+        let dir = tempfile::tempdir().unwrap();
+        let path: Vec<u8> = dir.path().to_str().unwrap().bytes().chain([0]).collect();
+        let result = run_probe("probe_ucrt", path.as_ptr() as u64);
+        assert_all(result, 0x1FFFF, "probe_ucrt");
+        assert!(
+            !dir.path().join("ucrt.bin").exists(),
+            "the probe removes its file"
+        );
+    }
+
+    #[test]
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
         // The probe's vectored handler hears every thread's exceptions.
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

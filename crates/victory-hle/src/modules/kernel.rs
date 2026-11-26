@@ -656,6 +656,8 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        crate::host_posix::ucrt::run_exit_handlers();
         std::process::exit(code)
     }
 

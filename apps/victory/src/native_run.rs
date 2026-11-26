@@ -209,6 +209,7 @@ pub fn run(
     execute: bool,
     list_imports: bool,
     console: Console,
+    title_args: &[String],
 ) -> Result<u32> {
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -280,6 +281,12 @@ pub fn run(
         storage.display()
     );
     victory_hle::posix::mount_at('G', title_dir);
+    // The title sees its executable on the package drive, then its arguments.
+    let exe_name_on_g = exe.file_name().unwrap_or_default().to_string_lossy();
+    let argv: Vec<String> = std::iter::once(format!("G:\\{exe_name_on_g}"))
+        .chain(title_args.iter().cloned())
+        .collect();
+    victory_hle::posix::set_command_line(&argv);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::posix::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });

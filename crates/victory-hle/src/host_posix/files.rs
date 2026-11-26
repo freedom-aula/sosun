@@ -123,7 +123,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<PathBuf> {
 }
 
 /// A NUL-terminated wide string.
-fn wide_str(p: *const u16) -> Vec<u16> {
+pub(super) fn wide_str(p: *const u16) -> Vec<u16> {
     // SAFETY: the title passes a NUL-terminated path.
     unsafe { std::slice::from_raw_parts(p, (0..).take_while(|&i| *p.add(i) != 0).count()) }.to_vec()
 }
@@ -135,7 +135,7 @@ pub(crate) fn wide_path(p: *const u16) -> Option<PathBuf> {
     translate(&wide_str(p))
 }
 
-fn narrow_path(p: *const c_char) -> Option<PathBuf> {
+pub(super) fn narrow_path(p: *const c_char) -> Option<PathBuf> {
     if p.is_null() {
         return None;
     }
@@ -618,7 +618,7 @@ pub(crate) struct Find {
 }
 
 /// Whether `name` matches a `*` and `?` pattern, ignoring case.
-fn wildcard(pattern: &[char], name: &[char]) -> bool {
+pub(super) fn wildcard(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),

@@ -219,9 +219,17 @@ fn main() -> Result<()> {
             execute,
             list_imports,
             console,
-            title_args: _,
+            title_args,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, list_imports, console)?;
+            let code = run::run(
+                &exe,
+                unimplemented,
+                strict,
+                execute,
+                list_imports,
+                console,
+                &title_args,
+            )?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

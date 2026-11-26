@@ -943,3 +943,262 @@ u32 probe_dll(ptr unused)
         ok |= D_PROC;
     return ok;
 }
+
+/* ---- the Universal C runtime ------------------------------------------- */
+
+/* ucrtbase.dll and api-ms-win-crt-math-l1-1-0.dll: victory-hle's host_posix::ucrt. */
+IMPORT u64 strlen(const char *);
+IMPORT int strcmp(const char *, const char *);
+IMPORT int _stricmp(const char *, const char *);
+IMPORT const char *strstr(const char *, const char *);
+IMPORT ptr memcpy(ptr, const void *, u64);
+IMPORT ptr memset(ptr, int, u64);
+IMPORT int memcmp(const void *, const void *, u64);
+IMPORT u64 wcslen(const u16 *);
+IMPORT double strtod(const char *, char **);
+IMPORT long strtol(const char *, char **, int);
+IMPORT int atoi(const char *);
+IMPORT char *_itoa(int, char *, int);
+IMPORT void qsort(ptr, u64, u64, int (*)(const void *, const void *));
+IMPORT ptr bsearch(const void *, const void *, u64, u64, int (*)(const void *, const void *));
+IMPORT int __stdio_common_vsprintf(u64, char *, u64, const char *, ptr, char *);
+IMPORT int __stdio_common_vswprintf(u64, u16 *, u64, const u16 *, ptr, char *);
+IMPORT int __stdio_common_vsscanf(u64, const char *, u64, const char *, ptr, char *);
+IMPORT ptr fopen(const char *, const char *);
+IMPORT int fclose(ptr);
+IMPORT u64 fwrite(const void *, u64, u64, ptr);
+IMPORT u64 fread(ptr, u64, u64, ptr);
+IMPORT int fseek(ptr, long, int);
+IMPORT long long _ftelli64(ptr);
+IMPORT int remove(const char *);
+IMPORT int _stat64(const char *, ptr);
+IMPORT int _access(const char *, int);
+IMPORT ptr malloc(u64);
+IMPORT ptr calloc(u64, u64);
+IMPORT ptr realloc(ptr, u64);
+IMPORT void free(ptr);
+IMPORT ptr _aligned_malloc(u64, u64);
+IMPORT void _aligned_free(ptr);
+IMPORT u64 _msize(ptr);
+IMPORT int _gmtime64_s(ptr, const long long *);
+IMPORT u64 strftime(char *, u64, const char *, const void *);
+IMPORT int rand(void);
+IMPORT void srand(u32);
+IMPORT int *_errno(void);
+IMPORT int *__p___argc(void);
+IMPORT void _initterm(void (**)(void), void (**)(void));
+IMPORT int _initialize_onexit_table(ptr);
+IMPORT int _register_onexit_function(ptr, void (*)(void));
+IMPORT int _execute_onexit_table(ptr);
+IMPORT ptr signal(int, void (*)(int));
+IMPORT int raise(int);
+IMPORT u64 _beginthreadex(ptr, u32, u32 (*)(ptr), ptr, u32, u32 *);
+
+IMPORT double sqrt(double);
+IMPORT double pow(double, double);
+IMPORT double fmod(double, double);
+IMPORT double ldexp(double, int);
+IMPORT double frexp(double, int *);
+IMPORT float floorf(float);
+IMPORT float sinf(float);
+IMPORT int _finite(double);
+
+enum {
+    U_STR = 1u << 0,
+    U_MATH = 1u << 1,
+    U_CONV = 1u << 2,
+    U_SORT = 1u << 3,
+    U_FMT = 1u << 4,
+    U_WFMT = 1u << 5,
+    U_FILE = 1u << 6,
+    U_HEAP = 1u << 7,
+    U_TIME = 1u << 8,
+    U_INIT = 1u << 9,
+    U_ONEXIT = 1u << 10,
+    U_RAND = 1u << 11,
+    U_SIGNAL = 1u << 12,
+    U_THREAD = 1u << 13,
+    U_STAT = 1u << 14,
+    U_SCAN = 1u << 15,
+    U_ERRNO = 1u << 16,
+    U_ALL = (1u << 17) - 1,
+};
+
+static int ucrt_sprintf(char *buf, u64 n, const char *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = __stdio_common_vsprintf(2, buf, n, fmt, 0, ap);
+    __builtin_va_end(ap);
+    return r;
+}
+
+static int ucrt_swprintf(u16 *buf, u64 n, const u16 *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = __stdio_common_vswprintf(2, buf, n, fmt, 0, ap);
+    __builtin_va_end(ap);
+    return r;
+}
+
+static int ucrt_sscanf(const char *in, const char *fmt, ...)
+{
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = __stdio_common_vsscanf(0, in, (u64)-1, fmt, 0, ap);
+    __builtin_va_end(ap);
+    return r;
+}
+
+static int same(const char *a, const char *b) { return strcmp(a, b) == 0; }
+
+static int by_value(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int init_calls, init_order;
+static void init_a(void) { init_calls++; init_order = init_order * 10 + 1; }
+static void init_b(void) { init_calls++; init_order = init_order * 10 + 2; }
+static void (*init_table[3])(void) = { init_a, 0, init_b };
+
+static int exit_order;
+static void exit_a(void) { exit_order = exit_order * 10 + 1; }
+static void exit_b(void) { exit_order = exit_order * 10 + 2; }
+
+static int signal_seen;
+static void on_signal(int sig) { signal_seen = sig; }
+
+static u32 thread_value;
+static u32 ucrt_thread(ptr arg)
+{
+    thread_value = (u32)(u64)arg + 1;
+    return 7;
+}
+
+/* `dir` is a narrow path of a folder the probe may write in. */
+u32 probe_ucrt(const char *dir)
+{
+    u32 ok = 0;
+    char buf[256];
+
+    if (strlen("hello") == 5 && strcmp("a", "b") < 0 && _stricmp("AbC", "aBc") == 0 &&
+        strstr("hello", "ll") && !strstr("hello", "z") && wcslen((const u16 *)L"wide") == 4) {
+        u8 a[8], b[8];
+        memset(a, 7, 8);
+        memcpy(b, a, 8);
+        if (memcmp(a, b, 8) == 0)
+            ok |= U_STR;
+    }
+
+    /* Windows ABI: the doubles arrive in xmm0/xmm1 and the int in edx. */
+    int e = 0;
+    double m = frexp(48.0, &e);
+    if (pow(2.0, 10.0) == 1024.0 && fmod(7.5, 2.0) == 1.5 && ldexp(1.5, 4) == 24.0 &&
+        sqrt(16.0) == 4.0 && floorf(2.7f) == 2.0f && _finite(1.5) && !_finite(1e308 * 10) &&
+        m == 0.75 && e == 6 && sinf(0.0f) == 0.0f)
+        ok |= U_MATH;
+
+    char *end;
+    if (strtod("3.5xyz", &end) == 3.5 && *end == 'x' && strtol("-42", 0, 10) == -42 &&
+        atoi("123") == 123 && same(_itoa(255, buf, 16), "ff"))
+        ok |= U_CONV;
+
+    int v[6] = { 5, 3, 9, 1, 7, 3 };
+    qsort(v, 6, 4, by_value);
+    int key = 7;
+    int *hit = (int *)bsearch(&key, v, 6, 4, by_value);
+    if (v[0] == 1 && v[1] == 3 && v[2] == 3 && v[5] == 9 && hit == &v[4])
+        ok |= U_SORT;
+
+    int n = ucrt_sprintf(buf, sizeof buf, "%d|%s|%.2f|%I64d|%x", 42, "ok", 3.14159, -5LL, 255);
+    if (n == 16 && same(buf, "42|ok|3.14|-5|ff"))
+        ok |= U_FMT;
+
+    u16 wbuf[32];
+    int wn = ucrt_swprintf(wbuf, 32, (const u16 *)L"%ls=%d", (const u16 *)L"k", 9);
+    if (wn == 3 && wbuf[0] == 'k' && wbuf[1] == '=' && wbuf[2] == '9' && wbuf[3] == 0)
+        ok |= U_WFMT;
+
+    int i1 = 0;
+    double d1 = 0;
+    char word[16];
+    if (ucrt_sscanf("12 3.5 word", "%d %lf %s", &i1, &d1, word) == 3 && i1 == 12 && d1 == 3.5 &&
+        same(word, "word"))
+        ok |= U_SCAN;
+
+    char path[300];
+    ucrt_sprintf(path, sizeof path, "%s/ucrt.bin", dir);
+    ptr f = fopen(path, "wb");
+    if (f && fwrite("abcdef", 1, 6, f) == 6) {
+        fclose(f);
+        f = fopen(path, "rb");
+        char got[4] = { 0 };
+        if (f && fseek(f, 2, 0) == 0 && fread(got, 1, 3, f) == 3 && same(got, "cde") &&
+            _ftelli64(f) == 5)
+            ok |= U_FILE;
+        if (f)
+            fclose(f);
+    }
+    u8 st[56];
+    if (_stat64(path, st) == 0 && *(long long *)(st + 24) == 6 && (*(u16 *)(st + 6) & 0x8000) &&
+        _access(path, 0) == 0 && remove(path) == 0 && _access(path, 0) == -1)
+        ok |= U_STAT;
+
+    u8 *p = (u8 *)malloc(100);
+    ptr z = calloc(4, 8);
+    ptr al = _aligned_malloc(64, 64);
+    if (p && z && al && ((u64)al & 63) == 0 && ((u64)p & 15) == 0) {
+        memset(p, 1, 100);
+        p = (u8 *)realloc(p, 1000);
+        if (p && p[99] == 1 && _msize(p) >= 1000 && *(u64 *)z == 0)
+            ok |= U_HEAP;
+    }
+    free(p);
+    free(z);
+    _aligned_free(al);
+
+    long long t = 31536000; /* 1971-01-01 */
+    int tm[9];
+    char date[32];
+    if (_gmtime64_s(tm, &t) == 0 && tm[5] == 71 && tm[4] == 0 && tm[3] == 1 &&
+        strftime(date, sizeof date, "%Y-%m-%d", tm) == 10 && same(date, "1971-01-01"))
+        ok |= U_TIME;
+
+    /* Title function pointers, called by the host: null entries are skipped. */
+    _initterm(init_table, init_table + 3);
+    if (init_calls == 2 && init_order == 12)
+        ok |= U_INIT;
+
+    u64 table[3] = { 0, 0, 0 };
+    _initialize_onexit_table(table);
+    _register_onexit_function(table, exit_a);
+    _register_onexit_function(table, exit_b);
+    _execute_onexit_table(table);
+    if (exit_order == 21) /* last registered runs first */
+        ok |= U_ONEXIT;
+
+    srand(1);
+    int r1 = rand(), r2 = rand();
+    if (r1 == 41 && r2 == 18467)
+        ok |= U_RAND;
+
+    signal(2, on_signal);
+    if (raise(2) == 0 && signal_seen == 2)
+        ok |= U_SIGNAL;
+
+    u32 tid = 0;
+    u64 th = _beginthreadex(0, 0, ucrt_thread, (ptr)41, 0, &tid);
+    if (th && WaitForSingleObject((ptr)th, 5000) == 0 && thread_value == 42 && *__p___argc() >= 1)
+        ok |= U_THREAD;
+    if (th)
+        CloseHandle((ptr)th);
+
+    *_errno() = 0;
+    double bad = sqrt(-1.0);
+    if (bad != bad && *_errno() == 33)
+        ok |= U_ERRNO;
+    return ok;
+}

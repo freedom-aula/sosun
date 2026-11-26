@@ -19,6 +19,7 @@ pub mod modules;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub mod posix {
     pub use crate::host_posix::files::{mount, mount_at};
+    pub use crate::host_posix::ucrt::set_command_line;
 }
 mod registry;
 pub mod runtime;

@@ -43,6 +43,7 @@ pub fn run(
     execute: bool,
     _list_imports: bool,
     console: Console,
+    _title_args: &[String],
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -607,11 +608,20 @@ pub fn run(
     execute: bool,
     list_imports: bool,
     console: Console,
+    title_args: &[String],
 ) -> Result<u32> {
-    crate::native_run::run(exe, unimplemented, strict, execute, list_imports, console)
+    crate::native_run::run(exe, unimplemented, strict, execute, list_imports, console, title_args)
 }
 
 #[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: &[String],
+) -> Result<u32> {
     anyhow::bail!("running titles requires Windows, or macOS on x86-64 (native host)")
 }
