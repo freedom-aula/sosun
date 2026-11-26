@@ -595,6 +595,39 @@ impl Module {
             .count()
     }
 
+    /// The calls [`Module::write`] writes of functions whose name starts
+    /// with `prefix`, in order: the name and each argument's constant value
+    /// (a float's bits, through bitcasts), if it is one.
+    #[cfg(test)]
+    pub fn written_call_args(&self, prefix: &str) -> Vec<(String, Vec<Option<i64>>)> {
+        fn constant(m: &Module, v: V) -> Option<i64> {
+            match v {
+                V::Const(i) => match m.consts[i as usize].1 {
+                    Const::Int(x) => Some(x),
+                    Const::Float(bits) => Some(bits.into()),
+                    _ => None,
+                },
+                V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Cast(Cast::Bitcast, x) => constant(m, x),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name.starts_with(prefix) => Some((
+                    self.funcs[*f as usize].name.clone(),
+                    args.iter().map(|&a| constant(self, a)).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
