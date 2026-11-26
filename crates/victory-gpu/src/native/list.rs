@@ -361,6 +361,12 @@ impl<B: GraphicsBackend> NativeList<B> {
         (&self.state.graphics_root, self.state.graphics_binding.as_deref())
     }
 
+    /// The compute root parameters the next dispatch takes (for traces).
+    #[cfg(target_os = "macos")]
+    pub(super) fn compute_args(&self) -> &[Option<Root<B>>] {
+        &self.state.compute_root
+    }
+
     /// `Reset`: forget everything recorded and set.
     pub fn reset(&mut self) {
         *self = NativeList::default();

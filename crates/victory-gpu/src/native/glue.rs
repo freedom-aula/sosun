@@ -932,16 +932,27 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
                 tracing::warn!(error = %e, "dispatch");
             }
         }
-        _ => dropped_dispatch(l, &format!("groups [{x}, {y}, {z}]")),
+        _ => dropped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")),
     });
 }
 
 /// A dispatch dropped for want of a host compute pipeline; with `VICTORY_TRACE_TARGETS`, counted
-/// by its shader and `how` (group counts, or indirect) for the frame line.
-fn dropped_dispatch(l: &MetalList, how: &str) {
+/// by its shader, `how` (group counts, or indirect) and the textures its tables hold as
+/// unordered-access views (what it may have written) for the frame line.
+fn dropped_dispatch(t: &MetalTitle, l: &MetalList, how: &str) {
     dropped("a dispatch without a host compute pipeline");
     if tracing_targets() {
-        trace_drop_pipe(format!("{:?} {how}", stage_hashes(l.pipeline)));
+        let uavs: Vec<String> = t
+            .host
+            .table_uav_textures(l.list.compute_args())
+            .into_iter()
+            .map(|r| {
+                let i = crate::resource::texture_info(r as This);
+                let (f, w, h) = i.map_or((0, 0, 0), |i| (i.format, i.width, i.height));
+                format!("{r:#x} fmt {f} {w}x{h}")
+            })
+            .collect();
+        trace_drop_pipe(format!("{:?} {how} uavs {uavs:?}", stage_hashes(l.pipeline)));
     }
 }
 
@@ -1268,7 +1279,7 @@ pub(crate) fn execute_indirect(
                         }
                     }
                 }
-                _ => dropped_dispatch(l, "indirect"),
+                _ => dropped_dispatch(t, l, "indirect"),
             });
             true
         }
