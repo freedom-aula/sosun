@@ -68,6 +68,85 @@ pub struct Surface {
     last: RefCell<Option<Retained<ProtocolObject<dyn MTLTexture>>>>,
     /// Frames presented.
     frames: std::cell::Cell<u64>,
+    /// `VICTORY_COUNT_GREEN` state: pixel probes of frames the GPU has not finished, and pacing.
+    green: RefCell<GreenCount>,
+}
+
+/// `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels (a 3 by 3 grid at a quarter, a
+/// half and three quarters of its size) copied out after it is drawn, and is counted green when
+/// most are pure green (what a YCbCr-to-RGB pass makes of zero planes: a movie frame sampled
+/// blank). Once a second stderr gets a `present pacing` line: presents, the longest gap between
+/// two, and the green frames in that second and so far. Costs one small blit per frame.
+fn counting_green() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COUNT_GREEN").is_some())
+}
+
+type Probe = (Retained<ProtocolObject<dyn MTLCommandBuffer>>, Retained<ProtocolObject<dyn MTLBuffer>>, bool);
+
+#[derive(Default)]
+struct GreenCount {
+    probes: std::collections::VecDeque<Probe>,
+    start: Option<std::time::Instant>,
+    second: u64,
+    last: Option<std::time::Instant>,
+    presents: u32,
+    longest: std::time::Duration,
+    green: u32,
+    partly: u32,
+    total: u64,
+}
+
+/// Whether nine probed pixels (`r, g, b, a` or `b, g, r, a`) are a green frame (five or more pure
+/// green), and how many of them are.
+pub(crate) fn green_pixels(px: &[u8], bgra: bool) -> (bool, usize) {
+    let n = px
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| {
+            let (r, g, b) = if bgra { (p[2], p[1], p[0]) } else { (p[0], p[1], p[2]) };
+            g >= 64 && r < 32 && b < 32
+        })
+        .count();
+    (n >= 5, n)
+}
+
+impl GreenCount {
+    /// A frame was presented: pacing, and the probes the GPU finished.
+    fn presented(&mut self) {
+        let now = std::time::Instant::now();
+        let start = *self.start.get_or_insert(now);
+        if let Some(last) = self.last.replace(now) {
+            self.longest = self.longest.max(now - last);
+        }
+        self.presents += 1;
+        while let Some((cb, _, _)) = self.probes.front() {
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed && status != MTLCommandBufferStatus::Error {
+                break;
+            }
+            let Some((_, buf, bgra)) = self.probes.pop_front() else { break };
+            if status == MTLCommandBufferStatus::Completed {
+                // SAFETY: the buffer holds the 36 bytes the finished blit wrote.
+                let px = unsafe { std::slice::from_raw_parts(buf.contents().as_ptr().cast::<u8>(), 36) };
+                match green_pixels(px, bgra) {
+                    (true, _) => self.green += 1,
+                    (false, n) if n > 0 => self.partly += 1,
+                    _ => {}
+                }
+            }
+        }
+        let second = (now - start).as_secs();
+        if second != self.second {
+            self.total += u64::from(self.green);
+            eprintln!(
+                "present pacing t={} presents={} longest_ms={:.1} green={} partly_green={} green_total={}",
+                self.second, self.presents, self.longest.as_secs_f64() * 1e3, self.green, self.partly, self.total
+            );
+            *self = GreenCount { probes: std::mem::take(&mut self.probes), start: self.start, second, last: self.last, total: self.total, ..Default::default() };
+        }
+    }
 }
 
 impl Surface {
@@ -197,6 +276,7 @@ impl PresentBackend for Metal {
             pipelines: RefCell::default(),
             last: RefCell::default(),
             frames: Default::default(),
+            green: Default::default(),
         })
     }
 
@@ -256,8 +336,16 @@ impl PresentBackend for Metal {
                 e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
             };
             e.endEncoding();
+            let probe = if counting_green() { probe_pixels(self, &cb, &src) } else { None };
             cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
             cb.commit();
+            if counting_green() {
+                let mut g = surface.green.borrow_mut();
+                if let Some((buf, bgra)) = probe {
+                    g.probes.push_back((cb.clone(), buf, bgra));
+                }
+                g.presented();
+            }
             *surface.last.borrow_mut() = Some(target);
             surface.frames.set(surface.frames.get() + 1);
             Ok(true)
@@ -265,11 +353,53 @@ impl PresentBackend for Metal {
     }
 }
 
+/// Copies the nine probe pixels of `src` (8-bit RGBA or BGRA) into a new shared buffer, in `cb`.
+fn probe_pixels(
+    m: &Metal,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+) -> Option<(Retained<ProtocolObject<dyn MTLBuffer>>, bool)> {
+    let bgra = match src.pixelFormat() {
+        MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::RGBA8Unorm_sRGB => false,
+        MTLPixelFormat::BGRA8Unorm | MTLPixelFormat::BGRA8Unorm_sRGB => true,
+        _ => return None,
+    };
+    let buf = m.dev.newBufferWithLength_options(36, MTLResourceOptions::StorageModeShared)?;
+    let blit = cb.blitCommandEncoder()?;
+    let (w, h) = (src.width(), src.height());
+    for (i, (fy, fx)) in [1, 2, 3].iter().flat_map(|y| [1, 2, 3].map(|x| (*y, x))).enumerate() {
+        // SAFETY: a 1 by 1 region inside the texture into 4 bytes inside the 36-byte buffer.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                src, 0, 0,
+                MTLOrigin { x: w * fx / 4, y: h * fy / 4, z: 0 },
+                MTLSize { width: 1, height: 1, depth: 1 },
+                &buf, i * 4, 4, 4,
+            )
+        };
+    }
+    blit.endEncoding();
+    Some((buf, bgra))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::ComputeBackend;
     use crate::resources::{Format, ResourceBackend, TextureDesc};
+
+    #[test]
+    fn zero_planes_through_ycbcr_count_as_green() {
+        let green = [10u8, 135, 0, 255];
+        let grey = [90u8, 90, 90, 255];
+        let frame = |n: usize| -> Vec<u8> { (0..9).flat_map(|i| if i < n { green } else { grey }).collect() };
+        assert_eq!(green_pixels(&frame(9), false), (true, 9));
+        assert_eq!(green_pixels(&frame(4), false), (false, 4));
+        assert_eq!(green_pixels(&frame(0), false), (false, 0));
+        // BGRA order.
+        let bgra: Vec<u8> = (0..9).flat_map(|_| [0u8, 135, 10, 255]).collect();
+        assert_eq!(green_pixels(&bgra, true), (true, 9));
+    }
 
     #[test]
     fn blocking_present_times_out_when_acquisition_never_returns() {
