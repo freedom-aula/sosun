@@ -1473,6 +1473,9 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if p.thread_counts {
+            self.launched();
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1623,6 +1626,44 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    /// [`Options::thread_counts`](super::Options): each lane's bit of EXEC
+    /// on entry, set where the thread is one the dispatch launches: below
+    /// the thread count in each dimension, which the host passes in
+    /// user-data dwords past the root signature's own.
+    fn launched(&mut self) {
+        let p = self.x.p;
+        let (Some(&(_, exec)), Some(threads)) = (
+            p.inputs.iter().find(|i| i.0 == Reg::S(EXEC)),
+            self.s.threads,
+        ) else {
+            return;
+        };
+        let layout = &self.x.native.layout;
+        let free = layout.iter().map(|rp| u32::from(rp.user_data) + rp.sgprs).max().unwrap_or(0);
+        let e = self.s.entry;
+        let mut on = self.s.m.bool(true);
+        // A dimension of one thread a group has no partial group.
+        for d in (0..3u8).filter(|&d| threads[usize::from(d)] > 1) {
+            let (Val::I32(t), Val::I32(g)) =
+                (self.thread_id(d), self.compute_id("groupId.i32", 94, d))
+            else {
+                unreachable!("compute ids are numbers")
+            };
+            let n = self.s.m.i32(threads[usize::from(d)]);
+            let at = self.s.m.bin(e, Bin::Mul, g, n);
+            let at = self.s.m.bin(e, Bin::Add, at, t);
+            let count = self.user_at(UserData {
+                index: free + u32::from(d),
+                slot: super::DISPATCH_THREADS,
+                root: RootType::Constants,
+                dword: d.into(),
+            });
+            let below = self.s.m.cmp(e, pred::IULT, at, count);
+            on = self.s.m.bin(e, Bin::And, on, below);
+        }
+        self.lane_bits.insert(exec, on);
     }
 
     /// Values of the program's input registers.
@@ -14559,6 +14600,17 @@ mod tests {
 
     /// The same program, lowered.
     fn lowered(words: &[u32], lanes: u32, narrow_waves: bool, wave32_host: bool) -> super::Lowered {
+        lowered_for(words, lanes, narrow_waves, wave32_host, false)
+    }
+
+    /// [`lowered`], for dispatches of thread counts or not.
+    fn lowered_for(
+        words: &[u32],
+        lanes: u32,
+        narrow_waves: bool,
+        wave32_host: bool,
+        thread_counts: bool,
+    ) -> super::Lowered {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -14572,7 +14624,8 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, true, 256).unwrap();
+        let mut p = ir::build(&native.code, true, 256).unwrap();
+        p.thread_counts = thread_counts;
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
@@ -14596,6 +14649,26 @@ mod tests {
             view_marks: false,
         })
         .expect("lower")
+    }
+
+    #[test]
+    fn a_program_for_thread_counts_reads_the_count_of_each_dimension_with_lanes() {
+        // `v_mov_b32 v1, 0`: nothing reads user data, but the lanes' EXEC on
+        // entry comes from the dispatch's thread count in x, which the host
+        // passes in the first dword past the root signature's (none here).
+        let w = [0x7E02_0280, S_ENDPGM];
+        let count = |dword| super::UserData {
+            index: dword,
+            slot: crate::emit::DISPATCH_THREADS,
+            root: RootType::Constants,
+            dword,
+        };
+        for split in [false, true] {
+            assert_eq!(lowered_for(&w, 64, false, split, true).user_data, [count(0)]);
+            assert_eq!(lowered_for(&w, 64, false, split, false).user_data, []);
+        }
+        // A group of one thread has no partial group: nothing to read.
+        assert_eq!(lowered_for(&w, 1, false, true, true).user_data, []);
     }
 
     #[test]

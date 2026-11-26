@@ -199,6 +199,9 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         groups: [usize; 3],
+        /// The thread counts of a dispatch that gives them (`DispatchX` with thread dimensions),
+        /// for the pipeline's lanes to start EXEC by; `u32::MAX` for any other dispatch.
+        threads: [u32; 3],
         /// `ExecuteIndirect`: the title address of the group counts, read on the GPU.
         indirect: Option<u64>,
         /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
@@ -245,6 +248,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root,
                 heaps,
                 groups,
+                threads,
                 indirect,
                 count,
             } => Cmd::Dispatch {
@@ -252,6 +256,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
+                threads: *threads,
                 indirect: *indirect,
                 count: *count,
             },
@@ -477,13 +482,22 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `Dispatch`. Needs the compute pipeline set.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
-        self.dispatch_from([x as usize, y as usize, z as usize], None, None)
+        self.dispatch_from([x as usize, y as usize, z as usize], [u32::MAX; 3], None, None)
+    }
+
+    /// `DispatchX` with thread counts, of a pipeline translated for them
+    /// (`victory_shader::emit::Options::thread_counts`): whole groups, rounded up, whose threads
+    /// past the counts start with EXEC off.
+    pub fn dispatch_threads(&mut self, threads: [u32; 3]) -> Result<(), String> {
+        let per = self.state.compute.as_ref().ok_or("dispatch without a compute pipeline")?.threads;
+        let groups = std::array::from_fn(|d| (threads[d] as usize).div_ceil(per[d]));
+        self.dispatch_from(groups, threads, None, None)
     }
 
     /// One dispatch of `ExecuteIndirect`: its group counts are the three words at title address
     /// `record`, read on the GPU.
     pub fn dispatch_indirect(&mut self, record: u64) -> Result<(), String> {
-        self.dispatch_from([0; 3], Some(record), None)
+        self.dispatch_from([0; 3], [u32::MAX; 3], Some(record), None)
     }
 
     /// Record `index` of an `ExecuteIndirect` of dispatches with a count buffer at title address
@@ -494,12 +508,13 @@ impl<B: GraphicsBackend> NativeList<B> {
         count: u64,
         index: u32,
     ) -> Result<(), String> {
-        self.dispatch_from([0; 3], Some(record), Some((count, index)))
+        self.dispatch_from([0; 3], [u32::MAX; 3], Some(record), Some((count, index)))
     }
 
     fn dispatch_from(
         &mut self,
         groups: [usize; 3],
+        threads: [u32; 3],
         indirect: Option<u64>,
         count: Option<(u64, u32)>,
     ) -> Result<(), String> {
@@ -513,6 +528,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.compute_root.clone(),
             heaps: self.state.heaps.clone(),
             groups,
+            threads,
             indirect,
             count,
         });

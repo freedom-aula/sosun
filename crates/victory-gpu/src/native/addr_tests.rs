@@ -122,9 +122,22 @@ pub(super) fn translate_io(
     threads: u32,
     options: victory_shader::emit::Options,
 ) -> HostShader {
+    translate_wave(words, sgprs, rsrc2, threads, true, options)
+}
+
+/// [`translate_io`] of a program of 64-lane waves (`wave64`) or 32, structured for dispatches of
+/// thread counts when `options` ask for them (as `translate_with` does).
+pub(super) fn translate_wave(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    wave64: bool,
+    options: victory_shader::emit::Options,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![RootParam {
             root: RootType::Constants,
@@ -141,7 +154,8 @@ pub(super) fn translate_io(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let mut p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    p.thread_counts = options.thread_counts;
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");

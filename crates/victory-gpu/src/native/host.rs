@@ -449,14 +449,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The arguments of a translated title shader: its user-data block, then its root views.
+    /// `threads`: the dispatch's thread counts, for a shader that reads them.
     fn translated_args(
         &self,
         root: &[Option<Root<B>>],
         b: &Binding,
         heap: Option<&Rc<NativeHeap<B>>>,
+        threads: [u32; 3],
         p: &mut Prep<B>,
     ) -> Result<(), String> {
-        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
+        use victory_shader::emit::{DISPATCH_THREADS, ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
         use victory_shader::RootType;
         let set = |slot: u8| {
             root.get(usize::from(slot))
@@ -467,6 +469,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if b.dwords > 0 {
             let mut values = vec![0u32; b.dwords];
             for u in &b.user_data {
+                if u.slot == DISPATCH_THREADS {
+                    values[u.index as usize] = threads.get(u.dword as usize).copied().unwrap_or(u32::MAX);
+                    continue;
+                }
                 values[u.index as usize] = match (u.root, set(u.slot)?) {
                     (RootType::Constants, Root::Constants(c)) => {
                         c.get(u.dword as usize).copied().unwrap_or(0)
@@ -909,9 +915,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 pso,
                 heaps,
                 groups,
+                threads,
                 indirect,
                 count,
-                ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, 12)?);
@@ -931,7 +937,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.remirror_tables(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
-                    self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                    self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;
                     if b.memory {
                         self.memory_args(heaps.0.as_ref(), &mut p)?;
                     } else if let Some(h) = p.heap.clone() {
@@ -966,13 +972,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {
-                        self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        self.translated_args(root, b, heaps.0.as_ref(), [u32::MAX; 3], &mut p)?;
                         if b.memory {
                             self.memory_args(heaps.0.as_ref(), &mut p)?;
                         }
                         if let Some(ps) = &b.ps {
                             let vs_args = std::mem::take(&mut p.root);
-                            self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            self.translated_args(root, ps, heaps.0.as_ref(), [u32::MAX; 3], &mut p)?;
                             if ps.memory {
                                 self.memory_args(heaps.0.as_ref(), &mut p)?;
                             }

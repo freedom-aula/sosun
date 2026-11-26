@@ -76,6 +76,13 @@ pub(crate) struct Shader {
     /// Its translation for rectangle lists (guessed vertex shaders; made at the first such draw).
     #[cfg(target_os = "macos")]
     rect: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
+    /// Its translation for dispatches of thread counts (compute shaders; made at the first one).
+    #[cfg(target_os = "macos")]
+    threads: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
+    /// Where the title last held the container when it made a pipeline of it (0: nowhere, the
+    /// host put it together), to read it again for [`native_threads`].
+    #[cfg(target_os = "macos")]
+    at: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for Shader {
@@ -161,6 +168,10 @@ impl Shader {
             native: std::sync::OnceLock::new(),
             #[cfg(target_os = "macos")]
             rect: std::sync::OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            threads: std::sync::OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            at: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -496,7 +507,39 @@ pub(crate) fn take_drops() -> Vec<(String, u64)> {
 /// The stage's container, if it has one.
 fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     // SAFETY: the title passes `size` bytes of shader code.
-    code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))
+    let shader = code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))?;
+    #[cfg(target_os = "macos")]
+    shader.at.store(code.code as usize, std::sync::atomic::Ordering::Relaxed);
+    Some(shader)
+}
+
+/// Compute pipeline `this`'s shader hash (as logged) and its translation for dispatches of thread
+/// counts (`Options::thread_counts`), made at the first one. The first translation let the
+/// container go, so it is read again where the title held it, and used only if it still hashes
+/// to the shader; if it is gone or changed, there is no translation.
+// shortcut: a container the host put together (a compute pipeline of pieces, 0x218) has none;
+// keep the pieces' addresses if one is ever dispatched with thread counts.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_threads(this: This) -> (String, Result<Arc<victory_shader::emit::HostShader>, String>) {
+    if this.is_null() {
+        return (String::new(), Err("no pipeline".into()));
+    }
+    let [shader] = &pipeline(this).shaders[..] else {
+        return (String::new(), Err("not a compute pipeline".into()));
+    };
+    let made = shader.threads.get_or_init(|| {
+        shader.native()?;
+        let mut container = vec![0; shader.size];
+        let at = shader.at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+            return Err("its container is no longer in title memory".into());
+        }
+        if blake3::hash(&container).to_hex()[..16] != *shader.hash {
+            return Err("its container changed since the pipeline was made".into());
+        }
+        crate::native::shaders::translate_threads(&container).map(Arc::new)
+    });
+    (shader.hash.clone(), made.clone())
 }
 
 /// The bytes a stage's bytecode names, if any.
@@ -1611,5 +1654,41 @@ mod pieces_tests {
             let err = crate::native::shaders::translate(&program(read)).err().expect("refused");
             assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
         }
+    }
+
+    /// A dispatch of thread counts needs a second translation, after the first let the container go:
+    /// it is read again where the title held it, and only if it still is the shader.
+    #[test]
+    fn a_compute_shader_is_translated_again_for_thread_counts() {
+        let counts = |h: &victory_shader::emit::HostShader| {
+            h.user_data.iter().filter(|u| u.slot == victory_shader::emit::DISPATCH_THREADS).count()
+        };
+        let release = |p| crate::object::slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+        // `v_mov_b32 v1, <n>; s_endpgm`, a shader of its own each time.
+        let container = |n: u32| container_of(&[0x7E02_0280 + n, 0xBF81_0000], &[]);
+
+        let mut held = container(1);
+        let p = test_compute(&held);
+        let shader = pipeline(p).shaders[0].clone();
+        let plain = shader.native().expect("translates").clone();
+        assert!(shader.container.lock().unwrap().is_empty());
+        let (hash, again) = native_threads(p);
+        assert_eq!(hash, shader.hash);
+        assert_eq!((counts(&plain), counts(&again.expect("translated again"))), (0, 1), "the count in x");
+        release(p);
+
+        // The title wrote over it since: not the shader any more.
+        held = container(2);
+        let p = test_compute(&held);
+        *held.last_mut().unwrap() ^= 1;
+        assert_eq!(native_threads(p).1.err().as_deref(), Some("its container changed since the pipeline was made"));
+        release(p);
+
+        // The title let it go (an address nothing is mapped at).
+        held = container(3);
+        let p = test_compute(&held);
+        pipeline(p).shaders[0].at.store(0x10, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(native_threads(p).1.err().as_deref(), Some("its container is no longer in title memory"));
+        release(p);
     }
 }
