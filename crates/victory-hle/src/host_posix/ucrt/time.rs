@@ -336,13 +336,14 @@ static DSTBIAS: super::Shared<i32> = super::Shared::new(0);
 static TZNAMES: super::Shared<[usize; 2]> = super::Shared::new([0; 2]);
 
 pub extern "system" fn _tzset() {
+    static UTC_NAME: LazyLock<usize> = LazyLock::new(|| leak_cstr(b"UTC") as usize);
     let now = clock::unix_time().as_secs() as i64;
     let off = zone_offset(now).unwrap_or(0);
     // SAFETY: the CRT's variables, shared with the title.
     unsafe {
         *TIMEZONE.ptr() = -off;
         *DAYLIGHT.ptr() = 0;
-        *TZNAMES.ptr() = [leak_cstr(b"UTC") as usize, leak_cstr(b"UTC") as usize];
+        *TZNAMES.ptr() = [*UTC_NAME, *UTC_NAME];
     }
 }
 
@@ -1144,5 +1145,18 @@ mod tests {
         let mut a = [0u8; 26];
         assert_eq!(_asctime_s(a.as_mut_ptr(), 26, &gmtime(951_827_696)), 0);
         assert_eq!(&a[..25], b"Tue Feb 29 12:34:56 2000\n");
+    }
+
+    #[test]
+    fn tzset_reuses_stable_tzname_pointers() {
+        // SAFETY: `__p__tzname` returns the CRT's two-entry NUL-terminated table.
+        unsafe {
+            let first = *__p__tzname();
+            _tzset();
+            let second = *__p__tzname();
+            assert_eq!(first, second);
+            assert_eq!(super::super::bytes(first[0] as *const u8), b"UTC");
+            assert_eq!(super::super::bytes(first[1] as *const u8), b"UTC");
+        }
     }
 }

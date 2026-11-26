@@ -88,6 +88,9 @@ pub(crate) struct Lowered {
     /// The sample and gather calls, with their constant arguments.
     #[cfg(test)]
     pub texture_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// The wave prefix calls, with their constant arguments.
+    #[cfg(test)]
+    pub wave_prefix_calls: Vec<(String, Vec<Option<i64>>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1380,14 +1383,14 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let (k0, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
                     Attr::NoUnwind,
                     ty,
                     121,
-                    &[arg, k0, k1],
+                    &[arg, k0, unsigned],
                 );
                 if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
@@ -1599,6 +1602,8 @@ impl<'a> Lower<'a> {
                 self.s.m.written_call_args("dx.op.textureGather"),
             ]
             .concat(),
+            #[cfg(test)]
+            wave_prefix_calls: self.s.m.written_call_args("dx.op.wavePrefixOp"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -14343,5 +14348,103 @@ mod tests {
         w.push(S_ENDPGM);
         assert!(super::split_wave_barriers(&wave64(&w)).is_none());
         assert_eq!(split_barriers(&w, 64, true), 0);
+    }
+
+    #[test]
+    fn float_wave_prefix_sum_passes_signed_zero_flag() {
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
+        };
+        let vop2 = |vdst: u8, op: u8, src0: u16, vsrc1: u8| -> u32 {
+            (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+        };
+        let dpp16 = |vsrc0: u8, ctrl: u16| -> u32 {
+            (0xFu32 << 28) | (0xFu32 << 24) | (ctrl as u32) << 8 | vsrc0 as u32
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (op as u32) << 16 | vdst as u32,
+                (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
+            ]
+        };
+
+        // Wave32 inclusive prefix sum over v0, storing the result to LDS so
+        // the `dx.op.wavePrefixOp.*` call stays live.
+        let prefix_words = |add_vop2: u8| -> Vec<u32> {
+            let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+            w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
+            for shift in [1u16, 2, 4, 8] {
+                w.push(vop2(1, add_vop2, 0xFA, 1));
+                w.push(dpp16(1, 0x110 + shift));
+            }
+            w.extend(vop3(2, 0x360, 257, 128 + 15, 0)); // v_readlane_b32 s2, v1, 15
+            w.push(sop1(126, 0x03, 255)); // s_mov_b32 exec_lo, 0xFFFF0000
+            w.push(0xFFFF_0000);
+            w.push(vop2(1, add_vop2, 2, 1)); // add s2 into upper 16 lanes
+            w.push(sop1(126, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+            w.extend([0xD834_0000, 0x0000_0102]); // ds_write_b32 v2, v1
+            w.push(S_ENDPGM);
+            w
+        };
+
+        let lower_cs = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15, // 512 bytes LDS
+                    threads: [32, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+                atomic_locks: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                wave32_host: true,
+                zero_copy_memory: false,
+                rect_list: false,
+                copy_params: [0; 32],
+            })
+            .unwrap()
+        };
+
+        // `v_add_f32` (VOP2 0x03): floating-point prefix sum passes unsigned=0.
+        let float_l = lower_cs(&prefix_words(0x03));
+        assert_eq!(
+            float_l.wave_prefix_calls,
+            vec![(
+                "dx.op.wavePrefixOp.f32".to_string(),
+                vec![Some(121), None, Some(0), Some(0)]
+            )]
+        );
+
+        // `v_add_nc_u32` (VOP2 0x25): unsigned integer prefix sum passes unsigned=1.
+        let uint_l = lower_cs(&prefix_words(0x25));
+        assert_eq!(
+            uint_l.wave_prefix_calls,
+            vec![(
+                "dx.op.wavePrefixOp.i32".to_string(),
+                vec![Some(121), None, Some(0), Some(1)]
+            )]
+        );
     }
 }
