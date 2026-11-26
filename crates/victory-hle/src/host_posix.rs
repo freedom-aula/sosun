@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::modules::xmem_physical::{self, Held, Owner, enter, tracing_owners};
 use victory_gpu::clock;
 use victory_loader::native::seh::context::Context;
 use victory_loader::native::{self, seh, teb};
@@ -121,14 +122,61 @@ pub extern "system" fn Sleep(ms: u32) {
 /// the whole region.
 static REGIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
+/// Who made each region of `REGIONS` (`VICTORY_TRACE_OWNERS` only).
+static REGION_OWNERS: Mutex<BTreeMap<usize, Owner>> = Mutex::new(BTreeMap::new());
+
 /// Lets `VirtualFree(MEM_RELEASE)` release a region another module reserved
 /// (`xmem`'s `XMemVirtualAlloc`), and takes it back when that module frees it.
 pub(crate) fn adopt_region(base: usize, len: usize) {
     lock(&REGIONS).insert(base, len);
+    region_made(base);
 }
 
 pub(crate) fn forget_region(base: usize) {
     lock(&REGIONS).remove(&base);
+    if tracing_owners() {
+        lock(&REGION_OWNERS).remove(&base);
+    }
+}
+
+fn region_made(base: usize) {
+    if tracing_owners() {
+        lock(&REGION_OWNERS).insert(base, Owner::now());
+    }
+}
+
+/// The region of `REGIONS` holding `at`, if any: its base and length.
+fn region_at(at: usize) -> Option<(usize, usize)> {
+    lock(&REGIONS)
+        .range(..=at)
+        .next_back()
+        .map(|(&base, &len)| (base, len))
+        .filter(|&(base, len)| at < base + len)
+}
+
+fn region_held(what: &'static str, (base, len): (usize, usize), owner_at: usize) -> Held {
+    Held {
+        what,
+        owner: lock(&REGION_OWNERS).get(&owner_at).copied(),
+        base,
+        len,
+        pool: 0,
+        index: 0,
+    }
+}
+
+/// Whether one region holds all of `[base, base + len)`; if not, the nearest region at or
+/// below `base` (for `VICTORY_TRACE_OWNERS`).
+pub(crate) fn region_of(base: usize, len: usize) -> Result<(), Held> {
+    let near = lock(&REGIONS)
+        .range(..=base)
+        .next_back()
+        .map(|(&b, &l)| (b, l));
+    match near {
+        Some((b, l)) if base.saturating_add(len) <= b + l => Ok(()),
+        Some(r) => Err(region_held("nearest region below", r, r.0)),
+        None => Err(region_held("no region below", (0, 0), 0)),
+    }
 }
 
 /// Win32 `PAGE_*` to a protection.
@@ -189,6 +237,7 @@ pub extern "system" fn VirtualAlloc(
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     };
+    let _call = enter("VirtualAlloc");
     let page = mem::page_size();
     let len = size.next_multiple_of(page);
     let at = address as usize;
@@ -205,6 +254,7 @@ pub extern "system" fn VirtualAlloc(
                 }
             }
             lock(&REGIONS).insert(p as usize, len);
+            region_made(p as usize);
             Ok(p)
         })
     } else if kind & MEM_COMMIT != 0 && at != 0 {
@@ -226,6 +276,7 @@ pub extern "system" fn VirtualAlloc(
 }
 
 pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    let _call = enter("VirtualFree");
     let ok = if kind & MEM_RELEASE != 0
         && kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0
     {
@@ -249,9 +300,18 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
         // The physical-page views in it go first (`XMemVirtualAlloc`'s pool backing, views
         // `XMemMapPhysicalPages` put there), as `XMemFreeDefault`'s release does.
         crate::modules::xmem::forget_physical(address as usize, len);
+        if tracing_owners() {
+            lock(&REGION_OWNERS).remove(&(address as usize));
+        }
         // SAFETY: a region this shim made.
         unsafe { mem::release(address.cast(), len) }.is_ok()
     } else if kind & MEM_DECOMMIT != 0 {
+        if tracing_owners() {
+            let at = address as usize;
+            let owner_at = region_at(at).map_or(0, |(base, _)| base);
+            let range = region_held("decommitted range", (at, size), owner_at);
+            xmem_physical::freeing("VirtualFree(MEM_DECOMMIT) over views", &range);
+        }
         // SAFETY: the title decommits inside its own reservation.
         unsafe { mem::decommit(address.cast(), size.next_multiple_of(mem::page_size())) }.is_ok()
     } else {
@@ -1076,5 +1136,48 @@ mod memory_tests {
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
         }
+    }
+
+    /// `VICTORY_TRACE_OWNERS`: views left in a range `VirtualFree(MEM_DECOMMIT)` gives back, and
+    /// a mapping outside every region, are each named with the pool they show.
+    #[test]
+    fn owners_name_views_left_in_freed_regions_and_mappings_outside_regions() {
+        use crate::modules::xmem_physical::{
+            TRIPS, XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages, pool_of,
+            pool_shown_at,
+        };
+        let trips = |case: &str| -> Vec<(usize, usize)> {
+            TRIPS.with(|t| {
+                t.borrow()
+                    .iter()
+                    .filter(|(c, ..)| *c == case)
+                    .map(|&(_, first, second)| (first, second))
+                    .collect()
+            })
+        };
+        const OUTSIDE: &str = "a mapping outside every region";
+        let (mut n, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let pool = pool_of(pages[0]);
+        // Inside a region of ours: no conflict.
+        let r = VirtualAlloc(std::ptr::null_mut(), 2 * GRANULARITY, MEM_RESERVE, 0x01);
+        assert!(!r.is_null());
+        assert_eq!(XMemMapPhysicalPages(r, 2, pages.as_ptr()), r);
+        assert!(trips(OUTSIDE).is_empty());
+        // Decommitting or releasing it while the pages show there.
+        assert_eq!(VirtualFree(r, GRANULARITY, MEM_DECOMMIT), 1);
+        assert_eq!(trips("VirtualFree(MEM_DECOMMIT) over views"), [(0, pool)]);
+        // Releasing it gives the views back first (`forget_physical`): nothing is left to name.
+        assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
+        assert_ne!(pool_shown_at(r as usize), Some(pool));
+        assert_eq!(TRIPS.with(|t| t.borrow().len()), 1, "only the decommit");
+        // Address space no region holds.
+        let q = reserve_granular(None, GRANULARITY).expect("reserved");
+        assert_eq!(XMemMapPhysicalPages(q.cast(), 1, pages.as_ptr()), q.cast());
+        assert_eq!(trips(OUTSIDE), [(pool, 0)]);
+        assert_eq!(XMemMapPhysicalPages(q.cast(), 1, std::ptr::null()), q.cast());
+        // SAFETY: the reservation just made, no longer mapped.
+        unsafe { mem::release(q, GRANULARITY) }.expect("released");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

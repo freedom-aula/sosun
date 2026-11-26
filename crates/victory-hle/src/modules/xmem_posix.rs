@@ -99,6 +99,7 @@ pub extern "system" fn XMemVirtualAlloc(
     let Some(mut prot) = protection(protect & HOST_PROTECTION).filter(|_| size > 0) else {
         return std::ptr::null_mut();
     };
+    let _call = super::xmem_physical::enter("XMemVirtualAlloc");
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`): here it is plain reserved address space, which
     // the pages are mapped over, so a placeholder is a reservation.
