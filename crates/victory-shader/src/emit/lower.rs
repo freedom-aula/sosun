@@ -6908,6 +6908,10 @@ impl<'a> Lower<'a> {
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
+            // Only image instructions get here (buffer accesses take
+            // `computed_buffer`): `resource` gives every four dwords it
+            // cannot trace this source, a sampler's state words too.
+            Source::BuiltMemory { .. } if sampler => Err("a sampler built from computed words"),
             Source::BuiltMemory { .. } => Err("a computed buffer descriptor used as a view"),
             Source::Built { address, .. } if address.param == MEMORY => {
                 Err("a buffer descriptor built around a computed address")

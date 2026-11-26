@@ -186,7 +186,25 @@ pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
 }
 
 pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
-    libm::nextafterf(x, y as f32)
+    // Compared as doubles: `y` rounded to a float can be `x` itself, which would not move.
+    let wide = f64::from(x);
+    if x.is_nan() || y.is_nan() {
+        return (wide + y) as f32;
+    }
+    if wide == y {
+        return y as f32;
+    }
+    let toward = if y > wide {
+        f32::INFINITY
+    } else {
+        f32::NEG_INFINITY
+    };
+    let r = libm::nextafterf(x, toward);
+    // A finite float stepping past FLT_MAX overflows.
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 pub extern "win64" fn fma(x: f64, y: f64, z: f64) -> f64 {
@@ -292,7 +310,18 @@ fn remquo_(x: f64, y: f64) -> (f64, i32) {
     if !r.is_finite() {
         return (check(&[x, y], r), 0);
     }
-    let q = ((x - r) / y).round().abs() as u64 & 7;
+    // The low three bits of the quotient's magnitude. `(x - r) / y` loses them once the
+    // quotient passes 2^53; `|x| mod 8|y|` (exact) keeps them: |x| = 8k|y| + m, so the
+    // quotient is 8k plus that of m, which `remainder` rounds the same way (8k is even).
+    // When 8|y| overflows, |x / y| is below 8 and m is |x| itself.
+    let (ax, ay) = (x.abs(), y.abs());
+    let m = if ay <= f64::MAX / 8.0 {
+        libm::fmod(ax, 8.0 * ay)
+    } else {
+        ax
+    };
+    // Divided before subtracting: m - remainder(m, |y|) itself can overflow near DBL_MAX.
+    let q = (m / ay - libm::remainder(m, ay) / ay).round() as u64 & 7;
     (
         r,
         if (x < 0.0) != (y < 0.0) {
@@ -610,6 +639,35 @@ mod tests {
     }
 
     #[test]
+    fn nexttowardf_steps_toward_its_double_target() {
+        // The target is a double: one between two floats still moves x a step.
+        let one = 1.0f32.to_bits();
+        assert_eq!(nexttowardf(1.0, 1.0 + 1e-10).to_bits(), one + 1);
+        assert_eq!(nexttowardf(1.0, 1.0 - 1e-10).to_bits(), one - 1);
+        assert_eq!(nexttowardf(0.0, 1e-300).to_bits(), 1);
+        assert_eq!(nexttowardf(-0.0, -1e-300).to_bits(), 0x8000_0001);
+        assert_eq!(nexttowardf(1.0, 1.0), 1.0);
+        assert_eq!(nexttowardf(1.0, 2.0).to_bits(), one + 1);
+        assert_eq!(nexttowardf(0.0, -0.0).to_bits(), 0x8000_0000);
+        assert_eq!(nexttowardf(-0.0, 0.0).to_bits(), 0);
+        for (target, sign) in [
+            (f64::INFINITY, 1.0),
+            (1e300, 1.0),
+            (f64::NEG_INFINITY, -1.0),
+        ] {
+            set_errno(0);
+            let r = nexttowardf(f32::MAX * sign as f32, target);
+            assert_eq!(r, f32::INFINITY * sign as f32);
+            assert_eq!(errno(), ERANGE, "overflow toward {target:e}");
+        }
+        set_errno(0);
+        assert_eq!(nexttowardf(f32::INFINITY, f64::INFINITY), f32::INFINITY);
+        assert_eq!(errno(), 0, "an infinity in is no overflow");
+        assert!(nexttowardf(1.0, f64::NAN).is_nan());
+        assert!(nexttowardf(f32::NAN, 1.0).is_nan());
+    }
+
+    #[test]
     fn errno_follows_the_domain_and_the_range() {
         set_errno(0);
         assert!(sqrt(-1.0).is_nan());
@@ -660,6 +718,59 @@ mod tests {
         let mut q = 0;
         assert_eq!(remquo(10.0, 3.0, &mut q), 1.0);
         assert_eq!(q, 3);
+    }
+
+    unsafe extern "C" {
+        /// The host's own `remquo`, the reference for the quotient bits.
+        #[link_name = "remquo"]
+        fn host_remquo(x: f64, y: f64, quo: *mut i32) -> f64;
+    }
+
+    #[test]
+    fn remquo_keeps_the_low_bits_of_a_huge_quotient() {
+        // The quotient here is about 5.9e156, far past 2^53; its low three bits are 100.
+        let mut q = 0;
+        remquo(7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!((q, q & 7), (4, 4));
+        remquo(-7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!(q, -4);
+        // Near DBL_MAX: |x| - r would overflow, the quotient is 2.
+        remquo(f64::MAX, 1.0e308, &mut q);
+        assert_eq!(q, 2);
+        // Every exponent: the sign and the low three bits of the magnitude, as C asks.
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..100_000 {
+            let (x, y) = (f64::from_bits(next() >> 1), f64::from_bits(next() >> 1));
+            if !x.is_finite() || !y.is_finite() || y == 0.0 {
+                continue;
+            }
+            for (x, y) in [(x, y), (-x, y), (x, -y)] {
+                let (mut ours, mut host) = (0, 0);
+                let r = remquo(x, y, &mut ours);
+                // SAFETY: a pure libm function.
+                let host_r = unsafe { host_remquo(x, y, &mut host) };
+                assert_eq!(r.to_bits(), host_r.to_bits(), "remquo({x:e}, {y:e})");
+                let low = host.unsigned_abs() & 7;
+                assert_eq!(
+                    ours.unsigned_abs() & 7,
+                    low,
+                    "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                );
+                if low != 0 {
+                    assert_eq!(
+                        ours < 0,
+                        host < 0,
+                        "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
