@@ -1615,6 +1615,76 @@ fn image_atomics_of_64_bits() {
     }
 }
 
+/// `image_store` of some channels writes the whole texel, 0 in the
+/// channels dmask leaves out (GFX11 and older: LLVM 88421ea, Mesa
+/// 4a6ee2c4833), the data holding the dmask's channels in turn. Row `r` of
+/// an RGBA32F UAV gets (1, 2, 0.5, 4) from every lane, then a store of
+/// dmask `masks[r]` from the same v1 on.
+#[test]
+fn image_stores_of_some_channels_zero_the_others() {
+    let masks = [0x1, 0x3, 0x5, 0xE, 0x8];
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+    words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+    words.extend([
+        vop1(0x001, 1, 242), // v1 = 1.0
+        vop1(0x001, 2, 244), // v2 = 2.0
+        vop1(0x001, 3, 240), // v3 = 0.5
+        vop1(0x001, 4, 246), // v4 = 4.0
+        vop1(0x001, 5, vgpr(0)),
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    for (row, &mask) in (128u16..).zip(&masks) {
+        // v6 = row; image_store (MIMG op 8) of all four, then of `mask`.
+        words.push(vop1(0x001, 6, row));
+        words.extend(image_atomic(0x08, 1, 5, 8, 0xF, false));
+        words.extend(image_atomic(0x08, 1, 5, 8, mask, false));
+    }
+    words.push(S_ENDPGM);
+    let mut want = Vec::new();
+    for mask in masks {
+        let mut data = [1.0f32, 2.0, 0.5, 4.0].into_iter();
+        let texel: Vec<f32> = (0..4)
+            .map(|ch| {
+                if mask >> ch & 1 != 0 {
+                    data.next().unwrap()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        for _ in 0..32 {
+            want.extend(&texel);
+        }
+    }
+    let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 8)], true);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::TextureUav(32, masks.len() as u32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let got: Vec<f32> = out[0].iter().map(|&x| f32::from_bits(x)).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
