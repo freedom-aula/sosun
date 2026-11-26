@@ -529,6 +529,7 @@ pub(crate) fn pipeline_released(pipeline: This) {
     with_title(|t| {
         t.pipelines.remove(&key);
         t.console_pipes.retain(|(k, _), _| *k != key);
+        t.thread_pipes.remove(&key);
     });
 }
 
@@ -840,6 +841,25 @@ fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<M
     (make_host_pipe(t, stages, graphics), console)
 }
 
+/// The host pipeline of compute pipeline `key` for dispatches of thread counts, made at first
+/// use: its shader translated for them (`Options::thread_counts`).
+fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    if let Some(p) = t.thread_pipes.get(&key) {
+        return p.clone();
+    }
+    let (hash, shader) = crate::pipeline::native_threads(key as This);
+    let name = format!("compute {hash} by thread counts");
+    let made = match shader {
+        Ok(cs) => t.compute_pipe(&cs, &name),
+        Err(e) => {
+            t.refused_translation(&name, e);
+            Pipe::Refused
+        }
+    };
+    t.thread_pipes.insert(key, made.clone());
+    made
+}
+
 fn make_host_pipe(
     t: &mut MetalTitle,
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
@@ -915,6 +935,21 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
             }
         }
         _ => dropped("a dispatch without a host compute pipeline"),
+    });
+}
+
+/// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
+/// them it is dropped: run as group counts, its lanes past the counts would write over memory
+/// that is not theirs.
+pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
+    with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
+        Pipe::Compute(pso) => {
+            l.list.set_compute_pipeline(&pso);
+            if let Err(e) = l.list.dispatch_threads(threads) {
+                tracing::warn!(error = %e, "dispatch of thread counts");
+            }
+        }
+        _ => dropped("a dispatch of thread counts without a host compute pipeline"),
     });
 }
 

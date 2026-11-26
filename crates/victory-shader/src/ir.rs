@@ -51,6 +51,11 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// Compute run by dispatches of thread counts
+    /// ([`Options::thread_counts`](crate::emit::Options)): EXEC on entry is
+    /// a lane mask of its own, the threads the dispatch launches, not every
+    /// lane. The translator sets it and structures the program again.
+    pub thread_counts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +339,7 @@ pub fn build_bounded(
         vgprs,
         blocks,
         inputs,
+        thread_counts: false,
     })
 }
 

@@ -378,6 +378,10 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::slot`] of a dword no root parameter fills: the host writes
+/// the dispatch's thread count in dimension [`UserData::dword`] (0 to 2)
+/// there ([`Options::thread_counts`]).
+pub const DISPATCH_THREADS: u8 = u8::MAX;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +444,13 @@ pub struct Options {
     /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
     /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
     pub copy_params: [u8; 32],
+    /// A compute program for dispatches that give thread counts, not group counts (the console's
+    /// `DispatchX` with thread dimensions): the last group in a dimension is partial. The host
+    /// runs whole groups, rounded up, and passes the counts ([`DISPATCH_THREADS`]); every thread
+    /// still runs, as the console's lanes do, but a thread past a count starts with EXEC off, so
+    /// it stores nothing and a count of EXEC leaves it out.
+    /// Guess: that is what the console's lanes past the count do (`docs/native-host.md`).
+    pub thread_counts: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -469,7 +480,11 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let (mut p, mut st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    if options.thread_counts && native.stage == HwStage::Cs {
+        p.thread_counts = true;
+        st = structure::structure(&p);
+    }
     let guessed = graphics::is_guessed(&c);
     let computed_buffers =
         (guessed || native.stage == HwStage::Cs) && options.zero_copy_memory;

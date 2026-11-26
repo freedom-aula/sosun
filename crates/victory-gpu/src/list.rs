@@ -1270,19 +1270,77 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX` flag: the counts are threads, not groups, so the last group
+/// in a dimension is partial. Guess (`docs/native-host.md`): the flags are
+/// the GPU's dispatch initiator bits, this one `USE_THREAD_DIMENSIONS`.
+const DISPATCH_THREADS: u32 = 0x20;
+/// `DispatchX` flag: the program runs in 32-lane waves (`CS_W32_EN` by the
+/// same guess), which its own header says too.
+const DISPATCH_WAVE32: u32 = 0x8000;
+
+/// `VICTORY_TRACE_DISPATCH_FLAGS=1`: the flags of dispatches are logged,
+/// each value once, so one the host does not honour shows.
+fn trace_dispatch_flags() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_DISPATCH_FLAGS").is_some())
+}
+
+/// Whether a dispatch with these `DispatchX` flags gives thread counts.
+fn thread_counts(flags: u32) -> bool {
+    flags & DISPATCH_THREADS != 0
+}
+
+/// Under [`trace_dispatch_flags`]: the first `DispatchX` with each flags
+/// value, and its bits the host does not know.
+fn trace_dispatch_x(flags: u32, counts: [u32; 3]) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    if !trace_dispatch_flags() {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&flags) {
+        seen.push(flags);
+        let unknown = flags & !(DISPATCH_THREADS | DISPATCH_WAVE32);
+        tracing::warn!(
+            flags = format!("{flags:#x}"),
+            unknown = format!("{unknown:#x}"),
+            ?counts,
+            "DispatchX: the first dispatch with these flags"
+        );
+    }
+}
+
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing builder dispatches this way). With [`DISPATCH_THREADS`] the
+/// host runs whole groups, rounded up, of a translation whose threads past
+/// the counts start with EXEC off (`native::glue::dispatch_threads`).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    trace_dispatch_x(flags, [x, y, z]);
+    let threads = thread_counts(flags);
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    {
+        // shortcut: the D3D12 host runs the counts as groups, so the threads
+        // past them write where they should not (the native host's crash in
+        // Grand Theft Auto VI's prologue); give it the native host's
+        // translation (`Options::thread_counts`) before relying on it.
+        if threads {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("DispatchX with thread counts runs them as group counts"));
+        }
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(target_os = "macos")]
     {
         count_dispatch();
-        crate::native::glue::dispatch(this, x, y, z);
+        if threads {
+            crate::native::glue::dispatch_threads(this, [x, y, z]);
+        } else {
+            crate::native::glue::dispatch(this, x, y, z);
+        }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, threads);
         count_dispatch();
     }
 }
@@ -1951,6 +2009,14 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
+    // The call has no flags and a type-105 record is three counts: whether
+    // the console takes them as threads anywhere is not known.
+    if let [[105, words @ ..]] = args
+        && trace_dispatch_flags()
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(?words, "an indirect dispatch of type 105 runs its counts as group counts"));
+    }
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
@@ -2249,6 +2315,15 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    #[test]
+    fn dispatch_x_flags_say_when_the_counts_are_threads() {
+        // The ray-tracing node writers' flags, with and without the 32-lane wave bit.
+        assert!(thread_counts(0x20));
+        assert!(thread_counts(0x8020));
+        assert!(!thread_counts(0));
+        assert!(!thread_counts(0x8000));
+    }
 
     /// Exercise the title-facing ABI and real descriptor lookup.
     #[cfg(target_os = "macos")]

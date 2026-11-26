@@ -42,6 +42,12 @@ fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> 
     })
 }
 
+/// A compute shader's container translated for dispatches of thread counts
+/// (`Options::thread_counts`).
+pub fn translate_threads(container: &[u8]) -> Result<HostShader, String> {
+    translate_cached(container, Options { thread_counts: true, ..options() })
+}
+
 /// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
 pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
     translate_cached(container, Options { rect_list: true, ..options() })
