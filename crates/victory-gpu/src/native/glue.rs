@@ -273,9 +273,8 @@ pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     }
 }
 
-/// `PresentX` on title queue `queue`: title texture `resource` over the layer.
-pub(crate) fn present(queue: This, resource: This) {
-    if tracing_targets() {
+#[inline(never)]
+fn trace_present(resource: This) {
         let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
         let described: Vec<String> = with_title(|t| {
@@ -302,6 +301,12 @@ pub(crate) fn present(queue: This, resource: This) {
             dropped = ops.len(),
             "frame targets"
         );
+}
+
+/// `PresentX` on title queue `queue`: title texture `resource` over the layer.
+pub(crate) fn present(queue: This, resource: This) {
+    if tracing_targets() {
+        trace_present(resource);
     }
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
