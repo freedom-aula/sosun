@@ -19,6 +19,8 @@ Wine-based work continues on the `test/run-C*` branches. This branch (`native/ho
 | The rest of `xmem` (`XMemVirtualAlloc`, `XMemVirtualQuery`, `XMemAlloc` and the hooks, working-set statistics, transfers), `modules::xmem_posix` | Done on macOS, on `mem::reserve_in` / `next_region` / `footprint`; served from the registry. Hooks are found by reading the mapped title's export table |
 | DirectStorage (`modules::dstorage`) | Done on macOS: the scheduler and completion rules are unchanged; file reads are `pread` on its worker threads, destinations go through `write_physical` and `page_window`. Paths go through `host_posix::files::translate`, so virtual drives (`G:`, `T:`) work |
 | Files: `CreateFile`, `ReadFile`, `WriteFile`, `SetFilePointer(Ex)`, `GetFileSize(Ex)`, `FindFirstFile`, attributes, virtual drives | Done (`host_posix/files.rs`) |
+| Title-shipped DLLs (`native::dll`): msvcp140, vcruntime140, Bink, libHttpClient, ... | Done: mapped beside the exe in dependency order (a DLL is wanted unless our runtime serves its name, so the C++ runtime comes from the title's folder), relocated, own static TLS, bound through the same resolver (hle, then `host_posix`, then the other title DLLs' exports, forwarders followed), `.pdata` added to the exception dispatcher, `DllMain` and TLS callbacks run in dependency order on the main title thread before the exe's own, `DLL_THREAD_ATTACH/DETACH` delivered (`DisableThreadLibraryCalls` honoured), `LoadLibrary`/`GetModuleHandle`/`GetProcAddress`/`GetModuleFileName` see them, late `LoadLibrary` maps, binds and starts a DLL on the calling thread. `--list-imports` binds them too and runs none of their code |
+| kernel32 and friends beyond the first slice (`host_posix/system.rs`) | Time and time zones, strings and locales, system information, mutexes, waitable timers, the thread pool, FLS, SLists, `InitOnce`, registry/ETW/COM/crypt32/bcrypt/user32 message stubs. The C runtime (`api-ms-win-crt-*`) is separate |
 | Window and audio on macOS | Not started (see below) |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
 
@@ -31,7 +33,7 @@ cargo test -p victory-platform -p victory-loader -p victory-hle --target x86_64-
 WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tests on the Win32 backend
 ```
 
-`crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code.
+`crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code. The probe also imports a second fixture, `probe_dll.c` (built beside it as `victory-probe-dll.dll`): the test maps it with `native::dll`, and `probe_dll` checks its `DllMain` and TLS callback order, per-thread static TLS, thread notices, an exception raised in the DLL unwinding through its `__finally` to a handler in the exe (and from the exe to a handler in the DLL), and `GetModuleHandle`/`GetProcAddress` by name. The C++ runtime is not ours to build, so the throw is a Windows exception through `__C_specific_handler`, not `_CxxThrowException` through `__CxxFrameHandler`.
 
 ## Which Win32 APIs the loader and HLE depend on
 

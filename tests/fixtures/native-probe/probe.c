@@ -829,3 +829,117 @@ u32 probe_files(const u16 *dir)
         ok |= F_MISSING;
     return ok;
 }
+
+/* ---- a DLL the title ships ------------------------------------------- */
+
+/* victory-probe-dll.dll (probe_dll.c): mapped from the title's folder by
+ * the loader, not provided by the host. */
+IMPORT u32 DllProbeState(void);
+IMPORT u32 DllProbeAdd(u32, u32);
+IMPORT u32 DllProbeTls(u32);
+IMPORT u32 DllProbeThreadAttaches(void);
+IMPORT u32 DllProbeTlsThreadAttaches(void);
+IMPORT void DllProbeThrow(u32);
+IMPORT u32 DllProbeFinallyRuns(void);
+IMPORT u32 DllProbeCatchInside(void);
+IMPORT u32 DllProbeCall(u32 (*)(void));
+IMPORT ptr GetModuleHandleA(const char *);
+IMPORT ptr GetProcAddress(ptr, const char *);
+
+enum {
+    D_ATTACH = 1u << 0,
+    D_STATIC = 1u << 1,
+    D_CALL = 1u << 2,
+    D_TLS_MAIN = 1u << 3,
+    D_TLS_THREAD = 1u << 4,
+    D_THREAD_NOTICE = 1u << 5,
+    D_TLS_CALLBACK_THREAD = 1u << 6,
+    D_THROW_CROSS = 1u << 7,
+    D_FINALLY = 1u << 8,
+    D_CATCH_INSIDE = 1u << 9,
+    D_CATCH_BELOW = 1u << 10,
+    D_PROC = 1u << 11,
+};
+#define DLL_ALL 0xFFFu
+
+static volatile u32 dll_worker_tls;
+static ptr dll_worker_done;
+
+static u32 dll_worker(ptr param)
+{
+    (void)param;
+    dll_worker_tls = DllProbeTls(5);
+    SetEvent(dll_worker_done);
+    return 0;
+}
+
+static u32 dll_raiser(void)
+{
+    RaiseException(0xE000000A, 0, 0, 0);
+    return 0;
+}
+
+/* Everything the DLL has that the executable does not. Run on a fresh
+ * thread (its own TLS). */
+u32 probe_dll(ptr unused)
+{
+    u32 ok = 0;
+    (void)unused;
+
+    /* DllMain and the TLS callback ran before this, in that order, with
+     * static TLS in place, and were told the executable imports the DLL. */
+    u32 state = DllProbeState();
+    if ((state & 0xB) == 0xB)
+        ok |= D_ATTACH;
+    if (state & 4)
+        ok |= D_STATIC;
+    if (DllProbeAdd(20, 22) == 42)
+        ok |= D_CALL;
+
+    if (DllProbeTls(1) == 501)
+        ok |= D_TLS_MAIN;
+    dll_worker_done = CreateEventW(0, 1, 0, 0);
+    ptr thread = CreateThread(0, 0, (ptr)dll_worker, 0, 0, 0);
+    if (thread && WaitForSingleObject(dll_worker_done, 5000) == 0) {
+        /* The worker has its own copy (500 + 5), ours is unchanged. */
+        if (dll_worker_tls == 505 && DllProbeTls(0) == 501)
+            ok |= D_TLS_THREAD;
+        WaitForSingleObject(thread, 5000);
+    }
+    if (thread)
+        CloseHandle(thread);
+    CloseHandle(dll_worker_done);
+    /* The DLL heard of the thread (DllMain) and so did its TLS callback. */
+    if (DllProbeThreadAttaches() >= 1)
+        ok |= D_THREAD_NOTICE;
+    if (DllProbeTlsThreadAttaches() >= 1)
+        ok |= D_TLS_CALLBACK_THREAD;
+
+    /* An exception raised three frames down in the DLL, past its __finally,
+     * is caught here, in another image. */
+    u32 finally_before = DllProbeFinallyRuns();
+    int caught = 0;
+    seen_code = 0;
+    __try {
+        DllProbeThrow(0xE0000007);
+    } __except (record_filter((struct exception_pointers *)_exception_info())) {
+        caught = 1;
+    }
+    if (caught && seen_code == 0xE0000007 && seen_kind == 0xD11)
+        ok |= D_THROW_CROSS;
+    if (DllProbeFinallyRuns() == finally_before + 1)
+        ok |= D_FINALLY;
+
+    if (DllProbeCatchInside() == 1)
+        ok |= D_CATCH_INSIDE;
+    /* Raised here, caught in the DLL's frame above ours. */
+    if (DllProbeCall(dll_raiser) == 1)
+        ok |= D_CATCH_BELOW;
+
+    /* The title finds the DLL by name, as the Windows loader would. */
+    ptr module = GetModuleHandleA("victory-probe-dll.dll");
+    ptr add = module ? GetProcAddress(module, "DllProbeAdd") : 0;
+    if (add && add == (ptr)DllProbeAdd && ((u32(*)(u32, u32))add)(1, 2) == 3)
+        ok |= D_PROC;
+    return ok;
+}

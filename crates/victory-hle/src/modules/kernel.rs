@@ -620,7 +620,24 @@ mod host {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_proc_address(_: *mut c_void, _: *const u8) -> *mut c_void {
+    /// Exports of the title's own DLLs (the native host maps them itself).
+    pub(super) fn get_proc_address(_module: *mut c_void, _name: *const u8) -> *mut c_void {
+        #[cfg(target_os = "macos")]
+        {
+            let symbol = if (_name as usize) < 0x1_0000 {
+                victory_pe::ImportSymbol::Ordinal(_name as usize as u16)
+            } else {
+                victory_pe::ImportSymbol::Name {
+                    hint: 0,
+                    name: super::narrow(_name),
+                }
+            };
+            if let Some(address) =
+                victory_loader::native::dll::proc_address(_module as usize, &symbol)
+            {
+                return address as *mut c_void;
+            }
+        }
         std::ptr::null_mut()
     }
 
@@ -628,7 +645,13 @@ mod host {
         0
     }
 
-    pub(super) fn disable_thread_library_calls(_: *mut c_void) -> i32 {
+    pub(super) fn disable_thread_library_calls(_module: *mut c_void) -> i32 {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            victory_loader::native::disable_thread_calls(_module as usize);
+            1
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         0
     }
 

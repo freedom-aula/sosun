@@ -1,0 +1,11 @@
+LIBRARY victory-probe-dll.dll
+EXPORTS
+DllProbeState
+DllProbeAdd
+DllProbeTls
+DllProbeThreadAttaches
+DllProbeTlsThreadAttaches
+DllProbeThrow
+DllProbeFinallyRuns
+DllProbeCatchInside
+DllProbeCall

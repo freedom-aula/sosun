@@ -32,13 +32,20 @@ fn map_elsewhere(bytes: &[u8]) -> (NativeImage, usize) {
     // The probe tests run in parallel and would pick the same free address.
     static LOOKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = LOOKING.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: reserved and released at once; the image maps there next.
-    let at = unsafe {
-        let p = mem::reserve(None, 1 << 20).unwrap();
-        mem::release(p, 1 << 20).unwrap();
-        p as usize
-    };
-    (NativeImage::map(bytes, Some(at)).unwrap(), at)
+    // Other tests' threads allocate meanwhile and can take the address
+    // between the release and the map: look again.
+    for _ in 0..50 {
+        // SAFETY: reserved and released at once; the image maps there next.
+        let at = unsafe {
+            let p = mem::reserve(None, 1 << 20).unwrap();
+            mem::release(p, 1 << 20).unwrap();
+            p as usize
+        };
+        if let Ok(image) = NativeImage::map(bytes, Some(at)) {
+            return (image, at);
+        }
+    }
+    panic!("no free address to map the probe at");
 }
 
 fn probe_bytes() -> Vec<u8> {
@@ -96,6 +103,7 @@ mod run {
 
     use super::*;
     use victory_hle::HleResolver;
+    use victory_loader::native::dll::{self, TitleDll, WithTitleDlls};
     use victory_loader::native::{self, call_win64, declare_win64, teb};
     use victory_loader::{ImportResolver, Provenance, Resolution, UnimplementedPolicy};
     use victory_pe::ImportSymbol;
@@ -160,8 +168,42 @@ mod run {
         }
     }
 
+    /// `victory-probe-dll.dll`, which the probe imports and the build puts
+    /// beside it: mapped, bound and started (`DllMain`, TLS callback) once,
+    /// as the loader does before the executable's first thread.
+    fn title_dlls() -> &'static [&'static TitleDll] {
+        static DLLS: std::sync::OnceLock<Vec<&'static TitleDll>> = std::sync::OnceLock::new();
+        DLLS.get_or_init(|| {
+            let info = victory_pe::ImageInfo::parse(&probe_bytes()).unwrap();
+            let dir = probe_exe().parent().unwrap();
+            let dlls = dll::map_title_dlls(&info, dir, &|_| true).unwrap();
+            assert_eq!(dlls.len(), 1, "the probe imports one title DLL");
+            let hle = HleResolver::default();
+            let resolver = WithTitleDlls { inner: &hle };
+            for d in &dlls {
+                let report =
+                    native::bind_imports(&d.image, &resolver, UnimplementedPolicy::Trap).unwrap();
+                assert!(report.missing.is_empty(), "{:?}", report.missing);
+                d.image.finalize().unwrap();
+                victory_hle::runtime::set_image_path(d.image.base(), &d.path);
+            }
+            let started = dlls.clone();
+            std::thread::spawn(move || {
+                for d in started {
+                    // SAFETY: the probe's own DLL, bound and finalized above.
+                    assert!(unsafe { native::attach_dll(&d.image, 1, 1) });
+                    native::register_dll_thread_notices(&d.image);
+                }
+            })
+            .join()
+            .unwrap();
+            dlls
+        })
+    }
+
     /// Maps, registers TLS, binds and finalizes the probe.
     fn load(relocated: bool, policy: UnimplementedPolicy) -> (&'static NativeImage, usize) {
+        title_dlls();
         let image = if relocated {
             map_elsewhere(&probe_bytes()).0
         } else {
@@ -170,12 +212,14 @@ mod run {
         if let Some(tls) = image.tls() {
             teb::register_tls(tls);
         }
-        let report =
-            native::bind_imports(&image, &ProbeResolver(HleResolver::default()), policy).unwrap();
+        let probe = ProbeResolver(HleResolver::default());
+        let report = native::bind_imports(&image, &WithTitleDlls { inner: &probe }, policy).unwrap();
         // Everything but the one import nobody implements is bound.
         assert_eq!(report.missing.len(), 1, "{:?}", report.missing);
         assert_eq!(report.missing[0].symbol, "ProbeNotImplemented");
         assert!(report.hle >= 1 && report.host >= 10, "{report:?}");
+        // Its imports of the title's DLL come from the DLL itself.
+        assert_eq!(report.title, 9, "{report:?}");
         image.finalize().unwrap();
         native::register_thread_callbacks(&image);
         let missing = image.export("probe_missing").unwrap();
@@ -232,7 +276,21 @@ mod run {
 
     #[test]
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
+        // The probe's vectored handler hears every thread's exceptions.
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         assert_all(run_probe("probe_seh", 0), 0x7FFF, "probe_seh");
+    }
+
+    /// The DLL the title ships: its `DllMain` and TLS callback ran in order
+    /// before the title's code, its static TLS is per thread, threads are
+    /// announced to it, an exception raised in it unwinds through its own
+    /// `__finally` to a handler in the executable (and the other way round),
+    /// and the title finds it by name.
+    #[test]
+    fn a_title_dll_has_its_own_main_tls_unwinding_and_name() {
+        // It raises exceptions, which another probe's vectored handler would hear.
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert_all(run_probe("probe_dll", 0), 0xFFF, "probe_dll");
     }
 
     #[test]

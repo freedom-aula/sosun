@@ -11,6 +11,7 @@
 //! `docs/native-host.md` explains the design and the interfaces other
 //! components (the Metal backend, the recompiler) code against.
 
+pub mod dll;
 mod image;
 pub mod seh;
 
@@ -32,4 +33,8 @@ pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
 pub use bridge::{call_win64, declare_direct, declare_win64};
 #[cfg(target_arch = "x86_64")]
-pub use run::{attach, register_thread_callbacks, run_entry, spawn_title_thread, spawn_title_thread_with};
+pub use run::{
+    attach, attach_dll, disable_thread_calls, register_dll_thread_notices,
+    register_thread_callbacks, run_entry, run_entry_with, spawn_title_thread,
+    spawn_title_thread_with,
+};
