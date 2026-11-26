@@ -666,11 +666,18 @@ impl Metal {
             StaticSamplers::args(vs, &root.0),
             StaticSamplers::args(ps, &fragment.0),
         );
+        // A mesh pipeline's first stage takes what a vertex shader would.
+        let mesh = pipeline.mesh.is_some();
+        let first = if mesh { MTLRenderStages::Mesh } else { MTLRenderStages::Vertex };
         // SAFETY: setBytes copies the bytes before returning.
         unsafe {
             if !root.is_empty() {
                 let p = NonNull::new(root.as_ptr().cast_mut().cast()).unwrap();
-                e.setVertexBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
+                if mesh {
+                    e.setMeshBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
+                } else {
+                    e.setVertexBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
+                }
             }
             if !fragment.is_empty() {
                 let p = NonNull::new(fragment.as_ptr().cast_mut().cast()).unwrap();
@@ -678,7 +685,7 @@ impl Metal {
             }
         }
         for (t, stage) in [
-            (vs, MTLRenderStages::Vertex),
+            (vs, first),
             (ps, MTLRenderStages::Fragment),
         ] {
             if let Some(t) = StaticSamplers::table(t) {
@@ -692,14 +699,18 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe {
-                    e.setVertexBuffer_offset_atIndex(Some(&h.buf), 0, slot);
+                    if mesh {
+                        e.setMeshBuffer_offset_atIndex(Some(&h.buf), 0, slot);
+                    } else {
+                        e.setVertexBuffer_offset_atIndex(Some(&h.buf), 0, slot);
+                    }
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
                 self.use_heap_encoder(h, named, |r| {
                     e.useResource_usage_stages(
                         r,
                         MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                        first | MTLRenderStages::Fragment,
                     )
                 });
             }

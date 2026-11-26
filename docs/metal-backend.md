@@ -473,7 +473,9 @@ A mesh pipeline draws with `DrawCall::Mesh { groups }` (`NativeList::dispatch_me
 record (three group counts, Metal's `MTLDispatchThreadgroupsIndirectArguments` word for word),
 `drawMeshThreadgroupsWithIndirectBuffer`; a counted record goes through the same gate as counted draws
 (three words). A mesh call of a vertex pipeline, or the reverse, is dropped. Test:
-`mesh_tests::a_mesh_draw_colours_the_target`.
+`mesh_tests::a_mesh_draw_colours_the_target`. The mesh stage is bound as the vertex stage is: root
+arguments with `setMeshBytes` at slot 2, the heaps with `setMeshBuffer` at 0 and 1, and every resource
+and static-sampler table used for the mesh stage (`mesh_tests::a_mesh_shader_reads_its_root_constants`).
 
 ### Mapping into victory-gpu (not done; victory-gpu is untouched)
 

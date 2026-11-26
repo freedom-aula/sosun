@@ -47,10 +47,14 @@ const RED: &[u32] = &[
 ];
 
 fn translate(stage: HwStage, words: &[u32]) -> HostShader {
-    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut meta = [0; 0x10];
     meta[12] = 0x40;
-    let c = victory_shader::emit::graphics::container(stage, &bytes, &meta).unwrap();
+    translate_with(stage, words, &meta)
+}
+
+fn translate_with(stage: HwStage, words: &[u32], meta: &[u8]) -> HostShader {
+    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(stage, &bytes, meta).unwrap();
     shaders::translate(&c).unwrap()
 }
 
@@ -106,4 +110,33 @@ fn a_mesh_draw_colours_the_target() {
     super::run(&t.host, &[&list]);
     assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// The mesh stage gets its root arguments: the triangle program with its corners scaled by the
+/// root constant in user data dword 0 (s8 of a mesh program), 1.0. Without them it reads 0 and
+/// draws nothing.
+#[test]
+fn a_mesh_shader_reads_its_root_constants() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x1004_0408, // v_mul_f32 v2, s8, v2
+        0x1006_0608, // v_mul_f32 v3, s8, v3
+    ]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0, user data dword 0.
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.set_graphics_root_constants(0, &[1.0f32.to_bits()]);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
 }
