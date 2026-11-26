@@ -5039,17 +5039,29 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
                 let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    // Signed overflow: both sources of one sign, the sum of
+                    // the other (RDNA2 ISA, SOP2 2 and SOPK 15).
+                    let x = self.s.m.bin(c, Bin::Xor, a, r);
+                    let y = self.s.m.bin(c, Bin::Xor, b, r);
+                    self.sign_set(x, y)
                 };
-                (r, carry)
+                (r, Some(carry))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let carry = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    // Signed overflow: sources of different signs, the
+                    // difference not of the first's (RDNA2 ISA, SOP2 3).
+                    let x = self.s.m.bin(c, Bin::Xor, a, b);
+                    let y = self.s.m.bin(c, Bin::Xor, a, r);
+                    self.sign_set(x, y)
+                };
+                (r, Some(carry))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -5226,6 +5238,14 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// Whether `x & y` has its sign bit set.
+    fn sign_set(&mut self, x: V, y: V) -> V {
+        let c = self.cur;
+        let both = self.s.m.bin(c, Bin::And, x, y);
+        let z = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::SLT, both, z)
     }
 
     /// Packs whether each consecutive group of four pixels has a set bit.
@@ -13186,6 +13206,30 @@ mod tests {
 
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_signed_overflow_reaches_the_select() {
+        // SCC of s_add_i32, s_sub_i32 and s_addk_i32 is their signed
+        // overflow; a select on it, and a branch on that (only code with an
+        // effect needs its operands), used to be refused.
+        for (what, op) in [
+            ("s_add_i32 s0, s0, 1", 0x8100_8100),
+            ("s_sub_i32 s0, s0, 1", 0x8180_8100),
+            ("s_addk_i32 s0, 0x7fff", 0xB780_7FFF),
+        ] {
+            let words = [
+                0xBE80_03C1, // s_mov_b32 s0, -1
+                0xBE81_0380, // s_mov_b32 s1, 0
+                op,
+                0x8502_0001, // s_cselect_b32 s2, s1, s0
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380, // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ];
+            lowers(&words, 0).unwrap_or_else(|e| panic!("{what}: {e}"));
         }
     }
 
