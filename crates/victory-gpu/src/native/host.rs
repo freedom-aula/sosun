@@ -623,6 +623,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
             return;
         }
+        self.trace_args(root, binding);
+    }
+
+    /// The root parameters and binding [`Self::trace_draw`] logs, for any one draw.
+    pub(super) fn trace_args(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
         let read = |at: u64, n: usize| {
             let mut b = vec![0u8; n];
             let ok = super::safe_read(at as *const u8, &mut b);
@@ -660,7 +665,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 });
                                 tracing::info!(entry = k, resource = format!("{r:#x}"), counter, desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), buffer = ?buffer, "table unordered view");
                             }
-                            Some(crate::descriptor::View::Placed(_, res, d)) => tracing::info!(entry = k, ?res, ?d, "table placed view"),
+                            Some(crate::descriptor::View::Placed(_, res, d)) => {
+                                let at = u64::from(d[10]) | u64::from(d[11]) << 32;
+                                let mem = if res[0] == 1 { read(at, 128) } else { String::new() };
+                                tracing::info!(entry = k, ?res, ?d, mem, "table placed view")
+                            }
                             Some(v) => tracing::info!(entry = k, ?v, "table view"),
                             None => {}
                         }

@@ -92,6 +92,39 @@ pub struct RenderPipeline {
     raster: Raster,
     /// The pipeline's target has a stencil plane (the pass attaches it too).
     stencil: bool,
+    /// Each stage's static samplers, which the stage's argument buffer points at.
+    vs_static: Option<StaticSamplers>,
+    ps_static: Option<StaticSamplers>,
+}
+
+/// One shader stage's static samplers, as Apple's converter reads them: not built into the
+/// shader, but one table of `IRDescriptorTableEntry` (sampler, 0, LOD bias), `s0` first, whose
+/// address the stage's top-level argument buffer holds at `offset`, right after the root
+/// parameters. Nothing wrote that address before: the shader read a sampler through whatever
+/// bytes followed the parameters, which sampled zeros on M1 and M2 (Apple7, Apple8) GPUs and
+/// left the window black at the title's present pass (Native-Victory-macOS #26).
+pub(crate) struct StaticSamplers {
+    table: Retained<ProtocolObject<dyn MTLBuffer>>,
+    offset: usize,
+    /// The table holds only their resource IDs.
+    _samplers: Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+}
+
+impl StaticSamplers {
+    /// `root` with the table's address at its offset.
+    fn args<'a>(t: Option<&Self>, root: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let Some(t) = t else { return root.into() };
+        let mut v = root.to_vec();
+        if v.len() < t.offset + 8 {
+            v.resize(t.offset + 8, 0);
+        }
+        v[t.offset..t.offset + 8].copy_from_slice(&t.table.gpuAddress().to_le_bytes());
+        v.into()
+    }
+
+    fn table(t: Option<&Self>) -> Option<&ProtocolObject<dyn MTLResource>> {
+        t.map(|t| ProtocolObject::from_ref(&*t.table))
+    }
 }
 
 fn pixel_format(f: Format) -> MTLPixelFormat {
@@ -233,6 +266,86 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
         Filter::Nearest => MTLSamplerMinMagFilter::Nearest,
         Filter::Linear => MTLSamplerMinMagFilter::Linear,
     }
+}
+
+/// A sampler for a static sampler's `D3D12_STATIC_SAMPLER_DESC` words up to `MaxLOD` (filter,
+/// address U, V, W, LOD bias, anisotropy, comparison, border, minimum and maximum LOD). The LOD
+/// bias is the table entry's. Minimum and maximum filtering (filter bits 0x100) have no
+/// equivalent here and filter normally.
+fn static_sampler(
+    dev: &ProtocolObject<dyn MTLDevice>,
+    w: &[u32; 10],
+) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, String> {
+    let [
+        filter,
+        u,
+        v,
+        ww,
+        _,
+        anisotropy,
+        comparison,
+        border,
+        min_lod,
+        max_lod,
+    ] = *w;
+    let aniso = filter & 0x40 != 0;
+    let linear = |bit: u32| {
+        if aniso || filter & bit != 0 {
+            MTLSamplerMinMagFilter::Linear
+        } else {
+            MTLSamplerMinMagFilter::Nearest
+        }
+    };
+    let mode = |m: u32| match m {
+        1 => MTLSamplerAddressMode::Repeat,
+        2 => MTLSamplerAddressMode::MirrorRepeat,
+        4 => MTLSamplerAddressMode::ClampToBorderColor,
+        5 => MTLSamplerAddressMode::MirrorClampToEdge,
+        _ => MTLSamplerAddressMode::ClampToEdge,
+    };
+    let sd = MTLSamplerDescriptor::new();
+    sd.setMinFilter(linear(0x10));
+    sd.setMagFilter(linear(0x4));
+    sd.setMipFilter(if aniso || filter & 1 != 0 {
+        MTLSamplerMipFilter::Linear
+    } else {
+        MTLSamplerMipFilter::Nearest
+    });
+    sd.setSAddressMode(mode(u));
+    sd.setTAddressMode(mode(v));
+    sd.setRAddressMode(mode(ww));
+    sd.setMaxAnisotropy(if aniso {
+        anisotropy.clamp(1, 16) as usize
+    } else {
+        1
+    });
+    if filter & 0x80 != 0 {
+        // `D3D12_COMPARISON_FUNC`, 1 (never) to 8 (always).
+        let c = [
+            Compare::Never,
+            Compare::Less,
+            Compare::Equal,
+            Compare::LessEqual,
+            Compare::Greater,
+            Compare::NotEqual,
+            Compare::GreaterEqual,
+            Compare::Always,
+        ];
+        sd.setCompareFunction(compare(c[(comparison.clamp(1, 8) - 1) as usize]));
+    }
+    sd.setBorderColor(match border {
+        1 => MTLSamplerBorderColor::OpaqueBlack,
+        2 => MTLSamplerBorderColor::OpaqueWhite,
+        _ => MTLSamplerBorderColor::TransparentBlack,
+    });
+    let (lo, hi) = (f32::from_bits(min_lod), f32::from_bits(max_lod));
+    let lo = if lo.is_nan() { 0.0 } else { lo.max(0.0) };
+    sd.setLodMinClamp(lo);
+    sd.setLodMaxClamp(if hi.is_nan() { f32::MAX } else { hi.max(lo) });
+    // The table holds the sampler's resource ID, which exists only for argument-buffer samplers.
+    sd.setSupportArgumentBuffers(true);
+    dev.newSamplerStateWithDescriptor(&sd)
+        .ok_or_else(|| "newSamplerState failed for a static sampler".into())
 }
 
 fn vertex_format(f: VertexFormat) -> MTLVertexFormat {
@@ -381,6 +494,60 @@ impl Metal {
         heap.refs.borrow().values().for_each(|r| use_res(r));
     }
 
+    /// The static samplers of one stage's `layout`, if it declares any.
+    pub(crate) fn static_samplers(
+        &self,
+        layout: Option<&victory_backend::backend::RootLayout>,
+    ) -> Result<Option<StaticSamplers>, String> {
+        let Some(l) = layout.filter(|l| !l.static_samplers.is_empty()) else {
+            return Ok(None);
+        };
+        // The converter's layout names the table as a table resource with no register.
+        // With no table in the layout there is nothing to fill: the pipeline is still made.
+        let Some(offset) = self
+            .msc()?
+            .locations(l)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .find(|&&(kind, space, slot, ..)| kind == 0 && space == u32::MAX && slot == u32::MAX)
+            .map(|&(.., offset, _)| offset as usize)
+        else {
+            return Ok(None);
+        };
+        let table = self
+            .dev
+            .newBufferWithLength_options(
+                l.static_samplers.len() * ENTRY,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or("no static sampler table")?;
+        let mut samplers = Vec::new();
+        for (n, w) in l.static_samplers.iter().enumerate() {
+            let s = static_sampler(&self.dev, w)?;
+            let bias = f32::from_bits(w[4]);
+            let bias = if bias.is_nan() {
+                0.0
+            } else {
+                bias.clamp(-16.0, 15.99)
+            };
+            let entry = [resource_id(s.gpuResourceID()), 0, u64::from(bias.to_bits())];
+            // SAFETY: entry `n` is inside the table, which no GPU work reads yet.
+            unsafe {
+                let p = table.contents().as_ptr().cast::<u64>().add(n * ENTRY / 8);
+                entry
+                    .iter()
+                    .enumerate()
+                    .for_each(|(i, w)| p.add(i).write(*w));
+            }
+            samplers.push(s);
+        }
+        Ok(Some(StaticSamplers {
+            table,
+            offset,
+            _samplers: samplers,
+        }))
+    }
+
     fn stage_function(
         &self,
         dxil: &[u8],
@@ -405,16 +572,21 @@ impl Metal {
         e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
+        statics: Option<&StaticSamplers>,
     ) {
-        if !root.0.is_empty() {
+        let root = StaticSamplers::args(statics, &root.0);
+        if !root.is_empty() {
             // SAFETY: setBytes copies `root` (at most 4 KiB) before returning.
             unsafe {
                 e.setBytes_length_atIndex(
-                    NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap(),
-                    root.0.len(),
+                    NonNull::new(root.as_ptr().cast_mut().cast()).unwrap(),
+                    root.len(),
                     ARGUMENT_BUFFER,
                 )
             };
+        }
+        if let Some(t) = StaticSamplers::table(statics) {
+            e.useResource_usage(t, MTLResourceUsage::Read);
         }
         for (h, slot) in [
             (heaps.resource, HEAP_SLOT[0]),
@@ -436,17 +608,31 @@ impl Metal {
         root: &RootArgs,
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
+        pipeline: &RenderPipeline,
     ) {
         let fragment = fragment.unwrap_or(root);
+        let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
+        let (root, fragment) = (
+            StaticSamplers::args(vs, &root.0),
+            StaticSamplers::args(ps, &fragment.0),
+        );
         // SAFETY: setBytes copies the bytes before returning.
         unsafe {
-            if !root.0.is_empty() {
-                let p = NonNull::new(root.0.as_ptr().cast_mut().cast()).unwrap();
-                e.setVertexBytes_length_atIndex(p, root.0.len(), ARGUMENT_BUFFER);
+            if !root.is_empty() {
+                let p = NonNull::new(root.as_ptr().cast_mut().cast()).unwrap();
+                e.setVertexBytes_length_atIndex(p, root.len(), ARGUMENT_BUFFER);
             }
-            if !fragment.0.is_empty() {
-                let p = NonNull::new(fragment.0.as_ptr().cast_mut().cast()).unwrap();
-                e.setFragmentBytes_length_atIndex(p, fragment.0.len(), ARGUMENT_BUFFER);
+            if !fragment.is_empty() {
+                let p = NonNull::new(fragment.as_ptr().cast_mut().cast()).unwrap();
+                e.setFragmentBytes_length_atIndex(p, fragment.len(), ARGUMENT_BUFFER);
+            }
+        }
+        for (t, stage) in [
+            (vs, MTLRenderStages::Vertex),
+            (ps, MTLRenderStages::Fragment),
+        ] {
+            if let Some(t) = StaticSamplers::table(t) {
+                e.useResource_usage_stages(t, MTLResourceUsage::Read, stage);
             }
         }
         for (h, slot) in [
@@ -837,6 +1023,12 @@ impl GraphicsBackend for Metal {
             cull,
             raster: d.raster,
             stencil: has_stencil,
+            vs_static: self.static_samplers(d.vs_layout)?,
+            ps_static: if d.ps.is_some() {
+                self.static_samplers(d.ps_layout)?
+            } else {
+                None
+            },
         })
     }
 
@@ -1175,7 +1367,7 @@ impl Metal {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps);
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
@@ -1395,7 +1587,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
