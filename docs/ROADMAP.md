@@ -9,8 +9,8 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 **Solved since:** the present pass now runs (static samplers in the root layout), so the window shows the game's screens. The boot movie's green frames are gone (its video planes were uploaded before the game decoded into them). A stack overflow at the first draw is fixed (title threads now get at least 8 MiB of stack, since the host builds Metal pipelines on them).
 
 **Now:**
-- **Many lowercase glyphs draw as filled boxes,** while headings are fine ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6)). The A8 glyph atlas reaches the host in time and no pipeline uses stencil, so the suspects are the text pixel shader's translation or how the atlas channel is read.
-- **There is a white band** across the top of the setup menu, and blocky areas around the panel on LEGAL NOTICES.
+- Guessed pipelines now read their blend state from the 0x1c8 register image, which fixed the boxed glyphs ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6)) and the opaque blocks on LEGAL NOTICES. Culling, depth, stencil and the write mask are still guessed.
+- Check whether the white band on FINISH SETUP is gone too (probably the same cause).
 - Dropped draw kinds and unknown formats should log loudly, once each.
 - Table re-mirroring (`NativeHost::remirror_tables`) only checks the first 16 entries per table.
 
