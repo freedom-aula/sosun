@@ -224,18 +224,28 @@ static THREAD_LOCAL_EXIT: AtomicUsize = AtomicUsize::new(0);
 static APP_TYPE: AtomicU32 = AtomicU32::new(0);
 
 pub extern "system" fn _crt_atexit(f: usize) -> i32 {
+    if f == 0 {
+        bad_param(EINVAL);
+        return -1;
+    }
     lock(&AT_EXIT).push(f);
     0
 }
 
 pub extern "system" fn _crt_at_quick_exit(f: usize) -> i32 {
+    if f == 0 {
+        bad_param(EINVAL);
+        return -1;
+    }
     lock(&AT_QUICK_EXIT).push(f);
     0
 }
 
 /// `_onexit` returns the function on success.
 pub extern "system" fn _onexit(f: usize) -> usize {
-    _crt_atexit(f);
+    if _crt_atexit(f) != 0 {
+        return 0;
+    }
     f
 }
 
@@ -250,8 +260,10 @@ pub extern "system" fn _set_app_type(kind: i32) {
 fn run_handlers(list: &Mutex<Vec<usize>>) {
     loop {
         let Some(f) = lock(list).pop() else { break };
-        // SAFETY: a function the title registered, taking no arguments.
-        unsafe { call_win64(f, &[]) };
+        if f != 0 {
+            // SAFETY: a function the title registered, taking no arguments.
+            unsafe { call_win64(f, &[]) };
+        }
     }
 }
 
@@ -451,11 +463,36 @@ pub fn set_command_line(args: &[String]) {
 }
 
 fn quote(a: &str) -> String {
-    if a.is_empty() || a.contains([' ', '\t', '"']) {
-        format!("\"{}\"", a.replace('"', "\\\""))
-    } else {
-        a.to_string()
+    if !(a.is_empty() || a.contains([' ', '\t', '"'])) {
+        return a.to_string();
     }
+    let mut out = String::with_capacity(a.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in a.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
 fn pointers<T>(items: Vec<*mut T>) -> *mut *mut T {
@@ -715,7 +752,7 @@ pub extern "system" fn getenv_s(
     size: usize,
     name: *const u8,
 ) -> i32 {
-    if len.is_null() || name.is_null() || (buf.is_null() && size != 0) {
+    if len.is_null() || name.is_null() || (buf.is_null() != (size == 0)) {
         return bad_param(EINVAL);
     }
     // SAFETY: a NUL-terminated name.
@@ -735,6 +772,7 @@ pub extern "system" fn getenv_s(
             return 0;
         }
         if v.len() + 1 > size {
+            buf.write(0);
             return bad_param(super::ERANGE);
         }
         std::ptr::copy_nonoverlapping(v.as_ptr(), buf, v.len());
@@ -775,11 +813,21 @@ fn set_env(name: &str, value: &str) -> i32 {
     if name.is_empty() || name.contains('=') {
         return bad_param(EINVAL);
     }
+    // Remove every case-insensitive match first so Windows semantics hold on
+    // macOS's case-sensitive environment.
+    let matching: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(k, _)| {
+            k.to_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(name))
+                .then_some(k)
+        })
+        .collect();
     // SAFETY: the host process's environment, set the way the title asks.
     unsafe {
-        if value.is_empty() {
-            std::env::remove_var(name);
-        } else {
+        for key in matching {
+            std::env::remove_var(key);
+        }
+        if !value.is_empty() {
             std::env::set_var(name, value);
         }
     }
@@ -1014,5 +1062,69 @@ mod tests {
         assert_eq!(signal(2, SIG_DFL), SIG_IGN);
         assert_eq!(signal(99, SIG_IGN), SIG_ERR);
         assert_eq!(raise(99), -1);
+    }
+
+    #[test]
+    fn env_updates_and_removals_are_case_insensitive_and_guards_hold() {
+        assert_eq!(
+            _putenv_s(c"VICTORY_CASE_TEST".as_ptr().cast(), c"one".as_ptr().cast()),
+            0
+        );
+        // Updating with different case must replace the original key.
+        assert_eq!(
+            _putenv_s(c"victory_case_test".as_ptr().cast(), c"two".as_ptr().cast()),
+            0
+        );
+        // SAFETY: NUL-terminated result.
+        assert_eq!(
+            unsafe { super::super::bytes(getenv(c"VICTORY_CASE_TEST".as_ptr().cast())) },
+            b"two"
+        );
+
+        // getenv_s rejects non-null buffer with zero size, and clears buf on ERANGE.
+        let mut n = 99usize;
+        let mut buf = [b'x'; 2];
+        assert_eq!(
+            getenv_s(
+                &mut n,
+                buf.as_mut_ptr(),
+                0,
+                c"VICTORY_CASE_TEST".as_ptr().cast()
+            ),
+            EINVAL
+        );
+        assert_eq!(
+            getenv_s(
+                &mut n,
+                buf.as_mut_ptr(),
+                2,
+                c"VICTORY_CASE_TEST".as_ptr().cast()
+            ),
+            super::super::ERANGE
+        );
+        assert_eq!((n, buf[0]), (4, 0));
+
+        // Removing with different case removes the variable completely.
+        assert_eq!(
+            _putenv_s(c"ViCtOrY_CaSe_TeSt".as_ptr().cast(), c"".as_ptr().cast()),
+            0
+        );
+        assert!(getenv(c"VICTORY_CASE_TEST".as_ptr().cast()).is_null());
+        assert!(getenv(c"victory_case_test".as_ptr().cast()).is_null());
+
+        // Null exit handlers are rejected instead of being queued to jump to 0.
+        set_errno(0);
+        assert_eq!(_crt_atexit(0), -1);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_crt_at_quick_exit(0), -1);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_onexit(0), 0);
+        assert_eq!(errno(), EINVAL);
+
+        // Windows command-line quoting doubles backslashes before quotes and closing quotes.
+        assert_eq!(quote(r"C:\Program Files\"), r#""C:\Program Files\\""#);
+        assert_eq!(quote(r#"a\"b"#), r#""a\\\"b""#);
     }
 }
