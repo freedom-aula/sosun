@@ -953,6 +953,16 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
     .unwrap_or_else(|| Err("no native host GPU".into()))
 }
 
+#[cfg(test)]
+pub(crate) fn install_test_render_pipeline(
+    key: usize,
+    pso: Rc<<Metal as victory_backend::resources::GraphicsBackend>::RenderPipeline>,
+) {
+    with_title(|t| {
+        t.pipelines.insert(key, Pipe::Render(pso, None));
+    });
+}
+
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
@@ -1130,17 +1140,19 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
         return None;
     }
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
-    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
+    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`). A described
+    // pipeline has no fourth-corner shader translation, so it falls back to its supplied vertices
+    // drawn as triangles rather than issuing 4-vertex instanced strips.
     let rect = l.topology == 17;
     let targets = l.targets.clone();
-    let made = match pipe(t, l.pipeline, &targets) {
-        Pipe::Guess(g) => guess(t, l, &g, rect),
+    let (made, rect) = match pipe(t, l.pipeline, &targets) {
+        Pipe::Guess(g) => (guess(t, l, &g, rect), rect),
         p if rect => {
             if env_set!("VICTORY_TRACE_RECTS") {
                 tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
             }
             warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
-            p
+            (p, false)
         }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
@@ -1148,7 +1160,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
             trace_drop(l);
             return None;
         }
-        p => p,
+        p => (p, false),
     };
     let Pipe::Render(pso, binding) = made else {
         dropped("a draw without a host render pipeline (refused or not translated)");
@@ -1165,8 +1177,9 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     }
     let topology = if rect {
         Some(victory_backend::resources::Topology::TriangleStrip)
-    } else if mesh {
-        // A mesh shader declares its own topology; the list's is unused.
+    } else if l.topology == 17 || mesh {
+        // Described rectangle lists draw each 3-corner rectangle as a triangle; a mesh shader
+        // declares its own topology and ignores the list's.
         Some(victory_backend::resources::Topology::Triangles)
     } else {
         super::state::topology(l.topology)
