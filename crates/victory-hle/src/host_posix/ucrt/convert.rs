@@ -293,8 +293,10 @@ fn to_f64(f: &Float) -> f64 {
             mantissa,
             exponent,
         } => {
-            let v = *mantissa as f64 * 2f64.powi((*exponent).clamp(-2200, 2200));
-            let v = if v.is_nan() { f64::INFINITY } else { v };
+            // One exact scaling: a power of two computed apart underflows to 0 below 2^-1022 and
+            // makes 0 * inf for a zero mantissa with a large exponent.
+            // SAFETY: libm's scalbn is a pure function of its arguments.
+            let v = unsafe { super::libc::scalbn(*mantissa as f64, *exponent) };
             if *negative { -v } else { v }
         }
         Float::Inf(n) => {
@@ -308,11 +310,24 @@ fn to_f64(f: &Float) -> f64 {
     }
 }
 
+/// Whether a number read as an infinity or a zero is out of range, which the CRT reports with
+/// `ERANGE`: an infinity from digits (overflow), or a zero from nonzero digits (underflow).
+fn out_of_range(f: &Float, infinite: bool, zero: bool) -> bool {
+    match f {
+        Float::Number(t) => {
+            let digits = t.split(['e', 'E']).next().unwrap_or("");
+            infinite || (zero && digits.bytes().any(|b| matches!(b, b'1'..=b'9')))
+        }
+        Float::Hex { mantissa, .. } => infinite || (zero && *mantissa != 0),
+        Float::Inf(_) | Float::Nan(_) => false,
+    }
+}
+
 /// Parses a prefix of `s` as a double: the value and the bytes consumed.
 pub(super) fn parse_double(s: &[u8]) -> Option<(f64, usize)> {
     let (f, n) = float_prefix(s)?;
     let v = to_f64(&f);
-    if v.is_infinite() && matches!(f, Float::Number(_) | Float::Hex { .. }) {
+    if out_of_range(&f, v.is_infinite(), v == 0.0) {
         set_errno(ERANGE);
     }
     Some((v, n))
@@ -324,7 +339,7 @@ fn parse_single(s: &[u8]) -> Option<(f32, usize)> {
         Float::Number(t) => t.parse().unwrap_or(0.0),
         other => to_f64(other) as f32,
     };
-    if v.is_infinite() && matches!(f, Float::Number(_) | Float::Hex { .. }) {
+    if out_of_range(&f, v.is_infinite(), v == 0.0) {
         set_errno(ERANGE);
     }
     Some((v, n))
@@ -1006,6 +1021,27 @@ mod tests {
     }
 
     #[test]
+    fn an_underflow_to_zero_sets_erange() {
+        let read = |s: &[u8]| {
+            set_errno(0);
+            let v = strtod(s.as_ptr(), std::ptr::null_mut());
+            (v, super::super::errno())
+        };
+        assert_eq!(read(b"1e-400\0"), (0.0, ERANGE));
+        assert_eq!(read(b"-0.0000001e-330\0"), (-0.0, ERANGE));
+        // Zero digits are a zero, not an underflow; a subnormal is no underflow to zero.
+        assert_eq!(read(b"0e-400\0"), (0.0, 0));
+        assert_eq!(read(b"0.000\0"), (0.0, 0));
+        assert_eq!(read(b"4.9e-324\0"), (f64::from_bits(1), 0));
+        set_errno(0);
+        assert_eq!(strtof(b"1e-50\0".as_ptr(), std::ptr::null_mut()), 0.0);
+        assert_eq!(super::super::errno(), ERANGE);
+        set_errno(0);
+        assert_eq!(strtof(b"1e-30\0".as_ptr(), std::ptr::null_mut()), 1e-30);
+        assert_eq!(super::super::errno(), 0);
+    }
+
+    #[test]
     fn doubles() {
         let mut end = std::ptr::null();
         let s = b" -1.5e3xyz\0";
@@ -1023,6 +1059,23 @@ mod tests {
         assert_eq!(strtod(b"1e999\0".as_ptr(), &mut end), f64::INFINITY);
         assert_eq!(super::super::errno(), ERANGE);
         assert_eq!(wcstod(w("2.25 ").as_ptr(), std::ptr::null_mut()), 2.25);
+    }
+
+    #[test]
+    fn hex_doubles_scale_exactly_at_both_ends() {
+        let hex = |s: &[u8]| {
+            set_errno(0);
+            let v = strtod(s.as_ptr(), std::ptr::null_mut());
+            (v, super::super::errno())
+        };
+        // What printf's %a writes for 2^-1000, and the smallest subnormal.
+        assert_eq!(hex(b"0x1.0000000000000p-1000\0"), (2f64.powi(-1000), 0));
+        assert_eq!(hex(b"0x1p-1074\0"), (f64::from_bits(1), 0));
+        assert_eq!(hex(b"-0x1.8p-1073\0"), (-f64::from_bits(3), 0));
+        assert_eq!(hex(b"0x1.fffffffffffffp1023\0"), (f64::MAX, 0));
+        // A zero mantissa is zero whatever its exponent.
+        assert_eq!(hex(b"0x0p2000\0"), (0.0, 0));
+        assert_eq!(hex(b"0x1p1024\0"), (f64::INFINITY, ERANGE));
     }
 
     #[test]
