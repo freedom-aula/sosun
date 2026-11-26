@@ -11604,10 +11604,14 @@ impl<'a> Lower<'a> {
                     v.split(',').filter_map(|p| p.parse::<u32>().ok()).any(|p| elements(self, primitive)[id].row == Some(p) && el_kind == 0)
                 });
             let x = if forced && suffix == ".f32" { self.s.m.f32(1.0f32.to_bits()) } else { x };
-            let x = if self.s.pixel && std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() && suffix == ".f32" {
-                self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
-            } else {
-                x
+            // Debug (`VICTORY_DEBUG_PS_RED`; `VICTORY_DEBUG_PS=white|alpha`): constant colours.
+            let x = match (self.s.pixel && suffix == ".f32", std::env::var("VICTORY_DEBUG_PS").ok().as_deref()) {
+                (true, Some("white")) => self.s.m.f32(1.0f32.to_bits()),
+                (true, Some("alpha")) if col == 3 => self.s.m.f32(1.0f32.to_bits()),
+                (true, _) if std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() => {
+                    self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
+                }
+                _ => x,
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),

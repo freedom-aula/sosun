@@ -776,6 +776,19 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
+        // A command buffer the GPU fails is logged (the first few), not silently dropped.
+        let failed = block2::RcBlock::new(|done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            // SAFETY: Metal passes the command buffer that completed.
+            let done = unsafe { done.as_ref() };
+            if let Some(e) = done.error()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
+            {
+                eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+            }
+        });
+        // SAFETY: the block is retained by Metal until it has run.
+        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
         Ok(())
     }
