@@ -313,6 +313,7 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.
 - `host_posix` (kernel32 side) is a few dozen functions, enough for the probe, not a title; the C runtime is complete enough for a title that links it dynamically.
 - `VirtualAlloc` reserves 64 KiB granules at 64 KiB boundaries; `VirtualFree(MEM_RELEASE)` takes a base from `VirtualAlloc` only.
+- `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory, or of a range `XMemMapPhysicalPages` mapped into, gives its physical-page views back too (`xmem_posix::forget_physical`, as `XMemFreeDefault` does). It used to give back only the address space, so the freed pool stayed in the GPU's pool table and the aliases at an address the next allocation was given: two memories at one title address (issue #15).
 - TLS images must be registered before the threads that use them; thread notices go to every registered image on every title thread.
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
