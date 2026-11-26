@@ -2238,6 +2238,70 @@ fn compute_root_constants_reach_the_user_data() {
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
+/// Reduce the active lanes with signed min. Each inactive lane contributes INT_MAX,
+/// supplied either directly to v_cndmask or through an SGPR in the whole-wave section.
+#[test]
+fn a_whole_wave_minimum_accepts_a_scalar_literal_identity() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let minimum = |setup: &[u32], identity: u32| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7D82_0085, // v_cmp_lt_u32 vcc_lo, 5, v0
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        ];
+        code.extend_from_slice(setup);
+        code.extend([0xD501_0001, 0x000A_0000 | identity]); // v_cndmask_b32 v1, identity, v0, s2
+        if identity == 255 {
+            code.push(i32::MAX as u32);
+        }
+        // Each row of 16 reduces in four butterflies.
+        for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+            code.extend([0x2202_02FA, 0xFF00_0001 | ctrl << 8]); // v_min_i32_dpp v1, v1, v1
+        }
+        code.extend([
+            0xD778_0002,
+            0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+            0x2202_0501, // v_min_i32 v1, v1, v2
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        let container = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+        translate_with(&container, Options::default())
+    };
+    let direct = minimum(&[], 255).expect("literal identity");
+    let moved = minimum(&[0xBE86_03FF, 0x7FFF_FFFF], 6).expect("s_mov_b32 s6, INT_MAX");
+    assert_eq!(moved.dxil, direct.dxil);
+
+    let exec_off = [
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBE86_03FF, 0x7FFF_FFFF, // s_mov_b32 s6, INT_MAX
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+    ];
+    let moved = minimum(&exec_off, 6).expect("scalar move with EXEC off");
+    assert_eq!(moved.dxil, direct.dxil);
+
+    // Overwriting INT_MAX with -1 no longer supplies the signed-min identity.
+    let wrong = minimum(&[0xBE86_03FF, 0x7FFF_FFFF, 0xBE86_03C1], 6);
+    assert!(matches!(
+        wrong,
+        Err(ShaderError::Unsupported { what: super::wave::NO_SHAPE, .. })
+    ));
+    // A scalar register read is not a literal.
+    let dynamic = minimum(&[0xBE86_0302], 6); // s_mov_b32 s6, s2 (saved EXEC)
+    assert!(matches!(dynamic, Err(ShaderError::Unsupported { what, .. })
+        if what.ends_with("a scalar ALU result")));
+}
+
 /// A value a whole-wave section leaves without a shape is refused naming the
 /// first step the simulation does not model, or, when it models every step,
 /// saying the value is no reduction or prefix.
