@@ -876,6 +876,13 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let targets = l.targets.clone();
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
+        p if rect => {
+            if std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+                tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
+            }
+            warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
+            p
+        }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
             return None;
@@ -926,6 +933,19 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     }
     with_list(this, |t, l| {
         if let Some(rect) = graphics(t, l) {
+            if rect && std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+                static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap();
+                if seen.iter().filter(|&&p| p == l.pipeline as usize).count() < 3 {
+                    seen.push(l.pipeline as usize);
+                    let stride = l.strides.first().copied().unwrap_or(0) as usize;
+                    let mut head = vec![0u8; (stride * 3).clamp(12, 192)];
+                    let at = l.list.vertex_buffer_address(0).map(|a| a + (first as u64) * stride as u64);
+                    let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
+                    let floats: Vec<f32> = head.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                    tracing::info!(pipeline = ?l.pipeline, vertices, first, strides = ?l.strides, ok, ?floats, "rect draw");
+                }
+            }
             let call = if rect {
                 l.list.draw_instanced(4, vertices / 3, 0, first / 3)
             } else {
