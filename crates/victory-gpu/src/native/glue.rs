@@ -548,7 +548,7 @@ pub(crate) fn mirror(handle: u64) {
         }
         if let Err(e) = t.host.mirror(handle) {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            if N.fetch_add(1, Ordering::Relaxed) < 3000 {
                 tracing::info!(error = %e, handle = format!("{handle:#x}"), "a descriptor was not mirrored");
             }
         }
@@ -874,6 +874,10 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
                 tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.targets, "draw");
             });
         }
+    }
+    // Debugging: only indexed draws (the content), not the boot passes.
+    if std::env::var_os("VICTORY_DEBUG_ONLY_INDEXED").is_some() {
+        return;
     }
     with_list(this, |t, l| {
         if let Some(rect) = graphics(t, l) {

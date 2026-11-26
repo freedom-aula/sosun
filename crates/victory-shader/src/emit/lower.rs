@@ -354,6 +354,8 @@ struct Lower<'a> {
     /// Generic pixel inputs interpolated with more than one mode:
     /// `(original input id, mode)` -> split `SigElement` id on its own row.
     split_inputs: Map<(usize, u8), usize>,
+    /// Debug (`VICTORY_DEBUG_VS_POS`): the last two-dword raw vertex fetch, as floats.
+    debug_pos: Option<(V, V)>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -836,6 +838,7 @@ impl<'a> Lower<'a> {
             round16: round16(p),
             mode16: Some(0),
             split_inputs: Map::default(),
+            debug_pos: None,
         }
     }
 
@@ -10928,6 +10931,13 @@ impl<'a> Lower<'a> {
                 v = self.s.m.select(c, c2, ex, v);
                 v = self.s.m.select(c, c3, d, v);
             }
+            if count == 2 && kind == 'F' {
+                match (k, self.debug_pos) {
+                    (0, _) => self.debug_pos = Some((v, v)),
+                    (_, Some((x, _))) => self.debug_pos = Some((x, v)),
+                    _ => {}
+                }
+            }
             self.write(inst, Reg::V(reg + k as u8), v, guard);
         }
         Ok(())
@@ -11758,9 +11768,29 @@ impl<'a> Lower<'a> {
                 && std::env::var("VICTORY_DEBUG_VS_PARAM").is_ok_and(|v| {
                     v.split(',').filter_map(|p| p.parse::<u32>().ok()).any(|p| elements(self, primitive)[id].row == Some(p) && el_kind == 0)
                 });
+            // Debug: VICTORY_DEBUG_VS_POS=1 positions from the raw vertex xy (scale 1/32768).
+            let x = match (self.debug_pos, el_kind == 3 && col < 2 && !self.s.pixel && !mesh) {
+                (Some((vx, vy)), true) if std::env::var_os("VICTORY_DEBUG_VS_POS").is_some() => {
+                    let raw = self.as_float(if col == 0 { vx } else { vy });
+                    let k = self.s.m.f32(if col == 0 { 3.0517578e-5f32.to_bits() } else { (-3.0517578e-5f32).to_bits() });
+                    self.s.m.bin(self.cur, Bin::Mul, raw, k)
+                }
+                _ => x,
+            };
             let x = if forced && suffix == ".f32" { self.s.m.f32(1.0f32.to_bits()) } else { x };
             // Debug (`VICTORY_DEBUG_PS_RED`; `VICTORY_DEBUG_PS=white|alpha`): constant colours.
             let x = match (self.s.pixel && suffix == ".f32", std::env::var("VICTORY_DEBUG_PS").ok().as_deref()) {
+                (true, Some(m)) if m.starts_with("in") && m[2..].parse::<u8>().is_ok() => {
+                    // Debug: the raw pixel input of that row as the colour (channel = the export's).
+                    let row = m[2..].parse::<u8>().unwrap_or(0);
+                    match self.find_input(row, col) {
+                        Some((iid, c)) => match self.load_any_input(iid, c) {
+                            Val::I32(v) => self.as_float(v),
+                            _ => self.s.m.f32(0),
+                        },
+                        None => self.s.m.f32(0),
+                    }
+                }
                 (true, Some("white")) => self.s.m.f32(1.0f32.to_bits()),
                 (true, Some("alpha")) if col == 3 => self.s.m.f32(1.0f32.to_bits()),
                 (true, _) if std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() => {
