@@ -10235,13 +10235,16 @@ impl<'a> Lower<'a> {
             }
             // shortcut: stores are taken to be of a float format (the
             // console converts by the view's format).
-            // A store of fewer channels still writes the whole texel: the
-            // hardware stores 0 in the channels dmask leaves out (GFX11 and
-            // older; LLVM 88421ea "[AMDGPU] Trim zero components from buffer
-            // and image stores", Mesa 4a6ee2c4833 "aco: shrink buffer stores
-            // with undef/zero components"), as for typed buffer stores. The
-            // data holds the dmask's channels in turn. With no channel
-            // enabled the hardware's behaviour is undocumented: refused.
+            // A store of fewer channels still writes the whole texel, the
+            // data holding the dmask's channels in turn. With a prefix dmask
+            // (0x1, 0x3, 0x7) the hardware stores 0 in the trailing channels
+            // left out (GFX11 and older; LLVM 88421ea "[AMDGPU] Trim zero
+            // components from buffer and image stores", Mesa 4a6ee2c4833
+            // "aco: shrink buffer stores with undef/zero components"), as for
+            // typed buffer stores. Guess (docs/native-host.md): a gapped
+            // dmask (0x5, or one without red) gets 0 in its gaps too, which
+            // that evidence does not cover. With no channel enabled the
+            // hardware's behaviour is undocumented: refused.
             if matches!(inst.fields, Fields::Image { dmask: 0, .. }) {
                 return Err("an image store of no channel");
             }
