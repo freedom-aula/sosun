@@ -609,6 +609,11 @@ impl<B: GraphicsBackend> NativeList<B> {
         };
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn color_targets(&self) -> &[Rc<B::Texture>] {
+        &self.state.targets.color
+    }
+
     /// `ClearRenderTargetView`. shortcut: each clear is a render pass of its own (load action
     /// clear); folding it into the following draws' pass saves one pass per clear.
     pub fn clear_render_target(&mut self, target: &Rc<B::Texture>, color: [f32; 4]) {

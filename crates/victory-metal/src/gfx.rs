@@ -2231,6 +2231,104 @@ mod transfer_tests {
 }
 
 #[cfg(test)]
+mod render_target_tests {
+    use super::*;
+    use objc2_foundation::NSString;
+
+    #[test]
+    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.dim = TexDim::D2Array;
+        desc.depth_or_layers = 2;
+        desc.mips = 2;
+        desc.render_target = true;
+        let texture = metal.create_texture(&desc).unwrap();
+        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
+            }
+        }
+        let target = metal.create_texture_view(&texture, &ViewDesc {
+            format: Format::Rgba8Unorm,
+            mips: (1, 1),
+            slices: (1, 1),
+        }).expect("narrowed render target");
+        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
+
+        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            vertex float4 test_vertex(uint i [[vertex_id]]) {
+                return float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
+            }
+            fragment float4 test_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
+        "#), None).expect("compile generated Metal shaders");
+        let pipeline_desc = MTLRenderPipelineDescriptor::new();
+        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
+        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        pipeline_desc.setVertexFunction(Some(&vertex));
+        pipeline_desc.setFragmentFunction(Some(&fragment));
+        // SAFETY: the descriptor has a color attachment at index 0.
+        unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        let pipeline = RenderPipeline {
+            pso: metal.dev.newRenderPipelineStateWithDescriptor_error(&pipeline_desc).unwrap(),
+            depth: None,
+            cull: MTLCullMode::None,
+            raster: Raster::default(),
+            stencil: false,
+            mesh: None,
+            vs_static: None,
+            ps_static: None,
+        };
+        let queue = metal.create_queue().unwrap();
+        let fence = metal.create_fence(0).unwrap();
+        let passes = [Pass::Render(RenderPass {
+            color: vec![ColorTarget { texture: &target, clear: None }],
+            depth: None,
+            draws: vec![Draw {
+                pipeline: &pipeline,
+                topology: Topology::Triangles,
+                state: DrawState::default(),
+                root: RootArgs::default(),
+                fragment_root: None,
+                heaps: Heaps::default(),
+                resources: vec![],
+                vertex_buffers: vec![],
+                index_buffer: None,
+                call: DrawCall::Arrays {
+                    vertex_count: 3,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                },
+                indirect: None,
+                count: None,
+            }],
+        })];
+        metal.submit_passes(&queue, &PassSubmission {
+            passes: &passes,
+            waits: &[],
+            signals: &[(&fence, 1)],
+        }).expect("draw through narrowed view");
+        assert!(metal.wait(&fence, 1, 2000), "draw did not complete");
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                let mut data = vec![0; n * n * 4];
+                metal.read_texture(&texture, mip, slice, &mut data, n * 4, 0);
+                let expected = if (mip, slice) == (1, 1) { [0, 255, 0, 255] } else { sentinel(mip, slice) };
+                assert!(data.as_chunks::<4>().0.iter().all(|p| *p == expected),
+                        "mip {mip} slice {slice}: expected {expected:?}, got {:?}", &data[..4]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod owed_tests {
     use super::*;
     use crate::backend::ComputeBackend;

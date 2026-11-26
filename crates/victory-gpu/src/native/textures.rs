@@ -307,11 +307,13 @@ pub struct Tracked<B: ResourceBackend> {
     /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
     /// them; once left to the scanner, their first frames showed green for a second or two).
     blank: bool,
-    /// Its view in the other format of its sRGB pair, once a render target view named it.
-    twin: Option<Rc<B::Texture>>,
+    /// Render-target views already made, kept so the same attachment keeps its identity.
+    #[cfg(target_os = "macos")]
+    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
 }
 
 /// The other format of an sRGB pair.
+#[cfg(target_os = "macos")]
 fn srgb_twin(f: Format) -> Option<Format> {
     Some(match f {
         Format::Rgba8Unorm => Format::Rgba8UnormSrgb,
@@ -626,7 +628,8 @@ impl<B: PresentBackend> Title<B> {
                 sampled_sees_writes: false,
                 skipped: 0,
                 blank: false,
-                twin: None,
+                #[cfg(target_os = "macos")]
+                target_views: Vec::new(),
             },
         );
         true
@@ -643,33 +646,50 @@ impl<B: PresentBackend> Title<B> {
         self.textures.get(&key).map(|t| t.texture.clone())
     }
 
-    /// What a render target view of title texture `key` in DXGI format `named` (0: the texture's
-    /// own) draws into, and its format: the host texture, or its view in the other format of
-    /// its sRGB pair when the view names that one. The view's format says how writes are stored:
-    /// a picture written through a plain view of an sRGB texture is display values already (a
-    /// movie), and drawn into the texture itself it was encoded again and shown too bright.
-    pub fn target_of(&mut self, key: usize, named: u32) -> Option<(Rc<B::Texture>, Format)> {
+    /// Resolves a render-target view to its attachment and its effective format. The base
+    /// attachment can use the texture itself. A narrowed view also supplies the mip's extent.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn target_of(
+        &mut self,
+        record: crate::descriptor::RtvRecord,
+    ) -> Option<(Rc<B::Texture>, Format)> {
+        let key = record.resource as usize;
         self.realize(key);
         let t = self.textures.get_mut(&key)?;
-        let own = t.info.desc()?.format;
-        let Some(twin) = format(named).filter(|&f| srgb_twin(own) == Some(f)) else {
-            return Some((t.texture.clone(), own));
-        };
-        if t.twin.is_none() {
+        let desc = t.info.desc()?;
+        let (mip, slice) = record.native_rtv_subresource(
+            t.info.dimension,
+            t.info.depth_or_layers,
+            desc.mips,
+            t.info.layout.desc.samples,
+        )?;
+        let base = (mip, slice) == (0, 0);
+        let own = desc.format;
+        let twin = format(record.format()).filter(|&f| srgb_twin(own) == Some(f));
+        // A failed format reinterpretation can fall back to the resource format, but must
+        // keep the same mip and slice.
+        for format in twin.into_iter().chain([own]) {
+            if base && format == own {
+                return Some((t.texture.clone(), own));
+            }
             let view = ViewDesc {
-                format: twin,
-                mips: (0, usize::MAX),
-                slices: (0, usize::MAX),
+                format,
+                mips: if base { (0, usize::MAX) } else { (mip, 1) },
+                slices: if base { (0, usize::MAX) } else { (slice, 1) },
             };
+            if let Some((_, texture)) = t.target_views.iter().find(|(cached, _)| *cached == view) {
+                return Some((texture.clone(), format));
+            }
             match self.host.backend.create_texture_view(&t.texture, &view) {
-                Ok(v) => t.twin = Some(Rc::new(v)),
-                Err(e) => {
-                    tracing::warn!(error = %e, ?own, view = ?twin, "no host view for a render target view: drawn in the texture's format");
-                    return Some((t.texture.clone(), own));
+                Ok(texture) => {
+                    let texture = Rc::new(texture);
+                    t.target_views.push((view, texture.clone()));
+                    return Some((texture, format));
                 }
+                Err(e) => tracing::warn!(error = %e, ?view, "no host view for a render target view"),
             }
         }
-        t.twin.clone().map(|v| (v, twin))
+        None
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.

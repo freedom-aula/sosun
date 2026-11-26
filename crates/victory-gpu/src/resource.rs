@@ -2357,13 +2357,18 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 /// A 2D texture in the title memory at `address`, in the console layout `swizzle`.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn test_texture_at(address: u64, (width, height): (u64, u32), mips: u16, format: u32, swizzle: u32, flags: u32) -> This {
+pub(crate) fn test_texture_at(address: u64, size: (u64, u32), mips: u16, format: u32, swizzle: u32, flags: u32) -> This {
+    test_texture_array_at(address, size, mips, 1, format, swizzle, flags)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_texture_array_at(address: u64, (width, height): (u64, u32), mips: u16, layers: u16, format: u32, swizzle: u32, flags: u32) -> This {
     let desc = ResourceDesc {
         dimension: 3,
         alignment: 0,
         width,
         height,
-        depth_or_array_size: 1,
+        depth_or_array_size: layers,
         mip_levels: mips,
         format,
         sample_count: 1,
