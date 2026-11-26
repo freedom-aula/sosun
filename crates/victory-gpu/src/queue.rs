@@ -694,6 +694,11 @@ extern "system" fn present(
     if frame <= 4 {
         tracing::info!(frame, "PresentX");
     }
+    #[cfg(target_os = "macos")]
+    if frame % 64 == 0 {
+        let (recorded, encoded, no_pipeline, no_texture) = crate::native::glue::draw_counts();
+        tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, "native draws so far");
+    }
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(feature = "diagnostics")]

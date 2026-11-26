@@ -481,6 +481,35 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// Device methods 0x1c8 and 0x218: a pipeline state from a console description whose layout is
+/// not known yet (`(desc, iid, out)`, the pipeline state's IID; title+0x2477578 and +0x24800d5).
+/// shortcut: the description is not read; the pipeline has no shaders, so draws with it are
+/// dropped.
+pub(crate) extern "system" fn create_unread(
+    _: This,
+    _desc: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if std::env::var_os("VICTORY_DUMP_DESC").is_some() && !_desc.is_null() {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+            // SAFETY: a debugging read of the title's description.
+            let words: Vec<u64> = (0..32).map(|i| unsafe { _desc.cast::<u64>().add(i).read_unaligned() }).collect();
+            tracing::warn!("pipeline description {words:x?}");
+        }
+    }
+    hand_out(
+        Vec::new(),
+        #[cfg(windows)]
+        None,
+        #[cfg(target_os = "macos")]
+        None,
+        iid,
+        out,
+    )
+}
+
 /// Device method 0x1f0: the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is

@@ -218,8 +218,12 @@ pub(crate) fn present(queue: This, resource: This) {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
     });
-    if let Some(Err(e)) = shown {
-        tracing::warn!(error = %e, "a frame was not presented");
+    match shown {
+        Some(Err(e)) => tracing::warn!(error = %e, "a frame was not presented"),
+        Some(Ok(false)) => {
+            NO_TEXTURE.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
     }
 }
 
@@ -393,6 +397,23 @@ fn dropped() {
     DROPPED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Draws the title recorded, and those that went on to the host list.
+static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Presents whose resource had no host texture.
+static NO_TEXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(draws recorded, draws handed to the host list, draws dropped for want of a host pipeline,
+/// presents that found no host texture)`, for the frame log.
+pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
+    (
+        RECORDED.load(Ordering::Relaxed),
+        ENCODED.load(Ordering::Relaxed),
+        DROPPED.load(Ordering::Relaxed),
+        NO_TEXTURE.load(Ordering::Relaxed),
+    )
+}
+
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
 fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
@@ -523,21 +544,29 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
 }
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if graphics(t, l)
-            && let Err(e) = l.list.draw_instanced(vertices, instances, first, first_instance)
-        {
-            tracing::warn!(error = %e, "draw");
+        if graphics(t, l) {
+            match l.list.draw_instanced(vertices, instances, first, first_instance) {
+                Ok(()) => {
+                    ENCODED.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => tracing::warn!(error = %e, "draw"),
+            }
         }
     });
 }
 
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if graphics(t, l)
-            && let Err(e) = l.list.draw_indexed_instanced(indices, instances, first, base, first_instance)
-        {
-            tracing::warn!(error = %e, "indexed draw");
+        if graphics(t, l) {
+            match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
+                Ok(()) => {
+                    ENCODED.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => tracing::warn!(error = %e, "indexed draw"),
+            }
         }
     });
 }
