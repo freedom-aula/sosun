@@ -3077,7 +3077,8 @@ impl<'a> Lower<'a> {
                 let hi = if self.x.wave32_host { None } else { hi };
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            // A mesh program's lanes are the console's too (`lane_index_at`).
+            Atom::Constant(k) if self.console_lanes || self.s.mesh.is_some() => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
@@ -3122,7 +3123,9 @@ impl<'a> Lower<'a> {
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        self.s.flags |= flags::WAVE_OPS;
+        if self.s.mesh.is_none() {
+            self.s.flags |= flags::WAVE_OPS;
+        }
         let lane = self.lane_index_at(at);
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
@@ -4170,6 +4173,12 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
+        self.lane_index_at(self.cur)
+    }
+
+    /// [`Self::lane_index`] in DXIL block `at`. On a 32-lane host where a
+    /// console wave is two host waves, the lane is the group index modulo 64.
+    fn lane_index_at(&mut self, at: usize) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
@@ -4177,12 +4186,6 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        self.lane_index_at(self.cur)
-    }
-
-    /// [`Self::lane_index`] in DXIL block `at`. On a 32-lane host where a
-    /// console wave is two host waves, the lane is the group index modulo 64.
-    fn lane_index_at(&mut self, at: usize) -> V {
         if self.halves {
             let f = self.console_flat();
             let m = self.s.m.i32(63);
@@ -8413,7 +8416,7 @@ impl<'a> Lower<'a> {
                             self.s.m.bool(false)
                         } else if x == u32::MAX {
                             self.s.m.bool(true)
-                        } else if self.console_lanes {
+                        } else if self.console_lanes || self.s.mesh.is_some() {
                             let lo = self.s.m.i32(x);
                             let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
                             self.lane_bit(c, lo, Some(hi))

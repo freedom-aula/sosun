@@ -106,6 +106,14 @@ fn infer(
     }
     let list = crate::gfx10::decode(code)?;
     let wave64 = infer_wave64(&list);
+    // A vertex stage that exports primitives is an NGG program, run as a mesh shader.
+    let stage = if stage == HwStage::Vs
+        && list.iter().any(|i| matches!(i.fields(wave64), Fields::Exp { target: EXP_PRIM, .. }))
+    {
+        HwStage::Ms
+    } else {
+        stage
+    };
     let (mut layout, mut used) = metadata_resources(meta, RECORDS, |_| Ok(1))?;
     // The registers the program names: its VGPR count, and what it reads on entry.
     let p = crate::ir::build(code, wave64, 256)?;
@@ -145,7 +153,10 @@ fn infer(
     // (`hi == 0`) feeding resource/sampler instructions; upgrade when the register image or root
     // signature blob is decoded.
     let inferred_roots = crate::resource::infer_roots(&p, &layout, stage)?;
+    // The tracer names SGPRs; a mesh program's user data starts at s8 (`HwStage::user_sgpr`).
+    let user_data_of = |sgpr: u8| sgpr.checked_sub(stage.user_sgpr(0));
     for (user_data, root) in inferred_roots.heaps {
+        let Some(user_data) = user_data_of(user_data) else { continue };
         if !occupied(&layout, user_data) {
             layout.push(RootParam {
                 root,
@@ -183,7 +194,7 @@ fn infer(
     // shortcut: the slot is the first free one; the register image does not
     // yet say which root parameter holds the pair.
     if let Ok(res) = crate::resource::track(&p, &layout, stage, None) {
-        for n in res.memory_inputs {
+        for n in res.memory_inputs.into_iter().filter_map(user_data_of) {
             if occupied(&layout, n) || occupied(&layout, n + 1) {
                 continue;
             }
@@ -271,7 +282,7 @@ fn infer(
     merge(&mut targets);
     attrs.sort_unstable();
 
-    let (io, sigs) = if stage == HwStage::Vs {
+    let (io, sigs) = if stage != HwStage::Ps {
         let rows = params.iter().map(|p| u32::from(p.0) + 1).max().unwrap_or(0);
         let mut outs: Vec<SigElement> = params
             .iter()
@@ -288,7 +299,12 @@ fn infer(
                 pack2: false,
             })
             .collect();
-        (StageIo::Vs { inputs: Vec::new(), outputs }, (Vec::new(), outs))
+        let io = if stage == HwStage::Ms {
+            StageIo::Ms(mesh_io(&p, &list, wave64, outputs)?)
+        } else {
+            StageIo::Vs { inputs: Vec::new(), outputs }
+        };
+        (io, (Vec::new(), outs))
     } else {
         let mut ins: Vec<SigElement> = attrs
             .iter()
@@ -407,6 +423,58 @@ fn infer(
         )
     };
     Ok((NativeProgram { stage, wave64, vgprs, layout, used, io, code: code.to_vec() }, sigs))
+}
+
+/// `exp prim`'s target.
+const EXP_PRIM: u8 = 20;
+
+/// What a mesh-style (NGG) vertex program's stage data would say, inferred from its code. All of
+/// it is a guess (docs/native-host.md, "Mesh-style vertex programs"): the register image that
+/// holds the group size is not decoded.
+/// * The group id arrives in v5 times the group stride, and the program shifts it right
+///   (`v_lshrrev_b32 vN, k, v5`): the group is `1 << k` lanes, which is also its maximum
+///   vertex and primitive count (the title's programs count both in 7 bits plus one, k = 7).
+/// * Triangles, every output per vertex, no clip distances.
+/// * LDS: up to the highest `ds_*` offset plus 16 bytes.
+// shortcut: LDS addresses are taken as constant 0 plus the offset (all the title's NGG programs
+// share three dwords at offsets 0, 4 and 8); a computed address beyond would be out of bounds.
+fn mesh_io(
+    p: &Program,
+    list: &[Instruction],
+    wave64: bool,
+    outputs: Vec<VsOutput>,
+) -> Result<crate::native::MeshIo, ShaderError> {
+    let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
+    let shift = p.blocks.iter().flat_map(|b| &b.insts).find_map(|i| match &i.fields {
+        Fields::Valu(v) if i.name() == "v_lshrrev_b32" && group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g))) => {
+            match v.src.first() {
+                Some(&Operand::Const(c @ 128..=135)) => Some(u32::from(c - 128)),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    let Some(shift) = shift else {
+        return Err(ShaderError::Unsupported { offset: 0, what: "a mesh-style vertex program whose group stride is not a shift" });
+    };
+    let threads = 1 << shift;
+    let lds_bytes = list
+        .iter()
+        .filter_map(|i| match i.fields(wave64) {
+            Fields::Ds { offset0, offset1, gds: false, .. } => Some((u32::from(offset1) << 8 | u32::from(offset0)) + 16),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    Ok(crate::native::MeshIo {
+        outputs,
+        clip_cntl: 0,
+        threads,
+        max_vertices: threads,
+        max_primitives: threads,
+        topology: 2,
+        lds_bytes,
+    })
 }
 
 /// Infers whether `list` runs as wave64 (else wave32) from ISA signals rather than formatted text
@@ -944,5 +1012,33 @@ mod tests {
                 .any(|&(_, a)| a.param == crate::resource::MEMORY),
             "{r:?}"
         );
+    }
+
+    /// A mesh-style vertex program as the title's start: lane 0 alone (EXEC 1) takes the group
+    /// id from v5 by a shift of 7, then every lane exports a position and a primitive.
+    pub(crate) fn ngg_code() -> Vec<u8> {
+        words(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xF800_08CF,
+            0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            0xF800_0941,
+            0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+    }
+
+    #[test]
+    fn a_vertex_program_exporting_primitives_is_a_mesh_program() {
+        let (p, _) = infer(HwStage::Vs, &ngg_code(), &meta_with(&[])).unwrap();
+        assert_eq!(p.stage, HwStage::Ms);
+        let StageIo::Ms(ms) = &p.io else { panic!("not a mesh program: {:?}", p.io) };
+        assert_eq!((ms.threads, ms.max_vertices, ms.max_primitives, ms.topology), (128, 128, 128, 2));
+        // Translated as a mesh shader; its EXEC of a constant 1 is lane 0 of each console wave.
+        let c = container(HwStage::Vs, &ngg_code(), &meta_with(&[])).unwrap();
+        let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
+        let h = super::super::translate_with(&c, options).unwrap();
+        assert_eq!(h.stage, HwStage::Ms);
     }
 }
