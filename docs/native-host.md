@@ -600,6 +600,10 @@ have partly run, and its source may have changed since). Guess: the console has 
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
 policy, not console behaviour.
 
+#### CPU texture transfers are bounds-checked
+
+`upload_texture` and `read_texture` compute what the mip needs from the texture's format (blocks wide times bytes per block, rows, slice pitch) and skip the Metal call, with a warning naming the format, region, pitches and buffer length (and a backtrace the first time), when the row pitch, slice pitch or buffer is too small. Metal's `AGX: Texture read/write assertion failed: bytes_per_row >= used_bytes_per_row` was seen 0.6-2 s before a burst of title-heap corruption, so a short pitch is suspected to let the driver run past the buffer; the check keeps that out of host memory (hypothesis, not yet proven).
+
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).

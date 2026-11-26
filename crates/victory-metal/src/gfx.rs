@@ -67,6 +67,37 @@ impl Drop for Heap {
 
 pub struct Texture {
     tex: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// What the pixels are as Metal reads them: sizes the CPU transfers' bounds check.
+    format: Format,
+}
+
+/// What a CPU transfer of a `w` x `h` x `d` mip needs of `format`: `(row bytes, total bytes)`, or the
+/// reason the pitches or the `len` bytes cannot hold it. Metal asserts (and may write past the buffer)
+/// when the row pitch is short, so a refused transfer is skipped.
+fn transfer_need(format: Format, [w, h, d]: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> Result<usize, (usize, usize)> {
+    let row = format.row_bytes(w);
+    let rows = h.div_ceil(format.block().0);
+    let image = (rows - 1) * row_pitch + row;
+    let total = if d > 1 { (d - 1) * slice_pitch + image } else { image };
+    if row_pitch < row || (d > 1 && slice_pitch < image) || len < total {
+        return Err((row, total));
+    }
+    Ok(total)
+}
+
+/// Whether the transfer fits; else logs it (the backtrace once) and says to skip it.
+#[allow(clippy::too_many_arguments)]
+fn transfer_fits(what: &str, t: &Texture, mip: usize, dims: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> bool {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    let Err((row, total)) = transfer_need(t.format, dims, row_pitch, slice_pitch, len) else {
+        return true;
+    };
+    tracing::warn!(
+        "{what} skipped: {:?} {:?} mip {mip} region {}x{}x{} row_pitch {row_pitch} slice_pitch {slice_pitch} buffer {len} bytes, needs row {row} total {total}",
+        t.format, t.tex.pixelFormat(), dims[0], dims[1], dims[2]
+    );
+    FIRST.call_once(|| tracing::warn!("first refused transfer, called from:\n{}", std::backtrace::Backtrace::force_capture()));
+    false
 }
 
 impl Texture {
@@ -758,7 +789,7 @@ impl ResourceBackend for Metal {
             .dev
             .newTextureWithDescriptor(&td)
             .ok_or("newTextureWithDescriptor failed")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: d.format })
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
@@ -772,6 +803,7 @@ impl ResourceBackend for Metal {
         } else {
             pixel_format(v.format)
         };
+        let title_format = if is_depth(source) { t.format } else { v.format };
         // Metal asserts (it does not return nil) on a range past the texture, which a
         // title view asks for over a texture we made with fewer levels or layers (one
         // over title memory has one level): the range is cut to what is there.
@@ -797,7 +829,7 @@ impl ResourceBackend for Metal {
                 .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: title_format })
     }
 
     fn create_texture_over_memory(
@@ -827,7 +859,7 @@ impl ResourceBackend for Metal {
             .buf
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, row_pitch)
             .ok_or("buffer-backed texture refused (offset, pitch or format)")?;
-        Ok(Texture { tex })
+        Ok(Texture { tex, format: d.format })
     }
 
     fn linear_alignment(&self, f: Format) -> usize {
@@ -849,6 +881,9 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
+        if !transfer_fits("upload_texture", t, mip, [w, h, d], row_pitch, slice_pitch, data.len()) {
+            return;
+        }
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: size([w, h, d]),
@@ -881,6 +916,9 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
+        if !transfer_fits("read_texture", t, mip, [w, h, d], row_pitch, slice_pitch, out.len()) {
+            return;
+        }
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: size([w, h, d]),
@@ -1925,6 +1963,25 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn transfers_are_checked_against_the_format() {
+        // RGBA16Float 4x4: a row is 32 bytes.
+        assert!(transfer_need(Format::Rgba16Float, [4, 4, 1], 16, 0, 1 << 20).is_err());
+        assert_eq!(transfer_need(Format::Rgba16Float, [4, 4, 1], 32, 0, 128), Ok(128));
+        // BC1 8x8: 2 block rows of 16 bytes; the last row needs no padding.
+        assert_eq!(transfer_need(Format::Bc1, [8, 8, 1], 16, 0, 32), Ok(32));
+        assert!(transfer_need(Format::Bc1, [8, 8, 1], 8, 0, 1 << 20).is_err());
+        // Too short a buffer, and a 3D slice pitch below one image.
+        assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 1], 16, 0, 63).is_err());
+        assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 32, 1 << 20).is_err());
+        assert_eq!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 64, 128), Ok(128));
+    }
 }
 
 #[cfg(test)]
