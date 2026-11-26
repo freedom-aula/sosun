@@ -1579,25 +1579,25 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
-        // Attachments must agree in size and sample count. Metal renders to the intersection and
-        // does not complain, which hides a title or decoder bug behind a cropped picture; refusing
-        // the pass is also the one refusal a test can build without a device error.
-        let mut shape = None;
+        // Attachments must agree in sample count. Their sizes may differ (a 1920x1080 colour
+        // target over a 3840x2160 depth target in GTA VI's story load): the console draws into
+        // the area all of them cover, and so does the pass, constrained to that intersection.
+        let mut samples = None;
+        let mut rt_size = (usize::MAX, usize::MAX);
         for t in rp
             .color
             .iter()
             .map(|c| &c.texture.tex)
             .chain(rp.depth.as_ref().map(|d| &d.texture.tex))
         {
-            let s = (t.width(), t.height(), t.sampleCount());
-            if let Some(want) = shape
-                && want != s
+            let n = t.sampleCount();
+            if let Some(want) = samples
+                && want != n
             {
-                return Err(format!(
-                    "render targets of different sizes or samples: {want:?} and {s:?}"
-                ));
+                return Err(format!("render targets of different sample counts: {want} and {n}"));
             }
-            shape = Some(s);
+            samples = Some(n);
+            rt_size = (rt_size.0.min(t.width()), rt_size.1.min(t.height()));
         }
         if rp.color.is_empty() && rp.depth.is_none() {
             // The title drew with no render targets. D3D12 runs it (it writes nothing visible);
@@ -1613,6 +1613,8 @@ impl Metal {
             return Ok(());
         }
         let desc = MTLRenderPassDescriptor::new();
+        desc.setRenderTargetWidth(rt_size.0);
+        desc.setRenderTargetHeight(rt_size.1);
         for (i, c) in rp.color.iter().enumerate() {
             // SAFETY: colour attachment index below 8.
             let a = unsafe { desc.colorAttachments().objectAtIndexedSubscript(i) };
@@ -1707,12 +1709,6 @@ impl Metal {
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex);
         }
-        let rt_size = rp
-            .color
-            .first()
-            .map(|c| &c.texture.tex)
-            .or(rp.depth.as_ref().map(|d| &d.texture.tex))
-            .map_or((0, 0), |t| (t.width(), t.height()));
         let mut named = Vec::new();
         for (k, d) in rp.draws.iter().enumerate() {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {

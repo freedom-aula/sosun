@@ -302,6 +302,26 @@ fn stencil_test_and_reference_are_applied() {
     assert_eq!(px(&out, 14, 14), [0, 0, 255, 255], "stencil zero: left alone");
 }
 
+/// A colour target smaller than its depth target (a 1920x1080 target over a 3840x2160 depth
+/// buffer in GTA VI's story load) draws into the area both cover, as the console does, with a
+/// scissor of the whole depth target. The pass used to be refused, and the whole piece with it.
+#[test]
+fn a_depth_target_larger_than_the_colour_target_still_draws() {
+    let Some(r) = Rig::new() else { return };
+    let color = r.target(Format::Rgba8Unorm, false);
+    let mut d = TextureDesc::d2(Format::D32FloatS8, W * 2, W * 2);
+    d.render_target = true;
+    let depth = r.h.texture(&d).unwrap();
+    let pso = r.pipeline(Some(Format::D32FloatS8), &[], |d| d.depth_test = Some((true, Compare::Always)));
+    let mut l = r.list(&color, Some(&depth), [0.0, 0.0, 1.0, 1.0]);
+    l.set_scissor(Some([0, 0, 2 * W as i32, 2 * W as i32]));
+    r.draw(&mut l, &pso, 0, &triangle([1.0, 0.0, 0.0, 1.0]));
+    run(&r.h, &[&l]);
+    let out = r.read(&color);
+    assert_eq!(px(&out, 8, 8), [255, 0, 0, 255], "inside the triangle");
+    assert_eq!(px(&out, 0, 0), [0, 0, 255, 255], "cleared corner");
+}
+
 /// Clearing depth must preserve stencil written by an earlier draw.
 #[test]
 fn depth_only_clear_preserves_stencil() {
