@@ -918,7 +918,7 @@ mod tests {
         assert!(!p2.layout.iter().any(|r| r.slot == VERTEX_TABLE && r.user_data == 0));
 
         // Genuinely unknown SGPR address (non-descriptor s_load_dword from s[6:7]) is NOT promoted
-        // and still fails resource::track with "an address in an SGPR that is no root parameter".
+        // to a root parameter; it tracks as a title-memory address.
         let unknown = words(&[
             0xF400_0203,
             0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
@@ -928,13 +928,12 @@ mod tests {
         ]);
         let (p3, _) = infer(HwStage::Vs, &unknown, &meta_s0).unwrap();
         let ir = crate::ir::build(&p3.code, p3.wave64, p3.vgprs).unwrap();
-        let err = crate::resource::track(&ir, &p3.layout, p3.stage, None).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                offset: 0,
-                what: "an address in an SGPR that is no root parameter",
-            }
+        let r = crate::resource::track(&ir, &p3.layout, p3.stage, None).unwrap();
+        assert!(
+            r.scalar
+                .iter()
+                .any(|&(_, a)| a.param == crate::resource::MEMORY),
+            "{r:?}"
         );
     }
 }

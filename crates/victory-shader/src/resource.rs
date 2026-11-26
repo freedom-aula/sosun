@@ -884,9 +884,10 @@ impl<'a> Tracer<'a> {
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register); title memory ([`MEMORY`]) when the
-    /// program computes it from data. Addresses into descriptor heaps, the
-    /// code or an SGPR the root signature does not fill are traced or
-    /// refused.
+    /// program computes it from data, including from a live-in SGPR the
+    /// root signature does not fill (the console's user data carries raw
+    /// addresses; guessed: such a pair is always a title-memory address).
+    /// Addresses into descriptor heaps or the code are traced or refused.
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         const DATA: &[&str] = &[
             "an address not from a root parameter",
@@ -895,6 +896,7 @@ impl<'a> Tracer<'a> {
             "an address with two computed terms",
             "an address with an untracked high half",
             "an address from a root parameter that is no address",
+            "an address in an SGPR that is no root parameter",
             "a constant address",
         ];
         match self.traced_address(lo, hi, extra) {
@@ -2368,9 +2370,13 @@ pub(crate) fn vertex_roots_match_rebased(
                 (Ok(Some(a)), after) if a.param < absolute.len() && after != Ok(Some(a)) => {
                     return Ok(false);
                 }
-                (Err("an address in an SGPR that is no root parameter"), Ok(Some(a)))
-                    if relative.get(a.param).is_some_and(|r|
-                        matches!(r.root, RootType::Table | RootType::Descriptor)) =>
+                // The old layout leaves the pair undeclared, so its address
+                // is title memory; the rebased one binds it to a table or
+                // descriptor parameter.
+                (Ok(Some(old_a)), Ok(Some(new_a)))
+                    if old_a.param == MEMORY
+                        && relative.get(new_a.param).is_some_and(|r|
+                            matches!(r.root, RootType::Table | RootType::Descriptor)) =>
                 {
                     found = true;
                 }
@@ -3088,21 +3094,18 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
     }
 
+    /// A live-in SGPR pair the layout does not declare holds a title-memory
+    /// address (guessed: the console's user data carries raw addresses), so
+    /// the load tracks to [`MEMORY`] and lowers through the memory space.
     #[test]
-    fn untraceable_addresses_fail_with_a_reason() {
+    fn an_address_in_an_sgpr_no_root_parameter_fills_is_title_memory() {
         let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
             .iter()
             .flat_map(|w: &u32| w.to_le_bytes())
             .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                offset: 0,
-                what: "an address in an SGPR that is no root parameter"
-            }
-        );
+        let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0))]);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the

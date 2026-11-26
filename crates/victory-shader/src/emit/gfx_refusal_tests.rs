@@ -1123,7 +1123,10 @@ fn refusal4_non_generic_and_non_provoking_interp_remain_refused() {
 }
 
 // =========================================================================
-// Refusal #5: "an address in an SGPR that is no root parameter"
+// Former refusal #5: "an address in an SGPR that is no root parameter".
+// Such an address now tracks as title memory and plain loads through it
+// lower; what still refuses is reading the SGPR itself when nothing declares
+// it ("a hardware SGPR input") or building a descriptor around it.
 // =========================================================================
 
 #[test]
@@ -1151,7 +1154,8 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
         graphics::container(HwStage::Vs, &bytes_of(&guessed_heap_vs), &[0u8; 0x10]).unwrap();
     translate_with(&container, Options::default()).unwrap();
 
-    // Non-guessed VS (`layout = []`) reading from undeclared s[2:3] MUST still refuse!
+    // Non-guessed VS (`layout = []`) reading from undeclared s[2:3] MUST still refuse:
+    // the address tracks as title memory, but lowering then reads s[2:3] itself.
     let undeclared_load = [
         0xF400_0101,
         0xFA00_0000, // s_load_dword s4, s[2:3], 0x0
@@ -1165,8 +1169,7 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
         .err()
         .expect("expected refusal");
     assert!(
-        err.to_string()
-            .contains("an address in an SGPR that is no root parameter"),
+        err.to_string().contains("a hardware SGPR input"),
         "got `{err}`"
     );
 }
@@ -1231,7 +1234,7 @@ fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
     ];
     meta[0x25] = 0;
     let err = lower(&unbound, &meta).err().unwrap();
-    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
 #[test]
@@ -1262,7 +1265,11 @@ fn guessed_vertex_rebases_a_header_relative_root_view() {
     assert_eq!(lower(&meta).unwrap().root_cbvs, [3]);
     meta[13] = 6;
     let err = lower(&meta).err().unwrap();
-    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("a buffer descriptor built around a computed address"),
+        "{err}"
+    );
 }
 
 // =========================================================================
