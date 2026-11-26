@@ -13,7 +13,7 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 </p>
 
 > [!IMPORTANT]
-> **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, gets past its "press A" start screen and runs for about 50 seconds (around 1,400 frames). It has drawn its first real image, its boot logo, in a debug mode, but normal frames are still black. We understand where both problems are, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
+> **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, gets past its "press A" start screen and runs for about 50 seconds (around 1,400 frames). Its menus now render on Metal: the start screen and the setup menus draw correctly into the game's UI target. The presented window is still black, and some text draws as boxes. We know where to look for both, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
 ## Why a native port?
 
@@ -37,7 +37,7 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | Loading: DirectStorage reads about 9,500 requests at about 79 MB/s | ✅ Works |
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
 | Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
-| First image on screen | 🟡 The boot logo renders when vertex positions are taken from raw data; in normal runs the vertex shader's constant buffer reads zero |
+| Menus rendering | 🟡 The start screen and setup menus render into the UI target; the final present to the window is still black, and some glyphs draw as boxes |
 | Start screen ("press A") | ✅ Passed with scripted key presses (no live keyboard or gamepad yet) |
 | Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
@@ -81,7 +81,7 @@ Point it at the folder that holds `game_scarlett_master.exe`. A window opens, an
 Whatever your background, there is something to do:
 
 - **Testers:** run the game on your Mac and file a tester report. No coding needed.
-- **Graphics and Metal:** find out why the content draws' constant buffer reads zero on the GPU. This is the step to the first proper frame.
+- **Graphics and Metal:** static samplers in the root layout (the last step to a visible window), glyphs drawn as boxes, texture formats.
 - **Debugging:** the Metal GPU timeout at about 50 s, and live keyboard and gamepad input.
 - **Compilers:** the arm64 recompiler (jump tables, SSE, exceptions).
 - **Rust and systems:** missing Windows and Xbox system calls, speed, tests.

@@ -2,17 +2,17 @@
 
 Updated 26 November 2026. Each problem lists what is already known, so you don't have to rediscover it. The deep detail, with addresses and every diagnostic switch, is in [native-host.md](native-host.md).
 
-## 1. The first proper frame (graphics)
+## 1. From the UI target to the window (graphics)
 
-**Symptom:** from frame ~830 the game issues about 20 indexed "content" draws per frame into a 3840x2160 target. In a normal run they draw nothing.
+**Solved on 26 November:** content draws used to be black. There were two bugs. Guessed render pipelines were built without the host root layout, so shaders read their user data from address 0. And descriptor records the game copies into the shader-visible heap with plain stores were never mirrored. Now the start screen ("ACCOUNT PICKER / SCREEN NARRATION / PLAYER") and the "FINISH SETUP?" menu render correctly into the 3840x2160 UI target.
 
-**Known:**
-- With `VICTORY_DEBUG_VS_POS=1` (vertex positions taken from the raw vertex data), the draws render the game's boot logo, stretched over the screen. So vertex fetch, the vertex→pixel link and the pixel shader all work.
-- `VICTORY_DEBUG_PS=in2` shows that the vertex shader's **constant-buffer reads return zero on the GPU**. The position matrix comes from the same buffer, so every vertex collapses to a point.
-- Ruled out: depth test, depth/stencil formats, Metal command errors, shader signatures, user-data register mapping, descriptor heap index range.
-- The constant buffers sit at low addresses (below 4 GiB, e.g. `0x19abdc00`). The GPU memory pools sit above 4 GiB. **Leading hypothesis:** the GPU address translation has no mapping for that low region.
+**Now:**
+- **The presented image is still black.** The pass that composites the UI target into the swapchain uses a pixel shader with static samplers, and the host `RootLayout` (and `msc.rs`) can't declare static samplers yet, so that stage still gets the old layout. Adding static samplers is the next step to a visible window.
+- **Some glyphs draw as filled boxes,** while the heading font works. It is probably a font-atlas texture format or channel issue.
+- **There is a white band** across the top of the setup menu.
+- Table re-mirroring (`NativeHost::remirror_tables`) only checks the first 16 entries per table.
 
-**Start here:** `crates/victory-gpu/src/native/` (memory, host), the "Guessed graphics pipelines" section of native-host.md.
+**Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-metal/src/msc.rs`, and the "First real frame" section of native-host.md.
 
 ## 2. Running past about 50 seconds (GPU timeout) and live input
 
