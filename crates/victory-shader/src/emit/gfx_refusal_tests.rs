@@ -2280,7 +2280,7 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
 
 /// "a cross-lane operation outside compute" names the operation and the stage, so a tester log
 /// shows which form the title's pixel programs use (127 of 639 refusals in the M5 Ultra log of
-/// #147, all graphics). A quad permutation in a pixel program still lowers.
+/// #147, all graphics). A quad permutation still lowers in a pixel program, not in a vertex one.
 #[test]
 fn a_cross_lane_operation_outside_compute_says_which_and_where() {
     const MRT0: [u32; 2] = [0xF800_180F, 0x0101_0101]; // exp mrt0 v1, v1, v1, v1 done vm
@@ -2313,10 +2313,15 @@ fn a_cross_lane_operation_outside_compute_says_which_and_where() {
             "{err}"
         );
     }
-    let vs = lower_vs(&with(&bpermute, POS0), false, vec![], false);
-    let err = vs.err().expect("vertex").to_string();
-    assert!(
-        err.contains("a cross-lane operation outside compute: ds_bpermute_b32 in a vertex program"),
-        "{err}"
-    );
+    for (op, want) in [
+        (&bpermute[..], "ds_bpermute_b32 in a vertex program"),
+        (&quad[..], "DPP quad_perm in a vertex program"),
+    ] {
+        let vs = lower_vs(&with(op, POS0), false, vec![], false);
+        let err = vs.err().expect(want).to_string();
+        assert!(
+            err.contains(&format!("a cross-lane operation outside compute: {want}")),
+            "{err}"
+        );
+    }
 }

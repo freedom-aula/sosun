@@ -4412,10 +4412,12 @@ impl<'a> Lower<'a> {
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(
-                    quad,
-                    outside_compute!("ds_swizzle_b32 with a bit-mask pattern"),
-                )?;
+                let outside = if quad {
+                    outside_compute!("ds_swizzle_b32 within a quad")
+                } else {
+                    outside_compute!("ds_swizzle_b32 across quads")
+                };
+                self.cross_lane(quad, outside)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -7762,9 +7764,11 @@ impl<'a> Lower<'a> {
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            // GFX10 DPP16 controls (RDNA2 ISA, DPP_CTRL); quad_perm passes above.
+            // GFX10 DPP16 controls (RDNA2 ISA, DPP_CTRL); quad_perm is refused
+            // only outside pixel programs.
             let outside = match dpp {
                 Dpp::Lanes { .. } => outside_compute!("DPP8"),
+                Dpp::Row { ctrl: 0..=0xFF, .. } => outside_compute!("DPP quad_perm"),
                 Dpp::Row {
                     ctrl: 0x101..=0x12F,
                     ..
@@ -8643,7 +8647,12 @@ impl<'a> Lower<'a> {
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
-                    self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
+                    let outside = if matches!(lane, V::Const(_)) {
+                        outside_compute!("v_readlane_b32 of a constant lane")
+                    } else {
+                        outside_compute!("v_readlane_b32 of a computed lane")
+                    };
+                    self.cross_lane(false, outside)?;
                 }
                 let r = if self.mask_data == MaskData::Host {
                     self.read_lane(a, lane)
