@@ -11524,10 +11524,9 @@ impl<'a> Lower<'a> {
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // A typed view has no bytes inside an element to address.
+                if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -11536,6 +11535,15 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                // A store of fewer channels (`_x`, `_xy`, `_xyz`) still
+                // writes the whole element: the hardware stores 0 in the
+                // channels the instruction does not name (GFX11 and older;
+                // LLVM 88421ea "[AMDGPU] Trim zero components from buffer and
+                // image stores", Mesa 4a6ee2c4833 "aco: shrink buffer stores
+                // with undef/zero components"), so they are not kept. Channels
+                // past the view's format are dropped by the host's store.
+                let zero = self.s.m.f32(0);
+                args.resize(3 + 4, zero);
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
                     Some(at) if self.x.view_marks => {

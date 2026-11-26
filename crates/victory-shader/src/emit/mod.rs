@@ -59,7 +59,9 @@
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
 //!   entry's stride when indexed; typed with four 32-bit float channels for
-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
+//!   `buffer_load_format_*` and `buffer_store_format_*` (a store of fewer
+//!   than four channels writes 0 to the others, as GFX10 does; none is at
+//!   an offset inside the element). The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
