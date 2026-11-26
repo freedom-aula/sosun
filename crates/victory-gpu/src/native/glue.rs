@@ -213,8 +213,95 @@ pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::presen
     with_title(|t| t.host.backend.create_layer(width, height)).ok_or_else(|| "no native host GPU".into())
 }
 
+/// `VICTORY_TRACE_TARGETS=1`: per frame, what drew into or cleared which title texture, and what
+/// was presented (logged at each present).
+fn tracing_targets() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_TARGETS").is_some())
+}
+
+/// Draws and clears by title texture since the last present, and dropped texture operations.
+static TRACE: Mutex<Option<std::collections::HashMap<usize, [u32; 2]>>> = Mutex::new(None);
+static DROPPED_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn trace_bump(key: usize, which: usize) {
+    if tracing_targets() {
+        TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().entry(key).or_default()[which] += 1;
+    }
+}
+
+/// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
+/// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`.
+fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
+    use std::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let Some((dir, secs)) = std::env::var("VICTORY_DUMP_TARGETS")
+        .ok()
+        .and_then(|v| v.rsplit_once(',').map(|(d, s)| (d.to_owned(), s.parse::<u64>().unwrap_or(25))))
+    else {
+        return;
+    };
+    if start.elapsed().as_secs() < secs || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    with_title(|t| {
+        for (n, key) in stats.keys().enumerate() {
+            let Some(info) = crate::resource::texture_info(*key as This) else { continue };
+            if !matches!(info.format, 28 | 87 | 91 | 29) {
+                continue;
+            }
+            let Some(tex) = t.texture_of(*key) else { continue };
+            let (w, h) = (info.width as usize, info.height as usize);
+            let mut px = vec![0u8; w * h * 4];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
+            let bgra = matches!(info.format, 87 | 91);
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}.ppm")), out);
+            tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
+        }
+    });
+}
+
+/// A texture operation the native host does not do (copies, resolves), counted by the trace.
+pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
+    if tracing_targets() {
+        DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
+    }
+}
+
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    if tracing_targets() {
+        let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
+        let described: Vec<String> = with_title(|t| {
+            stats
+                .iter()
+                .map(|(k, [d, c])| {
+                    let i = crate::resource::texture_info(*k as This);
+                    let (f, w, h, a) = i.map_or((0, 0, 0, 0), |i| (i.format, i.width, i.height, i.memory as usize));
+                    let mark = if *k == resource as usize { " PRESENTED" } else { "" };
+                    let _ = &t;
+                    format!("{k:#x} fmt {f} {w}x{h} at {a:#x} draws {d} clears {c}{mark}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+        dump_targets(&stats);
+        let pi = crate::resource::texture_info(resource);
+        tracing::info!(
+            present = ?resource,
+            at = pi.as_ref().map_or(0, |i| i.memory as usize),
+            fmt = pi.as_ref().map_or(0, |i| i.format),
+            targets = ?described,
+            dropped_ops = ?ops.iter().take(8).collect::<Vec<_>>(),
+            dropped = ops.len(),
+            "frame targets"
+        );
+    }
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
@@ -271,6 +358,7 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
+        l.target_keys = colors.iter().copied().chain(depth_key).collect();
         l.target_formats = (
             colors.iter().filter_map(|&k| t.format_of(k)).collect(),
             depth_key.and_then(|k| t.format_of(k)),
@@ -283,6 +371,9 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
         if let Some(tex) = crate::descriptor::rtv_record(handle).and_then(|r| t.texture_of(r.resource as usize)) {
+            if let Some(r) = crate::descriptor::rtv_record(handle) {
+                trace_bump(r.resource as usize, 1);
+            }
             l.list.clear_render_target(&tex, color);
         }
     });
@@ -603,6 +694,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
             match l.list.draw_instanced(vertices, instances, first, first_instance) {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
             }
@@ -617,6 +709,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
             }

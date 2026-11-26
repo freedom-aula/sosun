@@ -742,6 +742,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         crate::resource::buffer_bytes(src),
     ) {
         crate::native::glue::copy_memory(this, to as u64, from as u64, a.min(b));
+    } else {
+        #[cfg(target_os = "macos")]
+        crate::native::glue::dropped_op("CopyResource", dst, src);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, dst, src);
@@ -773,6 +776,11 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(target_os = "macos")]
+    // SAFETY: the title passes both locations (null is tolerated).
+    if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1068,6 +1076,8 @@ extern "system" fn resolve(
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::native::glue::dropped_op("ResolveSubresource", dst, src);
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }

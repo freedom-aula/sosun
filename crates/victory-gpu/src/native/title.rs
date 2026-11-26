@@ -59,6 +59,8 @@ pub struct TitleList<B: GraphicsBackend> {
     /// buffers by slot, which a guessed pipeline is made from at its draw.
     pub target_formats: (Vec<Format>, Option<Format>),
     pub strides: Vec<u32>,
+    /// The title resources bound as targets (colour, then depth), for the target trace.
+    pub target_keys: Vec<usize>,
 }
 
 impl<B: GraphicsBackend> Default for TitleList<B> {
@@ -72,6 +74,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             topology: 0,
             target_formats: (Vec::new(), None),
             strides: Vec::new(),
+            target_keys: Vec::new(),
         }
     }
 }
