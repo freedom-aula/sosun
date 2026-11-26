@@ -1072,3 +1072,15 @@ property that stops the tail from clicking at block boundaries), and
 `convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
 `VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
 input).
+
+## Zero-count dispatches, draws and buffer blits
+
+D3D12 treats zero-sized dispatches (`Dispatch`, `DispatchX` with thread counts), draws with zero
+vertices/indices/instances/mesh groups, zero-width/height viewports, and zero-length buffer copies
+or fills as no-ops, whereas Metal's validation layer asserts on `dispatchThreadgroups` with a zero
+grid dimension, `fillBuffer`/`copyFromBuffer` with a zero byte length, and `drawPrimitives`/
+`drawIndexedPrimitives` with `instanceCount == 0`. `NativeList` now skips recording empty direct
+commands (after checking the bound pipeline), and `victory-metal` skips encoding zero-sized direct
+dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
+`zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
+`victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).

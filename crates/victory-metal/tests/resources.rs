@@ -611,3 +611,39 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
         }
     }
 }
+
+#[test]
+fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
+    for m in backends() {
+        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+        let a = Arena::new(&m, 1);
+        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+        m.write_buffer(&heap, 5, &a.buf, a.at(0), 64);
+        m.write_buffer(&heap, 6, &a.buf, a.at(64), 64);
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let dispatches = [Dispatch {
+            pipeline: &p,
+            root: RootArgs::default()
+                .constants(&[5, 7])
+                .address(m.heap_address(&heap, 5)),
+            resources: vec![],
+            heaps: victory_metal::backend::Heaps {
+                resource: Some(&heap),
+                sampler: None,
+            },
+            groups: [0, 1, 1],
+            threads_per_group: [64, 1, 1],
+            indirect: None,
+            count: None,
+        }];
+        let blits = vec![
+            BlitOp::Fill { dst: (&a.buf, a.at(0) as *const u8), len: 0, value: 0xaa },
+            BlitOp::Copy { src: (&a.buf, a.at(0) as *const u8), dst: (&a.buf, a.at(64) as *const u8), len: 0 },
+        ];
+        let passes = [Pass::Compute(&dispatches), Pass::Blit(blits)];
+        let signals = [(&fence, 1)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        assert!(m.wait(&fence, 1, 5000));
+    }
+}

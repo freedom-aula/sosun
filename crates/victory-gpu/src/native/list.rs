@@ -579,6 +579,9 @@ impl<B: GraphicsBackend> NativeList<B> {
             .compute
             .clone()
             .ok_or("dispatch without a compute pipeline")?;
+        if indirect.is_none() && groups.contains(&0) {
+            return Ok(());
+        }
         self.cmds.push(Cmd::Dispatch {
             pso,
             root: self.state.compute_root.clone(),
@@ -593,12 +596,16 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `CopyBufferRegion` between title addresses. Runs on the GPU, in order with the rest.
     pub fn copy_buffer_region(&mut self, dst: u64, src: u64, len: usize) {
-        self.cmds.push(Cmd::Copy { dst, src, len });
+        if len > 0 {
+            self.cmds.push(Cmd::Copy { dst, src, len });
+        }
     }
 
     /// A byte fill of title memory (the console's `FillMemoryX`).
     pub fn fill(&mut self, dst: u64, len: usize, value: u8) {
-        self.cmds.push(Cmd::Fill { dst, len, value });
+        if len > 0 {
+            self.cmds.push(Cmd::Fill { dst, len, value });
+        }
     }
 
     /// `OMSetRenderTargets`.
@@ -684,6 +691,22 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
+        let empty = match call {
+            DrawCall::Arrays { vertex_count, instance_count, .. } => {
+                vertex_count == 0 || instance_count == 0
+            }
+            DrawCall::Indexed { index_count, instance_count, .. } => {
+                index_count == 0 || instance_count == 0
+            }
+            DrawCall::Mesh { groups } => groups.contains(&0),
+        };
+        if empty {
+            self.state
+                .graphics
+                .as_ref()
+                .ok_or("draw without a graphics pipeline")?;
+            return Ok(());
+        }
         self.draw_from(call, None, None)
     }
 
