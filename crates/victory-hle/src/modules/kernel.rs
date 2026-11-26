@@ -155,6 +155,10 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+    if name.is_null() {
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
+        return std::ptr::null_mut();
+    }
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -164,22 +168,19 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
-    if (name as usize) < 0x1_0000 {
-        tracing::warn!(
-            module = m.name,
-            ordinal = name as usize,
-            "GetProcAddress by ordinal"
-        );
-        return std::ptr::null_mut();
-    }
-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
+    // Values below 0x10000 are ordinals (stored as `"#<n>"`, e.g. `gameinput.dll` `#1`).
+    let lookup = if (name as usize) < 0x1_0000 {
+        std::borrow::Cow::Owned(format!("#{}", name as usize))
+    } else {
+        // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+        unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy()
+    };
+    match m.exports.iter().find(|e| e.name == lookup) {
         #[allow(clippy::unnecessary_cast)] // `usize` here, a pointer elsewhere
         Some(e) => title_callable(e.address as usize),
         None => {
-            tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            tracing::warn!(module = m.name, name = %lookup, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -368,6 +369,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// Suspends only the title's own threads. Under Wine on Rosetta, a thread
 /// of ours suspended while Wine held its virtual memory lock left the lock
@@ -623,10 +625,18 @@ mod host {
     }
 
     pub(super) fn load_library_ex_a(name: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
+        if name.is_null() {
+            set_last_error(super::ERROR_MOD_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
         system_dll(&super::narrow(name))
     }
 
     pub(super) fn load_library_ex_w(name: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
+        if name.is_null() {
+            set_last_error(super::ERROR_MOD_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
         system_dll(&super::wide(name))
     }
 
@@ -910,5 +920,19 @@ mod tests {
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
+    }
+
+    #[test]
+    fn null_load_library_and_pseudo_module_ordinals_behave_safely() {
+        assert!(LoadLibraryA(std::ptr::null()).is_null());
+        assert!(LoadLibraryW(std::ptr::null()).is_null());
+        assert!(LoadLibraryExA(std::ptr::null(), std::ptr::null_mut(), 0).is_null());
+        assert!(LoadLibraryExW(std::ptr::null(), std::ptr::null_mut(), 0).is_null());
+
+        let gameinput = LoadLibraryA(c"gameinput.dll".as_ptr().cast());
+        assert!(!gameinput.is_null());
+        assert!(GetProcAddress(gameinput, std::ptr::null()).is_null());
+        assert!(!GetProcAddress(gameinput, std::ptr::without_provenance(1)).is_null());
+        assert!(GetProcAddress(gameinput, std::ptr::without_provenance(2)).is_null());
     }
 }
