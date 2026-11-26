@@ -429,6 +429,13 @@ pub unsafe fn bridged_table(
     Ok(copy)
 }
 
+/// The bridged copy of the method table at `raw`, if there is one.
+pub fn bridged_copy_of(raw: *const *const ()) -> Option<*const *const ()> {
+    let guard = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_raw, _) = guard.as_ref()?;
+    by_raw.get(&(raw as usize)).map(|&c| c as *const *const ())
+}
+
 /// Whether the method table at `table` is one of our bridged copies.
 pub fn is_bridged(table: *const *const ()) -> bool {
     let guard = TABLES.lock().unwrap_or_else(|e| e.into_inner());

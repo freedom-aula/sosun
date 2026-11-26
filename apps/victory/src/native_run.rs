@@ -203,6 +203,7 @@ fn load_late(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -342,6 +343,7 @@ unsafe impl Send for Launch {}
 fn connect_gpu() {
     victory_gpu::object::set_bridge(victory_gpu::object::Bridge {
         is_bridged: native::is_bridged,
+        copy_of: native::bridged_copy_of,
         expose: |this, len, area| {
             // SAFETY: forwarded: a live object of ours whose first word is such a table.
             unsafe { native::expose_object(this, len, area) }

@@ -282,6 +282,20 @@ mod run {
         assert_all(run_probe("probe_netaudio", 0), 0xFFF, "probe_netaudio");
     }
 
+    /// The console device from `D3D12XboxCreateDevice`, called from title code through its bridged
+    /// table (Windows x64 registers and stack, `this` still the object's address).
+    #[test]
+    fn the_d3d12_device_and_its_fence_are_called_through_bridged_tables() {
+        victory_gpu::object::set_bridge(victory_gpu::object::Bridge {
+            is_bridged: native::is_bridged,
+            copy_of: native::bridged_copy_of,
+            // SAFETY: forwarded: a live object of ours with such a table.
+            expose: |this, len, area| unsafe { native::expose_object(this, len, area) },
+            declare_win64: native::declare_win64,
+        });
+        assert_all(run_probe("probe_d3d12", 0), 0xFF, "probe_d3d12");
+    }
+
     #[test]
     fn the_c_runtime_serves_a_title_that_links_it() {
         // The probe imports `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll`:

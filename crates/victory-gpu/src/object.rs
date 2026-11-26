@@ -124,6 +124,8 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
 pub struct Bridge {
     /// Whether a method table is already a bridged copy (`victory_loader::native::is_bridged`).
     pub is_bridged: fn(table: *const *const ()) -> bool,
+    /// The bridged copy of a method table, if it has one (`victory_loader::native::bridged_copy_of`).
+    pub copy_of: fn(raw: *const *const ()) -> Option<*const *const ()>,
     /// Gives the object at `this` (first word: its method table of `len` slots) a table the
     /// title can call, in place (`victory_loader::native::expose_object`).
     pub expose: unsafe fn(this: *const (), len: usize, area: &'static str),
@@ -142,6 +144,16 @@ pub fn set_bridge(bridge: Bridge) {
             declare(f);
         }
     }
+}
+
+/// Whether `word`, the first word of something in title memory, is `table` or its bridged copy:
+/// the test for "one of our objects".
+pub(crate) fn is_table(word: usize, table: *const *const ()) -> bool {
+    word == table as usize
+        || BRIDGE
+            .get()
+            .and_then(|b| (b.copy_of)(table))
+            .is_some_and(|copy| word == copy as usize)
 }
 
 /// An object leaves for the title: its table becomes one the title can call. Idempotent.

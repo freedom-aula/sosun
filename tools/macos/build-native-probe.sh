@@ -15,7 +15,7 @@ for def in xgameruntime victory-probe-host victory-probe-dll ucrtbase-probe ucrt
     "$LLVM/bin/llvm-dlltool" -m i386:x86-64 -d "$SRC/$def.def" -l "$WORK/lib$def.a"
 done
 # Import libraries for the network, media and audio DLLs (probe_net.c).
-for def in probe-ws2 probe-winhttp probe-mfplat probe-xaudio2; do
+for def in probe-ws2 probe-winhttp probe-mfplat probe-xaudio2 probe-d3d12; do
     "$LLVM/bin/llvm-dlltool" -m i386:x86-64 -d "$SRC/$def.def" -l "$WORK/lib$def.a"
 done
 # The DLL the probe imports, built first: it goes beside the probe, as a
@@ -33,5 +33,5 @@ tools/macos/gnullvm-cc.sh -O1 -ffreestanding -fno-builtin -fno-stack-protector \
     -Wl,--entry,probe_main -Wl,--subsystem,console -Wl,--dynamicbase \
     -Wl,--image-base,0x140000000 -Wl,--export-all-symbols \
     -L"$WORK" "$SRC/probe.c" "$SRC/probe_net.c" -lxgameruntime -lvictory-probe-host -lvictory-probe-dll -lucrtbase-probe -lucrt-math \
-    -lprobe-ws2 -lprobe-winhttp -lprobe-mfplat -lprobe-xaudio2 -lkernel32 -o "$OUT"
+    -lprobe-ws2 -lprobe-winhttp -lprobe-mfplat -lprobe-xaudio2 -lprobe-d3d12 -lkernel32 -o "$OUT"
 echo "$OUT"

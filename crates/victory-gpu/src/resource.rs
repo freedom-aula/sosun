@@ -1531,7 +1531,7 @@ pub(crate) fn is_resource(p: This) -> bool {
     let mut word = [0u8; 8];
     !p.is_null()
         && crate::queue::read_bytes(p as usize, &mut word)
-        && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.f.as_ptr() as usize
+        && crate::object::is_table(usize::from_le_bytes(word), RESOURCE_FUNCTIONS.f.as_ptr())
 }
 
 fn resource<'a>(this: This) -> &'a Resource {

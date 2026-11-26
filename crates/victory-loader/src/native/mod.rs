@@ -32,7 +32,7 @@ pub mod threadctl;
 pub use bind::bind_imports;
 #[cfg(target_arch = "x86_64")]
 pub use bridge::{
-    bridged_table, call_win64, declare_direct, declare_win64, expose_object, host_callbacks,
+    bridged_copy_of, bridged_table, call_win64, declare_direct, declare_win64, expose_object, host_callbacks,
     is_bridged, is_title_code,
 };
 #[cfg(target_arch = "x86_64")]

@@ -36,6 +36,7 @@ fn check_cpu_features() -> Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -602,6 +603,7 @@ mod cpu_check_tests {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -625,6 +627,7 @@ pub fn run(
 }
 
 #[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     _: &Path,
     _: Unimplemented,

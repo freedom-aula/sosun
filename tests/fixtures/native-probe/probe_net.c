@@ -66,14 +66,8 @@ enum {
 };
 #define NET_ALL 0xFFFu
 
-/* The compiler turns larger initialisers into calls; there is no libc. */
-__attribute__((used, noinline)) void *memset(void *dest, int value, u64 count)
-{
-    volatile u8 *p = dest;
-    while (count--)
-        *p++ = (u8)value;
-    return dest;
-}
+/* memset (which the compiler emits for larger initialisers) comes from the import library of
+   ucrtbase-probe, as probe.c's. */
 
 static ptr vslot(ptr object, int slot)
 {
@@ -194,5 +188,51 @@ u32 probe_netaudio(ptr unused)
     if (master)
         ((void (*)(ptr))vslot(master, 18))(master);
     ((u32 (*)(ptr))vslot(engine, 2))(engine);
+    return ok;
+}
+
+/* d3d12_xs.dll: the console device, made by the host's graphics objects and called through the
+ * methods of its (bridged) table: four register arguments, a fence made with an interface id and
+ * an out pointer, a slot nobody wrote. */
+IMPORT int D3D12XboxCreateDevice(ptr, const u32 *, const void *, ptr *);
+
+u32 probe_d3d12(ptr unused)
+{
+    (void)unused;
+    static const u8 IID_DEVICE[16] = {0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b,
+                                      0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7};
+    static const u8 IID_FENCE[16] = {0xcf, 0x3d, 0x75, 0x0a, 0xd8, 0xc4, 0x91, 0x4b,
+                                     0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76};
+    u32 ok = 0;
+    u32 params[16] = {0x20004};
+    ptr device = 0;
+    if (D3D12XboxCreateDevice(0, params, IID_DEVICE, &device) == 0 && device)
+        ok |= 1;
+    if (!device)
+        return ok;
+    if (((u32(*)(ptr))vslot(device, 7))(device) == 1) /* GetNodeCount */
+        ok |= 2;
+    u32 options[16] = {0};
+    if (((int(*)(ptr, u32, ptr, u32))vslot(device, 13))(device, 0, options, 64) == 0 &&
+        options[9] == 40) /* CheckFeatureSupport: GPU address bits */
+        ok |= 4;
+    ptr fence = 0;
+    if (((int(*)(ptr, u64, u32, const void *, ptr *))vslot(device, 36))(device, 5, 0, IID_FENCE,
+                                                                       &fence) == 0 &&
+        fence)
+        ok |= 8; /* CreateFence */
+    if (fence && ((u64(*)(ptr))vslot(fence, 8))(fence) == 5) /* GetCompletedValue */
+        ok |= 16;
+    ptr same = 0;
+    if (fence && ((int(*)(ptr, const void *, ptr *))vslot(fence, 7))(fence, IID_DEVICE, &same) == 0 &&
+        same == device) /* GetDevice */
+        ok |= 32;
+    /* A slot nobody wrote answers E_NOTIMPL (and logs), and so does one past the table. */
+    if (((int(*)(ptr))vslot(device, 30))(device) == (int)0x80004001)
+        ok |= 64;
+    if (((int(*)(ptr))vslot(device, 170))(device) == (int)0x80004001)
+        ok |= 128;
+    if (fence)
+        ((u32(*)(ptr))vslot(fence, 2))(fence);
     return ok;
 }
