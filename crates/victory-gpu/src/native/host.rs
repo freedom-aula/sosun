@@ -392,7 +392,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             &ViewDesc {
                                 format,
                                 mips: (first as usize, count as usize),
-                                slices: (0, 1),
+                                // Every slice of an array (the backend cuts it to what is there):
+                                // one slice showed an array view's first alone.
+                                slices: (0, usize::MAX),
                             },
                         )?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);

@@ -610,6 +610,14 @@ texture is released (guess: the title is done with it once it places another the
 old description still in a heap would name a released texture). Every texture placed in a pool is
 released at the first submission after the pool is (`NativeHost::released_pools`).
 
+#### Texture views show every array slice
+
+A texture view with a mip range (2D views, and every placed texture view) was made with one array
+slice, so a view of a texture array (placed views do not look at the view's dimension) showed
+slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend cuts the range to
+the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
+count are not read; a view of part of an array shows all of it.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers
