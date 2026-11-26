@@ -397,7 +397,9 @@ each allocation its entries name. An allocation is added when an entry first nam
 the last entry naming it is overwritten or the heap is dropped; the set does not retain what it holds,
 the heap does. The set is committed when entries changed and given to each command buffer that uses
 the heap (`useResidencySet`), so what the heap names is resident while that command buffer runs:
-residency follows the frame, and nothing is rebuilt per command buffer.
+residency follows the frame, and nothing is rebuilt per command buffer. `clear_entry` empties an
+entry (zero bytes, nothing kept): the host clears the entries of a texture the title released, so
+what the heap keeps alive and wired does not grow with play time.
 
 `VICTORY_METAL_RESIDENCY_SETS=0` names every allocation a heap names to every encoder with
 `useResource` instead, which is also what a Mac with less than 32 GiB does when the switch is unset.
@@ -447,7 +449,9 @@ Findings:
   (an assertion abort, not an error return: "not castable"); a depth texture is written to the heap
   itself and the shader samples it as `Texture2D<float4>` (depth in `.x`), which works. So `twin.rs`'s
   colour twin is still the way to a UAV on depth, to be checked on real shaders. `create_texture_view`
-  should validate format compatibility before calling Metal.
+  refuses a format Metal cannot cast the texture to (`castable`: uncompressed formats of one texel
+  size, or a BC format and its sRGB or signed twin; checked: R32Uint, RGB10A2 and BGRA8 views of an
+  RGBA8 texture are made, R8, RGBA16F, BC1 and depth ones are errors).
 - Samplers: `MTLSamplerDescriptor` with `supportArgumentBuffers = true` (without it there is no resource
   ID). Linear blends and nearest does not, through a sampler heap.
 - **Textures over zero-copy memory**: `newTextureWithDescriptor:offset:bytesPerRow:` on the wrapped title

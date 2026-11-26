@@ -212,6 +212,24 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
     }
 }
 
+/// Whether a texture of `from` may be viewed as `to`: uncompressed formats of one texel size, or
+/// a block format and its sRGB or signed twin. Never wider than what Metal casts (it asserts on
+/// the rest); a depth view of a colour texture is not one of them.
+fn castable(from: Format, to: Format) -> bool {
+    use Format::*;
+    let twin = |f| match f {
+        Bc1Srgb => Bc1,
+        Bc3Srgb => Bc3,
+        Bc7Srgb => Bc7,
+        Bc6hSigned => Bc6h,
+        f => f,
+    };
+    if matches!(to, D32Float | D32FloatS8 | D16Unorm) {
+        return false;
+    }
+    if from.block().0 == 1 { from.block() == to.block() } else { twin(from) == twin(to) }
+}
+
 fn tex_type(d: TexDim) -> MTLTextureType {
     match d {
         TexDim::D2 => MTLTextureType::Type2D,
@@ -789,6 +807,10 @@ impl ResourceBackend for Metal {
         self.heap_entry(heap, index, [id, 0, lod_bias.to_bits() as u64], None);
     }
 
+    fn clear_entry(&self, heap: &Heap, index: usize) {
+        self.heap_entry(heap, index, [0; 3], None);
+    }
+
     fn create_texture(&self, d: &TextureDesc) -> Result<Texture, String> {
         let td = MTLTextureDescriptor::new();
         td.setTextureType(tex_type(d.dim));
@@ -837,6 +859,11 @@ impl ResourceBackend for Metal {
             pixel_format(v.format)
         };
         let title_format = if is_depth(source) { t.format } else { v.format };
+        // Metal asserts on a format it cannot cast the texture to, too: a title view left in a
+        // heap over a resource object the title has since made anew, with another format.
+        if format != source && !castable(t.format, v.format) {
+            return Err(format!("a {:?} view of a {:?} texture", v.format, t.format));
+        }
         // Metal asserts (it does not return nil) on a range past the texture, which a
         // title view asks for over a texture we made with fewer levels or layers (one
         // over title memory has one level): the range is cut to what is there.
@@ -2223,5 +2250,12 @@ mod heap_set_tests {
         assert_eq!(held(), 3);
         m.write_texture(&heap, 1, &t2, 0.0);
         assert_eq!(held(), 2, "the first texture went with its last entry");
+        m.clear_entry(&heap, 0);
+        assert_eq!(held(), 2, "an entry still names the second texture");
+        m.clear_entry(&heap, 1);
+        assert_eq!(held(), 1, "cleared entries let their texture go");
+        // SAFETY: the heap buffer holds four entries of `ENTRY` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY) };
+        assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
     }
 }
