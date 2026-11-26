@@ -34,6 +34,7 @@ mod system;
 pub(crate) mod ucrt;
 mod winhttp;
 mod winsock;
+mod wasapi;
 mod xaudio2;
 
 const WAIT_OBJECT_0: u32 = 0;

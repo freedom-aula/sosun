@@ -1629,12 +1629,31 @@ pub extern "system" fn CoInitializeEx(_reserved: *const c_void, _model: u32) -> 
 pub extern "system" fn CoUninitialize() {}
 
 pub extern "system" fn CoCreateInstance(
-    _class: *const c_void,
+    class: *const c_void,
     _outer: *const c_void,
     _context: u32,
-    _interface: *const c_void,
+    interface: *const c_void,
     out: *mut *mut c_void,
 ) -> i32 {
+    if let Some(hr) = super::wasapi::create(class, interface, out) {
+        return hr;
+    }
+    static SEEN: Mutex<Vec<([u8; 16], [u8; 16])>> = Mutex::new(Vec::new());
+    let guid = |p: *const c_void| {
+        let mut g = [0u8; 16];
+        if !p.is_null() {
+            // SAFETY: a 16-byte GUID.
+            g.copy_from_slice(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), 16) });
+        }
+        g
+    };
+    let key = (guid(class), guid(interface));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        seen.push(key);
+        tracing::info!(class = ?key.0, interface = ?key.1, "CoCreateInstance: class not registered");
+    }
+    drop(seen);
     if !out.is_null() {
         // SAFETY: the title's output pointer.
         unsafe { out.write(std::ptr::null_mut()) };
