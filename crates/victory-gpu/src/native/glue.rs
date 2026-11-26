@@ -9,7 +9,7 @@
 //! work and fence values along.
 
 use super::memory::{PoolObserver, PoolTable};
-use super::title::{Pipe, Title, TitleList, Wait};
+use super::title::{Pipe, TargetFormats, Title, TitleList, Wait};
 use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,12 +262,17 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let color: Vec<_> = color
-            .iter()
-            .filter_map(|&h| crate::descriptor::rtv_record(h))
-            .filter_map(|r| t.texture_of(r.resource as usize))
-            .collect();
-        let depth = crate::descriptor::dsv_record(depth).and_then(|r| t.texture_of(r.resource as usize));
+        let color_records: Vec<_> = color.iter().filter_map(|&h| crate::descriptor::rtv_record(h)).collect();
+        let color: Vec<_> = color_records.iter().filter_map(|r| t.texture_of(r.resource as usize)).collect();
+        let depth_record = crate::descriptor::dsv_record(depth);
+        l.targets = TargetFormats {
+            color: color_records
+                .iter()
+                .filter_map(|r| t.format_of(r.resource as usize))
+                .collect(),
+            depth: depth_record.and_then(|r| t.format_of(r.resource as usize)),
+        };
+        let depth = depth_record.and_then(|r| t.texture_of(r.resource as usize));
         l.list.set_render_targets(&color, depth.as_ref());
     });
 }
@@ -380,13 +385,22 @@ pub(crate) fn set_pipeline(this: This, pipeline: This) {
     with_list(this, |_, l| l.pipeline = pipeline as usize);
 }
 
-/// The host pipeline of title pipeline `key`, made at first use.
-fn pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The host pipeline of title pipeline `key` for a draw into `targets`, made at first use. A
+/// console pipeline's state names no target formats, so it is made again for each set of targets.
+fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> {
     if let Some(p) = t.pipelines.get(&key) {
         return p.clone();
     }
-    let made = make_pipe(t, key);
-    t.pipelines.insert(key, made.clone());
+    let console_key = (key, targets.clone());
+    if let Some(p) = t.console_pipes.get(&console_key) {
+        return p.clone();
+    }
+    let (made, console) = make_pipe(t, key, targets);
+    if console {
+        t.console_pipes.insert(console_key, made.clone());
+    } else {
+        t.pipelines.insert(key, made.clone());
+    }
     made
 }
 
@@ -415,10 +429,31 @@ pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
-fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+/// The second result says the pipeline depends on the draw's targets.
+fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
-        return Pipe::Refused;
+        return (Pipe::Refused, false);
     };
+    let graphics = graphics.map(|g| {
+        if g.names_targets() {
+            (g, false)
+        } else {
+            (super::console_state::graphics_state_for(&g, targets.color.clone(), targets.depth), true)
+        }
+    });
+    let console = graphics.as_ref().is_some_and(|g| g.1);
+    if console && std::env::var_os("VICTORY_TRACE_BIND").is_some() {
+        tracing::info!(pipeline = key, ?targets, state = ?graphics.as_ref().map(|g| &g.0), "console pipeline state at its draw");
+    }
+    let graphics = graphics.map(|g| g.0);
+    (make_host_pipe(t, stages, graphics), console)
+}
+
+fn make_host_pipe(
+    t: &mut MetalTitle,
+    stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
+    graphics: Option<super::state::Graphics>,
+) -> Pipe<Metal> {
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -467,7 +502,7 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
 }
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
-    with_list(this, |t, l| match pipe(t, l.pipeline) {
+    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
             l.list.set_compute_pipeline(&pso);
             if let Err(e) = l.list.dispatch(x, y, z) {
@@ -530,7 +565,7 @@ pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64]) {
 /// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
 /// counted) when there is nothing to draw with.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
-    let Pipe::Render(pso, binding) = pipe(t, l.pipeline) else {
+    let Pipe::Render(pso, binding) = pipe(t, l.pipeline, &l.targets) else {
         dropped();
         return false;
     };

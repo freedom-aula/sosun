@@ -13,7 +13,7 @@ pub enum HeapKind {
 }
 
 /// The DXGI formats the title's textures use.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,

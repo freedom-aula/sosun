@@ -17,7 +17,7 @@ use crate::hold::{Held, Item, ValueWait, World};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use victory_backend::resources::{GraphicsBackend, PresentBackend};
+use victory_backend::resources::{Format, GraphicsBackend, PresentBackend};
 
 /// A wait for a memory value (`Wait32BitValueX`, `Wait64BitValueX`): the value at `address`
 /// (`bytes` 4 or 8, masked) compared with `reference` by a D3D12 comparison function.
@@ -55,6 +55,15 @@ pub struct TitleList<B: GraphicsBackend> {
     /// topology set (the console's `D3D_PRIMITIVE_TOPOLOGY`).
     pub pipeline: usize,
     pub topology: u32,
+    /// The formats of the targets `OMSetRenderTargets` bound last.
+    pub targets: TargetFormats,
+}
+
+/// The formats of a draw's bound colour and depth targets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TargetFormats {
+    pub color: Vec<Format>,
+    pub depth: Option<Format>,
 }
 
 impl<B: GraphicsBackend> Default for TitleList<B> {
@@ -66,6 +75,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             cuts: 0,
             pipeline: 0,
             topology: 0,
+            targets: TargetFormats::default(),
         }
     }
 }
@@ -140,6 +150,9 @@ pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
+    /// Host pipelines of the console's pipelines (whose state names no target formats) by title
+    /// pipeline object and the targets of the draw ([`super::console_state`]).
+    pub console_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
@@ -162,6 +175,7 @@ impl<B: PresentBackend> Title<B> {
         Title {
             host: NativeHost::with_memory(backend, memory),
             pipelines: HashMap::new(),
+            console_pipes: HashMap::new(),
             shaders: Default::default(),
             libraries: Default::default(),
             textures: Default::default(),

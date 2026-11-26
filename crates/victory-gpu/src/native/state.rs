@@ -70,6 +70,9 @@ pub struct Graphics {
     rt_formats: Vec<u32>,
     depth_format: u32,
     pub samples: u32,
+    /// The formats of the targets bound at the draw, for pipelines whose description has none
+    /// (the console's; see [`Graphics::with_targets`]).
+    bound: Option<(Vec<Format>, Option<Format>)>,
 }
 
 impl Default for Graphics {
@@ -93,6 +96,7 @@ impl Default for Graphics {
             rt_formats: Vec::new(),
             depth_format: 0,
             samples: 1,
+            bound: None,
         }
     }
 }
@@ -209,6 +213,18 @@ impl Graphics {
         }
     }
 
+    /// Whether the state names the targets' formats (a stream's does, the console's does not).
+    pub fn names_targets(&self) -> bool {
+        !self.rt_formats.is_empty() || self.depth_format != 0
+    }
+
+    /// This state for a draw into the given targets: the console's pipelines name no formats, the
+    /// draw's bound targets do.
+    pub fn with_targets(mut self, color: Vec<Format>, depth: Option<Format>) -> Self {
+        self.bound = Some((color, depth));
+        self
+    }
+
     /// The input elements, in the title's order.
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
@@ -216,11 +232,17 @@ impl Graphics {
 
     /// The colour target formats the host knows; `None` if one is not (the pipeline is refused).
     pub fn color_formats(&self) -> Option<Vec<Format>> {
+        if let Some((color, _)) = &self.bound {
+            return Some(color.clone());
+        }
         self.rt_formats.iter().map(|&f| format(f)).collect()
     }
 
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
     pub fn depth_format(&self) -> Result<Option<Format>, u32> {
+        if let Some((_, depth)) = &self.bound {
+            return Ok(*depth);
+        }
         match self.depth_format {
             0 => Ok(None),
             f => format(f).map(Some).ok_or(f),
@@ -267,7 +289,8 @@ impl Graphics {
     /// Blend and write mask of each colour target (target 0's description for all when the blend
     /// description is not independent).
     pub fn color_state(&self) -> Vec<ColorState> {
-        (0..self.rt_formats.len().max(1))
+        let targets = self.bound.as_ref().map_or(self.rt_formats.len(), |b| b.0.len());
+        (0..targets.max(1))
             .map(|i| {
                 let t = &self.blend[if self.independent { i } else { 0 }];
                 ColorState {

@@ -14,6 +14,7 @@
 //! physical-memory observer forwards to.
 
 pub mod addr;
+pub mod console_state;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;

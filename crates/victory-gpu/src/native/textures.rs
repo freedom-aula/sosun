@@ -187,6 +187,11 @@ impl<B: PresentBackend> Title<B> {
         true
     }
 
+    /// The format of the host texture of title texture `key`.
+    pub fn format_of(&self, key: usize) -> Option<Format> {
+        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
