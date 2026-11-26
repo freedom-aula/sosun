@@ -3,7 +3,7 @@
 //! cleared through the title's views. Our own synthetic texels. Skipped without Metal.
 
 use super::Pool;
-use crate::native::glue::{self, with_title};
+use crate::native::glue::{self, with_list, with_title};
 use crate::native::memory::{PoolInfo, PoolObserver};
 use crate::object::{This, slot};
 use victory_backend::resources::*;
@@ -317,4 +317,45 @@ fn present_draws_the_back_buffer_over_the_apps_layer() {
         &bgra[..8]
     );
     drop(layer);
+}
+
+/// A colour target the host cannot make must keep its slot: binding the later ones would put
+/// `SV_Target1` on slot 0 and write a surface this pass does not own. Nothing is bound instead,
+/// and the draws that follow are refused.
+#[test]
+fn a_target_the_host_cannot_make_does_not_shift_the_ones_after_it() {
+    let Some(pool) = pool(9201, 4) else { return };
+    // 12 (R16G16B16A16_UINT) has no host texture; 28 is R8G8B8A8_UNORM.
+    let gone = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 12, Swizzle::SW_64KB_R_X.0, 1);
+    let good = crate::resource::test_texture_at(pool.va(0x2000), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    // Two view handles, 64 bytes apart, as a title's own descriptor memory holds them.
+    let mut slots = vec![0u64; 16];
+    let first = slots.as_mut_ptr() as u64;
+    let second = first + 64;
+    crate::descriptor::create_rtv(std::ptr::null(), gone, std::ptr::null(), first);
+    crate::descriptor::create_rtv(std::ptr::null(), good, std::ptr::null(), second);
+    let list = crate::list::test_list(false, std::ptr::null());
+    let handles = [first, second];
+    // OMSetRenderTargets(2, &handles, false, null).
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+        list,
+        handles.len() as u32,
+        handles.as_ptr(),
+        0,
+        std::ptr::null(),
+    );
+    let bound = with_list(list, |_, l| l.targets.color.len()).unwrap();
+    assert_eq!(bound, 0, "a target without a host texture must not renumber the ones after it");
+    // A set the host can make is taken again.
+    let only = [second];
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+        list,
+        only.len() as u32,
+        only.as_ptr(),
+        0,
+        std::ptr::null(),
+    );
+    let bound = with_list(list, |_, l| l.targets.color.len()).unwrap();
+    assert_eq!(bound, 1, "a makeable target binds again after a refused pass");
+    drop(slots);
 }
