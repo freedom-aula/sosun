@@ -42,6 +42,20 @@ WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tes
 
 `crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code. The probe also imports a second fixture, `probe_dll.c` (built beside it as `victory-probe-dll.dll`): the test maps it with `native::dll`, and `probe_dll` checks its `DllMain` and TLS callback order, per-thread static TLS, thread notices, an exception raised in the DLL unwinding through its `__finally` to a handler in the exe (and from the exe to a handler in the DLL), and `GetModuleHandle`/`GetProcAddress` by name. The C++ runtime is not ours to build, so the throw is a Windows exception through `__C_specific_handler`, not `_CxxThrowException` through `__CxxFrameHandler`.
 
+The native probe's waits check must run as `x86_64-apple-darwin` (under Rosetta
+on Apple Silicon); the arm64 binary only runs its two image-mapping tests.
+Its critical-section try check holds the lock on the calling thread until the
+competing thread finishes, rather than assuming it runs within an 80 ms sleep,
+then requires a successful try after release.
+Under contention, an SRW acquisition CAS can fail and then observe the previous
+owner's release. The POSIX host retries acquisition if that observed state is
+available to the caller; sleeping on an unlocked word can strand a waiter with
+no owner left to wake it. `srw_does_not_sleep_on_an_available_lock_after_a_failed_try`
+exercises those states directly, with a bounded failure guard and worker cleanup.
+This preserves Windows' [shared-reader/exclusive-writer ownership semantics](https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks);
+it does not add a fairness guarantee.
+
+
 ## Function pointers we hand to title code, and title pointers we call
 
 Title code runs with GS = its TEB, ours with GS = the host's TSD, and the two ABIs differ, so every pointer crossing needs a bridge.

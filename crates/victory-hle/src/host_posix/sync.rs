@@ -217,14 +217,29 @@ fn srw_acquire(word: &AtomicU32, shared: bool) {
         let Err(seen) = srw_try(word, shared) else {
             return;
         };
-        let held = seen | WAITERS;
-        let marked = seen & WAITERS != 0
-            || word
-                .compare_exchange(seen, held, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok();
-        if marked {
-            wait_on_address(word, held, None);
-        }
+        srw_wait(word, seen, shared);
+    }
+}
+
+fn srw_wait(word: &AtomicU32, seen: u32, shared: bool) {
+    // srw_try's acquisition CAS can lose a race, then observe the owner's
+    // release. Do not sleep on an available lock: nobody owns it to wake us.
+    // A reader can also retry immediately while other readers hold it.
+    let incompatible = if shared {
+        EXCLUSIVE
+    } else {
+        EXCLUSIVE | READERS
+    };
+    if seen & incompatible == 0 {
+        return;
+    }
+    let held = seen | WAITERS;
+    let marked = seen & WAITERS != 0
+        || word
+            .compare_exchange(seen, held, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok();
+    if marked {
+        wait_on_address(word, held, None);
     }
 }
 
@@ -395,4 +410,45 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         SwitchToThread,
         SleepEx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, mpsc};
+
+    #[test]
+    fn srw_does_not_sleep_on_an_available_lock_after_a_failed_try() {
+        // A failed acquisition CAS can be followed by the owner's release,
+        // so srw_try can return Err with an available word. WAITERS alone
+        // is also available (the last shared owner leaves that bit set).
+        for (seen, shared) in [
+            (0, false),
+            (WAITERS, false),
+            (0, true),
+            (WAITERS, true),
+            (1, true),
+            (WAITERS | 1, true),
+        ] {
+            let word = Arc::new(AtomicU32::new(seen));
+            let waiter_word = Arc::clone(&word);
+            let (tx, rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                srw_wait(&waiter_word, seen, shared);
+                tx.send(()).unwrap();
+            });
+            let completed = rx.recv_timeout(Duration::from_secs(1)).is_ok();
+            let after = word.load(Ordering::Relaxed);
+            // Rescue a broken implementation before asserting, including if
+            // it has not reached wait_on_address yet. Never leave a sleeper.
+            word.store(EXCLUSIVE, Ordering::Release);
+            wake_all(&word);
+            waiter.join().unwrap();
+            assert!(
+                completed,
+                "slept on available SRW word {seen:#x}, shared={shared}"
+            );
+            assert_eq!(after, seen, "marked an available lock as waiting");
+        }
+    }
 }

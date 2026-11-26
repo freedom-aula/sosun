@@ -576,7 +576,7 @@ static u8 cs_area[64] __attribute__((aligned(16)));
 static u8 srw_area[16] __attribute__((aligned(16)));
 static u8 cv_area[16] __attribute__((aligned(16)));
 static volatile u32 shared_counter, cv_ready, cv_seen;
-static ptr consumer_done, late_event;
+static ptr consumer_done;
 
 static u32 cs_worker(ptr param)
 {
@@ -591,16 +591,6 @@ static u32 cs_worker(ptr param)
             ReleaseSRWLockExclusive(srw_area);
         }
     }
-    return 0;
-}
-
-static u32 holder(ptr param)
-{
-    (void)param;
-    EnterCriticalSection(cs_area);
-    SetEvent(late_event);
-    Sleep(80);
-    LeaveCriticalSection(cs_area);
     return 0;
 }
 
@@ -682,17 +672,24 @@ u32 probe_sync(ptr unused)
         ok |= T_CS;
     CloseHandle(w[0]);
     CloseHandle(w[1]);
-    late_event = CreateEventW(0, 1, 0, 0);
-    ptr h = CreateThread(0, 0, (ptr)holder, 0, 0, 0);
-    WaitForSingleObject(late_event, 5000);
+    /* Keep ownership until the other thread has actually tried. A holder
+       sleeping for 80 ms could release before that thread was scheduled. */
+    EnterCriticalSection(cs_area);
+    shared_counter = 0xFFFFFFFF;
     ptr tr = CreateThread(0, 0, (ptr)try_from_other, 0, 0, 0);
-    WaitForSingleObject(tr, 5000);
+    u32 tried = WaitForSingleObject(tr, 5000);
+    u32 rejected = tr && tried == 0 && shared_counter == 0;
+    LeaveCriticalSection(cs_area);
     CloseHandle(tr);
-    if (shared_counter == 0)
-        ok |= T_CS_TRY;
-    WaitForSingleObject(h, 5000);
-    CloseHandle(h);
-    CloseHandle(late_event);
+    /* Do not reuse shared_counter if a broken TryEnter left a worker live. */
+    if (!tr || tried != 0)
+        return ok;
+    /* A stub that always refuses TryEnter must not pass the check either. */
+    if (TryEnterCriticalSection(cs_area)) {
+        if (rejected)
+            ok |= T_CS_TRY;
+        LeaveCriticalSection(cs_area);
+    }
 
     /* SRW locks. */
     shared_counter = 0;
