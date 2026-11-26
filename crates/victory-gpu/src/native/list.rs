@@ -21,6 +21,8 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// The page table built for this heap (its view indices are the heap's own) and the pool-table
     /// generation it is current for.
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
+    /// The title record (tag, view index, generation) each entry was last mirrored from.
+    pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):

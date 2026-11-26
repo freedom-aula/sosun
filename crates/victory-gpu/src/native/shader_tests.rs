@@ -166,7 +166,9 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     // SAFETY: as above, only the formats.
     unsafe { no_layout.read(15, rts.as_ptr()) };
     assert!(matches!(t.render_pipe(&vs, Some(&ps), &no_layout, "bare"), Pipe::Refused));
-    // A pixel stage with arguments of its own has an argument block of its own.
+    // A pixel stage with arguments of its own is converted with the host's layout of them: this
+    // fixture (plain HLSL with a texture at t0, not translator output) is then refused, as its
+    // texture is in no host layout.
     let mut args = ps.clone();
     args.user_data.push(victory_shader::emit::UserData {
         index: 0,
@@ -174,12 +176,7 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
         root: victory_shader::RootType::Constants,
         dword: 0,
     });
-    match t.render_pipe(&vs, Some(&args), &g, "args") {
-        Pipe::Render(_, Some(b)) => {
-            assert_eq!(b.dwords, 0, "the vertex stage's block is unchanged");
-            assert_eq!(b.ps.as_ref().map(|p| p.dwords), Some(4));
-        }
-        _ => panic!("{:?}", t.shaders),
-    }
+    assert!(matches!(t.render_pipe(&vs, Some(&args), &g, "args"), Pipe::Refused));
+    assert!(t.shaders.refused.iter().any(|(why, _)| why.starts_with("args") && why.contains("root signature")));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("layout lacks")));
 }
