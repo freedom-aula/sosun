@@ -13,7 +13,7 @@ check() {
   touch "$tools/llvm/bin/llvm-dlltool" "$tools/llvm/bin/clang" "$tools/lld/bin/ld.lld"
   rm -rf "${tools:?}/$missing"
   out=$(LLVM_PREFIX="$tools/llvm" LLD_PREFIX="$tools/lld" MINGW_PREFIX="$tools/mingw" \
-    /bin/sh "$script" "$tools/out/probe.exe" 2>&1) || rc=$?
+    /bin/bash "$script" "$tools/out/probe.exe" 2>&1) || rc=$?
   if [ "$rc" -eq 0 ]; then
     echo "FAIL: without $missing the probe build succeeded" >&2
     exit 1
