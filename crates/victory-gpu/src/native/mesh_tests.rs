@@ -299,3 +299,36 @@ fn halves_of_many_parameters_stay_within_the_mesh_size() {
         panic!("{:?}", t.shaders.refused);
     };
 }
+
+/// A parameter only a packing instruction makes (`v_cvt_pkrtz_f16_f32`: 0.5 low, 1.0 high) is
+/// exported as its halves alone, and the pixel program's f16 interpolations of both halves of
+/// x read them.
+#[test]
+fn a_parameter_of_halves_only_reaches_the_pixel_program() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x5E10_0CF0, // v_cvt_pkrtz_f16_f32 v8, 0.5, v6 (1.0)
+        0xF800_0201, 0x0000_0008, // exp param0 v8
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0xD742_0002, 0x0202_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
+        0xD75A_0004, 0x040A_0300, // v_interp_p2_f16 v4, v1, attr0.x high, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0xF800_180F, 0x0403_0403, // exp mrt0 v3, v4, v3, v4 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 128, 255]), "{:?}", pixels(&t, &color));
+}
