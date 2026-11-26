@@ -424,6 +424,9 @@ pub struct Options {
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
     /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being v1 + v2 - v0.
     pub rect_list: bool,
+    /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
+    /// n, undefined values) because its pixel shader reads them.
+    pub extra_params: u32,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -491,6 +494,27 @@ pub fn emit_with(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if !pixel && options.extra_params != 0 {
+        let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+                continue;
+            }
+            outputs.push(container::SigElement {
+                name: "TEXCOORD".into(),
+                index: n,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
+            row += 1;
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };

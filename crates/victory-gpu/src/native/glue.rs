@@ -280,17 +280,24 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
 fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
     use std::sync::atomic::AtomicBool;
     static DONE: AtomicBool = AtomicBool::new(false);
+    static LAST: Mutex<Option<u64>> = Mutex::new(None);
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
-    let Some((dir, secs)) = std::env::var("VICTORY_DUMP_TARGETS")
-        .ok()
-        .and_then(|v| v.rsplit_once(',').map(|(d, s)| (d.to_owned(), s.parse::<u64>().unwrap_or(25))))
-    else {
-        return;
+    let Ok(v) = std::env::var("VICTORY_DUMP_TARGETS") else { return };
+    // `<dir>,<seconds>[,<every>]`: from that second on, once or every that many seconds.
+    let mut parts = v.split(',');
+    let dir = parts.next().unwrap_or(".").to_owned();
+    let secs = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(25);
+    let every = parts.next().and_then(|s| s.parse::<u64>().ok());
+    let now = start.elapsed().as_secs();
+    let due = match (every, *LAST.lock().unwrap_or_else(|e| e.into_inner())) {
+        (Some(e), Some(last)) => now >= last + e,
+        _ => true,
     };
-    if start.elapsed().as_secs() < secs || DONE.swap(true, Ordering::Relaxed) {
+    if now < secs || !due || (every.is_none() && DONE.swap(true, Ordering::Relaxed)) {
         return;
     }
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
     with_title(|t| {
         for (n, key) in stats.keys().enumerate() {
             let Some(info) = crate::resource::texture_info(*key as This) else { continue };
@@ -304,7 +311,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}.ppm")), out);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}.ppm")), out);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
@@ -742,6 +749,9 @@ pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides:
 /// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
 fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> Pipe<Metal> {
     let key = format!("{:?}{rect}", l.strides);
+    if let Some(p) = g.made.borrow().get(&key) {
+        return p.clone();
+    }
     let rect_vs = if rect {
         match g.vs_source.native_rect() {
             Ok(h) => Some(h.clone()),
@@ -753,10 +763,25 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     } else {
         None
     };
-    let vs = rect_vs.as_deref().unwrap_or(&g.vs);
-    if let Some(p) = g.made.borrow().get(&key) {
-        return p.clone();
-    }
+    // Parameters the pixel shader reads and the vertex shader does not write: written (undefined)
+    // too, as the converter refuses a pipeline whose fragment inputs the vertex stage lacks.
+    let base_vs = rect_vs.as_deref().unwrap_or(&g.vs);
+    let extra = g.ps.as_ref().map_or(0, |ps| {
+        super::state::texcoords(&ps.dxil, victory_shader::FourCC::ISG1)
+            & !super::state::texcoords(&base_vs.dxil, victory_shader::FourCC::OSG1)
+    });
+    let widened = if extra != 0 {
+        match g.vs_source.translate_extra(rect, extra) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                t.refused_translation(&g.name, format!("extra outputs: {e}"));
+                return Pipe::Refused;
+            }
+        }
+    } else {
+        None
+    };
+    let vs = widened.as_deref().unwrap_or(base_vs);
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);

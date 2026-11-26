@@ -140,6 +140,12 @@ impl Shader {
 
 #[cfg(target_os = "macos")]
 impl Shader {
+    /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
+    pub(crate) fn translate_extra(&self, rect: bool, extra: u32) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        crate::native::shaders::translate_extra(&container, rect, extra).map(Arc::new)
+    }
+
     /// The translation for rectangle-list draws, made on first use.
     pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
         self.rect
