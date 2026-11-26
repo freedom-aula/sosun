@@ -50,8 +50,8 @@ source tools/macos/native-binary.sh
 bin=$(native_binary) || exit 2
 [[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
 
-run_dir="runs/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$run_dir"
+mkdir -p runs || exit 1
+run_dir=$(mktemp -d "runs/$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
 log="$run_dir/victory.log"
 {
   echo "# $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), ${ram_gb} GB, console=${console}"
