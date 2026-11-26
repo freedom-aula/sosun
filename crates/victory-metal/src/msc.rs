@@ -79,6 +79,68 @@ fn note(started: std::time::Instant, dxil: usize, hit: bool) {
     }
 }
 
+/// `IRResourceLocation`: where the converter puts one resource of a root signature in the
+/// top-level argument buffer.
+#[repr(C)]
+struct Location {
+    kind: u32,
+    space: u32,
+    slot: u32,
+    offset: u32,
+    size: u64,
+    name: *const c_char,
+}
+
+type Count = unsafe extern "C" fn(*const c_void) -> usize;
+type Locations = unsafe extern "C" fn(*const c_void, *mut Location);
+
+/// The converter's root signature for `l` (destroyed with `IRRootSignatureDestroy`), or the code
+/// it refused it with.
+///
+/// # Safety
+/// `h` is the converter's dlopen handle.
+unsafe fn make_signature(h: *mut c_void, l: &RootLayout) -> Result<*mut c_void, u32> {
+    let params: Vec<Parameter> = l.params.iter().map(Parameter::of).collect();
+    // `IRStaticSamplerDescriptor` (`D3D12_STATIC_SAMPLER_DESC`): the layout's ten words,
+    // then register n, space 0, visibility all.
+    let samplers: Vec<[u32; 13]> = l
+        .static_samplers
+        .iter()
+        .enumerate()
+        .map(|(n, w)| {
+            let mut d = [0u32; 13];
+            d[..10].copy_from_slice(w);
+            d[10] = n as u32;
+            d
+        })
+        .collect();
+    let d = Descriptor {
+        version: 2,
+        _pad: 0,
+        count: params.len() as u32,
+        parameters: params.as_ptr(),
+        samplers: samplers.len() as u32,
+        static_samplers: samplers.as_ptr().cast(),
+        flags: HEAPS_DIRECTLY_INDEXED,
+    };
+    let mut err = std::ptr::null_mut();
+    // SAFETY: the converter's documented C API; `d` and what it points at outlive the call.
+    unsafe {
+        let signature =
+            sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
+        if signature.is_null() {
+            return Err(if err.is_null() {
+                0
+            } else {
+                let code = sym::<ErrCode>(h, "IRErrorGetCode")(err);
+                sym::<Destroy>(h, "IRErrorDestroy")(err);
+                code
+            });
+        }
+        Ok(signature)
+    }
+}
+
 pub struct Msc {
     h: *mut c_void,
     /// Which converter this is (its path, size and modification time): part of the library cache's keys.
@@ -153,6 +215,35 @@ impl Msc {
         self.convert_with(dxil, entry, None)
     }
 
+    /// Where the converter lays out `l` in the top-level argument buffer: (resource type, space,
+    /// register, byte offset, size) per resource, as `IRRootSignatureGetResourceLocations` gives.
+    pub fn locations(&self, l: &RootLayout) -> Result<Vec<(u32, u32, u32, u32, u64)>, ConvError> {
+        let h = self.h;
+        // SAFETY: the converter's documented C API; the signature is destroyed below.
+        unsafe {
+            let signature = make_signature(h, l).map_err(|code| ConvError {
+                code,
+                msg: "the root signature was refused".into(),
+            })?;
+            let n = sym::<Count>(h, "IRRootSignatureGetResourceCount")(signature);
+            let mut v: Vec<Location> = (0..n)
+                .map(|_| Location {
+                    kind: 0,
+                    space: 0,
+                    slot: 0,
+                    offset: 0,
+                    size: 0,
+                    name: std::ptr::null(),
+                })
+                .collect();
+            sym::<Locations>(h, "IRRootSignatureGetResourceLocations")(signature, v.as_mut_ptr());
+            sym::<Destroy>(h, "IRRootSignatureDestroy")(signature);
+            Ok(v.iter()
+                .map(|l| (l.kind, l.space, l.slot, l.offset, l.size))
+                .collect())
+        }
+    }
+
     /// [`Self::convert`] with the top-level argument buffer laid out as `layout` says (for DXIL
     /// that carries no root signature), and out-of-range raw buffer accesses made safe if it asks.
     pub fn convert_with(
@@ -190,52 +281,18 @@ impl Msc {
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
             let comp = sym::<Create>(h, "IRCompilerCreate")();
-            let params: Vec<Parameter> = layout
-                .map(|l| l.params.iter().map(Parameter::of).collect())
-                .unwrap_or_default();
-            // `IRStaticSamplerDescriptor` (`D3D12_STATIC_SAMPLER_DESC`): the layout's ten words,
-            // then register n, space 0, visibility all.
-            let samplers: Vec<[u32; 13]> = layout
-                .map(|l| {
-                    l.static_samplers
-                        .iter()
-                        .enumerate()
-                        .map(|(n, w)| {
-                            let mut d = [0u32; 13];
-                            d[..10].copy_from_slice(w);
-                            d[10] = n as u32;
-                            d
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             let mut signature = std::ptr::null_mut();
             if let Some(l) = layout {
-                let d = Descriptor {
-                    version: 2,
-                    _pad: 0,
-                    count: params.len() as u32,
-                    parameters: params.as_ptr(),
-                    samplers: samplers.len() as u32,
-                    static_samplers: samplers.as_ptr().cast(),
-                    flags: HEAPS_DIRECTLY_INDEXED,
+                signature = match make_signature(h, l) {
+                    Ok(s) => s,
+                    Err(code) => {
+                        sym::<Destroy>(h, "IRCompilerDestroy")(comp);
+                        return Err(ConvError {
+                            code,
+                            msg: "the root signature was refused".into(),
+                        });
+                    }
                 };
-                let mut err = std::ptr::null_mut();
-                signature = sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
-                if signature.is_null() {
-                    let code = if err.is_null() {
-                        0
-                    } else {
-                        let code = sym::<ErrCode>(h, "IRErrorGetCode")(err);
-                        sym::<Destroy>(h, "IRErrorDestroy")(err);
-                        code
-                    };
-                    sym::<Destroy>(h, "IRCompilerDestroy")(comp);
-                    return Err(ConvError {
-                        code,
-                        msg: "the root signature was refused".into(),
-                    });
-                }
                 sym::<SetSignature>(h, "IRCompilerSetGlobalRootSignature")(comp, signature);
                 if l.bounds_checked {
                     sym::<SetFlags>(h, "IRCompilerSetCompatibilityFlags")(comp, BOUNDS_CHECK);

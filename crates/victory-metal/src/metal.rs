@@ -69,7 +69,11 @@ pub struct Queue(
     pub(crate) std::cell::Cell<u64>,
 );
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
-pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
+pub struct Pipeline(
+    pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The shader's static samplers, which its argument buffer points at.
+    pub(crate) Option<crate::gfx::StaticSamplers>,
+);
 
 /// A wrapped range of title memory.
 pub struct Buffer {
@@ -125,6 +129,7 @@ impl Metal {
     fn compute_from(
         &self,
         converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
+        layout: Option<&RootLayout>,
     ) -> Result<Pipeline, String> {
         let (_, lib) = converted.map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
@@ -141,7 +146,7 @@ impl Metal {
                 .newComputePipelineStateWithFunction_error(&f)
                 .map_err(|e| e.localizedDescription().to_string())?,
         };
-        Ok(Pipeline(p))
+        Ok(Pipeline(p, self.static_samplers(layout)?))
     }
 
     /// The pipeline archive, if the cache is on.
@@ -252,7 +257,7 @@ impl ComputeBackend for Metal {
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc()?.convert(dxil, None))
+        self.compute_from(self.msc()?.convert(dxil, None), None)
     }
 
     fn create_compute_pipeline_with(
@@ -260,7 +265,10 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
-        self.compute_from(self.msc()?.convert_with(dxil, None, Some(layout)))
+        self.compute_from(
+            self.msc()?.convert_with(dxil, None, Some(layout)),
+            Some(layout),
+        )
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
