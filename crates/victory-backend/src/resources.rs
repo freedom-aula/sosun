@@ -572,8 +572,8 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
     pub draws: Vec<Draw<'a, B>>,
 }
 
-/// A GPU-side buffer operation on title memory (`CopyBufferRegion`, a fill), ordered with the passes around it.
-pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
+/// A GPU-side copy or fill operation, ordered with the passes around it.
+pub enum BlitOp<'a, B: ResourceBackend + ?Sized> {
     Copy {
         src: (&'a B::Buffer, *const u8),
         dst: (&'a B::Buffer, *const u8),
@@ -583,6 +583,39 @@ pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
         dst: (&'a B::Buffer, *const u8),
         len: usize,
         value: u8,
+    },
+    CopyTexture {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
     },
 }
 

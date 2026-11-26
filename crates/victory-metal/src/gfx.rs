@@ -478,6 +478,14 @@ fn resource_id(id: MTLResourceID) -> u64 {
     unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }
 }
 
+fn origin(a: [usize; 3]) -> MTLOrigin {
+    MTLOrigin {
+        x: a[0],
+        y: a[1],
+        z: a[2],
+    }
+}
+
 fn size(a: [usize; 3]) -> MTLSize {
     MTLSize {
         width: a[0],
@@ -1560,6 +1568,9 @@ impl Metal {
     ) -> Result<(), String> {
         let nonzero = |op: &BlitOp<'_, Metal>| match op {
             BlitOp::Copy { len, .. } | BlitOp::Fill { len, .. } => *len > 0,
+            BlitOp::CopyTexture { size, .. } => !size.contains(&0),
+            BlitOp::CopyBufferToTexture { len, size, .. }
+            | BlitOp::CopyTextureToBuffer { len, size, .. } => *len > 0 && !size.contains(&0),
         };
         if !ops.iter().any(nonzero) {
             return Ok(());
@@ -1571,6 +1582,38 @@ impl Metal {
             e.waitForFence(f);
         }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
+        let tex_dims = |t: &ProtocolObject<dyn MTLTexture>, mip: usize| {
+            [(t.width() >> mip).max(1), (t.height() >> mip).max(1), (t.depth() >> mip).max(1)]
+        };
+        let tex_slices = |t: &ProtocolObject<dyn MTLTexture>| {
+            if t.textureType() == MTLTextureType::Type2DArray { t.arrayLength() } else { 1 }
+        };
+        let fits_region = |t: &ProtocolObject<dyn MTLTexture>, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3]| {
+            if sz.contains(&0) || mip >= t.mipmapLevelCount() || slice >= tex_slices(t) {
+                return false;
+            }
+            let dims = tex_dims(t, mip);
+            (0..3).all(|i| at[i].saturating_add(sz[i]) <= dims[i])
+        };
+        let fits_buffer_transfer = |what: &str, buf: (&Buffer, *const u8), t: &Texture, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize| -> Option<(usize, usize)> {
+            let align = t.format.block().1;
+            let buf_off = off(buf.0, buf.1);
+            if is_depth(t.tex.pixelFormat())
+                || !fits_region(&t.tex, mip, slice, at, sz)
+                || buf_off % align != 0
+                || row_pitch % align != 0
+                || buf_off.saturating_add(len) > buf.0.buf.length()
+                || !transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+            {
+                return None;
+            }
+            let slice_bytes = if sz[2] > 1 || t.tex.textureType() == MTLTextureType::Type3D {
+                slice_pitch
+            } else {
+                0
+            };
+            (slice_bytes % align == 0).then_some((buf_off, slice_bytes))
+        };
         for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
@@ -1588,6 +1631,140 @@ impl Metal {
                 BlitOp::Fill { dst, len, value } => {
                     let o = off(dst.0, dst.1);
                     e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
+                }
+                BlitOp::CopyTexture {
+                    src,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size: sz,
+                    dst,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                } => {
+                    if !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz)
+                        || !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, *sz)
+                    {
+                        continue;
+                    }
+                    let view = if src.tex.pixelFormat() == dst.tex.pixelFormat() {
+                        None
+                    } else if !is_depth(src.tex.pixelFormat())
+                        && !is_depth(dst.tex.pixelFormat())
+                        && castable(src.format, dst.format)
+                        && src.tex.textureType() == dst.tex.textureType()
+                    {
+                        src.tex.newTextureViewWithPixelFormat(dst.tex.pixelFormat())
+                    } else {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::warn!(
+                                src = ?src.format,
+                                dst = ?dst.format,
+                                "metal: skipping incompatible CopyTexture formats"
+                            );
+                        });
+                        continue;
+                    };
+                    if src.tex.pixelFormat() != dst.tex.pixelFormat() && view.is_none() {
+                        continue;
+                    }
+                    let src_tex: &ProtocolObject<dyn MTLTexture> = view.as_deref().unwrap_or(&*src.tex);
+                    // SAFETY: bounds, mip/slice ranges, and equal pixel formats are checked above.
+                    unsafe {
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            src_tex,
+                            *src_slice,
+                            *src_mip,
+                            origin(*src_origin),
+                            size(*sz),
+                            &dst.tex,
+                            *dst_slice,
+                            *dst_mip,
+                            origin(*dst_origin),
+                        )
+                    };
+                }
+                BlitOp::CopyBufferToTexture {
+                    src,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                    size: sz,
+                    dst,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                } => {
+                    let Some((src_off, slice_bytes)) = fits_buffer_transfer(
+                        "copy_buffer_to_texture",
+                        *src,
+                        dst,
+                        *dst_mip,
+                        *dst_slice,
+                        *dst_origin,
+                        *sz,
+                        *row_pitch,
+                        *slice_pitch,
+                        *len,
+                    ) else {
+                        continue;
+                    };
+                    // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
+                    unsafe {
+                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            &src.0.buf,
+                            src_off,
+                            *row_pitch,
+                            slice_bytes,
+                            size(*sz),
+                            &dst.tex,
+                            *dst_slice,
+                            *dst_mip,
+                            origin(*dst_origin),
+                        )
+                    };
+                }
+                BlitOp::CopyTextureToBuffer {
+                    src,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size: sz,
+                    dst,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                } => {
+                    let Some((dst_off, slice_bytes)) = fits_buffer_transfer(
+                        "copy_texture_to_buffer",
+                        *dst,
+                        src,
+                        *src_mip,
+                        *src_slice,
+                        *src_origin,
+                        *sz,
+                        *row_pitch,
+                        *slice_pitch,
+                        *len,
+                    ) else {
+                        continue;
+                    };
+                    // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
+                    unsafe {
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                            &src.tex,
+                            *src_slice,
+                            *src_mip,
+                            origin(*src_origin),
+                            size(*sz),
+                            &dst.0.buf,
+                            dst_off,
+                            *row_pitch,
+                            slice_bytes,
+                        )
+                    };
                 }
             }
         }

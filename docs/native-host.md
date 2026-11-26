@@ -1101,3 +1101,16 @@ commands (after checking the bound pipeline), and `victory-metal` skips encoding
 dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
 `zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
 `victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).
+
+## Texture copies on the native Metal host
+
+`CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource, buffer
+footprint-to-subresource, and subresource-to-buffer footprint) now record `BlitOp::CopyTexture`,
+`BlitOp::CopyBufferToTexture`, and `BlitOp::CopyTextureToBuffer` on `Pass::Blit` and encode them
+into `MTLBlitCommandEncoder` in order with adjacent GPU work (format casting via
+`newTextureViewWithPixelFormat` where formats differ within a castable family; depth/stencil and
+`B4G4R4A4_UNORM` buffer transfers still fall back to `dropped_op` rather than tripping Metal
+validation). Previously all texture copy calls incremented `texture_copies` (`DROPPED_KINDS[3]`)
+and left destination textures empty (tests: `victory-metal`
+`texture_blit_ops_copy_between_textures_and_buffers` and `victory-gpu`
+`native::texture_tests::copy_resource_and_copy_texture_region_run_on_the_gpu`).
