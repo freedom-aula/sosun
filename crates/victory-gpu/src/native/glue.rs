@@ -443,17 +443,30 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let colors: Vec<usize> = color
+        let keys: Vec<Option<usize>> = color
             .iter()
-            .filter_map(|&h| crate::descriptor::rtv_record(h))
-            .map(|r| r.resource as usize)
+            .map(|&h| crate::descriptor::rtv_record(h).map(|r| r.resource as usize))
             .collect();
-        let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
-        l.target_keys = colors.iter().copied().chain(depth_key).collect();
+        l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
+        // A view the host cannot make keeps its slot: binding the rest would move every later
+        // target down one, and `SV_TargetN` would write a surface this pass does not own.
+        let made: Option<Vec<_>> = keys
+            .iter()
+            .map(|slot| slot.and_then(|k| t.texture_of(k)))
+            .collect();
+        let Some(color) = made else {
+            l.targets_ready = false;
+            l.targets = TargetFormats::default();
+            l.target_keys.clear();
+            l.list.set_render_targets(&[], None);
+            warn_once("a render target the host cannot make; the passes that use it are refused");
+            return;
+        };
+        l.targets_ready = true;
         l.targets = TargetFormats {
-            color: colors.iter().filter_map(|&k| t.format_of(k)).collect(),
+            color: keys.iter().flatten().filter_map(|&k| t.format_of(k)).collect(),
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
         // Debugging: no depth attachment at all.
@@ -883,6 +896,10 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
 
 /// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+    if !l.targets_ready {
+        dropped("a draw of a pass whose render targets the host cannot make");
+        return None;
+    }
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
     // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
     let rect = l.topology == 17;
