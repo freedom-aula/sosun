@@ -498,3 +498,34 @@ fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed()
     assert_eq!(got[40..50], [1; 10]);
     assert_eq!(got[50..], [0; 14]);
 }
+
+#[test]
+fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() {
+    // `s[8:9]` holds loaded data; lanes 0..39 make it -1 or 0 by SCC (here -1). At the join
+    // the only read is an `s_nand` with EXEC: lanes 40..63 skipped in with the data and are not
+    // in that EXEC, so their bits are 1 whatever it holds; lanes 0..39 read SCC's bit, giving
+    // 0 (a small compute pass of the title's that holds the HDR scene colour; was refused:
+    // "data, ...").
+    let w = [
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(2),
+        0xBF07_8004, // s_cmp_lg_u32 s4, 0
+        0x8588_80C1, // s_cselect_b64 s[8:9], -1, 0
+        0x8C88_7E08, // join: s_nand_b64 s[8:9], s[8:9], exec
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [0; 40]);
+    assert_eq!(got[40..], [1; 24]);
+}

@@ -10344,8 +10344,9 @@ impl<'a> Lower<'a> {
     /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
     /// edge into its header; the others take the wave's.
     /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
-    /// it and EXEC (or `s_orn2` of it by EXEC) in `b`, with no lane of edge `n` in that EXEC as the
-    /// edge brings it: those lanes' bits of the result are 0 (1) whatever the mask holds for them.
+    /// it and EXEC (or `s_nand` with EXEC, or `s_orn2` of it by EXEC) in `b`, with no lane of
+    /// edge `n` in that EXEC as the edge brings it: those lanes' bits of the result are 0 (1)
+    /// whatever the mask holds for them.
     fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let block = &p.blocks[b];
@@ -10359,7 +10360,10 @@ impl<'a> Lower<'a> {
                 let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
                     && matches!(&inst.fields, Fields::Sop { src, .. }
                         if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                if bb != b || !(matches!(inst.name(), "s_and_b32" | "s_and_b64") || orn2_of_exec) {
+                // `s_nand` with EXEC sets those bits whatever it holds, as `s_and` clears them.
+                let and =
+                    matches!(inst.name(), "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64");
+                if bb != b || !(and || orn2_of_exec) {
                     return false;
                 }
                 let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
@@ -10422,6 +10426,23 @@ impl<'a> Lower<'a> {
                 })
             })
         })
+    }
+
+    /// The lane mask `low` (the low dword's value) as each lane's bit when it is a select in IR
+    /// block `q` of an inline -1 (every lane) or 0 (none) by SCC: SCC, the same for every lane.
+    fn scc_mask(&self, low: Value, q: usize) -> Option<V> {
+        let block = &self.x.p.blocks[q];
+        let op = if self.x.native.wave64 { "s_cselect_b64" } else { "s_cselect_b32" };
+        let (inst, [Operand::Const(a), Operand::Const(b)]) = scalar_def::<2>(block, low, op)? else {
+            return None;
+        };
+        if (crate::resource::inline(a)?, crate::resource::inline(b)?) != (u32::MAX, 0) {
+            return None;
+        }
+        match self.vals.get(&inst.read(Reg::Scc)?) {
+            Some(&Val::Bit(scc)) => Some(scc),
+            _ => None,
+        }
     }
 
     /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
@@ -13634,6 +13655,8 @@ impl<'a> Lower<'a> {
                     (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
                         self.s.m.bool(all)
                     }
+                    // -1 or 0 by SCC: SCC is every lane's bit.
+                    (None, Some(Val::I32(_))) if let Some(scc) = self.scc_mask(arg, q) => scc,
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
                     }
