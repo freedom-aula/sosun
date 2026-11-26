@@ -118,9 +118,6 @@ impl CodeViewInfo {
     }
 }
 
-/// Upper bound on TLS callbacks we are willing to walk (defends against garbage).
-const MAX_TLS_CALLBACKS: usize = 1024;
-
 impl ImageInfo {
     /// Parses a complete PE32+ x86-64 image from its file bytes.
     pub fn parse(data: &[u8]) -> Result<Self, PeError> {
@@ -415,7 +412,11 @@ fn parse_tls(
         let array = sections
             .pe_data_at(data, array_rva)
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS) {
+        let mut slots = array.as_chunks::<8>().0.iter();
+        loop {
+            let slot = slots
+                .next()
+                .ok_or_else(|| PeError::Malformed("unterminated TLS callback array".into()))?;
             let va = u64::from_le_bytes(*slot);
             if va == 0 {
                 break;
@@ -542,6 +543,50 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    fn synthetic_tls_image(terminated: bool) -> Vec<u8> {
+        let mut data = synthetic_image(&[]);
+        let opt = 0x58;
+        let section = opt + 240;
+        let section_size = 0x2200u32;
+        data[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes());
+        data[section + 8..section + 12].copy_from_slice(&section_size.to_le_bytes());
+        data[section + 16..section + 20].copy_from_slice(&section_size.to_le_bytes());
+        data.resize(0x200 + section_size as usize, 0);
+        data[opt + 112..opt + 120].fill(0); // no exports
+        let tls = layout::data_directory_offset(&data, pe::IMAGE_DIRECTORY_ENTRY_TLS).unwrap();
+        data[tls..tls + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        data[tls + 4..tls + 8].copy_from_slice(&40u32.to_le_bytes());
+
+        // Place the table flush with the end of the section in both cases.
+        let base = 0x1_8000_0000u64;
+        let array = data.len() - (1025 + usize::from(terminated)) * 8;
+        let array_va = base + 0x1000 + (array - 0x200) as u64;
+        let field = 0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        data[field..field + 8].copy_from_slice(&array_va.to_le_bytes());
+        for (i, rva) in (0x1000..0x1000 + 1025).enumerate() {
+            let offset = array + i * 8;
+            data[offset..offset + 8].copy_from_slice(&(base + rva).to_le_bytes());
+        }
+        data.extend_from_slice(&[0; 8]); // outside the section
+        data
+    }
+
+    #[test]
+    fn tls_callbacks_preserve_every_rva_in_order() {
+        let info = ImageInfo::parse(&synthetic_tls_image(true)).unwrap();
+        let callbacks = info.tls.unwrap().callback_rvas;
+        assert_eq!(callbacks.len(), 1025);
+        assert!(callbacks.into_iter().eq(0x1000..0x1000 + 1025));
+    }
+
+    #[test]
+    fn tls_callbacks_require_a_terminator_in_the_section() {
+        assert!(matches!(
+            ImageInfo::parse(&synthetic_tls_image(false)),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
