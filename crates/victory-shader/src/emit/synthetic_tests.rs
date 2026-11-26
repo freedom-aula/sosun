@@ -143,6 +143,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         zero_copy_memory: false,
         rect_list: false,
         view_marks: false,
+        rect_list: false,
     })
 }
 

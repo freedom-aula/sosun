@@ -504,11 +504,11 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
         l.kills.clear();
     }
     loop {
-        let execs = l.masks_in_order();
+        let (execs, kill_lanes) = l.masks_in_order();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
-            return l.finish(&execs, &cond);
+            return l.finish(&execs, kill_lanes, &cond);
         }
         l.unresolved.extend(wrong);
         l.reset();
@@ -518,6 +518,37 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
 /// A lane mask by the values of its low and high dword (both the low one in
 /// wave32).
 type Key = (Value, Value);
+type Execs = Vec<Vec<Option<Bool>>>;
+type Discards = Map<(usize, usize), Bool>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spilled {
+    Value(Value),
+    Const(u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HalfOp {
+    Val(Value),
+    Const(u32),
+}
+
+enum SplitPair {
+    Not(HalfOp, HalfOp),
+    Bin {
+        op: &'static str,
+        a0: HalfOp,
+        b0: HalfOp,
+        a1: HalfOp,
+        b1: HalfOp,
+        comm: bool,
+    },
+    Select {
+        scc: Value,
+        a: (HalfOp, HalfOp),
+        c: (HalfOp, HalfOp),
+    },
+}
 
 struct Lanes<'a> {
     p: &'a Program,
@@ -550,6 +581,9 @@ struct Lanes<'a> {
     active: Set<Value>,
     /// See [`Structured::restored`].
     restored: Map<Value, Value>,
+    /// `v_readlane_b32` results of a constant lane whose spilled value was a
+    /// 32-bit scalar constant.
+    restored_const: Map<Value, u32>,
     /// A pixel's discards (see [`Structured::discards`]) by block and
     /// instruction.
     kills: HashSet<(usize, usize)>,
@@ -617,16 +651,16 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: Set::default(),
             restored: Map::default(),
+            restored_const: Map::default(),
             kills: HashSet::new(),
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
                 && let Some(last) = block.insts.last()
-                && l.discards(last)
                 && (l.kill_exit(taken) || l.kill_exit(not_taken))
-                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+                && let Some(def) = l.discard_def(last)
             {
-                l.kills.insert(*def);
+                l.kills.insert(def);
             }
         }
         for inst in blocks.iter().flat_map(|b| &b.insts) {
@@ -638,15 +672,23 @@ impl<'a> Lanes<'a> {
                 && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
                 && let Some(&(_, r)) = inst.writes.first()
             {
-                l.restored.insert(r, s);
+                match s {
+                    Spilled::Value(v) => {
+                        l.restored.insert(r, v);
+                    }
+                    Spilled::Const(c) => {
+                        l.restored_const.insert(r, c);
+                    }
+                }
             }
         }
         Ok(l)
     }
 
     /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
-    /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
+    /// an SGPR or scalar constant there: `Ok(None)` for a phi in `seen`
+    /// (being resolved).
+    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Spilled>, ()> {
         if let Some(&(b, i)) = self.phis.get(&v) {
             if seen.contains(&v) {
                 return Ok(None);
@@ -678,9 +720,15 @@ impl<'a> Lanes<'a> {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Some).ok_or(())
-            }
+            Operand::Scalar { code: NULL, .. } => Ok(Some(Spilled::Const(0))),
+            Operand::Scalar { code, .. } => inst
+                .read(Reg::S(code))
+                .map(|v| Some(Spilled::Value(v)))
+                .ok_or(()),
+            Operand::Const(c) => crate::resource::inline(c)
+                .map(|x| Some(Spilled::Const(x)))
+                .ok_or(()),
+            Operand::Literal(x) => Ok(Some(Spilled::Const(x))),
             _ => Err(()),
         }
     }
@@ -697,8 +745,9 @@ impl<'a> Lanes<'a> {
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
-    /// block in reverse postorder; returns EXEC at each instruction reading it.
-    fn masks_in_order(&mut self) -> Vec<Vec<Option<Bool>>> {
+    /// block in reverse postorder; returns EXEC at each instruction reading it
+    /// and the discarded lanes at each pixel discard.
+    fn masks_in_order(&mut self) -> (Execs, Discards) {
         let p = self.p;
         let input = |reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
         if let Some(lo) = input(Reg::S(EXEC)) {
@@ -712,6 +761,7 @@ impl<'a> Lanes<'a> {
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
+        let mut kill_lanes: Map<(usize, usize), Bool> = Map::default();
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
@@ -731,31 +781,63 @@ impl<'a> Lanes<'a> {
             }
             // EXEC where known in this block (read or written so far).
             let mut now = None;
+            // Pending split 32-bit writes to exec_lo/exec_hi in wave64.
+            let mut split_exec: (Option<Value>, Option<Value>) = (None, None);
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                if inst.read(Reg::S(EXEC)).is_some() {
-                    let e = self.exec(inst);
+                if let Some(k) = self.key(|r| inst.read(r), EXEC) {
+                    let e = self.mask(k).0;
                     execs[b][i] = Some(e);
                     now = Some(e);
                 }
                 self.step(inst, now);
                 if self.kills.contains(&(b, i))
                     && let Fields::Sop {
-                        dst: Some(Operand::Scalar { code, .. }),
+                        dst: Some(Operand::Scalar { code: dst_code, .. }),
+                        src,
                         ..
-                    } = inst.fields
-                    && let (Some(old), Some(new)) = (
-                        self.key(|r| inst.read(r), code),
-                        self.key(|r| inst.write(r), code),
+                    } = &inst.fields
+                    && let [
+                        Operand::Scalar { code: live_code, .. },
+                        Operand::Scalar { code: kill_code, .. },
+                    ] = src[..]
+                    && let (Some(old), Some(killed), Some(new)) = (
+                        self.key(|r| inst.read(r), live_code),
+                        self.key(|r| inst.read(r), kill_code),
+                        self.key(|r| inst.write(r), *dst_code),
                     )
                 {
                     let m = self.mask(old).0;
+                    let k = self.mask(killed).0;
                     self.masks.insert(new, m);
+                    if now.is_some_and(|e| self.b.implies(m, e)) {
+                        self.active.insert(new.0);
+                    }
                     if let Some(scc) = inst.write(Reg::Scc) {
                         self.scc_lane.insert(scc, m);
                     }
+                    kill_lanes.insert((b, i), k);
                 }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
+                    split_exec = (None, None);
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
+                } else if p.wave64
+                    && (inst.write(Reg::S(EXEC)).is_some()
+                        || inst.write(Reg::S(EXEC + 1)).is_some())
+                {
+                    if let Some(lo) = inst.write(Reg::S(EXEC)) {
+                        split_exec.0 = Some(lo);
+                    }
+                    if let Some(hi) = inst.write(Reg::S(EXEC + 1)) {
+                        split_exec.1 = Some(hi);
+                    }
+                    if let (Some(lo), Some(hi)) = split_exec {
+                        let m = self.mask((lo, hi)).0;
+                        self.active.insert(lo);
+                        now = Some(m);
+                        split_exec = (None, None);
+                    } else {
+                        now = None;
+                    }
                 }
             }
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
@@ -764,11 +846,7 @@ impl<'a> Lanes<'a> {
                 let mut w = self.branch(last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
-                if last
-                    .read(Reg::Scc)
-                    .and_then(|v| self.defs.get(&v))
-                    .is_some_and(|d| self.kills.contains(d))
-                {
+                if self.discard_def(last).is_some_and(|d| self.kills.contains(&d)) {
                     if self.kill_exit(taken) {
                         w = Bool::FALSE;
                     } else if self.kill_exit(not_taken) {
@@ -778,7 +856,7 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(w);
             }
         }
-        execs
+        (execs, kill_lanes)
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
@@ -820,6 +898,7 @@ impl<'a> Lanes<'a> {
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
+        kill_lanes: Discards,
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
@@ -887,11 +966,7 @@ impl<'a> Lanes<'a> {
             },
             active: self.active,
             restored: self.restored,
-            discards: self
-                .kills
-                .iter()
-                .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
-                .collect(),
+            discards: kill_lanes,
             bools: self.b,
             exits,
             guards,
@@ -916,6 +991,408 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    fn constant(&mut self, v: u64) -> Bool {
+        let v = if self.p.wave64 { v } else { v & 0xFFFF_FFFF };
+        match v {
+            0 => Bool::FALSE,
+            _ if v == u64::MAX >> (32 * u8::from(!self.p.wave64)) => Bool::TRUE,
+            _ => self.b.atom(Atom::Constant(v), 0),
+        }
+    }
+
+    fn has_opaque(&self, b: Bool) -> bool {
+        self.b
+            .support(b)
+            .iter()
+            .any(|a| matches!(a, Atom::Opaque(_)))
+    }
+
+    fn half_const(op: &Operand) -> Option<u32> {
+        match *op {
+            Operand::Scalar { code: NULL, .. } => Some(0),
+            Operand::Const(c) => crate::resource::inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    /// One step back across a 32-bit value-preserving copy or spill restore.
+    fn unwrap_half_step(&self, v: Value) -> Option<Value> {
+        if let Some(&s) = self.restored.get(&v) {
+            return Some(s);
+        }
+        if !self.p.wave64 {
+            return None;
+        }
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let scalar = |op: &Operand| match *op {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            _ => None,
+        };
+        match (inst.name(), src.as_slice()) {
+            ("s_mov_b32", [a]) => scalar(a),
+            ("s_and_b32", [a, c]) if Self::half_const(c) == Some(u32::MAX) => scalar(a),
+            ("s_and_b32", [a, c]) if Self::half_const(a) == Some(u32::MAX) => scalar(c),
+            ("s_or_b32" | "s_xor_b32", [a, c]) if Self::half_const(c) == Some(0) => scalar(a),
+            ("s_or_b32" | "s_xor_b32", [a, c]) if Self::half_const(a) == Some(0) => scalar(c),
+            ("s_andn2_b32", [a, c]) if Self::half_const(c) == Some(0) => scalar(a),
+            _ => None,
+        }
+    }
+
+    fn unwrap_key(&self, mut k: Key) -> Key {
+        for _ in 0..16 {
+            if self.masks.contains_key(&k) || self.other.contains_key(&k) {
+                break;
+            }
+            let (u0, u1) = (self.unwrap_half_step(k.0), self.unwrap_half_step(k.1));
+            let next = (u0.unwrap_or(k.0), u1.unwrap_or(k.1));
+            if next == k {
+                break;
+            }
+            k = next;
+        }
+        k
+    }
+
+    /// 32-bit constant held by scalar value `v`, following copies and spills.
+    fn const32(&self, mut v: Value) -> Option<u32> {
+        for _ in 0..16 {
+            if let Some(&c) = self.restored_const.get(&v) {
+                return Some(c);
+            }
+            if let Some(&(b, i)) = self.defs.get(&v) {
+                let inst = &self.p.blocks[b].insts[i];
+                if let Fields::Sop { src, imm, .. } = &inst.fields {
+                    let same_reg = |a: &Operand, c: &Operand| {
+                        matches!(a, Operand::Scalar { code, .. } if *code != NULL) && a == c
+                    };
+                    match (inst.name(), src.as_slice()) {
+                        ("s_mov_b32", [a]) => {
+                            if let Some(c) = Self::half_const(a) {
+                                return Some(c);
+                            }
+                        }
+                        ("s_movk_i32", _) => {
+                            if let Some(x) = imm {
+                                return Some(i32::from(*x as i16) as u32);
+                            }
+                        }
+                        ("s_xor_b32" | "s_andn2_b32" | "s_sub_u32" | "s_sub_i32", [a, c])
+                            if same_reg(a, c) =>
+                        {
+                            return Some(0);
+                        }
+                        ("s_orn2_b32", [a, c]) if same_reg(a, c) => return Some(u32::MAX),
+                        ("s_and_b32", [a, c])
+                            if Self::half_const(a) == Some(0)
+                                || Self::half_const(c) == Some(0) =>
+                        {
+                            return Some(0);
+                        }
+                        ("s_or_b32", [a, c])
+                            if Self::half_const(a) == Some(u32::MAX)
+                                || Self::half_const(c) == Some(u32::MAX) =>
+                        {
+                            return Some(u32::MAX);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            v = self.unwrap_half_step(v)?;
+        }
+        None
+    }
+
+    fn half_op(&self, inst: &Inst, op: &Operand) -> Option<HalfOp> {
+        if let Some(c) = Self::half_const(op) {
+            return Some(HalfOp::Const(c));
+        }
+        match *op {
+            Operand::Scalar { code, .. } if code != NULL => {
+                let v = inst.read(Reg::S(code))?;
+                Some(self.const32(v).map_or(HalfOp::Val(v), HalfOp::Const))
+            }
+            _ => None,
+        }
+    }
+
+    /// Matches two distinct 32-bit SOP instructions defining the low and high
+    /// halves of a wave64 pair with the same bitwise, select, or cmov op.
+    fn split_pair(&self, k: Key) -> Option<SplitPair> {
+        let (d0, d1) = (self.defs.get(&k.0)?, self.defs.get(&k.1)?);
+        if d0 == d1 {
+            return None;
+        }
+        let (i0, i1) = (
+            &self.p.blocks[d0.0].insts[d0.1],
+            &self.p.blocks[d1.0].insts[d1.1],
+        );
+        let (
+            Fields::Sop {
+                dst: dst0,
+                src: s0,
+                imm: imm0,
+            },
+            Fields::Sop {
+                dst: dst1,
+                src: s1,
+                imm: imm1,
+            },
+        ) = (&i0.fields, &i1.fields)
+        else {
+            return None;
+        };
+        match (i0.name(), i1.name()) {
+            ("s_not_b32", "s_not_b32") => Some(SplitPair::Not(
+                self.half_op(i0, s0.first()?)?,
+                self.half_op(i1, s1.first()?)?,
+            )),
+            ("s_cselect_b32", "s_cselect_b32") => {
+                let scc = i0.read(Reg::Scc)?;
+                if i1.read(Reg::Scc) != Some(scc) {
+                    return None;
+                }
+                Some(SplitPair::Select {
+                    scc,
+                    a: (
+                        self.half_op(i0, s0.first()?)?,
+                        self.half_op(i1, s1.first()?)?,
+                    ),
+                    c: (
+                        self.half_op(i0, s0.get(1)?)?,
+                        self.half_op(i1, s1.get(1)?)?,
+                    ),
+                })
+            }
+            ("s_cmov_b32" | "s_cmovk_i32", "s_cmov_b32" | "s_cmovk_i32") => {
+                let scc = i0.read(Reg::Scc)?;
+                if i1.read(Reg::Scc) != Some(scc) {
+                    return None;
+                }
+                let src_half = |inst: &Inst, s: &[Operand], imm: Option<u16>| {
+                    if inst.name() == "s_cmovk_i32" {
+                        imm.map(|x| HalfOp::Const(i32::from(x as i16) as u32))
+                    } else {
+                        self.half_op(inst, s.first()?)
+                    }
+                };
+                Some(SplitPair::Select {
+                    scc,
+                    a: (src_half(i0, s0, *imm0)?, src_half(i1, s1, *imm1)?),
+                    c: (
+                        self.half_op(i0, dst0.as_ref()?)?,
+                        self.half_op(i1, dst1.as_ref()?)?,
+                    ),
+                })
+            }
+            (n0, n1) if n0 == n1 => {
+                let op = n0.strip_prefix("s_")?.strip_suffix("_b32")?;
+                let comm = match op {
+                    "and" | "or" | "xor" | "nand" | "nor" | "xnor" => true,
+                    "andn2" | "orn2" => false,
+                    _ => return None,
+                };
+                Some(SplitPair::Bin {
+                    op,
+                    a0: self.half_op(i0, s0.first()?)?,
+                    b0: self.half_op(i0, s0.get(1)?)?,
+                    a1: self.half_op(i1, s1.first()?)?,
+                    b1: self.half_op(i1, s1.get(1)?)?,
+                    comm,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Read-only check whether `k` derives from a tracked mask in `self.masks`
+    /// without creating any `Atom::Opaque`.
+    fn derives_mask(&self, k: Key, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if self.masks.contains_key(&k) {
+            return true;
+        }
+        if self.other.contains_key(&k) {
+            return false;
+        }
+        let (u0, u1) = (self.unwrap_half_step(k.0), self.unwrap_half_step(k.1));
+        if u0.is_some() || u1.is_some() {
+            let next = (u0.unwrap_or(k.0), u1.unwrap_or(k.1));
+            if next != k && self.derives_mask(next, depth - 1) {
+                return true;
+            }
+        }
+        if !self.p.wave64 {
+            return false;
+        }
+        let pair_has_mask = |a: HalfOp, c: HalfOp| match (a, c) {
+            (HalfOp::Val(v0), HalfOp::Val(v1)) => self.derives_mask((v0, v1), depth - 1),
+            _ => false,
+        };
+        let pair_compat = |a: HalfOp, c: HalfOp| {
+            matches!(
+                (a, c),
+                (HalfOp::Const(_), HalfOp::Const(_)) | (HalfOp::Val(_), HalfOp::Val(_))
+            )
+        };
+        match self.split_pair(k) {
+            Some(SplitPair::Not(a0, a1)) => pair_has_mask(a0, a1),
+            Some(SplitPair::Select { a, c, .. }) => {
+                pair_compat(a.0, a.1)
+                    && pair_compat(c.0, c.1)
+                    && (pair_has_mask(a.0, a.1) || pair_has_mask(c.0, c.1))
+            }
+            Some(SplitPair::Bin {
+                a0,
+                b0,
+                a1,
+                b1,
+                comm,
+                ..
+            }) => {
+                pair_compat(a0, a1)
+                    && pair_compat(b0, b1)
+                    && (pair_has_mask(a0, a1) || pair_has_mask(b0, b1))
+                    || comm
+                        && pair_compat(a0, b1)
+                        && pair_compat(b0, a1)
+                        && (pair_has_mask(a0, b1) || pair_has_mask(b0, a1))
+            }
+            None => false,
+        }
+    }
+
+    /// Resolves `k` only if it is a known structural mask or constant (never
+    /// returning a diagram containing `Atom::Opaque`).
+    fn try_known(&mut self, k: Key, depth: u8) -> Option<(Bool, bool)> {
+        if depth == 0 {
+            return None;
+        }
+        if let Some(&m) = self.masks.get(&k) {
+            return (!self.has_opaque(m)).then_some((m, true));
+        }
+        if let Some(&m) = self.other.get(&k) {
+            return (!self.has_opaque(m)).then_some((m, false));
+        }
+        if (self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1)) && !self.joins_loaded(k) {
+            if let Some((m, d)) = self.join(k)
+                && !self.has_opaque(m)
+            {
+                let cache = if d { &mut self.masks } else { &mut self.other };
+                cache.insert(k, m);
+                return Some((m, d));
+            }
+            return None;
+        }
+        let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
+        if let (Some(at), Some(hi_at)) = (lo, hi)
+            && at == hi_at
+        {
+            let inst = &self.p.blocks[at.0].insts[at.1];
+            if let Some(r) = self.sop(inst)
+                && let Some((_, m)) = r.dst
+                && !self.has_opaque(m)
+            {
+                let cache = if r.derived {
+                    &mut self.masks
+                } else {
+                    &mut self.other
+                };
+                cache.insert(k, m);
+                return Some((m, r.derived));
+            }
+            return None;
+        }
+        if !self.p.wave64 {
+            if let Some(c) = self.const32(k.0) {
+                let m = self.constant(u64::from(c));
+                self.other.insert(k, m);
+                return Some((m, false));
+            }
+            return None;
+        }
+        let (m, d) = self.split_wave64(k, depth - 1)?;
+        let cache = if d { &mut self.masks } else { &mut self.other };
+        cache.insert(k, m);
+        Some((m, d))
+    }
+
+    /// Resolves a wave64 mask or constant built from two 32-bit halves
+    /// (copies, spill restores, constants, or matching 32-bit SOP ops).
+    fn split_wave64(&mut self, k: Key, depth: u8) -> Option<(Bool, bool)> {
+        if depth == 0 {
+            return None;
+        }
+        let (u0, u1) = (self.unwrap_half_step(k.0), self.unwrap_half_step(k.1));
+        if u0.is_some() || u1.is_some() {
+            let next = (u0.unwrap_or(k.0), u1.unwrap_or(k.1));
+            if next != k
+                && let Some(res) = self.try_known(next, depth - 1)
+            {
+                return Some(res);
+            }
+        }
+        if let (Some(c0), Some(c1)) = (self.const32(k.0), self.const32(k.1)) {
+            let v = u64::from(c0) | (u64::from(c1) << 32);
+            return Some((self.constant(v), false));
+        }
+        let eval_pair = |l: &mut Self, a: HalfOp, c: HalfOp| -> Option<(Bool, bool)> {
+            match (a, c) {
+                (HalfOp::Const(lo), HalfOp::Const(hi)) => {
+                    let v = u64::from(lo) | (u64::from(hi) << 32);
+                    Some((l.constant(v), false))
+                }
+                (HalfOp::Val(v0), HalfOp::Val(v1)) => l.try_known((v0, v1), depth - 1),
+                _ => None,
+            }
+        };
+        match self.split_pair(k)? {
+            SplitPair::Not(a0, a1) => {
+                let (a, d) = eval_pair(self, a0, a1)?;
+                Some((self.b.not(a), d))
+            }
+            SplitPair::Select { scc, a, c } => {
+                let (a, d0) = eval_pair(self, a.0, a.1)?;
+                let (c, d1) = eval_pair(self, c.0, c.1)?;
+                let born = self.born(scc);
+                let u = self.b.atom(Atom::Uniform(scc), born);
+                Some((self.b.ite(u, a, c), d0 || d1))
+            }
+            SplitPair::Bin {
+                op,
+                a0,
+                b0,
+                a1,
+                b1,
+                comm,
+            } => {
+                let (a, da, c, dc) =
+                    if let (Some((a, da)), Some((c, dc))) =
+                        (eval_pair(self, a0, a1), eval_pair(self, b0, b1))
+                    {
+                        (a, da, c, dc)
+                    } else if comm
+                        && let (Some((a, da)), Some((c, dc))) =
+                            (eval_pair(self, a0, b1), eval_pair(self, b0, a1))
+                    {
+                        (a, da, c, dc)
+                    } else {
+                        return None;
+                    };
+                let r = self.combine(op, a, c)?;
+                Some((r, da || dc))
+            }
+        }
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -937,32 +1414,38 @@ impl<'a> Lanes<'a> {
             self.restored.get(&k.0).copied(),
             self.restored.get(&k.1).copied(),
         );
+        let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
+        let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
+        // What an EXEC write the pass does not follow leaves there.
+        let exec_write = |d: Option<(usize, usize)>, v: Value| {
+            def(d).is_some_and(|i| {
+                i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
+            })
+        };
+        let exec_w = exec_write(lo, k.0) || exec_write(hi, k.1);
         let (m, derived) = match (self.join(k), restored) {
             (Some(join), _) => join,
             // A mask spilled to VGPR lanes and read back: the same mask.
-            (None, (Some(lo), Some(hi))) => self.mask((lo, hi)),
+            (None, (Some(rlo), Some(rhi))) => self.mask((rlo, rhi)),
             (None, _) => {
-                let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
-                let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
-                // What an EXEC write the pass does not follow leaves there.
-                let exec_write = |d: Option<(usize, usize)>, v: Value| {
-                    def(d).is_some_and(|i| {
-                        i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
-                    })
-                };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                let m = m.unwrap_or_else(|| {
+                if let (Some(at), Some(hi_at)) = (lo, hi)
+                    && at == hi_at
+                    && let Some(r) = def(lo).and_then(|i| self.sop(i))
+                    && let Some((_, m)) = r.dst
+                {
+                    (m, r.derived || exec_w)
+                } else if !p.wave64
+                    && let Some(c) = self.const32(k.0)
+                {
+                    (self.constant(u64::from(c)), exec_w)
+                } else if p.wave64
+                    && let Some((m, d)) = self.split_wave64(k, 16)
+                {
+                    (m, d || exec_w)
+                } else {
                     let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
-                });
-                (m, derived)
+                    (self.b.atom(Atom::Opaque(k.0), born), exec_w)
+                }
             }
         };
         let cache = if derived {
@@ -981,10 +1464,22 @@ impl<'a> Lanes<'a> {
     fn join(&mut self, k: Key) -> Option<(Bool, bool)> {
         let p = self.p;
         let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
-        let block = match (lo, hi) {
-            (Some((a, _)), Some((b, _))) if a != b => return None,
-            (Some((b, _)), _) | (_, Some((b, _))) => b,
-            _ => return None,
+        let (lo, hi, block) = match (lo, hi) {
+            (Some((a, ia)), Some((b, ib))) if a == b => (Some((a, ia)), Some((b, ib)), a),
+            (Some((a, ia)), Some((b, ib))) => {
+                let (ra, rb) = (self.index[a], self.index[b]);
+                if ra == usize::MAX || rb == usize::MAX {
+                    return None;
+                }
+                if ra > rb {
+                    (Some((a, ia)), None, a)
+                } else {
+                    (None, Some((b, ib)), b)
+                }
+            }
+            (Some((b, i)), None) => (Some((b, i)), None, b),
+            (None, Some((b, i))) => (None, Some((b, i)), b),
+            (None, None) => return None,
         };
         let target = &p.blocks[block];
         let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
@@ -1036,17 +1531,9 @@ impl<'a> Lanes<'a> {
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
-        let wave64 = self.p.wave64;
-        let constant = |b: &mut Bools, v: u64| {
-            let v = if wave64 { v } else { v & 0xFFFF_FFFF };
-            match v {
-                0 => Bool::FALSE,
-                _ if v == u64::MAX >> (32 * u8::from(!wave64)) => Bool::TRUE,
-                _ => b.atom(Atom::Constant(v), 0),
-            }
-        };
         Some(match *op {
-            Operand::Scalar { code, .. } if code != NULL => {
+            Operand::Scalar { code: NULL, .. } => (Bool::FALSE, false),
+            Operand::Scalar { code, .. } => {
                 let k = self.key(|r| inst.read(r), code)?;
                 self.mask(k)
             }
@@ -1056,27 +1543,59 @@ impl<'a> Lanes<'a> {
                 } else {
                     192 - i64::from(c)
                 };
-                (constant(&mut self.b, v as u64), false)
+                (self.constant(v as u64), false)
             }
-            Operand::Literal(x) => (constant(&mut self.b, u64::from(x)), false),
+            Operand::Literal(x) => (self.constant(u64::from(x)), false),
             _ => return None,
         })
     }
 
     /// Lane-mask meaning of a lane-width scalar operation.
     fn sop(&mut self, inst: &Inst) -> Option<SopMasks> {
-        let Fields::Sop { dst, src, .. } = &inst.fields else {
+        let Fields::Sop { dst, src, imm } = &inst.fields else {
             return None;
         };
-        let width = if self.p.wave64 { "_b64" } else { "_b32" };
-        let op = inst.name().strip_prefix("s_")?.strip_suffix(width)?;
-        let dst = match dst {
-            Some(Operand::Scalar { code, .. }) if *code != NULL => {
-                self.key(|r| inst.write(r), *code)
-            }
+        let dst_op = match dst {
+            Some(op @ Operand::Scalar { code, .. }) if *code != NULL => Some(*op),
+            _ => None,
+        };
+        let dst = match dst_op {
+            Some(Operand::Scalar { code, .. }) => self.key(|r| inst.write(r), code),
             _ => None,
         };
         let exec_out = self.key(|r| inst.write(r), EXEC);
+        if !self.p.wave64 {
+            match inst.name() {
+                "s_movk_i32" => {
+                    let v = i32::from((*imm)? as i16) as u32;
+                    let r = self.constant(u64::from(v));
+                    return Some(SopMasks {
+                        dst: dst.map(|d| (d, r)),
+                        exec: exec_out.map(|e| (e, r)),
+                        derived: exec_out.is_some(),
+                        scc: None,
+                    });
+                }
+                "s_cmovk_i32" => {
+                    let v = i32::from((*imm)? as i16) as u32;
+                    let a = self.constant(u64::from(v));
+                    let (old, d) = self.operand(inst, &dst_op?)?;
+                    let scc = inst.read(Reg::Scc)?;
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    let r = self.b.ite(u, a, old);
+                    return Some(SopMasks {
+                        dst: dst.map(|k| (k, r)),
+                        exec: exec_out.map(|e| (e, r)),
+                        derived: exec_out.is_some() || d,
+                        scc: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let op = inst.name().strip_prefix("s_")?.strip_suffix(width)?;
         let (save, f) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
             (Some(f), _) => (Some(true), f),
             (_, Some(f)) => (Some(false), f),
@@ -1102,6 +1621,15 @@ impl<'a> Lanes<'a> {
         }
         let (result, scc) = match op {
             "mov" => (arg(0, self)?, None),
+            "cmov" => {
+                let a = arg(0, self)?;
+                let (old, d) = self.operand(inst, &dst_op?)?;
+                derived |= d;
+                let scc = inst.read(Reg::Scc)?;
+                let born = self.born(scc);
+                let u = self.b.atom(Atom::Uniform(scc), born);
+                (self.b.ite(u, a, old), None)
+            }
             "not" => {
                 let a = arg(0, self)?;
                 let r = self.b.not(a);
@@ -1178,16 +1706,18 @@ impl<'a> Lanes<'a> {
     fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
         match &inst.fields {
-            Fields::Sop { src, .. } => {
+            Fields::Sop { dst, src, imm } => {
                 let mut takes_mask = false;
-                for s in src {
+                let extra = dst.as_ref().filter(|_| name.starts_with("s_cmov"));
+                for s in src.iter().chain(extra) {
                     if let Operand::Scalar { code, .. } = *s
                         && code != NULL
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
-                        let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k)
-                            || phi && !self.joins_loaded(k) && self.mask(k).1;
+                        let u = self.unwrap_key(k);
+                        let phi = self.phis.contains_key(&u.0) || self.phis.contains_key(&u.1);
+                        takes_mask |= self.derives_mask(u, 8)
+                            || phi && !self.joins_loaded(u) && self.mask(u).1;
                     }
                 }
                 let touches_exec =
@@ -1208,18 +1738,64 @@ impl<'a> Lanes<'a> {
                         self.scc_lane.insert(scc, m);
                     }
                 }
+                // Wave64: `s_or_b32 tmp, lo, hi` sets SCC iff `(lo | hi) != 0`
+                // ("some lane of the 64-bit mask is set").
+                if self.p.wave64
+                    && name == "s_or_b32"
+                    && let Some(scc) = inst.write(Reg::Scc)
+                    && let [
+                        Operand::Scalar { code: a, .. },
+                        Operand::Scalar { code: c, .. },
+                    ] = src[..]
+                    && a != NULL
+                    && c != NULL
+                    && let (Some(va), Some(vc)) = (inst.read(Reg::S(a)), inst.read(Reg::S(c)))
+                {
+                    for k in [(va, vc), (vc, va)] {
+                        let u = self.unwrap_key(k);
+                        if self.derives_mask(u, 8) {
+                            let (m, d) = self.mask(k);
+                            if d {
+                                self.scc_lane.insert(scc, m);
+                                break;
+                            }
+                        }
+                    }
+                }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
                 let width = if self.p.wave64 { "64" } else { "32" };
                 if takes_mask
                     && let (Some(rest), Some(scc)) =
                         (name.strip_prefix("s_cmp_"), inst.write(Reg::Scc))
-                    && rest
-                        .strip_suffix(width)
-                        .is_some_and(|r| r == "eq_u" || r == "lg_u")
+                    && rest.strip_suffix(width).is_some_and(|r| {
+                        r == "eq_u" || r == "lg_u" || !self.p.wave64 && (r == "eq_i" || r == "lg_i")
+                    })
                     && let [a, c] = &src[..]
                     && let (Some((a, _)), Some((c, _))) =
                         (self.operand(inst, a), self.operand(inst, c))
                 {
+                    let ne = self.b.xor(a, c);
+                    let m = if rest.starts_with("eq") {
+                        self.b.not(ne)
+                    } else {
+                        ne
+                    };
+                    self.scc_lane.insert(scc, m);
+                }
+                if !self.p.wave64
+                    && takes_mask
+                    && let (Some(rest), Some(scc), Some(imm)) =
+                        (name.strip_prefix("s_cmpk_"), inst.write(Reg::Scc), *imm)
+                    && matches!(rest, "eq_i32" | "lg_i32" | "eq_u32" | "lg_u32")
+                    && let [a] = &src[..]
+                    && let Some((a, _)) = self.operand(inst, a)
+                {
+                    let v = if rest.ends_with("i32") {
+                        i32::from(imm as i16) as u32
+                    } else {
+                        u32::from(imm)
+                    };
+                    let c = self.constant(u64::from(v));
                     let ne = self.b.xor(a, c);
                     let m = if rest.starts_with("eq") {
                         self.b.not(ne)
@@ -1238,9 +1814,9 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select or carry-in reads a mask nothing else may: a join of
+                // compare/carry results is resolved here, as for EXEC.
+                if (name == "v_cndmask_b32" || name.ends_with("_ci_u32"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
@@ -1281,25 +1857,100 @@ impl<'a> Lanes<'a> {
         })
     }
 
-    /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
-    /// any lane is left in a pixel's live mask after a discard.
-    fn discards(&self, inst: &Inst) -> bool {
-        if !inst.name().starts_with("s_cbranch_scc") {
-            return false;
+    /// The `s_andn2` updating a pixel's live mask before `inst` branches to a
+    /// discard exit (`kill_exit`), if `inst` tests whether any lane remains.
+    fn discard_def(&self, inst: &Inst) -> Option<(usize, usize)> {
+        let andn2_name = if self.p.wave64 {
+            "s_andn2_b64"
+        } else {
+            "s_andn2_b32"
+        };
+        let wqm_name = if self.p.wave64 {
+            "s_wqm_b64"
+        } else {
+            "s_wqm_b32"
+        };
+        let is_andn2 = |at: (usize, usize)| -> bool {
+            let def = &self.p.blocks[at.0].insts[at.1];
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: d, .. }),
+                src,
+                ..
+            } = &def.fields
+            else {
+                return false;
+            };
+            def.name() == andn2_name
+                && *d != NULL
+                && matches!(
+                    src.as_slice(),
+                    [
+                        Operand::Scalar { code: s0, .. },
+                        Operand::Scalar { code: s1, .. },
+                    ] if *s0 != NULL && *s1 != NULL
+                )
+        };
+        let def_of_pair = |inst: &Inst, code: u8| -> Option<(usize, usize)> {
+            let k = self.key(|r| inst.read(r), code)?;
+            let d0 = *self.defs.get(&k.0)?;
+            let d1 = *self.defs.get(&k.1)?;
+            (d0 == d1).then_some(d0)
+        };
+        let wqm_to_andn2 = |at: (usize, usize)| -> Option<(usize, usize)> {
+            let def = &self.p.blocks[at.0].insts[at.1];
+            if def.name() != wqm_name {
+                return None;
+            }
+            let Fields::Sop { src, .. } = &def.fields else {
+                return None;
+            };
+            let [Operand::Scalar { code, .. }] = src[..] else {
+                return None;
+            };
+            let prev = def_of_pair(def, code)?;
+            is_andn2(prev).then_some(prev)
+        };
+        let name = inst.name();
+        if name.starts_with("s_cbranch_scc") {
+            let at = *inst.read(Reg::Scc).and_then(|v| self.defs.get(&v))?;
+            if is_andn2(at) {
+                return Some(at);
+            }
+            if let Some(prev) = wqm_to_andn2(at) {
+                return Some(prev);
+            }
+            // `s_cmp_{eq,lg}` of the updated live mask against 0.
+            let def = &self.p.blocks[at.0].insts[at.1];
+            let width = if self.p.wave64 { "64" } else { "32" };
+            let cmp_ok = def
+                .name()
+                .strip_prefix("s_cmp_")
+                .and_then(|r| r.strip_suffix(width))
+                .is_some_and(|r| {
+                    r == "eq_u" || r == "lg_u" || !self.p.wave64 && (r == "eq_i" || r == "lg_i")
+                });
+            if cmp_ok && let Fields::Sop { src, .. } = &def.fields {
+                let code = match src.as_slice() {
+                    [Operand::Scalar { code, .. }, z]
+                    | [z, Operand::Scalar { code, .. }]
+                        if *code != NULL && Self::half_const(z) == Some(0) =>
+                    {
+                        *code
+                    }
+                    _ => return None,
+                };
+                let prev = def_of_pair(def, code)?;
+                if is_andn2(prev) {
+                    return Some(prev);
+                }
+            }
+            return None;
         }
-        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
-            return false;
-        };
-        let def = &self.p.blocks[db].insts[di];
-        let Fields::Sop {
-            dst: Some(d), src, ..
-        } = &def.fields
-        else {
-            return false;
-        };
-        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
-            && src.first() == Some(d)
-            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+        if matches!(name, "s_cbranch_execz" | "s_cbranch_execnz") {
+            let at = def_of_pair(inst, EXEC)?;
+            return wqm_to_andn2(at);
+        }
+        None
     }
 
     /// Whether a lane entering block `b` leaves the program doing nothing but
@@ -1656,6 +2307,613 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    fn has_any_opaque(s: &Structured) -> bool {
+        let exit_conds = s.exits.iter().filter_map(|e| match *e {
+            LaneExit::Branch { when, .. } => Some(when),
+            _ => None,
+        });
+        let guard_conds = s.guards.iter().flatten().flatten().copied();
+        let discard_conds = s.discards.values().copied();
+        exit_conds
+            .chain(guard_conds)
+            .chain(discard_conds)
+            .any(|b| {
+                s.bools
+                    .support(b)
+                    .iter()
+                    .any(|a| matches!(a, Atom::Opaque(_)))
+            })
+    }
+
+    #[test]
+    fn s_cmov_selects_between_lane_masks_without_opaque() {
+        // Wave64: s_cmov_b64 s[4:5], vcc (over 0), then branch on it.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE84_0480, // s_mov_b64 s[4:5], 0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xBE84_066A, // s_cmov_b64 s[4:5], vcc
+                0xBE86_2404, // s_and_saveexec_b64 s[6:7], s[4:5]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let scc = p.blocks[0].insts[2].write(Reg::Scc).unwrap();
+        assert_eq!(
+            s.bools.support(when),
+            vec![Atom::Lane(cmp), Atom::Uniform(scc)]
+        );
+        assert_eq!(guarded(&s), 0);
+
+        // Wave64: s_cmov_b64 s[4:5], 0 where old dst holds a mask.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xBE84_0680, // s_cmov_b64 s[4:5], 0
+                0xBE86_2404, // s_and_saveexec_b64 s[6:7], s[4:5]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let cmov_dst = p.blocks[0].insts[3].write(Reg::S(4)).unwrap();
+        assert!(s.masks.contains_key(&cmov_dst));
+        assert!(s.active.contains(&cmov_dst));
+
+        // Wave64: s_cmov_b64 exec, vcc writes EXEC directly.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xBEFE_066A, // s_cmov_b64 exec, vcc
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let g = s.guards[0][3].expect("guarded by s_cmov_b64 exec");
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let scc = p.blocks[0].insts[1].write(Reg::Scc).unwrap();
+        assert_eq!(
+            s.bools.support(g),
+            vec![Atom::Lane(cmp), Atom::Uniform(scc)]
+        );
+
+        // Wave32: s_cmov_b32 and s_cmovk_i32.
+        for words in [
+            vec![
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xBE84_056A, // s_cmov_b32 s4, vcc_lo
+                0xBE86_3C04, // s_and_saveexec_b32 s6, s4
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            vec![
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+                0xBE84_036A, // s_mov_b32 s4, vcc_lo
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xB104_0000, // s_cmovk_i32 s4, 0
+                0xBE86_3C04, // s_and_saveexec_b32 s6, s4
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+        ] {
+            let p = build(&words, false);
+            let s = structure(&p).unwrap();
+            assert!(!has_any_opaque(&s));
+            assert_eq!(guarded(&s), 0);
+        }
+    }
+
+    #[test]
+    fn split_32bit_moves_and_constants_resolve_wave64_masks() {
+        // Save/restore EXEC with split s_mov_b32 pairs across a divergent branch.
+        let p = build(
+            &[
+                0xBE94_037E, // s_mov_b32 s20, exec_lo
+                0xBE95_037F, // s_mov_b32 s21, exec_hi
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                0xBEFE_0314, // s_mov_b32 exec_lo, s20
+                0xBEFF_0315, // s_mov_b32 exec_hi, s21
+                0x7E04_0282, // v_mov_b32_e32 v2, 2
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+        let restored_exec_lo = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+        assert!(s.masks.contains_key(&restored_exec_lo));
+        assert!(s.active.contains(&restored_exec_lo));
+
+        // Split s_mov_b32 of vcc_lo/vcc_hi used by s_and_saveexec_b64.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE94_036A, // s_mov_b32 s20, vcc_lo
+                0xBE95_036B, // s_mov_b32 s21, vcc_hi
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
+
+        // Split 32-bit zero and all-ones constants.
+        for (lo_w, hi_w, expect) in [
+            (0xBE94_0380, 0xBE95_0380, Bool::TRUE),  // 0, 0 -> execz always taken
+            (0xBE94_03C1, 0xBE95_03C1, Bool::FALSE), // -1, -1 -> execz never taken
+        ] {
+            let p = build(
+                &[
+                    lo_w,
+                    hi_w,
+                    0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                    0xBF88_0001, // s_cbranch_execz 1
+                    0x7E02_0281, // v_mov_b32_e32 v1, 1
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            assert!(!has_any_opaque(&s));
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("{:?}", s.exits);
+            };
+            assert_eq!(when, expect);
+        }
+
+        // Split 32-bit asymmetric constant (0, -1) -> Atom::Constant, not Atom::Opaque.
+        let p = build(
+            &[
+                0xBE94_0380, // s_mov_b32 s20, 0
+                0xBE95_03C1, // s_mov_b32 s21, -1
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        assert_eq!(
+            s.bools.support(when),
+            vec![Atom::Constant(0xFFFF_FFFF_0000_0000)]
+        );
+    }
+
+    #[test]
+    fn split_32bit_bitwise_cselect_and_cmov_resolve_wave64_masks() {
+        // Matching 32-bit binary bitwise ops on wave64 mask halves.
+        for (op_lo, op_hi) in [
+            (0x8714_086A, 0x8715_096B), // s_and_b32
+            (0x8814_086A, 0x8815_096B), // s_or_b32
+            (0x8A14_086A, 0x8A15_096B), // s_andn2_b32
+            (0x8914_086A, 0x8915_096B), // s_xor_b32
+        ] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                    0xD4C4_0008,
+                    0x0002_0085, // v_cmp_gt_u32_e64 s[8:9], 5, v0
+                    op_lo,
+                    op_hi,
+                    0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                    0xBF88_0001, // s_cbranch_execz 1
+                    0x7E02_0281, // v_mov_b32_e32 v1, 1
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            assert!(!has_any_opaque(&s), "op {op_lo:#x}/{op_hi:#x}");
+            assert_eq!(guarded(&s), 0);
+        }
+
+        // Split s_not_b32 + s_or_b32 non-zero test into s_cbranch_scc0.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE94_076A, // s_not_b32 s20, vcc_lo
+                0xBE95_076B, // s_not_b32 s21, vcc_hi
+                0x8818_1514, // s_or_b32 s24, s20, s21
+                0xBF84_0001, // s_cbranch_scc0 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        // s_or_b32 sets SCC iff ~vcc != 0; s_cbranch_scc0 taken iff vcc holds.
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::FALSE, Bool::TRUE))
+        );
+
+        // Split s_cselect_b32 with matching SCC.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xD4C4_0008,
+                0x0002_0085, // v_cmp_gt_u32_e64 s[8:9], 5, v0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0x8514_086A, // s_cselect_b32 s20, vcc_lo, s8
+                0x8515_096B, // s_cselect_b32 s21, vcc_hi, s9
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert_eq!(guarded(&s), 0);
+
+        // Split s_cmov_b32 with matching SCC over split 0.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0xBE84_056A, // s_cmov_b32 s4, vcc_lo
+                0xBE85_056B, // s_cmov_b32 s5, vcc_hi
+                0xBE86_2404, // s_and_saveexec_b64 s[6:7], s[4:5]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn pixel_wqm_discard_and_saveexec_patterns_resolve_cleanly() {
+        // WQM + s_andn2_b64 s_live, s_live, vcc; s_cbranch_scc0 .kill_exit
+        let p = build(
+            &[
+                0xBE84_047E, // s_mov_b64 s[4:5], exec
+                0xBEFE_0A7E, // s_wqm_b64 exec, exec
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0x8A84_6A04, // s_andn2_b64 s[4:5], s[4:5], vcc
+                0xBF84_0003, // s_cbranch_scc0 -> kill_exit (skip 3 words)
+                0xBE86_2404, // s_and_saveexec_b64 s[6:7], s[4:5]
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+                0xF800_0890,
+                0x0000_0000, // kill_exit: exp null off, off, off, off done
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert_eq!(s.discards.len(), 1);
+        let cmp = p.blocks[0].insts[2].write(Reg::S(VCC)).unwrap();
+        assert_eq!(
+            s.bools.node(s.discards[&(0, 3)]),
+            Some((Atom::Lane(cmp), Bool::FALSE, Bool::TRUE))
+        );
+        assert!(matches!(
+            s.exits[0],
+            LaneExit::Branch {
+                when: Bool::FALSE,
+                ..
+            }
+        ));
+
+        // WQM + s_andn2_b64 s_live, s_live, exec; s_wqm_b64 exec, s_live; s_cbranch_execz .kill_exit
+        let p = build(
+            &[
+                0xBE84_047E, // s_mov_b64 s[4:5], exec
+                0xBEFE_0A7E, // s_wqm_b64 exec, exec
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+                0x8A84_7E04, // s_andn2_b64 s[4:5], s[4:5], exec
+                0xBEFE_0A04, // s_wqm_b64 exec, s[4:5]
+                0xBF88_0002, // s_cbranch_execz -> kill_exit (skip 2 words)
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+                0xF800_0890,
+                0x0000_0000, // kill_exit: exp null off, off, off, off done
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert_eq!(s.discards.len(), 1);
+        assert!(s.discards.contains_key(&(0, 4)));
+        assert!(matches!(
+            s.exits[0],
+            LaneExit::Branch {
+                when: Bool::FALSE,
+                ..
+            }
+        ));
+
+        // s_andn2_saveexec_b64, s_or_saveexec_b64, s_andn1_wrexec_b64, s_andn2_wrexec_b64.
+        let p = build(
+            &[
+                0xBE84_047E, // s_mov_b64 s[4:5], exec
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+                0xBE86_2706, // s_andn2_saveexec_b64 s[6:7], s[6:7]
+                0xBE86_256A, // s_or_saveexec_b64 s[6:7], vcc
+                0xBE86_396A, // s_andn1_wrexec_b64 s[6:7], vcc
+                0xBE86_3A04, // s_andn2_wrexec_b64 s[6:7], s[4:5]
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        for idx in 2..=6 {
+            let exec_w = p.blocks[0].insts[idx].write(Reg::S(EXEC)).unwrap();
+            assert!(s.masks.contains_key(&exec_w), "inst {idx}");
+            assert!(s.active.contains(&exec_w), "inst {idx}");
+        }
+    }
+
+    #[test]
+    fn spilled_wave64_masks_and_partial_spills_resolve_without_opaque() {
+        // Direct spill of exec_lo/exec_hi + restore + s_not_b64 + s_cmp_eq_u64 (no EXEC touch on use).
+        let p = build(
+            &[
+                0xD761_0001,
+                0x0001_007E, // v_writelane_b32 v1, exec_lo, 0
+                0xD761_0001,
+                0x0001_027F, // v_writelane_b32 v1, exec_hi, 1
+                0xD760_0014,
+                0x0001_0101, // v_readlane_b32 s20, v1, 0
+                0xD760_0015,
+                0x0001_0301, // v_readlane_b32 s21, v1, 1
+                0xBE96_0814, // s_not_b64 s[22:23], s[20:21]
+                0xBF12_8016, // s_cmp_eq_u64 s[22:23], 0
+                0xBF85_0001, // s_cbranch_scc1 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        // ~TRUE == 0 always holds -> branch taken unconditionally.
+        assert!(matches!(
+            s.exits[0],
+            LaneExit::Branch {
+                when: Bool::TRUE,
+                ..
+            }
+        ));
+
+        // Copy before and after spill into EXEC.
+        let p = build(
+            &[
+                0xBE94_037E, // s_mov_b32 s20, exec_lo
+                0xBE95_037F, // s_mov_b32 s21, exec_hi
+                0xD761_0001,
+                0x0001_0014, // v_writelane_b32 v1, s20, 0
+                0xD761_0001,
+                0x0001_0215, // v_writelane_b32 v1, s21, 1
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+                0xD760_000A,
+                0x0001_0101, // v_readlane_b32 s10, v1, 0
+                0xD760_000B,
+                0x0001_0301, // v_readlane_b32 s11, v1, 1
+                0xBEFE_030A, // s_mov_b32 exec_lo, s10
+                0xBEFF_030B, // s_mov_b32 exec_hi, s11
+                0x7E04_0282, // v_mov_b32_e32 v2, 2
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        // The two v_readlane_b32 run while EXEC is narrowed; v_mov_b32 after
+        // restoring EXEC via split s_mov_b32 is unguarded.
+        assert_eq!(s.guards[0][10], None, "{:?}", s.guards);
+
+        // Partial spill: low half spilled via v_writelane/v_readlane, high half copied via s_mov_b32.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xD761_0001,
+                0x0001_046A, // v_writelane_b32 v1, vcc_lo, 2
+                0xBE95_036B, // s_mov_b32 s21, vcc_hi
+                0xD760_0014,
+                0x0001_0501, // v_readlane_b32 s20, v1, 2
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits);
+        };
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
+        );
+
+        // Spilled constant zero mask.
+        let p = build(
+            &[
+                0xD761_0001,
+                0x0001_0080, // v_writelane_b32 v1, 0, 0
+                0xD761_0001,
+                0x0001_0280, // v_writelane_b32 v1, 0, 1
+                0xD760_0014,
+                0x0001_0101, // v_readlane_b32 s20, v1, 0
+                0xD760_0015,
+                0x0001_0301, // v_readlane_b32 s21, v1, 1
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert!(!has_any_opaque(&s));
+        assert!(matches!(
+            s.exits[0],
+            LaneExit::Branch {
+                when: Bool::TRUE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn genuinely_opaque_masks_still_produce_opaque() {
+        // 1. Loaded from memory into EXEC.
+        let p = build(
+            &[
+                0xF404_0100,
+                0xFA00_0000, // s_load_dwordx2 s[4:5], s[0:1], 0x0
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
+
+        // 2. Shifted mask written to EXEC.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0x8FFE_816A, // s_lshl_b64 exec, vcc, 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
+
+        // 3. Duplicated low half (vcc_lo into both s20 and s21).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE94_036A, // s_mov_b32 s20, vcc_lo
+                0xBE95_036A, // s_mov_b32 s21, vcc_lo
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
+
+        // 4. Mixed mask half + constant half (vcc_lo and 0).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xBE94_036A, // s_mov_b32 s20, vcc_lo
+                0xBE95_0380, // s_mov_b32 s21, 0
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
+
+        // 5. Split s_cselect_b32 with DIFFERENT SCCs between lo and hi.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32_e32 vcc, 0, v0
+                0xD4C4_0008,
+                0x0002_0085, // v_cmp_gt_u32_e64 s[8:9], 5, v0
+                0xBF06_8100, // s_cmp_eq_u32 s0, 1
+                0x8514_086A, // s_cselect_b32 s20, vcc_lo, s8
+                0xBF06_8201, // s_cmp_eq_u32 s1, 2 (clobbers SCC!)
+                0x8515_096B, // s_cselect_b32 s21, vcc_hi, s9
+                0xBE96_2414, // s_and_saveexec_b64 s[22:23], s[20:21]
+                0xBF88_0001, // s_cbranch_execz 1
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
+
+        // 6. Split s_and_b32 of loaded scalar pairs.
+        let p = build(
+            &[
+                0xF404_0100,
+                0xFA00_0000, // s_load_dwordx2 s[4:5], s[0:1], 0x0
+                0xF404_0180,
+                0xFA00_0008, // s_load_dwordx2 s[6:7], s[0:1], 0x8
+                0x8714_0604, // s_and_b32 s20, s4, s6
+                0x8715_0705, // s_and_b32 s21, s5, s7
+                0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+                0x7E02_0281, // v_mov_b32_e32 v1, 1
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert!(has_any_opaque(&structure(&p).unwrap()));
     }
 
     /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
