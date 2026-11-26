@@ -88,11 +88,25 @@ core::arch::global_asm!(
     "mov [rsp + 0x28], rax",
     // A stub with a context word (an unimplemented import) takes it as the
     // first argument.
+    // Bit 0 of the context marks a traced method: `this` stays the first
+    // argument and the result goes to `trace_ret` (VICTORY_TRACE_FAILS).
     "test r14, r14",
-    "cmovnz rdi, r14",
+    "jz 7f",
+    "test r14, 1",
+    "jnz 7f",
+    "mov rdi, r14",
+    "7:",
     "xor eax, eax",
     "call r13",
     "mov r13, rax",
+    "test r14, 1",
+    "jz 8f",
+    "lea rdi, [r14 - 1]",
+    "mov esi, r13d",
+    "mov rdx, [rsp + 0x30]",
+    "mov rcx, [rbp + 8]",
+    "call {trace_ret}",
+    "8:",
     "mov rdi, r12",
     "mov eax, {set_gs}",
     "syscall",
@@ -255,7 +269,37 @@ core::arch::global_asm!(
     "ret",
     host_tsd = const OFF_HOST_TSD,
     set_gs = const SET_GS_BASE,
+    trace_ret = sym trace_ret,
 );
+
+/// Which method of which object a traced stub stands for.
+struct Traced {
+    area: &'static str,
+    slot: usize,
+}
+
+extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
+    if hr < 0 || trace_level() == 2 {
+        tracing::warn!(
+            area = info.area,
+            slot = format_args!("{:#x}", info.slot * 8),
+            this = format_args!("{this:#x}"),
+            hr = format_args!("{:#010x}", hr as u32),
+            from = format_args!("{:#x?}", super::seh::unwind::image_base_of(ret).map(|b| ret - b)),
+            "title -> host method returned"
+        );
+    }
+}
+
+/// 0 off, 1 failing results (negative `eax`; a method returning a pointer
+/// or a count shows up as noise), 2 every call.
+fn trace_level() -> u8 {
+    match std::env::var("VICTORY_TRACE_FAILS").as_deref() {
+        Ok("0") | Err(_) => 0,
+        Ok("2") => 2,
+        Ok(_) => 1,
+    }
+}
 
 unsafe extern "C" {
     fn victory_bridge_to_host();
@@ -400,15 +444,33 @@ pub unsafe fn bridged_table(
     let mut unique: Vec<(usize, bool)> = targets.clone();
     unique.sort_unstable();
     unique.dedup();
-    let mut block = StubBlock::new(unique.len() + SPARE_SLOTS)?;
+    let tracing_on = trace_level() > 0;
+    let mut block = StubBlock::new(unique.len() + len + SPARE_SLOTS)?;
     let mut stub_of = std::collections::HashMap::new();
-    for &(target, win64) in &unique {
-        stub_of.insert(target, block.emit(target, 0, win64)?);
+    let mut copy: Vec<usize> = Vec::with_capacity(len + SPARE_SLOTS);
+    if tracing_on {
+        // One stub per slot, so the log can name the slot.
+        for (slot, &s) in slots.iter().enumerate() {
+            if s.is_null() {
+                copy.push(0);
+                continue;
+            }
+            let info = Box::leak(Box::new(Traced { area, slot }));
+            let ctx = info as *const Traced as usize | 1;
+            let win64 = is_win64(s as usize);
+            // win64 targets skip the remapping and cannot be traced.
+            copy.push(block.emit(s as usize, if win64 { 0 } else { ctx }, win64)?);
+        }
+    } else {
+        for &(target, win64) in &unique {
+            stub_of.insert(target, block.emit(target, 0, win64)?);
+        }
+        copy.extend(
+            slots
+                .iter()
+                .map(|&s| stub_of.get(&(s as usize)).copied().unwrap_or(0)),
+        );
     }
-    let mut copy: Vec<usize> = slots
-        .iter()
-        .map(|&s| stub_of.get(&(s as usize)).copied().unwrap_or(0))
-        .collect();
     for i in 0..SPARE_SLOTS {
         let spare = Box::leak(Box::new(Spare {
             area,
