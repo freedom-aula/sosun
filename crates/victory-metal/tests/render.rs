@@ -86,6 +86,7 @@ impl<'a> Scene<'a> {
                 min_mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
+                border_color: BorderColor::TransparentBlack,
                 max_anisotropy: 1,
             })
             .unwrap();
@@ -266,6 +267,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
             min_mag: Filter::Nearest,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         })
         .unwrap();

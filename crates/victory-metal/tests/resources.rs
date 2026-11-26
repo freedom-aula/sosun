@@ -86,6 +86,7 @@ impl Grid<'_> {
                 min_mag: self.filter,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
+                border_color: BorderColor::TransparentBlack,
                 max_anisotropy: 1,
             })
             .unwrap();
