@@ -205,7 +205,51 @@ pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
 }
 
 pub(crate) fn resource_released(res: This) {
-    with_title(|t| t.host.forget_resource(res as usize));
+    with_title(|t| {
+        t.host.forget_resource(res as usize);
+        t.texture_released(res as usize);
+    });
+}
+
+/// A title texture object: its host texture is made, and filled from title memory when work is
+/// next submitted.
+pub(crate) fn texture_created(res: This) {
+    if let Some(info) = crate::resource::texture_info(res) {
+        with_title(|t| t.texture_created(res as usize, info));
+    }
+}
+
+/// `OMSetRenderTargets`: the host textures of the views' resources.
+pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
+    with_list(this, |t, l| {
+        let color: Vec<_> = color
+            .iter()
+            .filter_map(|&h| crate::descriptor::rtv_record(h))
+            .filter_map(|r| t.texture_of(r.resource as usize))
+            .collect();
+        let depth = crate::descriptor::dsv_record(depth).and_then(|r| t.texture_of(r.resource as usize));
+        l.list.set_render_targets(&color, depth.as_ref());
+    });
+}
+
+/// `ClearRenderTargetView`. shortcut: the whole target, whatever rectangles the title passes.
+pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
+    with_list(this, |t, l| {
+        if let Some(tex) = crate::descriptor::rtv_record(handle).and_then(|r| t.texture_of(r.resource as usize)) {
+            l.list.clear_render_target(&tex, color);
+        }
+    });
+}
+
+/// `ClearDepthStencilView`: the depth (flag 1); the stencil is cleared with it.
+pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32) {
+    with_list(this, |t, l| {
+        if flags & 1 != 0
+            && let Some(tex) = crate::descriptor::dsv_record(handle).and_then(|r| t.texture_of(r.resource as usize))
+        {
+            l.list.clear_depth(&tex, depth);
+        }
+    });
 }
 
 /// Shader-visible descriptor heaps by address range: start, end, sampler heap, count. The host
@@ -263,6 +307,27 @@ fn heap_of(t: &mut MetalTitle, handle: u64) -> Option<(Rc<super::list::NativeHea
 /// The title wrote a view at `handle` (the call `descriptor::mirror` is on Windows).
 pub(crate) fn mirror(handle: u64) {
     with_title(|t| {
+        match crate::descriptor::view(handle) {
+            // A texture the title placed in its own memory has no resource object: the host
+            // makes one the first time a view names it.
+            Some(crate::descriptor::View::Placed(_, res, d)) if res[0] > 1 => {
+                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                let key = super::textures::placed_key(address, &res);
+                if !t.host.knows(key)
+                    && let Some(info) = crate::resource::placed_info(address, &res)
+                {
+                    t.texture_created(key, info);
+                    t.realize(key);
+                }
+            }
+            // A view of a texture object that no list has used yet.
+            Some(
+                crate::descriptor::View::Shader(r, _) | crate::descriptor::View::Unordered(r, ..),
+            ) => {
+                t.realize(r);
+            }
+            _ => {}
+        }
         if let Err(e) = t.host.mirror(handle) {
             tracing::debug!(error = %e, "a descriptor was not mirrored");
         }

@@ -60,7 +60,8 @@ fn buffer_view(
 /// The DXGI formats of textures the native host knows.
 pub fn format(dxgi: u32) -> Option<Format> {
     Some(match crate::resource::pc_format(dxgi) {
-        28 => Format::Rgba8Unorm,
+        28 | 27 => Format::Rgba8Unorm,
+        39 => Format::R32Float,
         29 => Format::Rgba8UnormSrgb,
         87 => Format::Bgra8Unorm,
         10 => Format::Rgba16Float,
@@ -116,6 +117,19 @@ pub(crate) fn decode(
                 let (addr, size) = buffer_view(base, w[0], w[7], w[8], first, w[6])?;
                 Some(Decoded::Buffer { addr, size })
             }
+        }
+        // A texture the title placed in its own memory: named by address and description.
+        View::Placed(unordered, res, d) if res[0] > BUFFER => {
+            let base = u64::from(d[10]) | u64::from(d[11]) << 32;
+            Some(Decoded::Image {
+                resource: super::textures::placed_key(base, res),
+                mips: if *unordered {
+                    Some((d[2], 1))
+                } else {
+                    Some((d[4], if d[5] == u32::MAX { 0 } else { d[5] }))
+                },
+                format: format(d[0]),
+            })
         }
         // A whole buffer (no description): raw.
         View::Shader(r, None) | View::Unordered(r, _, None) => {

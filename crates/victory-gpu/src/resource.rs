@@ -1798,19 +1798,69 @@ fn hand_out_resource(
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
     }
-    // The native host names a buffer by its object, to decode views of it.
+    // The native host names a buffer by its object, to decode views of it, and keeps a texture
+    // of its own for each title texture.
     #[cfg(target_os = "macos")]
     let made = (desc.dimension == BUFFER).then(|| (resource.data() as u64, desc.width));
     let hr = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
     #[cfg(target_os = "macos")]
-    if hr == S_OK
-        && let Some((address, width)) = made
-        && !out.is_null()
-    {
+    if hr == S_OK && !out.is_null() {
         // SAFETY: handed out just now.
-        crate::native::glue::buffer_created(unsafe { *out }, address, width);
+        let this = unsafe { *out };
+        match made {
+            Some((address, width)) => crate::native::glue::buffer_created(this, address, width),
+            None => crate::native::glue::texture_created(this),
+        }
     }
     hr
+}
+
+/// A title texture's description and memory for the native host.
+#[cfg(target_os = "macos")]
+fn native_info(desc: &ResourceDesc, memory: *const u8) -> Option<crate::native::textures::TextureInfo> {
+    use victory_formats::texture::Dimension;
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_2D: u32 = 3;
+    let dimension = match desc.dimension {
+        TEXTURE_1D => Dimension::Tex1d,
+        TEXTURE_2D => Dimension::Tex2d,
+        TEXTURE_3D => Dimension::Tex3d,
+        _ => return None,
+    };
+    let layout = texture_layout(desc)?;
+    Some(crate::native::textures::TextureInfo {
+        dimension,
+        format: desc.format,
+        width: u32::try_from(desc.width).ok()?,
+        height: desc.height,
+        depth_or_layers: u32::from(desc.depth_or_array_size),
+        flags: desc.flags,
+        layout: layout.planes.first()?.layout.clone(),
+        memory,
+        size: usize::try_from(layout.size).ok()?,
+    })
+}
+
+/// A title texture object's description and memory; `None` for buffers and layouts not known.
+#[cfg(target_os = "macos")]
+pub(crate) fn texture_info(this: This) -> Option<crate::native::textures::TextureInfo> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    native_info(&r.desc, r.data())
+}
+
+/// The texture of resource description `words` placed at `address` (a view of memory the title
+/// laid out itself).
+#[cfg(target_os = "macos")]
+pub(crate) fn placed_info(address: u64, words: &[u32; 14]) -> Option<crate::native::textures::TextureInfo> {
+    // Words 1 and 13 are padding (stack bytes in the title's records).
+    let mut words = *words;
+    (words[1], words[13]) = (0, 0);
+    // SAFETY: 56 bytes in the description's layout.
+    let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    native_info(&desc, address as *const u8)
 }
 
 /// Title textures with a host copy, by the console memory they start at.
@@ -2293,6 +2343,36 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+/// A 2D texture in the title memory at `address`, in the console layout `swizzle`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_texture_at(address: u64, (width, height): (u64, u32), mips: u16, format: u32, swizzle: u32, flags: u32) -> This {
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: mips,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0x100 | swizzle,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_at_address(
+        std::ptr::null(),
+        address,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 /// A buffer of `width` bytes in the title memory at `address`.
 #[cfg(all(test, target_os = "macos"))]

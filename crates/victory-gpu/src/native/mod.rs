@@ -21,6 +21,7 @@ pub mod list;
 pub mod memory;
 pub mod shaders;
 pub mod state;
+pub mod textures;
 pub mod title;
 
 #[cfg(target_os = "macos")]

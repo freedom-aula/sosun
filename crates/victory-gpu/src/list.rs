@@ -1122,7 +1122,15 @@ extern "system" fn clear_rtv(
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (count, rects);
+        // SAFETY: the title passes four floats (null is tolerated).
+        if let Some(&color) = unsafe { color.as_ref() } {
+            crate::native::glue::clear_rtv(this, handle, color);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, color, count, rects);
 }
 
@@ -1168,7 +1176,12 @@ extern "system" fn clear_dsv(
             )
         };
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (stencil, count, rects);
+        crate::native::glue::clear_dsv(this, handle, flags, depth);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
@@ -1672,7 +1685,27 @@ mod state {
     pub(super) use super::draw as dispatch_mesh_x;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
-    pub(super) use super::ignored_state as targets;
+
+    /// `(count, handles, one range, depth)`: with one range, the handles follow the first at the
+    /// render target view size (128 bytes).
+    pub(super) extern "system" fn targets(
+        this: This,
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+        depth: *const u64,
+    ) {
+        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+        } else {
+            items(handles, count).to_vec()
+        };
+        // SAFETY: the title passes a handle or null.
+        let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        glue::targets(this, &handles, depth);
+    }
 
     pub(super) extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
         super::count_draw();

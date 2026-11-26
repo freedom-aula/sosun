@@ -111,6 +111,10 @@ pub struct Stats {
     pub refused: u64,
     /// Segments that waited for a memory value before they ran.
     pub waited: u64,
+    /// Title textures detiled (again) because their memory changed.
+    pub detiles: u64,
+    /// Textures whose layout the host cannot detile (counted once per content).
+    pub undetilable: u64,
 }
 
 /// What a title pipeline object became on the host.
@@ -139,6 +143,9 @@ pub struct Title<B: GraphicsBackend> {
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
+    pub(super) textures: super::textures::Textures<B>,
+    /// Title textures no view has named yet.
+    pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
@@ -155,6 +162,8 @@ impl<B: GraphicsBackend> Title<B> {
             pipelines: HashMap::new(),
             shaders: Default::default(),
             libraries: Default::default(),
+            textures: Default::default(),
+            pending: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             held: Held::new(),
@@ -228,6 +237,7 @@ impl<B: GraphicsBackend> Title<B> {
     /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
+        self.sync_textures();
         for (list, waits) in segments {
             self.stats.segments += 1;
             let waits: Vec<ValueWait> = waits.into_iter().map(Into::into).collect();

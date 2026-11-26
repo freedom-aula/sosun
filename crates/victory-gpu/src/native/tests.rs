@@ -18,6 +18,8 @@ use victory_metal::metal::Metal;
 mod shader_tests;
 #[path = "state_tests.rs"]
 mod state_tests;
+#[path = "texture_tests.rs"]
+mod texture_tests;
 #[path = "title_tests.rs"]
 mod title_tests;
 
