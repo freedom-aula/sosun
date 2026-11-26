@@ -307,3 +307,98 @@ fn unmapped_title_address_is_refused() {
     let err = h.execute(&q, &[&l], &[], &[]).unwrap_err();
     assert!(err.contains("not in a mapped pool"), "{err}");
 }
+
+/// Pool buffers are made resident through one `MTLResidencySet`, added to each queue once, instead
+/// of a `useResource` per dispatch; a buffer leaves it with its pool. The same work with sets off
+/// names every buffer on every dispatch, and gives the same results.
+#[test]
+fn pool_buffers_are_resident_through_one_set_per_queue() {
+    let Some(on) = host() else { return };
+    if !on.backend.residency_sets() {
+        eprintln!("skipped: no residency sets on this system");
+        return;
+    }
+    let off = Host::new(Metal::new().unwrap().with_residency_sets(false));
+
+    let work = |h: &Host, queues: usize, submissions: usize| {
+        let pool = Pool::new(h, 4);
+        let (src, dst) = (0, 16384);
+        pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+        let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+        let qs: Vec<_> = (0..queues).map(|_| h.backend.create_queue().unwrap()).collect();
+        let f = h.backend.create_fence(0).unwrap();
+        let mut value = 0;
+        for i in 0..submissions {
+            let mut l = NativeList::default();
+            l.set_compute_pipeline(&pso);
+            l.set_compute_root_constants(0, &[i as u32 + 2, 1]);
+            l.set_compute_root_view(1, pool.va(src));
+            l.set_compute_root_view(2, pool.va(dst));
+            l.dispatch((N / 64) as u32, 1, 1).unwrap();
+            value += 1;
+            h.execute(&qs[i % queues], &[&l], &[(&f, value - 1)], &[(&f, value)]).unwrap();
+        }
+        assert!(h.backend.wait(&f, value, 10_000));
+        let last = submissions as u32 + 1;
+        let out: Vec<u32> = pool.read(dst, N);
+        assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * last + 1), "{:?}", &out[..4]);
+        pool
+    };
+
+    let _pool = work(&on, 2, 6);
+    let c = on.backend.residency_counts();
+    // One pool buffer, in the set once; the set is on both queues; no dispatch names a buffer.
+    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2 });
+
+    let _pool = work(&off, 2, 6);
+    let c = off.backend.residency_counts();
+    assert_eq!((c.added, c.queues), (0, 0));
+    assert!(c.use_resource >= 6 * 2, "{c:?}");
+}
+
+/// A pool that goes away takes its buffer out of the set (and does not break the next work).
+#[test]
+fn a_released_pool_leaves_the_residency_set() {
+    let Some(h) = host() else { return };
+    if !h.backend.residency_sets() {
+        return;
+    }
+    let pool = Pool::new(&h, 2);
+    pool.write(0, &(0..64u32).collect::<Vec<_>>());
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+    let dispatch = |pool: &Pool| {
+        let mut l = NativeList::default();
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[2, 0]);
+        l.set_compute_root_view(1, pool.va(0));
+        l.set_compute_root_view(2, pool.va(4096));
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+    };
+    dispatch(&pool);
+    assert_eq!(h.backend.residency_counts().added, 1);
+    let info = PoolInfo {
+        id: 1,
+        base: pool.mem.primary as usize,
+        len: pool.mem.len,
+        memory_entry: None,
+    };
+    h.memory().pool_released(&info);
+    // The next resolve drops the released pool's buffer.
+    let second = {
+        let mem = Alias::new(2 * page_size()).unwrap();
+        let info = PoolInfo {
+            id: 2,
+            base: mem.primary as usize,
+            len: mem.len,
+            memory_entry: None,
+        };
+        h.memory().pool_created(&info);
+        h.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+        Pool { mem }
+    };
+    second.write(0, &(0..64u32).collect::<Vec<_>>());
+    dispatch(&second);
+    assert_eq!(h.backend.residency_counts().added, 2);
+    assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
+}

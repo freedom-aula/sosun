@@ -18,12 +18,48 @@ pub struct Metal {
     pub(crate) msc: Msc,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
+    /// The set of the title's pool buffers, made when the first one is.
+    pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
+    /// What the encoders did to make buffers resident, for the tests and the frame line.
+    pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+}
+
+/// Counters of residency work.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ResidencyCounts {
+    /// `useResource` calls on title buffers (compute, render and blit encoders).
+    pub use_resource: u64,
+    /// Buffers added to the pool set.
+    pub added: u64,
+    /// Queues the pool set was added to.
+    pub queues: u64,
+}
+
+impl Metal {
+    /// Whether residency sets are in use (macOS 15 and later, unless switched off).
+    pub fn residency_sets(&self) -> bool {
+        self.residency_sets
+    }
+
+    pub fn residency_counts(&self) -> ResidencyCounts {
+        self.counts.get()
+    }
+
+    pub(crate) fn count(&self, f: impl FnOnce(&mut ResidencyCounts)) {
+        let mut c = self.counts.get();
+        f(&mut c);
+        self.counts.set(c);
+    }
 }
 
 /// Library file names are unique per process, not per backend: Metal keeps libraries by URL.
 static LIBRARIES: AtomicU64 = AtomicU64::new(0);
 
-pub struct Queue(pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>);
+pub struct Queue(
+    pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// Whether the pool residency set was added to it.
+    pub(crate) std::cell::Cell<bool>,
+);
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
 pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>);
 
@@ -31,6 +67,23 @@ pub struct Pipeline(pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineSta
 pub struct Buffer {
     pub(crate) buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) base: *const u8,
+    /// The residency set it is in (so that dropping it leaves the set).
+    pub(crate) resident: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if let Some(set) = self.resident.get_mut().take() {
+            set.removeAllocation(ProtocolObject::from_ref(&*self.buf));
+            set.commit();
+        }
+    }
+}
+
+impl Buffer {
+    pub(crate) fn is_resident(&self) -> bool {
+        self.resident.borrow().is_some()
+    }
 }
 
 impl Metal {
@@ -43,6 +96,8 @@ impl Metal {
             dev,
             msc: Msc::open_default(),
             residency_sets,
+            pool_set: Default::default(),
+            counts: Default::default(),
         })
     }
 
@@ -79,7 +134,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        Ok(Queue(q))
+        Ok(Queue(q, std::cell::Cell::new(false)))
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
@@ -101,7 +156,46 @@ impl ComputeBackend for Metal {
                 )
         }
         .ok_or("newBufferWithBytesNoCopy refused the range (alignment or size)")?;
-        Ok(Buffer { buf, base: ptr })
+        Ok(Buffer {
+            buf,
+            base: ptr,
+            resident: Default::default(),
+        })
+    }
+
+    fn make_resident(&self, queue: &Queue, buffers: &[&Buffer]) -> Result<(), String> {
+        if !self.residency_sets {
+            return Ok(());
+        }
+        let set = {
+            let mut slot = self.pool_set.borrow_mut();
+            match &*slot {
+                Some(s) => s.clone(),
+                None => {
+                    let s = self
+                        .dev
+                        .newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new())
+                        .map_err(|e| e.localizedDescription().to_string())?;
+                    *slot = Some(s.clone());
+                    s
+                }
+            }
+        };
+        let mut joined = false;
+        for b in buffers.iter().filter(|b| !b.is_resident()) {
+            set.addAllocation(ProtocolObject::from_ref(&*b.buf));
+            *b.resident.borrow_mut() = Some(set.clone());
+            self.count(|c| c.added += 1);
+            joined = true;
+        }
+        if joined {
+            set.commit();
+        }
+        if !queue.1.replace(true) {
+            queue.0.addResidencySet(&set);
+            self.count(|c| c.queues += 1);
+        }
+        Ok(())
     }
 
     fn gpu_address(&self, b: &Buffer, title: *const u8) -> u64 {

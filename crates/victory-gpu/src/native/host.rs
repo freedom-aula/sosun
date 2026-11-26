@@ -391,6 +391,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             i = j;
         }
 
+        // Every pool buffer the work reaches is resident for the queue's work from now on (once).
+        let mut buffers: Vec<&B::Buffer> = Vec::new();
+        for p in &preps {
+            buffers.extend(p.bufs.iter().map(|b| &**b));
+            buffers.extend(p.vertex.iter().map(|b| &*b.0));
+            buffers.extend(p.index.iter().map(|b| &*b.0));
+            buffers.extend(p.blit.iter().map(|b| &*b.0));
+        }
+        if let Err(e) = self.backend.make_resident(queue, &buffers) {
+            tracing::warn!(error = %e, "pool buffers were not made resident");
+        }
+
         let compute: Vec<Vec<Dispatch<'_, B>>> = groups
             .iter()
             .map(|g| match g {

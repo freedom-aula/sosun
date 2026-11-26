@@ -535,26 +535,72 @@ the tests stay `cfg(windows)`), `descriptor.rs` (`record` and `increment` are `p
   draw with a texture and sampler through descriptor tables, pixels read back),
   `unmapped_title_address_is_refused`; plus unit tests of the pool table and the decoders.
 
+### The title-facing objects on the native host (branch `native/gpu-wire`)
+
+On macOS `queue.rs`, `fence.rs`, `list.rs`, `descriptor.rs` and `resource.rs` call
+`crates/victory-gpu/src/native/glue.rs` where they call `crate::host` on Windows (the D3D12 path is
+unchanged). `glue` holds the one `Title<Metal>` (`native/title.rs`, generic over the backend) behind a lock:
+the backend's objects and the `Rc`s in recorded lists are not thread safe, so every call that touches them
+takes it (before a list's own lock), lists are dropped under it, and a timer thread (1 ms) moves held work
+and raises fence values.
+
+- **Lists** record into a `TitleList` (`NativeList` + the segments cut off it): root constants (also at an
+  offset), root views, tables (the heap is made when a list first names it, from what the title wrote by
+  then), `SetDescriptorHeaps`, pipelines, dispatch, copies, topology, viewport, scissor, stencil reference,
+  blend factor, vertex and index buffers, draws, render targets and clears, bottom-of-pipe value writes
+  (byte fills, GPU ordered). A `Wait32/64BitValueX` after commands cuts the list; the segments of a title
+  `ExecuteCommandLists` go through `hold.rs` (unchanged) per title queue: a segment whose waits hold goes to
+  `NativeHost::execute` at once, the others stay on the CPU until the memory value is there (read with
+  `mach_vm_read_overwrite` where it is not in a pool).
+- **Queues and fences**: one backend queue per title queue; `Signal` and `Wait` are `MTLSharedEvent`
+  signal and wait in the queue (behind held work they are held, in order); the title's fence keeps its own
+  atomic (titles read it from memory) which the timer and every poll raise to the event's value; `Signal`
+  from the CPU signals the event; `SetEventOnCompletion` with no event blocks while pumping held work, with
+  an event it calls the hook set with `native::set_event_hook`.
+- **Pool observer**: `victory_gpu::native::pool_observer()` returns an `Arc<dyn PoolObserver>` over the pool
+  table; `victory-hle`'s observer forwards `pool_created`, `pool_released`, `mapped`, `unmapped` to it.
+- **Shaders** (`native/shaders.rs`, `native/state.rs`): a title pipeline's containers are translated with
+  `Options { wave32_host: true, .. }` on first use, DXIL goes to the converter through the backend (one
+  library file name per library, pipelines cached by the BLAKE3 of their DXIL), graphics state is read from
+  the pipeline-state stream (blend and write masks per target, depth, stencil, rasterizer, input layout in
+  the vertex shader's `ISG1` order, target formats) into `RenderPipelineDesc` (backend: blend, stencil,
+  winding, fill, depth bias, depth clip; per draw: viewport, scissor, stencil reference, blend factor).
+  A shader the host cannot run is refused with a reason, counted (`glue::shader_stats()`) and its work
+  dropped; the submission and its fences go on. Refused today: title memory read at computed addresses
+  (the page table of `victory_shader::emit`), heap indexing by the shader, root views as heap views,
+  write marks and view addresses, a pixel stage with arguments of its own (one argument block serves a
+  pipeline), multisampling, vertex inputs missing from the layout.
+- **Textures** (`native/textures.rs`): a title texture object gets a host texture when a view, render target
+  or clear first names it; its tiled memory (`victory_formats::texture`, the addressable modes: linear and
+  the S and D modes without XOR) is detiled on the CPU, mip by mip, when a hash of the memory changed at a
+  submission; block-compressed formats as blocks; textures named by address and description
+  (`CreateShaderResourceViewPlaced`) are made by the view; layouts the host cannot address are counted.
+- **Present**: `native::set_layer(CAMetalLayer*)` (the app's, or `native::create_layer` for one without a
+  window) and `PresentX` draws the first resource of the largest plane over the next drawable with a
+  full-screen triangle, after the queue's earlier work (`PresentBackend`).
+- **Residency**: pool buffers join one `MTLResidencySet` when first used by a submission, the set is added
+  to each queue once, and encoders skip `useResource` for them; a buffer leaves the set when dropped.
+
 ### What is left
 
-1. **Title-facing wiring.** `list.rs`, `queue.rs`, `fence.rs`, `device.rs` still end in
-   `cfg(not(windows))` no-ops on macOS: the vtable methods do not yet call `NativeList` / `NativeHost`,
-   and `hold.rs`'s memory-value waits are not connected to `NativeHost::execute` (cut a list at a
-   wait into two `execute` calls, as `list::wait` does into host lists). `resource.rs` must call
-   `register_buffer` / `register_texture` where it makes the objects the views name.
-2. **Textures of the title** (tiled console layouts, placed textures): needs the compute detile
-   reading title memory; `Decoded` returns nothing for `View::Placed` textures and for textures no
-   resource registered. Only host-made textures (render targets, test textures) work.
-3. **Graphics state from the title list**: pipelines come from `render_pipeline(desc)`, not yet
-   from `pipeline.rs`'s translated shaders; blend state, viewport/scissor, stencil, MRT,
-   `ExecuteIndirect`, mesh shaders, queries, 64-bit image atomics, `WriteValue`-style immediate
-   writes (needs a blit or a tiny kernel), present on `CAMetalLayer`.
+1. **The translated-shader contract on Metal.** Pipelines are made and run only for shaders that need no
+   title memory by computed address: translator output reads it through a page table of shadow copies
+   (`HostShader::memory`), which the zero-copy design replaces by the pool offset (step 6 of the next steps
+   above, a translator change). Binding and the converter's root signature for translator output
+   (`HostShader` carries none; the host root signature of `pipeline/host.rs` is built outside the container)
+   is untested on the GPU: only DXIL with its own root signature (our fixtures) runs end to end. Per-stage
+   argument blocks (the D3D12 host's visibility) have no equivalent in one argument buffer.
+2. Textures: the detile is CPU and hashes the memory of every sampled texture per submission (a compute
+   detile over the pool buffer and a per-page change test are the next step); render targets and depth
+   targets are not read back to title memory (`CopyTextureRegion` to a buffer, the title's CPU reads);
+   clears ignore their rectangles; array and 3D views are not decoded (`Decoded::Image` has no slices);
+   resolves, texture copies and uploads from buffers are ignored.
+3. `ExecuteIndirect`, mesh shaders, queries, 64-bit image atomics, a mid-pass clear splitting the pass,
+   stencil-only formats and the console's 24-bit depth (shown as 32-bit float with stencil).
 4. Plain D3D12 sampler descriptions (13 words, `View::Sampler`) are not decoded.
 5. Buffer views across two adjacent mappings of one pool are refused (`PoolTable::resolve`).
-6. Residency is `useResource` per dispatch / draw for root views; a `MTLResidencySet` over the pool
-   buffers (made at `pool_created`) is the cheaper end state. Pool buffers are dropped at
-   `pool_released` without waiting for in-flight command buffers (Metal retains them for the
-   command buffer, but a title that frees memory the GPU still uses is the title's bug).
+6. Present is not held behind work the queue still holds back (as on the D3D12 host), takes one plane, no
+   overlay composite, no HDR or colour space, no frame pacing, and `NSWindow` creation is the app's.
 7. The Windows build was only checked with clippy (`--target x86_64-pc-windows-gnullvm`, `-D warnings`)
    and the existing tests, which this change cannot affect (no Wine run).
 

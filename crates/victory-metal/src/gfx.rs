@@ -690,8 +690,8 @@ impl GraphicsBackend for Metal {
         }
         for pass in work.passes {
             match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches)?,
-                Pass::Render(rp) => self.encode_render(&cb, rp)?,
+                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, queue.1.get())?,
+                Pass::Render(rp) => self.encode_render(&cb, rp, queue.1.get())?,
                 Pass::Blit(ops) => self.encode_blit(&cb, ops)?,
             }
         }
@@ -737,10 +737,21 @@ impl Metal {
 }
 
 impl Metal {
+    /// Whether encoder `use` calls are needed for `b`: not when the queue has the pool residency set
+    /// and the buffer is in it.
+    fn names(&self, b: &Buffer, set_on_queue: bool) -> bool {
+        let needed = !(set_on_queue && b.is_resident());
+        if needed {
+            self.count(|c| c.use_resource += 1);
+        }
+        needed
+    }
+
     pub(crate) fn encode_compute(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         dispatches: &[crate::backend::Dispatch<'_, Metal>],
+        set_on_queue: bool,
     ) -> Result<(), String> {
         if dispatches.is_empty() {
             return Ok(());
@@ -752,7 +763,7 @@ impl Metal {
                 self.use_heap_cb(cb, h);
             }
             self.bind_root_compute(&e, &d.root, &d.heaps);
-            for b in &d.resources {
+            for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -768,6 +779,7 @@ impl Metal {
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         rp: &RenderPass<'_, Metal>,
+        set_on_queue: bool,
     ) -> Result<(), String> {
         let desc = MTLRenderPassDescriptor::new();
         for (i, c) in rp.color.iter().enumerate() {
@@ -891,7 +903,7 @@ impl Metal {
             }
             e.setScissorRect(scissor);
             self.bind_root_render(&e, &d.root, &d.heaps);
-            for b in &d.resources {
+            for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -904,11 +916,13 @@ impl Metal {
                 unsafe {
                     e.setVertexBuffer_offset_atIndex(Some(&b.buf), off, VERTEX_BUFFERS + slot)
                 };
-                e.useResource_usage_stages(
-                    ProtocolObject::from_ref(&*b.buf),
-                    MTLResourceUsage::Read,
-                    MTLRenderStages::Vertex,
-                );
+                if self.names(b, set_on_queue) {
+                    e.useResource_usage_stages(
+                        ProtocolObject::from_ref(&*b.buf),
+                        MTLResourceUsage::Read,
+                        MTLRenderStages::Vertex,
+                    );
+                }
             }
             let prim = match d.topology {
                 Topology::Triangles => MTLPrimitiveType::Triangle,
@@ -970,11 +984,13 @@ impl Metal {
                     ];
                     ib = if wide { 2 } else { 1 };
                     set_draw_bytes(&e, &dp, ib);
-                    e.useResource_usage_stages(
-                        ProtocolObject::from_ref(&*b.buf),
-                        MTLResourceUsage::Read,
-                        MTLRenderStages::Vertex,
-                    );
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage_stages(
+                            ProtocolObject::from_ref(&*b.buf),
+                            MTLResourceUsage::Read,
+                            MTLRenderStages::Vertex,
+                        );
+                    }
                     // SAFETY: the index buffer is live and holds `index_count` indices at `off`.
                     unsafe {
                         e.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(

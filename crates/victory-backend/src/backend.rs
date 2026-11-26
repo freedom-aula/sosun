@@ -76,6 +76,14 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// Makes `buffers` resident for everything submitted to `queue` from now on, so that dispatches
+    /// and draws need not name them one by one (Metal: an `MTLResidencySet` of the title's pools,
+    /// made once, committed when a pool joins, added to each queue once). Idempotent; a buffer
+    /// leaves the set when it is dropped. The default does nothing (the backend names buffers per
+    /// dispatch).
+    fn make_resident(&self, _queue: &Self::Queue, _buffers: &[&Self::Buffer]) -> Result<(), String> {
+        Ok(())
+    }
     /// The GPU address of a title address inside `buffer` (`gpu = title + delta`).
     fn gpu_address(&self, buffer: &Self::Buffer, title: *const u8) -> u64;
     /// DXIL container (`victory_shader::emit` output) to a compute pipeline.
