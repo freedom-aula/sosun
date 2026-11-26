@@ -509,20 +509,39 @@ fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
     assert!(out[N / 2..].iter().all(|v| *v == 0), "only the record's groups ran");
 }
 
-/// An address outside every mapped pool is an error at submission, not a GPU fault.
+/// A command that names title memory outside every mapped pool is not encoded (no GPU fault) and
+/// is dropped by itself: the value writes, and the dispatch, recorded around it still run.
 #[test]
-fn unmapped_title_address_is_refused() {
+fn a_command_at_unmapped_title_memory_is_dropped_alone() {
     let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, flag, done) = (0, 16384, 32768, 32776);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0xEEEE_EEEEu32; N]);
+    pool.write(flag, &[0u64, 0]);
     let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
     let mut l = NativeList::default();
+    l.write_value(pool.va(flag), 0xD6D, 8);
     l.set_compute_pipeline(&pso);
-    l.set_compute_root_constants(0, &[1, 0]);
+    l.set_compute_root_constants(0, &[5, 7]);
+    // Its source is no title memory the host knows.
     l.set_compute_root_view(1, 0xDEAD_0000);
-    l.set_compute_root_view(2, 0xDEAD_1000);
-    l.dispatch(1, 1, 1).unwrap();
-    let q = h.backend.create_queue().unwrap();
-    let err = h.execute(&q, &[&l], &[], &[]).unwrap_err();
-    assert!(err.contains("not in a mapped pool"), "{err}");
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    l.set_compute_root_view(1, pool.va(src));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    // A copy from no title memory the host knows.
+    l.copy_buffer_region(pool.va(src), 0xDEAD_1000, 64);
+    l.write_value(pool.va(done), 0xD0E, 8);
+    run(&h, &[&l]);
+
+    assert_eq!(h.unmapped(), 2);
+    assert_eq!(pool.read::<u64>(flag, 2), [0xD6D, 0xD0E], "the value writes ran");
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
+    let kept: Vec<u32> = pool.read(src, 16);
+    assert_eq!(kept, (0..16).collect::<Vec<u32>>(), "the copy was dropped, not run");
 }
 
 /// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value

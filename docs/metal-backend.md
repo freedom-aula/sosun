@@ -533,7 +533,7 @@ the tests stay `cfg(windows)`), `descriptor.rs` (`record` and `increment` are `p
   the `create_placed_*` device calls, decoded, reached through a root table; a second submission
   on the same queue waits on the first's fence value), `clear_and_draw_into_render_target` (clear,
   draw with a texture and sampler through descriptor tables, pixels read back),
-  `unmapped_title_address_is_refused`; plus unit tests of the pool table and the decoders.
+  `a_command_at_unmapped_title_memory_is_dropped_alone`; plus unit tests of the pool table and the decoders.
 
 ### The title-facing objects on the native host (branch `native/gpu-wire`)
 
