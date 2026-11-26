@@ -512,6 +512,11 @@ impl Metal {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
                 set.commit();
+                self.count(|c| {
+                    c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
+                    c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
+                    c.heap_set_bytes = c.heap_set_bytes.max(set.allocatedSize());
+                });
             }
             cb.useResidencySet(set);
         }
@@ -1086,9 +1091,10 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        // With the pool set on the queue the encoders do not name the title's buffers, so Metal
-        // cannot order them: this command buffer starts after the previous one finished, and each
-        // encoder after the one before.
+        // With residency sets the encoders do not name what they reach through a heap (nor, with
+        // the pool's set on the queue, the title's buffers), so Metal cannot order them: this
+        // command buffer starts after the previous one finished, and each encoder after the one
+        // before.
         let set_on_queue = queue.1.get();
         let order = set_on_queue.then(|| {
             let n = queue.3.get();
@@ -2186,5 +2192,36 @@ mod sampler_tests {
         let second = id(&m.create_sampler(&desc(Filter::Linear)).unwrap());
         assert_ne!(first, second, "a freed sampler's ID was reused while a heap still names it");
         assert_eq!(id(&m.create_sampler(&desc(Filter::Nearest)).unwrap()), first, "samplers are shared by descriptor");
+    }
+}
+
+#[cfg(test)]
+mod heap_set_tests {
+    use super::*;
+
+    /// A heap's residency set holds the heap buffer and each allocation its entries name, once,
+    /// and lets an allocation go when the last entry naming it is overwritten: the set is what a
+    /// command buffer that uses the heap keeps resident.
+    #[test]
+    fn a_heaps_set_follows_its_entries() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+        let Some(set) = &heap.set else {
+            eprintln!("skipped: no residency sets on this system");
+            return;
+        };
+        let held = || {
+            set.commit();
+            set.allocationCount()
+        };
+        let texture = || m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let (t1, t2) = (texture(), texture());
+        m.write_texture(&heap, 0, &t1, 0.0);
+        m.write_texture(&heap, 1, &t1, 0.0);
+        assert_eq!(held(), 2, "the heap buffer and the texture two entries name");
+        m.write_texture(&heap, 0, &t2, 0.0);
+        assert_eq!(held(), 3);
+        m.write_texture(&heap, 1, &t2, 0.0);
+        assert_eq!(held(), 2, "the first texture went with its last entry");
     }
 }
