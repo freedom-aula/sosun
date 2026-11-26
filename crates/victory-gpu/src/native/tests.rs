@@ -799,7 +799,7 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
     let _pool = work(&on, 2, 6);
     let c = on.backend.residency_counts();
     // One pool buffer, in the set once; the set is on both queues; no dispatch names a buffer.
-    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2 });
+    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2, ..Default::default() });
 
     let _pool = work(&off, 2, 6);
     let c = off.backend.residency_counts();

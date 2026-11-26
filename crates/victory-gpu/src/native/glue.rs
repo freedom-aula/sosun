@@ -730,7 +730,8 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+    let r = with_title(|t| t.host.backend.residency_counts()).unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, "native draws so far");
     super::descriptor_trace::log(frame);
 }
 

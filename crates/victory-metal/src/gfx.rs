@@ -524,7 +524,14 @@ impl Metal {
             return;
         }
         use_res(ProtocolObject::from_ref(&*heap.buf));
-        heap.refs.borrow().values().for_each(|r| use_res(r));
+        let refs = heap.refs.borrow();
+        refs.values().for_each(|r| use_res(r));
+        let allocations = heap.alloc_counts.borrow().len() as u64;
+        self.count(|c| {
+            c.heap_resources += 1 + refs.len() as u64;
+            c.heap_entries = c.heap_entries.max(refs.len() as u64);
+            c.heap_allocations = c.heap_allocations.max(allocations);
+        });
     }
 
     /// The static samplers of one stage's `layout`, if it declares any.
