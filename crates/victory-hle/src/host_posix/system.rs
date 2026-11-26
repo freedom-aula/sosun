@@ -832,7 +832,15 @@ fn set_env(name: &str, value: Option<&str>) -> i32 {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // One title writer at a time, so the name matched ignoring case is still the one set (two
+    // threads setting `Foo` and `FOO` would otherwise make two variables).
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = lock(&WRITING);
     let key = env_entry(name).map_or_else(|| name.to_string(), |(k, _)| k);
+    // shortcut: std::env locks around each of its calls, so this cannot race the C runtime's
+    // getenv (std::env too) or GetEnvironmentVariable; host C code that calls libc's getenv
+    // while a title thread sets a variable still can. Move to a title-private environment if a
+    // crash ever points there.
     // SAFETY: the process environment, changed as the title asks, as `_putenv` does.
     unsafe {
         match value {
