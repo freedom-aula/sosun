@@ -199,6 +199,21 @@ fn infer(
             layout[i].sgprs = u32::from(next - start);
         }
     }
+    // Guess: root constants that are a pixel program's last user data take the SGPRs after them
+    // that it reads on entry (the metadata names only their first), as compute's reach its user
+    // SGPR count (`constants_to_the_end`); observed: the upscale program's b500 in s9 to s12. The
+    // primitive mask, which follows the user SGPRs and only reaches M0, ends them.
+    if stage == HwStage::Ps
+        && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
+        && last.root == RootType::Constants
+    {
+        let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
+        let mut end = u32::from(last.user_data) + last.sgprs;
+        while end < 32 && live(end).is_some_and(|v| !crate::io::is_prim_mask_only(&p, v, true)) {
+            end += 1;
+        }
+        last.sgprs = end - u32::from(last.user_data);
+    }
     // A vertex shader's own vertex fetch: usually s0/s1 address the table of vertex buffer
     // descriptors it loads from (observed: `s_load_dwordx4 sN, s[0:1]` before its `buffer_load`),
     // unless metadata already occupies s0..s1 or an inferred vertex table sits at another pair.
@@ -1285,6 +1300,29 @@ mod tests {
         assert_eq!((k[&0], k[&1], k[&2]), (Packing::Plain, Packing::Unknown, Packing::Halves));
     }
 
+    /// A parameter its pixel shader reads and the vertex program does not write is written too
+    /// (`Options::extra_params`), even when a `HALF` element of another parameter has its index:
+    /// the converter refused the pipeline (`user(texcoord8)` not written by the vertex shader).
+    #[test]
+    fn an_extra_parameter_is_written_beside_a_half_of_its_index() {
+        let code = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E06_02FF, 0x3C00_3800, // v_mov_b32 v3, 0x3c003800
+            0xF800_0201, 0x0000_0001, // exp param0 v1
+            0xF800_0211, 0x0000_0003, // exp param1 v3 (HALF2, HALF3)
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let c = container(HwStage::Vs, &words(&code), &meta_with(&[])).unwrap();
+        let options = super::super::Options { extra_params: 1 << 2, ..Default::default() };
+        let h = super::super::translate_with(&c, options).unwrap();
+        let c = crate::Container::parse(&h.dxil).unwrap();
+        let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let named = |name: &str| -> Vec<u32> { outs.iter().filter(|o| o.name == name).map(|o| o.index).collect() };
+        assert_eq!(named(HALF), [2, 3], "{outs:?}");
+        assert_eq!(named("TEXCOORD"), [0, 1, 2], "{outs:?}");
+    }
+
     /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
     /// mesh program).
     fn mesh(code: &[u32]) -> Result<super::super::HostShader, ShaderError> {
@@ -1317,6 +1355,38 @@ mod tests {
         assert!(p.layout.iter().any(|r| r.root == RootType::ResourceHeap && r.user_data == 2), "{:?}", p.layout);
         assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 0 && r.sgprs == 2), "{:?}", p.layout);
         mesh(&code).unwrap();
+    }
+
+    /// The title's upscale pixel program reads its b500 root constants as four dwords, s9 to s12,
+    /// from a metadata record that names only s9 (and interpolates nothing). The constants take
+    /// the SGPRs after them that the program reads on entry, so s10 to s12 are user data, not
+    /// hardware SGPR inputs.
+    #[test]
+    fn a_pixel_programs_last_root_constants_take_the_sgprs_it_reads_after_them() {
+        let code = [
+            0x7E00_0209, // v_mov_b32 v0, s9
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0x7E04_020B, // v_mov_b32 v2, s11
+            0x7E06_020C, // v_mov_b32 v3, s12
+            0xF800_080F, 0x0302_0100, // exp mrt0 v0, v1, v2, v3 done
+            ENDPGM,
+        ];
+        let meta = meta_with(&[rec(0, 3, 8, 0), rec(2, 0, 9, 1)]);
+        let (p, _) = infer(HwStage::Ps, &words(&code), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 4), "{:?}", p.layout);
+        let c = container(HwStage::Ps, &words(&code), &meta).unwrap();
+        super::super::translate_with(&c, super::super::Options::default()).unwrap();
+        // An interpolating program's primitive mask, which follows its user SGPRs and only
+        // reaches M0, is not taken.
+        let interp = [
+            0x7E00_0209, // v_mov_b32 v0, s9
+            0xBEFC_030A, // s_mov_b32 m0, s10
+            0xC808_0000, 0xC809_0001, // v_interp_p1_f32 v2, v0, attr0.x; v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_0803, 0x0000_0200, // exp mrt0 v0, v2 done
+            ENDPGM,
+        ];
+        let (p, _) = infer(HwStage::Ps, &words(&interp), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 1), "{:?}", p.layout);
     }
 
     /// `s_sext_i32_i16` and `s_sext_i32_i8` (some of the title's mesh programs) translate.
