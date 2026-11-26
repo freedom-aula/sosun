@@ -55,6 +55,10 @@ const MEM_RELEASE: u32 = 0x8000;
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const DEFAULT_STACK: usize = 1 << 20;
+/// The least stack a title thread gets: host work runs on title threads too (the native GPU host
+/// converts and builds Metal pipelines at a draw), and the title's own sizes (1 MiB and less)
+/// overflowed there at the first guessed draw.
+const MIN_STACK: usize = 8 << 20;
 const STILL_ACTIVE: u32 = 259;
 /// `VirtualAlloc`'s allocation granularity: where a reservation starts, and
 /// the least it takes of the address space.
@@ -658,11 +662,7 @@ pub extern "system" fn CreateThread(
     let started = unsafe {
         native::spawn_title_thread_with(
             "title-thread",
-            if stack_size == 0 {
-                DEFAULT_STACK
-            } else {
-                stack_size
-            },
+            if stack_size == 0 { DEFAULT_STACK } else { stack_size }.max(MIN_STACK),
             start,
             param as usize,
             // Before anything of the title's runs: park if suspended.
