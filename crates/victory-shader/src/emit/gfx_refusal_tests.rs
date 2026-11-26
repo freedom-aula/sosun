@@ -837,6 +837,48 @@ fn guessed_pixel_masked_prim_mask_anchors_the_pops_input() {
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
+#[test]
+fn guessed_pixel_extracted_prim_mask_anchors_the_pops_input() {
+    // Bit-field extraction is another way to prepare M0 for interpolation.
+    // The collision ID is s7 because the primitive mask is live-in s6.
+    let code = [
+        0x9385_FF06,
+        0x0010_0000, // s_bfe_u32 s5, s6, 0x00100000 (offset 0, width 16)
+        0xBEFC_0305, // s_mov_b32 m0, s5
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0xBF06_EF07, // s_cmp_eq_u32 s7, src_pops_exiting_wave_id
+        0x8512_8081, // s_cselect_b32 s18, 1, 0
+        0x7E0A_0212, // v_mov_b32 v5, s18
+        0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        0xF800_180F,
+        0x0404_0504, // exp mrt0 v4, v5, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    for wave32_host in [false, true] {
+        let lower = |code: &[u32]| {
+            let container = graphics::container(HwStage::Ps, &bytes_of(code), &[0; 0x10]).unwrap();
+            translate_with(&container, Options { wave32_host, ..Options::default() })
+        };
+        lower(&code).unwrap();
+
+        let mut mixed = code;
+        mixed[7] = 0x7E0A_0206; // The live-in mask also escapes into an export.
+        let err = lower(&mixed).expect_err("exported mask must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+        let mut extracted = code;
+        extracted[7] = 0x7E0A_0205; // The extracted mask escapes into an export.
+        let err = lower(&extracted).expect_err("exported extraction must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+        let mut scc_use = code;
+        scc_use.swap(5, 6); // The select consumes the extraction's SCC result.
+        let err = lower(&scc_use).expect_err("observable SCC must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+    }
+}
+
 // =========================================================================
 // Refusal #4: "one input interpolated two ways"
 // =========================================================================
