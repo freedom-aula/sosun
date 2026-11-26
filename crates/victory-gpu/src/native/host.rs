@@ -45,6 +45,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+    /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
+    /// taken by [`Self::take_written`].
+    written: RefCell<Option<std::collections::HashSet<usize>>>,
 }
 
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
@@ -136,6 +139,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unmapped: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
+            written: Default::default(),
         }
     }
 
@@ -408,6 +412,45 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Minimum entries of each bound table checked at submission when a shader has no
     /// metadata for that table (or declares fewer entries).
     const TABLE_CHECK: usize = 16;
+
+    /// Turns the collection of GPU-written texture keys on or off.
+    pub(super) fn collect_written(&self, on: bool) {
+        *self.written.borrow_mut() = on.then(Default::default);
+    }
+
+    /// The keys collected since the last call.
+    pub(super) fn take_written(&self) -> Vec<usize> {
+        self.written.borrow_mut().as_mut().map_or_else(Vec::new, |w| w.drain().collect())
+    }
+
+    /// Notes the textures the tables `root` binds hold unordered access views of: what a dispatch
+    /// may write. More than it does write (the shader may not use every entry).
+    ///
+    /// shortcut: a shader that indexes the descriptor heap itself, and pixel shader writes, are
+    /// not seen; add them when a title texture needs it.
+    fn note_written(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        let mut written = self.written.borrow_mut();
+        let Some(written) = written.as_mut() else { return };
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
+            for index in *at..end {
+                match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
+                    Some(crate::descriptor::View::Unordered(r, ..)) => {
+                        written.insert(r);
+                    }
+                    Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
+                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                        written.insert(super::textures::placed_key(address, &res));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
@@ -935,6 +978,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
                 self.remirror_tables(root, pso.binding.as_ref());
+                self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;

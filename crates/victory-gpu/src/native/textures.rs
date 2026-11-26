@@ -5,7 +5,8 @@
 //! Apple's own. Each texture the host samples is detiled into a linear staging buffer and uploaded,
 //! mip by mip and slice by slice, when the memory's content changed since the last time (a hash of
 //! the memory, taken when work is submitted). Render targets and depth targets are the GPU's: they
-//! start empty and are not read from memory.
+//! start empty and are not read from memory. With `VICTORY_TEXTURE_BACK=1`, textures compute writes
+//! are retiled back into title memory ([`Back`]).
 //!
 //! shortcut: the detile runs on the CPU (`Layout::detile`, the code the D3D12 host uses too) and
 //! a thread hashes the memory of every sampled texture round after round (see `Watch`); a compute detile that reads the
@@ -13,6 +14,7 @@
 //! next step. A change detiles the whole texture.
 
 use super::descriptors::format;
+use super::host::NativeHost;
 use super::title::Title;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -86,6 +88,15 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
+/// Host texels as title memory holds them: the reverse of [`to_host`].
+fn from_host(format: u32, texels: &mut [u8]) {
+    if format == 115 {
+        for t in texels.as_chunks_mut::<2>().0 {
+            *t = u16::from_le_bytes(*t).rotate_right(4).to_le_bytes();
+        }
+    }
+}
+
 /// Title texels as the host format holds them: DXGI `B4G4R4A4_UNORM` (115) has blue in the low
 /// nibble and alpha in the top one, Metal's `ABGR4Unorm` alpha low and red top. The host's own
 /// writes and reads agree with each other, so only bytes from title memory are converted.
@@ -126,6 +137,89 @@ pub fn upload<B: ResourceBackend>(
         }
     }
     Ok(())
+}
+
+/// The reverse of [`upload`]: every mip of every slice of `tex`, retiled into `tiled` (the
+/// texture's whole memory; bytes between subresources stay as they are).
+fn download<B: ResourceBackend>(
+    backend: &B,
+    tex: &B::Texture,
+    info: &TextureInfo,
+    tiled: &mut [u8],
+) -> Result<(), String> {
+    let layout = &info.layout;
+    let slices = if info.dimension == Dimension::Tex3d {
+        1
+    } else {
+        layout.slices
+    };
+    let n = layout.desc.element_bytes as usize;
+    for mip in 0..layout.mips.len() as u32 {
+        let m = &layout.mips[mip as usize];
+        let row = m.width as usize * n;
+        let slice_pitch = row * m.height as usize;
+        let depth = layout.subresource_depth(mip).max(1) as usize;
+        let mut linear = vec![0u8; slice_pitch * depth];
+        for slice in 0..slices {
+            backend.read_texture(tex, mip as usize, slice as usize, &mut linear, row, slice_pitch);
+            from_host(info.format, &mut linear);
+            layout
+                .tile(tiled, mip, slice, &linear, row, slice_pitch)
+                .map_err(|e| format!("tile mip {mip} slice {slice}: {e:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The largest texture copied back (the ocean maps are small; a guess until a world run's
+/// "copied back" lines show what is written).
+const BACK_LIMIT: usize = 4 << 20;
+
+/// Textures compute work wrote, to be copied back into title memory once it completes
+/// (`VICTORY_TEXTURE_BACK=1`). Host textures are the GPU's own, so without this the title's CPU
+/// reads what was there before (VIctory-macOS issue #46: boats sink).
+///
+/// shortcut: copied back before a fence value is shown to the title; a title that instead polls a
+/// label the GPU writes into memory may read a frame late.
+pub(super) struct Back<B: PresentBackend> {
+    /// A fence of ours per title queue, and the last value queued on it.
+    fences: HashMap<usize, (Rc<B::Fence>, u64)>,
+    /// Submissions not yet copied back: reached when the fence has the value.
+    pending: Vec<(Rc<B::Fence>, u64, Vec<usize>)>,
+    /// Textures already logged.
+    logged: std::collections::HashSet<usize>,
+}
+
+impl<B: PresentBackend> Default for Back<B> {
+    fn default() -> Self {
+        Back {
+            fences: HashMap::new(),
+            pending: Vec::new(),
+            logged: Default::default(),
+        }
+    }
+}
+
+impl<B: PresentBackend> Back<B> {
+    /// Work of title queue `key` just went to `queue`: if it wrote textures, our fence follows it.
+    pub(super) fn submitted(&mut self, host: &NativeHost<B>, queue: &B::Queue, key: usize) {
+        let written = host.take_written();
+        if written.is_empty() {
+            return;
+        }
+        let (fence, value) = match self.fences.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => match host.backend.create_fence(0) {
+                Ok(f) => e.insert((Rc::new(f), 0)),
+                Err(error) => return tracing::warn!(%error, "no fence to copy textures back by"),
+            },
+        };
+        *value += 1;
+        if let Err(error) = host.execute(queue, &[], &[], &[(&**fence, *value)]) {
+            return tracing::warn!(%error, "textures will not be copied back");
+        }
+        self.pending.push((fence.clone(), *value, written));
+    }
 }
 
 /// Textures whose memory the scanner thread watches, and those it found changed.
@@ -379,6 +473,73 @@ pub fn placed_key(address: u64, description: &[u32; 14]) -> usize {
 }
 
 impl<B: PresentBackend> Title<B> {
+    /// Turns copying GPU-written textures back into title memory on or off.
+    pub fn set_texture_back(&mut self, on: bool) {
+        self.host.collect_written(on);
+    }
+
+    /// Copies back what completed submissions wrote.
+    pub(super) fn copy_back(&mut self) {
+        let mut done = Vec::new();
+        let backend = &self.host.backend;
+        self.back.pending.retain(|(fence, value, keys)| {
+            let reached = backend.completed(fence) >= *value;
+            if reached {
+                done.extend(keys.iter().copied());
+            }
+            !reached
+        });
+        done.sort_unstable();
+        done.dedup();
+        for key in done {
+            self.write_back(key);
+        }
+    }
+
+    /// Retiles the host texture of `key` into its title memory.
+    fn write_back(&mut self, key: usize) {
+        // Not a texture (a buffer view), or released since: nothing to copy.
+        let Some(t) = self.textures.get_mut(&key) else { return };
+        let info = &t.info;
+        // Render and depth targets are left out: nothing says the title reads one.
+        if info.flags & UNORDERED_ACCESS == 0 || info.render_target() {
+            return;
+        }
+        let first = self.back.logged.insert(key);
+        let described = (info.format, info.width, info.height, info.depth_or_layers, info.size);
+        if info.size > BACK_LIMIT {
+            if first {
+                tracing::info!(texture = key, ?described, "a GPU-written texture is too large to copy back");
+            }
+            return;
+        }
+        let mut tiled = read_memory(info.memory, info.size);
+        // The title wrote the memory since the host texture was filled from it: its bytes stay,
+        // and the next submission uploads them.
+        if t.last != Some(blake3::hash(&tiled)) {
+            return;
+        }
+        if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
+            if first {
+                tracing::warn!(texture = key, ?described, %error, "a GPU-written texture was not copied back");
+            }
+            return;
+        }
+        let hash = blake3::hash(&tiled);
+        if t.last == Some(hash) {
+            return;
+        }
+        // Through the pool's own mapping; `None` when the title unmapped the memory meanwhile.
+        let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else { return };
+        // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
+        unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
+        // What the host texture holds, so the scanner's sighting of this write uploads nothing.
+        t.last = Some(hash);
+        if first {
+            tracing::info!(texture = key, ?described, layout = ?info.layout.desc, "a GPU-written texture is copied back into title memory");
+        }
+    }
+
     /// A title texture exists. Its host texture is made when a view, a render target or a clear
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.
@@ -604,6 +765,17 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_host_undoes_to_host() {
+        let title: Vec<u8> = (0..=255).collect();
+        for format in [28, 115] {
+            let mut texels = title.clone();
+            to_host(format, &mut texels);
+            from_host(format, &mut texels);
+            assert_eq!(texels, title, "{format}");
+        }
+    }
 
     #[test]
     fn probe_hash_detects_writes_in_sampled_and_whole_modes() {
