@@ -42,7 +42,7 @@ The whole game executable (about 440,000 functions) is recompiled to C and then 
 
 ## 5. Everything after that
 
-Textures and the boot movie (Bink), the loading screens, input (GameInput), more of the GPU (mesh shaders, indirect draws), speed, and eventually the prologue.
+Reverb (the audio DSP's convolution is not emulated, so reverb returns are silent), the loading screens, input (GameInput), more of the GPU (mesh shaders, indirect draws), speed, and eventually the prologue.
 
 ## Good first contributions
 
