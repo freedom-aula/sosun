@@ -2204,7 +2204,7 @@ mod heap_set_tests {
     /// command buffer that uses the heap keeps resident.
     #[test]
     fn a_heaps_set_follows_its_entries() {
-        let m = Metal::new().unwrap();
+        let m = Metal::new().unwrap().with_heap_sets();
         let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
         let Some(set) = &heap.set else {
             eprintln!("skipped: no residency sets on this system");

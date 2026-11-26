@@ -132,28 +132,72 @@ impl Buffer {
     }
 }
 
+/// `MTLResidencySet` exists (macOS 15 and later).
+fn sets_supported(dev: &Dev) -> bool {
+    dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:))
+}
+
+/// The Mac's memory in bytes (`hw.memsize`), 0 if it cannot be read.
+fn physical_memory() -> u64 {
+    let (mut bytes, mut len) = (0u64, size_of::<u64>());
+    // SAFETY: `hw.memsize` is a 64-bit value, written into `bytes`.
+    let read = unsafe {
+        libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut bytes).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if read == 0 { bytes } else { 0 }
+}
+
+/// `(the heaps' residency sets, the pool's set on the queues)` for `VICTORY_METAL_RESIDENCY_SETS`
+/// (`asked`) on a Mac with `memory` bytes.
+///
+/// What a descriptor heap names is resident through the heap's own set, given to each command
+/// buffer that uses the heap, so residency follows the frame. Naming it to every encoder with
+/// `useResource` instead (`0`) cost the kernel about 155 ms per drawing render pass in GTA VI's
+/// world, whose heap names 37,000 allocations. The title's pool buffers stay named by the
+/// encoders that use them: in a set on the queue (`1`) all of title memory (about 6.7 GB) is
+/// resident for the whole process, which on an 18 GB Mac preceded
+/// `kIOGPUCommandBufferCallbackErrorTimeout` and `...OutOfMemory`.
+///
+/// Guess: the heaps' sets are safe from 32 GiB. The world's heap set holds 17 to 18 GB, more
+/// than a 16 or 18 GB Mac has, and none has run it: until one has, a smaller Mac keeps
+/// `useResource` unless `heap` asks for the sets.
+fn residency_mode(asked: Option<&str>, supported: bool, memory: u64) -> (bool, bool) {
+    match asked {
+        Some("0") => (false, false),
+        Some("heap") => (supported, false),
+        Some(_) => (supported, supported),
+        None => (supported && memory >= 32 << 30, false),
+    }
+}
+
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
     /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        // What a descriptor heap names is resident through the heap's own set, given to each
-        // command buffer that uses the heap, so residency follows the frame. Naming it to every
-        // encoder with `useResource` instead (`VICTORY_METAL_RESIDENCY_SETS=0`) cost the kernel
-        // about 155 ms per drawing render pass in GTA VI's world, whose heap names 37,000
-        // allocations. The title's pool buffers stay named by the encoders that use them: in a
-        // set on the queue (`VICTORY_METAL_RESIDENCY_SETS=1`) all of title memory (about 6.7 GB
-        // here) is resident for the whole process, which on an 18 GB Mac preceded
-        // `kIOGPUCommandBufferCallbackErrorTimeout` and `...OutOfMemory`.
         let asked = std::env::var("VICTORY_METAL_RESIDENCY_SETS").ok();
-        let residency_sets = asked.as_deref() != Some("0")
-            && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
+        let memory = physical_memory();
+        let (residency_sets, pool_sets) = residency_mode(asked.as_deref(), sets_supported(&dev), memory);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mode = match (residency_sets, pool_sets) {
+                (false, _) => "useResource per encoder",
+                (true, false) => "a set per heap",
+                (true, true) => "a set per heap and the pool's on the queues",
+            };
+            tracing::info!(
+                mode,
+                memory_gb = memory >> 30,
+                switch = asked.as_deref().unwrap_or("unset"),
+                "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
+            );
+        });
         Ok(Metal {
             dev,
             msc: Msc::try_open_default(),
             residency_sets,
-            pool_sets: residency_sets && asked.is_some(),
+            pool_sets,
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
@@ -201,11 +245,17 @@ impl Metal {
     }
 
     /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the
-    /// queues) or `useResource` in every encoder (`false`). [`Metal::new`] is in between: the
-    /// heaps' sets alone.
+    /// queues, where the system has sets) or `useResource` in every encoder (`false`).
     pub fn with_residency_sets(mut self, on: bool) -> Metal {
-        self.residency_sets = on;
-        self.pool_sets = on;
+        self.residency_sets = on && sets_supported(&self.dev);
+        self.pool_sets = self.residency_sets;
+        self
+    }
+
+    /// The heaps' sets alone, whatever the Mac's memory: what [`Metal::new`] chooses on a large one.
+    pub fn with_heap_sets(mut self) -> Metal {
+        self.residency_sets = sets_supported(&self.dev);
+        self.pool_sets = false;
         self
     }
 
@@ -559,6 +609,21 @@ mod tests {
         );
         // SUBS is even: the last write is array 0.
         assert!((0..N).all(|i| mem.get(0, i) == SUBS as u32));
+    }
+
+    /// The heaps' sets are the default only from 32 GiB (the world's set holds 17 to 18 GB), `heap`
+    /// forces them on any Mac, `0` names everything per encoder and `1` adds the pool's queue set.
+    #[test]
+    fn the_default_residency_mode_follows_the_macs_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(residency_mode(None, true, 18 * GIB), (false, false));
+        assert_eq!(residency_mode(None, true, 32 * GIB), (true, false));
+        assert_eq!(residency_mode(None, false, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("heap"), true, 16 * GIB), (true, false));
+        assert_eq!(residency_mode(Some("heap"), false, 16 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("0"), true, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("1"), true, 16 * GIB), (true, true));
+        assert!(physical_memory() >= GIB);
     }
 
     #[test]

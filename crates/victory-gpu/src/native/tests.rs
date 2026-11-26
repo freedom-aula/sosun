@@ -301,13 +301,17 @@ fn a_heap_is_named_once_per_encoder() {
     assert_eq!(named_for_a_heap(&h), [2, 2]);
 }
 
-/// By default what a heap names is resident through the heap's own set, given to the command
-/// buffer: nothing is named to the encoders for it (in GTA VI's world that was 37,000 allocations
-/// for every pass, about 155 ms of kernel time per drawing render pass), and the title's pools
-/// are in no set of their own (all of title memory would stay resident).
+/// With the heaps' sets (the default on a Mac with 32 GiB or more) what a heap names is resident
+/// through the heap's own set, given to the command buffer: nothing is named to the encoders for
+/// it (in GTA VI's world that was 37,000 allocations for every pass, about 155 ms of kernel time
+/// per drawing render pass), and the title's pools are in no set of their own (all of title
+/// memory would stay resident).
 #[test]
-fn a_heap_is_resident_through_its_set_by_default() {
-    let Some(h) = host() else { return };
+fn a_heap_is_resident_through_its_set() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_heap_sets());
     if !h.backend.residency_sets() {
         eprintln!("skipped: no residency sets on this system");
         return;
@@ -879,12 +883,14 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
 /// names every buffer on every dispatch, and gives the same results.
 #[test]
 fn pool_buffers_are_resident_through_one_set_per_queue() {
-    let Some(default) = host() else { return };
-    if !default.backend.residency_sets() {
-        eprintln!("skipped: no residency sets on this system");
+    if host().is_none() {
         return;
     }
     let on = Host::new(Metal::new().unwrap().with_residency_sets(true));
+    if !on.backend.residency_sets() {
+        eprintln!("skipped: no residency sets on this system");
+        return;
+    }
     let off = Host::new(Metal::new().unwrap().with_residency_sets(false));
 
     let work = |h: &Host, queues: usize, submissions: usize| {
@@ -926,11 +932,13 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
 /// A pool that goes away takes its buffer out of the set (and does not break the next work).
 #[test]
 fn a_released_pool_leaves_the_residency_set() {
-    let Some(default) = host() else { return };
-    if !default.backend.residency_sets() {
+    if host().is_none() {
         return;
     }
     let h = Host::new(Metal::new().unwrap().with_residency_sets(true));
+    if !h.backend.residency_sets() {
+        return;
+    }
     let pool = Pool::new(&h, 2);
     pool.write(0, &(0..64u32).collect::<Vec<_>>());
     let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();

@@ -391,15 +391,21 @@ Resources reached only through a heap entry are **not** resident unless named. M
 residency set nor `useResource`, every heap test returns wrong data (Apple Silicon does not make an
 unnamed resource work by luck).
 
-By default a heap carries its own `MTLResidencySet`: the heap buffer and each allocation its entries
-name. An allocation is added when an entry first names it and removed (and the set committed) before
+On a Mac with 32 GiB of memory or more (`hw.memsize`), and on any Mac with
+`VICTORY_METAL_RESIDENCY_SETS=heap`, a heap carries its own `MTLResidencySet`: the heap buffer and
+each allocation its entries name. An allocation is added when an entry first names it and removed (and the set committed) before
 the last entry naming it is overwritten or the heap is dropped; the set does not retain what it holds,
 the heap does. The set is committed when entries changed and given to each command buffer that uses
 the heap (`useResidencySet`), so what the heap names is resident while that command buffer runs:
 residency follows the frame, and nothing is rebuilt per command buffer.
 
 `VICTORY_METAL_RESIDENCY_SETS=0` names every allocation a heap names to every encoder with
-`useResource` instead, which was the default before. In GTA VI's world the heap names about 37,000
+`useResource` instead, which is also what a Mac with less than 32 GiB does when the switch is unset.
+The 32 GiB line is a guess, not a measurement: the world's heap set holds 17 to 18 GB (`heap_set_mb`
+on the frame line), more than all the memory of a 16 or 18 GB Mac, and no such Mac has run it yet;
+the process's footprint was the same either way on 48 GB, so it may well be safe, and `heap` is there
+to find out. The choice is logged once at start-up (`metal: residency of what descriptor heaps name`,
+with the mode, the Mac's memory and the switch). In GTA VI's world the heap names about 37,000
 allocations (130,000 entries), and the kernel took about 155 ms to take that list for each render pass
 that draws (10 ms for a compute pass), whatever the pass's shaders, with the GPU idle. Measured with
 each pass in its own command buffer: 164 drawing passes, 0.153 s each between the kernel taking the
