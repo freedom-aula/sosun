@@ -76,6 +76,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         80 => Format::Bc4,
         83 => Format::Bc5,
         95 => Format::Bc6h,
+        96 => Format::Bc6hSigned,
         98 => Format::Bc7,
         61 => Format::R8Unorm,
         65 => Format::A8Unorm,
@@ -242,6 +243,22 @@ mod tests {
             assert_eq!(f.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
         }
         assert!(super::format(42).unwrap().is_integer() && !super::format(26).unwrap().is_integer());
+    }
+
+    /// Both BC6H formats, apart: the unsigned one (95) and the signed one (96), 16-byte blocks of
+    /// 4x4 texels as the title's.
+    #[test]
+    fn bc6h_keeps_its_signedness() {
+        use victory_backend::resources::Format;
+        assert_eq!(super::format(95), Some(Format::Bc6h));
+        assert_eq!(super::format(96), Some(Format::Bc6hSigned));
+        for dxgi in [95, 96] {
+            let (bytes, block) = crate::resource::element(dxgi).expect("a title format");
+            assert_eq!(
+                super::format(dxgi).unwrap().block(),
+                (block as usize, bytes as usize)
+            );
+        }
     }
 
     #[test]

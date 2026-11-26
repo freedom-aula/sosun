@@ -234,6 +234,7 @@ fn sample_bc1_and_create_every_bc_format() {
         Format::Bc4,
         Format::Bc5,
         Format::Bc6h,
+        Format::Bc6hSigned,
         Format::Bc7,
     ] {
         let t = m
@@ -247,6 +248,45 @@ fn sample_bc1_and_create_every_bc_format() {
             f.row_bytes(16),
             0,
         );
+    }
+}
+
+/// One BC6H block, mode 11 (mode bits `00011`: one region, 10-bit endpoints, not transformed),
+/// endpoint 0 = (0x100, 0x300, 0), every index 0, so every texel is endpoint 0. Decoded as
+/// Microsoft's "BC6H Format" page and the reference decoder (DirectXTex `BC6HBC7.cpp`,
+/// `Unquantize` and `FinishUnquantize`) say:
+/// - unsigned (`BC6H_UF16`): `(x << 16 | 0x8000) >> 10`, then `* 31 >> 6`, as half bits:
+///   0x100 -> 0x1F0F = 1807 / 2^18, 0x300 -> 0x5D0F = 323.75;
+/// - signed (`BC6H_SF16`): endpoints are 10-bit two's complement, so 0x300 is -256;
+///   `(|x| << 15 | 0x4000) >> 9`, then `* 31 >> 5`, sign kept: 0x100 -> 0x3E1F = 1567 / 1024,
+///   0x300 -> 0xBE1F = -1567 / 1024.
+///
+/// Metal's `BC6H_RGBFloat` is the signed format and `BC6H_RGBUfloat` the unsigned one; the host
+/// used the signed one for DXGI 95.
+#[test]
+fn sample_bc6h_unsigned_and_signed() {
+    let Some(m) = backend() else { return };
+    let block = (0b00011u128 | 0x100 << 5 | 0x300 << 15).to_le_bytes();
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1.0);
+    for (format, want) in [
+        (Format::Bc6h, [1807.0 / 262_144.0, 323.75, 0.0]),
+        (Format::Bc6hSigned, [1567.0 / 1024.0, -1567.0 / 1024.0, 0.0]),
+    ] {
+        let t = m.create_texture(&d2(format, 4, 4)).unwrap();
+        m.upload_texture(&t, 0, 0, &block, format.row_bytes(4), 0);
+        let g = Grid {
+            m: &m,
+            dxil: &fixture("sample2d"),
+            g: [4, 4],
+            z: 1,
+            filter: Filter::Nearest,
+        };
+        for (i, c) in g.run(&t).iter().enumerate() {
+            assert!(
+                (0..3).all(|k| close(c[k], want[k])) && near(c[3], 1.0),
+                "{format:?} texel {i}: {c:?} != {want:?}"
+            );
+        }
     }
 }
 
