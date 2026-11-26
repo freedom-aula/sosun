@@ -744,6 +744,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The textures the first 32 entries from each of `root`'s tables name as unordered-access
     /// views (for traces of work whose program is not known: a table may be shorter).
+    #[cfg(target_os = "macos")]
     pub(super) fn table_uav_textures(&self, root: &[Option<Root<B>>]) -> Vec<usize> {
         let handles = root.iter().flatten().filter_map(|r| match r {
             Root::Table(h, at) if h.kind == HeapKind::Resource => Some((h.start, *at as u64)),
