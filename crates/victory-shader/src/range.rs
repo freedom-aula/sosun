@@ -39,7 +39,6 @@ pub fn build(
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -47,9 +46,6 @@ pub fn build(
         .filter(|i| relative(i))
         .map(|i| (i.machine.offset, 0))
         .collect();
-    if st.is_err() {
-        assumed.clear();
-    }
     // Each round grows a bound or drops a move; few programs need more than two.
     for _ in 0..8 {
         if assumed.is_empty() {
@@ -77,6 +73,9 @@ pub fn build(
             .filter_map(|(&o, &m)| Some((o, u8::try_from(found[&o]).ok()?.max(m))))
             .collect();
     }
+    // Structurisation is most of a large program's translation: the unbounded
+    // form is structured only when the bounded one is not used.
+    let st = structure::structure(&p);
     Ok((p, st))
 }
 
