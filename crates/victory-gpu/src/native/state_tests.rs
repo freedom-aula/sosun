@@ -328,3 +328,30 @@ fn culling_follows_the_winding_and_its_front_face() {
     assert!(!drawn(Cull::Front, true));
     assert!(drawn(Cull::None, false));
 }
+
+/// Depth bias applies to a draw and resets to zero on the following draw in the same render pass.
+#[test]
+fn depth_bias_resets_between_draws_in_the_same_pass() {
+    let Some(r) = Rig::new() else { return };
+    let color = r.target(Format::Rgba8Unorm, false);
+    let depth = r.target(Format::D32Float, true);
+    let biased = r.pipeline(Some(Format::D32Float), &[], |d| {
+        d.depth_test = Some((true, Compare::Always));
+        d.raster.depth_bias = (10000.0, 0.0, 0.0);
+    });
+    let unbiased = r.pipeline(Some(Format::D32Float), &[], |d| {
+        d.depth_test = Some((false, Compare::Less));
+    });
+
+    let mut l = r.list(&color, Some(&depth), [0.0; 4]);
+    // Draw 1 pushes depth back with positive bias; Draw 2 at the same Z with zero bias must pass Less.
+    r.draw(&mut l, &biased, 0, &triangle([1.0, 0.0, 0.0, 1.0]));
+    r.draw(&mut l, &unbiased, 256, &triangle([0.0, 1.0, 0.0, 1.0]));
+    run(&r.h, &[&l]);
+    let out = r.read(&color);
+    assert_eq!(
+        px(&out, 8, 8),
+        [0, 255, 0, 255],
+        "zero depth bias must not inherit the previous draw's bias"
+    );
+}

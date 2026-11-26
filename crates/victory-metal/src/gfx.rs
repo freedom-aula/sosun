@@ -992,9 +992,7 @@ impl Metal {
             } else {
                 MTLDepthClipMode::Clamp
             });
-            if r.depth_bias != (0.0, 0.0, 0.0) {
-                e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            }
+            e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
             if let Some(ds) = &d.pipeline.depth {
                 e.setDepthStencilState(Some(ds));
             }
