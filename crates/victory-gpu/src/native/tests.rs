@@ -50,7 +50,9 @@ struct Pool {
 
 impl Pool {
     fn new(h: &Host, pages: usize) -> Pool {
-        let mem = Alias::new(pages * page_size()).unwrap();
+        // Tests assume at least 16 KiB per page (e.g. offsets 16384, 32768); under x86_64
+        // Rosetta `page_size()` reports 4 KiB, so clamp the unit to at least 16 KiB.
+        let mem = Alias::new(pages * page_size().max(16384)).unwrap();
         let info = PoolInfo {
             id: 1,
             base: mem.primary as usize,
@@ -433,7 +435,7 @@ fn a_released_pool_leaves_the_residency_set() {
     h.memory().pool_released(&info);
     // The next resolve drops the released pool's buffer.
     let second = {
-        let mem = Alias::new(2 * page_size()).unwrap();
+        let mem = Alias::new(2 * page_size().max(16384)).unwrap();
         let info = PoolInfo {
             id: 2,
             base: mem.primary as usize,

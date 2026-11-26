@@ -28,7 +28,7 @@ fn read(path: &str) -> Vec<u8> {
 
 /// A pool of `pages` pages told to the observer under `id` and shown at an alias address.
 fn pool(id: usize, pages: usize) -> Pool {
-    let mem = Alias::new(pages * page_size()).unwrap();
+    let mem = Alias::new(pages * page_size().max(16384)).unwrap();
     let info = PoolInfo {
         id,
         base: mem.primary as usize,
