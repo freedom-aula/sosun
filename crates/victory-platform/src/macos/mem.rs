@@ -129,9 +129,13 @@ pub unsafe fn reserve(at: Option<usize>, len: usize) -> io::Result<*mut u8> {
         mach_vm_allocate(task(), &mut addr, len as u64, flags)
     })?;
     // SAFETY: the range was just allocated.
-    check("mach_vm_protect", unsafe {
+    if let Err(e) = check("mach_vm_protect", unsafe {
         mach_vm_protect(task(), addr, len as u64, 0, 0)
-    })?;
+    }) {
+        // SAFETY: release the allocation we just made so it does not leak.
+        unsafe { mach_vm_deallocate(task(), addr, len as u64) };
+        return Err(e);
+    }
     Ok(addr as *mut u8)
 }
 
@@ -252,6 +256,9 @@ pub unsafe fn reserve_in(
     len: usize,
     align: usize,
 ) -> io::Result<*mut u8> {
+    let Some(step) = align.max(page_size()).checked_next_power_of_two() else {
+        return Err(io::Error::other("alignment overflow"));
+    };
     // A gap the walk sees as free may not be (a test binary's page zero is
     // not a region): the next one up then.
     let mut from = lowest;
@@ -260,7 +267,10 @@ pub unsafe fn reserve_in(
         if let Ok(p) = unsafe { reserve(Some(start), len) } {
             return Ok(p);
         }
-        from = start + align.max(page_size());
+        let Some(next) = start.checked_add(step) else {
+            break;
+        };
+        from = next;
     }
     Err(io::Error::other("no free address range below the limit"))
 }
@@ -268,16 +278,19 @@ pub unsafe fn reserve_in(
 /// The lowest address at or above `lowest`, a multiple of `align`, where
 /// `len` bytes lie free and end at or below `highest`.
 fn free_gap(lowest: usize, highest: usize, len: usize, align: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
     // Walk the mapped regions for the first gap that fits: the kernel's own
     // "anywhere" placement ignores the hint when the process is full of
     // libraries (a window brings Metal's) and lands above `highest`.
-    let align = align.max(page_size()).next_power_of_two();
+    let align = align.max(page_size()).checked_next_power_of_two()?;
     let up = |a: usize| a.checked_add(align - 1).map(|v| v & !(align - 1));
     let mut at = up(lowest);
     while let Some(start) = at {
         let end = start.checked_add(len).filter(|&e| e - 1 <= highest)?;
         match next_region(start) {
-            Some(r) if r.base < end => at = up(r.base + r.len),
+            Some(r) if r.base < end => at = r.base.checked_add(r.len).and_then(up),
             _ => return Some(start),
         }
     }
@@ -530,4 +543,17 @@ pub unsafe fn unmap_over(addr: *mut u8, len: usize) -> io::Result<()> {
 pub unsafe fn unmap(addr: *mut u8, len: usize) -> io::Result<()> {
     // SAFETY: forwarded from the caller.
     unsafe { release(addr, len) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_gap_rejects_zero_length_and_overflowing_alignment() {
+        assert_eq!(free_gap(0, usize::MAX, 0, page_size()), None);
+        assert_eq!(free_gap(0x10000, usize::MAX, 0, page_size()), None);
+        assert_eq!(free_gap(0, usize::MAX, page_size(), (usize::MAX >> 1) + 2), None);
+        assert_eq!(free_gap(usize::MAX, usize::MAX, page_size(), page_size()), None);
+    }
 }
