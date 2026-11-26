@@ -30,6 +30,7 @@ pub enum Format {
     Bc3,
     Bc4,
     Bc5,
+    /// BC6H of unsigned half floats (DXGI `BC6H_UF16`).
     Bc6h,
     Bc7,
     R8Unorm,
@@ -65,6 +66,8 @@ pub enum Format {
     Bgr5a1Unorm,
     /// Metal's `ABGR4Unorm`.
     Abgr4Unorm,
+    /// BC6H of signed half floats (DXGI `BC6H_SF16`).
+    Bc6hSigned,
 }
 
 impl Format {
@@ -78,7 +81,7 @@ impl Format {
             D32FloatS8 => (1, 8),
             Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
-            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
+            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc6hSigned | Bc7 | Bc7Srgb => (4, 16),
             R8Unorm | A8Unorm | R8Uint => (1, 1),
             R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),

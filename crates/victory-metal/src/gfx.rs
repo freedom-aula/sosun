@@ -109,7 +109,9 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Bc3 => MTLPixelFormat::BC3_RGBA,
         Format::Bc4 => MTLPixelFormat::BC4_RUnorm,
         Format::Bc5 => MTLPixelFormat::BC5_RGUnorm,
-        Format::Bc6h => MTLPixelFormat::BC6H_RGBFloat,
+        // Metal's `RGBFloat` is the signed BC6H, `RGBUfloat` the unsigned one.
+        Format::Bc6h => MTLPixelFormat::BC6H_RGBUfloat,
+        Format::Bc6hSigned => MTLPixelFormat::BC6H_RGBFloat,
         Format::Bc7 => MTLPixelFormat::BC7_RGBAUnorm,
         Format::R8Unorm => MTLPixelFormat::R8Unorm,
         Format::A8Unorm => MTLPixelFormat::A8Unorm,
