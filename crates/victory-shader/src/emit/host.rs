@@ -755,7 +755,6 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         zero_copy_memory: false,
         rect_list: false,
         view_marks: false,
-        rect_list: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
