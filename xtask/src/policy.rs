@@ -29,10 +29,25 @@ const ALLOWED_NAMES: &[&str] = &[
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
-const EXCEPTIONS: &[(&str, &str)] = &[(
-    "crates/victory-formats/src/bcpack-tables.bin",
-    "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
-)];
+const EXCEPTIONS: &[(&str, &str)] = &[
+    (
+        "crates/victory-formats/src/bcpack-tables.bin",
+        "the BCPack format's constant tables: nothing decodes without them and they cannot be derived (owner's decision, 2026-11-23; docs/asset-policy.md)",
+    ),
+    // Our own test shaders, compiled from the .hlsl beside them, so the Metal
+    // tests run without a DXC install. Nothing from the game.
+    ("crates/victory-metal/tests/affine.dxil", "synthetic Metal test shader"),
+    ("crates/victory-metal/tests/fixtures/heap_rw.dxil", "compiled from heap_rw.hlsl"),
+    ("crates/victory-metal/tests/fixtures/sample2d.dxil", "compiled from sample2d.hlsl"),
+    ("crates/victory-metal/tests/fixtures/sample2darray.dxil", "compiled from sample2darray.hlsl"),
+    ("crates/victory-metal/tests/fixtures/sample3d.dxil", "compiled from sample3d.hlsl"),
+    ("crates/victory-metal/tests/fixtures/tri_ps.dxil", "compiled from tri_ps.hlsl"),
+    ("crates/victory-metal/tests/fixtures/tri_vs.dxil", "compiled from tri_vs.hlsl"),
+    // shortcut: one source file over the size limit, until it is split into modules.
+    ("crates/victory-shader/src/emit/lower.rs", "hand-written translator source, over the size limit"),
+    ("tools/swizzle/gen_xor_tables.py", "script that generates the swizzle tables"),
+    ("tools/swizzle/xor_reference.py", "reference model for the swizzle tests"),
+];
 
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
