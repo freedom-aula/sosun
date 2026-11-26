@@ -573,7 +573,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -632,7 +632,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             super::safe_read(a as *const u8, &mut b);
             b
         });
-        tracing::info!(draw = n, ?kinds, ?vertex, ?call, ?head, "content: draw");
+        tracing::info!(draw = n, ?kinds, ?vertex, ?call, ?head, vs = ?binding.map(|b| (b.dwords, b.user_data.clone(), b.views.clone())), ps = ?binding.and_then(|b| b.ps.as_ref()).map(|p| (p.dwords, p.user_data.clone())), "content: draw");
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let base = h.start + *at as u64 * Self::step(h.kind);
@@ -728,7 +728,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
-                self.trace_content(root, vertex, call);
+                self.trace_content(root, vertex, call, binding.as_deref());
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
