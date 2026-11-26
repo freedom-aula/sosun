@@ -140,7 +140,7 @@ fn pipeline(
     surface: &Surface,
     format: MTLPixelFormat,
 ) -> Result<Pipeline, String> {
-    if let Some(p) = surface.pipelines.borrow().get(&(format.0 as usize)) {
+    if let Some(p) = surface.pipelines.borrow().get(&format.0) {
         return Ok(p.clone());
     }
     let d = MTLRenderPipelineDescriptor::new();
@@ -158,7 +158,7 @@ fn pipeline(
         .dev
         .newRenderPipelineStateWithDescriptor_error(&d)
         .map_err(|e| e.localizedDescription().to_string())?;
-    surface.pipelines.borrow_mut().insert(format.0 as usize, p.clone());
+    surface.pipelines.borrow_mut().insert(format.0, p.clone());
     Ok(p)
 }
 
@@ -206,9 +206,15 @@ impl PresentBackend for Metal {
         surface: &Surface,
         source: &Texture,
     ) -> Result<(), String> {
+        // Standalone backend callers may block, but an unavailable drawable must not keep
+        // them here forever. The title pump uses try_present instead and never sleeps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if self.try_present(queue, surface, source)? {
                 return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for a drawable".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -256,5 +262,35 @@ impl PresentBackend for Metal {
             surface.frames.set(surface.frames.get() + 1);
             Ok(true)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::ComputeBackend;
+    use crate::resources::{Format, ResourceBackend, TextureDesc};
+
+    #[test]
+    fn blocking_present_times_out_when_acquisition_never_returns() {
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(4, 4);
+        let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        // A connected acquisition worker that never produces a drawable. Disconnect after
+        // four seconds as a test watchdog, so removing the deadline fails rather than hangs.
+        let (requests, _requests_rx) = std::sync::mpsc::channel();
+        let (results, drawables) = std::sync::mpsc::channel();
+        surface.acquisition = requests;
+        surface.drawables = drawables;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            drop(results);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(metal.present(&queue, &surface, &source).unwrap_err(), "timed out waiting for a drawable");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(surface.frames(), 0);
     }
 }
