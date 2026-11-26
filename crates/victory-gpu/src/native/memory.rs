@@ -95,9 +95,11 @@ impl PoolTable {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The pool `[addr, addr + len)` lies in, and the pool-mapping address of `addr`. The range must
-    /// lie in one mapping (shortcut: a range over two adjacent mappings of one pool is refused; merge
-    /// them here if a title builds a buffer view across a map boundary).
+    /// The pool `[addr, addr + len)` lies in, and the pool-mapping address of `addr`. The range may
+    /// run over several mappings when each follows the one before it both in title memory and in
+    /// the same pool (the pages of one allocation are reported one mapping at a time, and titles
+    /// build buffer views across them). A range over a gap, over two pools, or over mappings that
+    /// are not next to each other in the pool is refused: one pointer cannot show it.
     pub fn resolve(&self, addr: u64, len: u64) -> Option<(PoolInfo, *const u8)> {
         let (addr, len) = (
             usize::try_from(addr).ok()?,
@@ -105,8 +107,18 @@ impl PoolTable {
         );
         let g = self.lock();
         let (&at, m) = g.maps.range(..=addr).next_back()?;
-        if addr + len > at + m.len {
+        if addr >= at + m.len {
             return None;
+        }
+        let end = addr.checked_add(len)?;
+        let (mut title_end, mut pool_end) = (at + m.len, m.offset + m.len);
+        while end > title_end {
+            let next = g.maps.get(&title_end)?;
+            if next.pool != m.pool || next.offset != pool_end {
+                return None;
+            }
+            title_end += next.len;
+            pool_end += next.len;
         }
         let pool = g.pools.get(&m.pool)?;
         Some((
@@ -207,6 +219,35 @@ mod tests {
         t.pool_released(&p);
         assert!(t.resolve(0x7000_1000, 1).is_none());
         assert_eq!(t.take_released(), vec![1]);
+    }
+
+    #[test]
+    fn a_range_over_adjacent_mappings_resolves_when_the_pool_continues() {
+        let t = PoolTable::default();
+        let (p, q) = (pool(1), pool(2));
+        t.pool_created(&p);
+        t.pool_created(&q);
+        // Three 64 KiB pages of one allocation, reported one at a time, in pool order.
+        for i in 0..3 {
+            t.mapped(0x7000_0000 + i * 0x1_0000, 0x1_0000, &p, 0x4_0000 + i * 0x1_0000);
+        }
+        // Over one boundary, and over all three.
+        let (info, ptr) = t.resolve(0x7000_fff0, 0x20).unwrap();
+        assert_eq!((info.id, ptr as usize), (1, p.base + 0x4_fff0));
+        let (_, ptr) = t.resolve(0x7000_8000, 0x2_0000).unwrap();
+        assert_eq!(ptr as usize, p.base + 0x4_8000);
+        // Up to the last byte, not past it.
+        assert!(t.resolve(0x7000_0000, 0x3_0000).is_some());
+        assert!(t.resolve(0x7000_0000, 0x3_0001).is_none());
+        // The next title page shows the same pool, but not the bytes that follow in it.
+        t.mapped(0x7003_0000, 0x1_0000, &p, 0x9_0000);
+        assert!(t.resolve(0x7002_fff0, 0x20).is_none());
+        assert!(t.resolve(0x7003_0000, 0x10).is_some());
+        // The next title page shows another pool at the offset that would follow.
+        t.mapped(0x7003_0000, 0x1_0000, &q, 0x7_0000);
+        assert!(t.resolve(0x7002_fff0, 0x20).is_none());
+        // A length that wraps is refused, not followed.
+        assert!(t.resolve(0x7000_0000, u64::MAX).is_none());
     }
 
     #[test]
