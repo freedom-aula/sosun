@@ -252,32 +252,27 @@ pub unsafe fn reserve_in(
     len: usize,
     align: usize,
 ) -> io::Result<*mut u8> {
-    let mut addr = lowest as u64;
-    // SAFETY: anonymous memory placed by the kernel; nothing of the caller's is touched.
-    check("mach_vm_map", unsafe {
-        mach_vm_map(
-            task(),
-            &mut addr,
-            len as u64,
-            align.max(page_size()).next_power_of_two() as u64 - 1,
-            VM_FLAGS_ANYWHERE,
-            0,
-            0,
-            0,
-            0,
-            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
-            VM_INHERIT_NONE,
-        )
-    })?;
-    if (addr as usize)
-        .checked_add(len)
-        .is_none_or(|end| end - 1 > highest)
-    {
-        // SAFETY: just mapped.
-        unsafe { release(addr as *mut u8, len) }?;
-        return Err(io::Error::other("no free address range below the limit"));
+    // Walk the mapped regions for the first gap that fits: the kernel's own
+    // "anywhere" placement ignores the hint when the process is full of
+    // libraries (a window brings Metal's) and lands above `highest`.
+    let align = align.max(page_size()).next_power_of_two();
+    let up = |a: usize| a.checked_add(align - 1).map(|v| v & !(align - 1));
+    let mut at = up(lowest);
+    while let Some(start) = at {
+        let end = start.checked_add(len).filter(|&e| e - 1 <= highest);
+        let Some(end) = end else { break };
+        match next_region(start) {
+            Some(r) if r.base < end => at = up(r.base + r.len),
+            _ => {
+                // SAFETY: the gap is free as far as the region walk saw; FIXED fails if not.
+                if let Ok(p) = unsafe { reserve(Some(start), len) } {
+                    return Ok(p);
+                }
+                at = up(end);
+            }
+        }
     }
-    Ok(addr as *mut u8)
+    Err(io::Error::other("no free address range below the limit"))
 }
 
 /// The process's memory footprint in bytes (what the system charges it for).
