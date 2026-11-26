@@ -16,7 +16,7 @@
 use super::descriptors::format;
 use super::host::NativeHost;
 use super::title::Title;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_formats::texture::{Dimension, Layout};
@@ -791,13 +791,7 @@ impl<B: PresentBackend> Title<B> {
         if unloaded.is_empty() && dirty.is_empty() {
             return;
         }
-        let mut todo: Vec<usize> = unloaded.into_iter().collect();
-        for key in dirty {
-            if !todo.contains(&key) {
-                todo.push(key);
-            }
-        }
-        self.sync_keys(todo);
+        self.sync_keys(keys_to_sync(&unloaded, &dirty));
     }
 
     fn sync_keys(&mut self, keys: Vec<usize>) {
@@ -850,12 +844,29 @@ impl<B: PresentBackend> Title<B> {
     }
 }
 
+fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize> {
+    unloaded.iter().chain(dirty.difference(unloaded)).copied().collect()
+}
+
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {
+        let unloaded = (0..20_000).collect();
+        let dirty = (10_000..30_000).collect();
+        let mut keys = keys_to_sync(&unloaded, &dirty);
+
+        let (first, rest) = keys.split_at_mut(unloaded.len());
+        first.sort_unstable();
+        rest.sort_unstable();
+        assert!(first.iter().copied().eq(0..20_000));
+        assert!(rest.iter().copied().eq(20_000..30_000));
+    }
 
     fn dirty_this_round(
         entries: &HashMap<usize, (usize, usize, bool)>,
