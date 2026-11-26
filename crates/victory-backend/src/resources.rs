@@ -36,6 +36,29 @@ pub enum Format {
     A8Unorm,
     R16Unorm,
     Rgba32Float,
+    Rg32Float,
+    Rgb10a2Unorm,
+    Rg11b10Float,
+    Rgba8Uint,
+    Rg16Float,
+    Rg16Unorm,
+    R32Uint,
+    R8Uint,
+    /// Shared-exponent RGB (DXGI `R9G9B9E5_SHAREDEXP`).
+    Rgb9e5Float,
+    Bc7Srgb,
+    Rgba32Uint,
+    Rgba16Unorm,
+    Rgba16Snorm,
+    Rg32Uint,
+    Rg16Uint,
+    Rg8Unorm,
+    Rg8Uint,
+    R16Float,
+    R16Uint,
+    D16Unorm,
+    Bc1Srgb,
+    Bc3Srgb,
 }
 
 impl Format {
@@ -44,14 +67,22 @@ impl Format {
         use Format::*;
         match self {
             Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
+            Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
+            Rg16Uint => (1, 4),
             D32FloatS8 => (1, 8),
-            Rgba16Float => (1, 8),
-            Bc1 | Bc4 => (4, 8),
-            Bc2 | Bc3 | Bc5 | Bc6h | Bc7 => (4, 16),
-            R8Unorm | A8Unorm => (1, 1),
-            R16Unorm => (1, 2),
-            Rgba32Float => (1, 16),
+            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
+            Bc1 | Bc1Srgb | Bc4 => (4, 8),
+            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
+            R8Unorm | A8Unorm | R8Uint => (1, 1),
+            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint => (1, 2),
+            Rgba32Float | Rgba32Uint => (1, 16),
         }
+    }
+
+    /// An integer format: its render targets cannot blend.
+    pub fn is_integer(self) -> bool {
+        use Format::*;
+        matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
     }
 
     /// Bytes of one row of `width` texels (of blocks, for BC).

@@ -54,6 +54,9 @@ impl TextureInfo {
         if depth && format == Format::R32Float {
             format = Format::D32Float;
         }
+        if depth && format == Format::R16Unorm {
+            format = Format::D16Unorm;
+        }
         let (dim, d) = match self.dimension {
             Dimension::Tex3d => (TexDim::D3, self.depth_or_layers as usize),
             _ if self.depth_or_layers > 1 => (TexDim::D2Array, self.depth_or_layers as usize),

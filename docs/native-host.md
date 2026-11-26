@@ -465,3 +465,27 @@ offsets back from them (the field layouts below match the values seen):
 | 0x4 | `CB_TARGET_MASK` | 0xffffffff, 0 (depth only), 0xf, 0x3ffff |
 
 `Graphics::guess_from` now reads all of these over the guessed defaults: cull (FACE 0 = counter-clockwise front), depth enable, write and function (hardware + 1 = D3D12), stencil enable, read and write masks, front and back ops and functions (the back face's only with BACKFACE_ENABLE), and each target's write mask. Most depth tests are GREATER_EQUAL (reversed Z), where the guess was LESS_EQUAL with writes. The polygon offset floats are not mapped. `VICTORY_GUESS_BLEND_ONLY=1` keeps the earlier blend-only reading, for comparison. A run past setup to the loading screen gave the same presented images, byte for byte, as without this change. The setup screens were not checked: runs now skip them, probably because the profile is saved.
+
+#### Texture formats the host lacked
+
+The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
+
+| DXGI | Format | First texture seen (flags: 1 render target, 2 depth, 4 unordered access) | Metal |
+|---|---|---|---|
+| 42 | R32_UINT | 1280x720, unordered access (a compute output) | R32Uint |
+| 26 | R11G11B10_FLOAT | 1280x720, unordered access (a compute output) | RG11B10Float |
+| 67 | R9G9B9E5_SHAREDEXP | 1280x720, read only | RGB9E5Float |
+| 16 | R32G32_FLOAT | 160x90, unordered access | RG32Float |
+| 62 | R8_UINT | 640x360, render target and unordered access | R8Uint |
+| 34, 35 | R16G16_FLOAT, R16G16_UNORM | 256x256, 127x128, render targets | RG16Float, RG16Unorm |
+| 24 | R10G10B10A2_UNORM | 32x32 | RGB10A2Unorm |
+| 30 | R8G8B8A8_UINT | 1x1 | RGBA8Uint |
+| 99, 72, 78 | BC7, BC1, BC3 UNORM_SRGB | 512x512, 32x32, 512x512 | the `_sRGB` BC formats |
+| 53 | R16_TYPELESS | 2048x8192 depth (a shadow map) | Depth16Unorm (R16Unorm when not depth) |
+| 55 | D16_UNORM | (its depth views) | Depth16Unorm |
+| 3, 17, 36, 51, 57 | R32G32B32A32, R32G32, R16G16, R8G8, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
+| 11, 13 | R16G16B16A16_UNORM, _SNORM | 128x4, 256x256 | RGBA16Unorm, RGBA16Snorm |
+| 49, 50 | R8G8_TYPELESS, _UNORM | 16x16, 64x64 | RG8Unorm |
+| 54 | R16_FLOAT | 512x512 | R16Float |
+
+Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. Not mapped yet: B5G5R5A1_UNORM (86, 1024x4096 render target) and B4G4R4A4_UNORM (115, 2560x1440 render target). Metal's packed 16-bit formats (BGR5A1Unorm, ABGR4Unorm) need their bit order checked against DXGI's before they are used. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
