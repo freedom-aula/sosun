@@ -123,19 +123,19 @@ pub(crate) fn translate(path: &[u16]) -> Option<PathBuf> {
 }
 
 /// A NUL-terminated wide string.
-fn wide_str(p: *const u16) -> Vec<u16> {
+pub(super) fn wide_str(p: *const u16) -> Vec<u16> {
     // SAFETY: the title passes a NUL-terminated path.
     unsafe { std::slice::from_raw_parts(p, (0..).take_while(|&i| *p.add(i) != 0).count()) }.to_vec()
 }
 
-fn wide_path(p: *const u16) -> Option<PathBuf> {
+pub(super) fn wide_path(p: *const u16) -> Option<PathBuf> {
     if p.is_null() {
         return None;
     }
     translate(&wide_str(p))
 }
 
-fn narrow_path(p: *const c_char) -> Option<PathBuf> {
+pub(super) fn narrow_path(p: *const c_char) -> Option<PathBuf> {
     if p.is_null() {
         return None;
     }

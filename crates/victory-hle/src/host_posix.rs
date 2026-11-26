@@ -25,6 +25,7 @@ use victory_platform::thread;
 
 pub(crate) mod files;
 mod sync;
+pub(crate) mod ucrt;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
@@ -712,6 +713,9 @@ pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) ->
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
+    if let Some(address) = ucrt::lookup(&dll, name) {
+        return Some(address);
+    }
     // The API sets and kernelbase forward to kernel32's functions; the
     // exception functions are ntdll's (and `__C_specific_handler` the C
     // runtime's).
