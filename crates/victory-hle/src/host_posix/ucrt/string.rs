@@ -442,6 +442,7 @@ thread_local! {
 }
 
 pub extern "system" fn strtok_s(s: *mut u8, delim: *const u8, ctx: *mut *mut u8) -> *mut u8 {
+    // SAFETY: the title's context pointer, checked non-null first.
     if delim.is_null() || ctx.is_null() || (s.is_null() && unsafe { (*ctx).is_null() }) {
         set_errno(EINVAL);
         return std::ptr::null_mut();
@@ -733,6 +734,7 @@ pub extern "system" fn wcspbrk(s: *const u16, set: *const u16) -> *const u16 {
 }
 
 pub extern "system" fn wcstok_s(s: *mut u16, delim: *const u16, ctx: *mut *mut u16) -> *mut u16 {
+    // SAFETY: the title's context pointer, checked non-null first.
     if delim.is_null() || ctx.is_null() || (s.is_null() && unsafe { (*ctx).is_null() }) {
         set_errno(EINVAL);
         return std::ptr::null_mut();
@@ -955,6 +957,7 @@ pub extern "system" fn ___lc_handle_func() -> *const u32 {
 }
 
 fn has(c: i32, mask: u16) -> bool {
+    // SAFETY: the table has 257 entries and `c + 1` is in 0..=256.
     (-1..=255).contains(&c) && unsafe { *ctype_table().add((c + 1) as usize) } & mask != 0
 }
 

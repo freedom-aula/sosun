@@ -613,7 +613,7 @@ pub(crate) struct Find {
 }
 
 /// Whether `name` matches a `*` and `?` pattern, ignoring case.
-fn wildcard(pattern: &[char], name: &[char]) -> bool {
+pub(super) fn wildcard(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),

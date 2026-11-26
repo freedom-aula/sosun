@@ -5,6 +5,40 @@
 
 use super::{EDOM, ERANGE, Shared, exports64, libc, set_errno};
 
+/// Safe calls of libm's functions, which are pure.
+mod libm {
+    use super::libc;
+
+    macro_rules! wrap {
+        ($($n:ident($($a:ident: $t:ty),*) -> $r:ty;)*) => {$(
+            pub fn $n($($a: $t),*) -> $r {
+                // SAFETY: a pure function of its arguments.
+                unsafe { libc::$n($($a),*) }
+            }
+        )*};
+    }
+
+    wrap! {
+        erf(x: f64) -> f64;
+        erfc(x: f64) -> f64;
+        tgamma(x: f64) -> f64;
+        lgamma(x: f64) -> f64;
+        logb(x: f64) -> f64;
+        j0(x: f64) -> f64;
+        j1(x: f64) -> f64;
+        y0(x: f64) -> f64;
+        y1(x: f64) -> f64;
+        jn(n: i32, x: f64) -> f64;
+        yn(n: i32, x: f64) -> f64;
+        remainder(x: f64, y: f64) -> f64;
+        fmod(x: f64, y: f64) -> f64;
+        nextafter(x: f64, y: f64) -> f64;
+        nextafterf(x: f32, y: f32) -> f32;
+        scalbn(x: f64, n: i32) -> f64;
+        ilogb(x: f64) -> i32;
+    }
+}
+
 /// Sets `errno` the way the CRT does for a result `r` of arguments `args`.
 fn check(args: &[f64], r: f64) -> f64 {
     if r.is_nan() && !args.iter().any(|a| a.is_nan()) {
@@ -77,11 +111,11 @@ unary! {
     log1p, log1pf => f64::ln_1p;
     sqrt, sqrtf => f64::sqrt;
     cbrt, cbrtf => f64::cbrt;
-    erf, erff => |x| unsafe { libc::erf(x) };
-    erfc, erfcf => |x| unsafe { libc::erfc(x) };
-    tgamma, tgammaf => |x| unsafe { libc::tgamma(x) };
-    lgamma, lgammaf => |x| unsafe { libc::lgamma(x) };
-    logb, logbf => |x| unsafe { libc::logb(x) };
+    erf, erff => libm::erf;
+    erfc, erfcf => libm::erfc;
+    tgamma, tgammaf => libm::tgamma;
+    lgamma, lgammaf => libm::lgamma;
+    logb, logbf => libm::logb;
 }
 
 plain! {
@@ -95,31 +129,27 @@ plain! {
 }
 
 pub extern "win64" fn _j0(x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::j0(x) }
+    libm::j0(x)
 }
 
 pub extern "win64" fn _j1(x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::j1(x) }
+    libm::j1(x)
 }
 
 pub extern "win64" fn _y0(x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::y0(x) }
+    libm::y0(x)
 }
 
 pub extern "win64" fn _y1(x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::y1(x) }
+    libm::y1(x)
 }
 
 binary! {
     pow, powf => f64::powf;
     atan2, atan2f => f64::atan2;
-    fmod, fmodf => |x, y| unsafe { libc::fmod(x, y) };
+    fmod, fmodf => libm::fmod;
     hypot, hypotf => f64::hypot;
-    remainder, remainderf => |x, y| unsafe { libc::remainder(x, y) };
+    remainder, remainderf => libm::remainder;
 }
 
 macro_rules! simple2 {
@@ -143,8 +173,7 @@ simple2! {
 }
 
 pub extern "win64" fn nextafter(x: f64, y: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::nextafter(x, y) }
+    libm::nextafter(x, y)
 }
 
 /// `long double` is `double` on this ABI.
@@ -153,13 +182,11 @@ pub extern "win64" fn nexttoward(x: f64, y: f64) -> f64 {
 }
 
 pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
-    // SAFETY: libm.
-    unsafe { libc::nextafterf(x, y) }
+    libm::nextafterf(x, y)
 }
 
 pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
-    // SAFETY: libm.
-    unsafe { libc::nextafterf(x, y as f32) }
+    libm::nextafterf(x, y as f32)
 }
 
 pub extern "win64" fn fma(x: f64, y: f64, z: f64) -> f64 {
@@ -179,8 +206,7 @@ pub extern "win64" fn ldexpf(x: f32, e: i32) -> f32 {
 }
 
 fn scalbn_(x: f64, e: i32) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::scalbn(x, e) }
+    libm::scalbn(x, e)
 }
 
 pub extern "win64" fn scalbn(x: f64, e: i32) -> f64 {
@@ -205,8 +231,7 @@ pub extern "win64" fn _scalb(x: f64, e: i32) -> f64 {
 }
 
 pub extern "win64" fn ilogb(x: f64) -> i32 {
-    // SAFETY: libm.
-    unsafe { libc::ilogb(x) }
+    libm::ilogb(x)
 }
 
 pub extern "win64" fn ilogbf(x: f32) -> i32 {
@@ -263,7 +288,7 @@ pub extern "win64" fn modff(x: f32, int: *mut f32) -> f32 {
 }
 
 fn remquo_(x: f64, y: f64) -> (f64, i32) {
-    let r = unsafe { libc::remainder(x, y) };
+    let r = libm::remainder(x, y);
     if !r.is_finite() {
         return (check(&[x, y], r), 0);
     }
@@ -324,13 +349,11 @@ pub extern "win64" fn llrintf(x: f32) -> i64 {
 }
 
 pub extern "win64" fn _jn(n: i32, x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::jn(n, x) }
+    libm::jn(n, x)
 }
 
 pub extern "win64" fn _yn(n: i32, x: f64) -> f64 {
-    // SAFETY: libm.
-    unsafe { libc::yn(n, x) }
+    libm::yn(n, x)
 }
 
 // The `_` names and classification.

@@ -29,6 +29,8 @@ fn secs(t: std::io::Result<SystemTime>) -> i64 {
 
 /// Fills a `struct _stat64` (`wide_size`) or `_stat64i32` (32-bit size).
 unsafe fn fill_stat(out: *mut u8, m: &Metadata, drive: u32, wide_size: bool, name: &str) {
+    // A folder has no size on Windows.
+    let size = if m.is_dir() { 0 } else { m.len() };
     let writable = !m.permissions().readonly();
     let executable = m.is_dir()
         || [".exe", ".cmd", ".bat", ".com"]
@@ -46,12 +48,12 @@ unsafe fn fill_stat(out: *mut u8, m: &Metadata, drive: u32, wide_size: bool, nam
         out.add(8).cast::<i16>().write_unaligned(1);
         out.add(16).cast::<u32>().write_unaligned(drive);
         let times = if wide_size {
-            out.add(24).cast::<i64>().write_unaligned(m.len() as i64);
+            out.add(24).cast::<i64>().write_unaligned(size as i64);
             32
         } else {
             out.add(20)
                 .cast::<i32>()
-                .write_unaligned(m.len().min(i32::MAX as u64) as i32);
+                .write_unaligned(size.min(i32::MAX as u64) as i32);
             24
         };
         out.add(times)
@@ -198,35 +200,35 @@ fn with_path(p: Option<PathBuf>, f: impl FnOnce(PathBuf) -> std::io::Result<()>)
 }
 
 pub extern "system" fn _mkdir(path: *const u8) -> i32 {
-    with_path(narrow_name(path).0, |p| std::fs::create_dir(p))
+    with_path(narrow_name(path).0, std::fs::create_dir)
 }
 
 pub extern "system" fn _wmkdir(path: *const u16) -> i32 {
-    with_path(wide_name(path).0, |p| std::fs::create_dir(p))
+    with_path(wide_name(path).0, std::fs::create_dir)
 }
 
 pub extern "system" fn _rmdir(path: *const u8) -> i32 {
-    with_path(narrow_name(path).0, |p| std::fs::remove_dir(p))
+    with_path(narrow_name(path).0, std::fs::remove_dir)
 }
 
 pub extern "system" fn _wrmdir(path: *const u16) -> i32 {
-    with_path(wide_name(path).0, |p| std::fs::remove_dir(p))
+    with_path(wide_name(path).0, std::fs::remove_dir)
 }
 
 pub extern "system" fn _chdir(path: *const u8) -> i32 {
-    with_path(narrow_name(path).0, |p| std::env::set_current_dir(p))
+    with_path(narrow_name(path).0, std::env::set_current_dir)
 }
 
 pub extern "system" fn _wchdir(path: *const u16) -> i32 {
-    with_path(wide_name(path).0, |p| std::env::set_current_dir(p))
+    with_path(wide_name(path).0, std::env::set_current_dir)
 }
 
 pub extern "system" fn remove(path: *const u8) -> i32 {
-    with_path(narrow_name(path).0, |p| std::fs::remove_file(p))
+    with_path(narrow_name(path).0, std::fs::remove_file)
 }
 
 pub extern "system" fn _wremove(path: *const u16) -> i32 {
-    with_path(wide_name(path).0, |p| std::fs::remove_file(p))
+    with_path(wide_name(path).0, std::fs::remove_file)
 }
 
 fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
@@ -579,11 +581,194 @@ pub extern "system" fn _wmakepath_s(
     unsafe { g_makepath(out, size, drive, dir, fname, ext, true) }
 }
 
+// _findfirst64 and relatives: directory listings by wildcard.
+
+type Entry = (String, Option<Metadata>);
+
+struct Listing {
+    entries: Vec<Entry>,
+    next: usize,
+}
+
+static FINDS: std::sync::Mutex<Vec<Option<Listing>>> = std::sync::Mutex::new(Vec::new());
+
+fn finds() -> std::sync::MutexGuard<'static, Vec<Option<Listing>>> {
+    FINDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `_findfirst` shows for `pattern` (`dir/*.ext`): the matching names
+/// with `.` and `..`, in directory order.
+fn list(path: Option<PathBuf>) -> Option<Vec<Entry>> {
+    let path = path?;
+    let pattern: Vec<char> = path.file_name()?.to_string_lossy().chars().collect();
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut entries: Vec<Entry> = vec![(".".into(), None), ("..".into(), None)];
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        entries.push((
+            e.file_name().to_string_lossy().into_owned(),
+            e.metadata().ok(),
+        ));
+    }
+    for (name, meta) in entries.iter_mut() {
+        if meta.is_none() {
+            *meta = std::fs::metadata(dir.join(&*name)).ok();
+        }
+    }
+    entries.retain(|(n, _)| files::wildcard(&pattern, &n.chars().collect::<Vec<_>>()));
+    Some(entries)
+}
+
+/// `_finddata64i32_t` and friends: attributes, three times, a size (32 or
+/// 64 bits) and the name (260 units of either width).
+unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
+    let (name, meta) = e;
+    let (len, attrib) = meta.as_ref().map_or((0, 0), |m| {
+        let a = if m.is_dir() { 0x10 } else { 0 } | if m.permissions().readonly() { 1 } else { 0 };
+        (if m.is_dir() { 0 } else { m.len() }, a)
+    });
+    // SAFETY: the title's structure of at least 296 (or 560) bytes.
+    unsafe {
+        out.cast::<u32>().write_unaligned(attrib);
+        if let Some(m) = meta {
+            out.add(8)
+                .cast::<i64>()
+                .write_unaligned(secs(m.created().or_else(|_| m.modified())));
+            out.add(16)
+                .cast::<i64>()
+                .write_unaligned(secs(m.accessed()));
+            out.add(24)
+                .cast::<i64>()
+                .write_unaligned(secs(m.modified()));
+        }
+        let name_at = if wide_size {
+            out.add(32).cast::<i64>().write_unaligned(len as i64);
+            40
+        } else {
+            out.add(32)
+                .cast::<u32>()
+                .write_unaligned(len.min(u64::from(u32::MAX)) as u32);
+            36
+        };
+        if wide_name {
+            let w: Vec<u16> = name.encode_utf16().take(259).collect();
+            for (i, c) in w.iter().enumerate() {
+                out.add(name_at + i * 2).cast::<u16>().write_unaligned(*c);
+            }
+            out.add(name_at + w.len() * 2)
+                .cast::<u16>()
+                .write_unaligned(0);
+        } else {
+            let b = &name.as_bytes()[..name.len().min(259)];
+            std::ptr::copy_nonoverlapping(b.as_ptr(), out.add(name_at), b.len());
+            out.add(name_at + b.len()).write(0);
+        }
+    }
+}
+
+fn find_first(path: Option<PathBuf>, out: *mut u8, wide_name: bool, wide_size: bool) -> isize {
+    if out.is_null() {
+        bad_param(EINVAL);
+        return -1;
+    }
+    let Some(entries) = list(path).filter(|e| !e.is_empty()) else {
+        set_errno(ENOENT);
+        return -1;
+    };
+    // SAFETY: the title's structure.
+    unsafe { fill_find(out, &entries[0], wide_name, wide_size) };
+    let mut table = finds();
+    let listing = Some(Listing { entries, next: 1 });
+    let slot = match table.iter().position(Option::is_none) {
+        Some(i) => {
+            table[i] = listing;
+            i
+        }
+        None => {
+            table.push(listing);
+            table.len() - 1
+        }
+    };
+    slot as isize + 1
+}
+
+fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i32 {
+    let mut table = finds();
+    let Some(Some(l)) = usize::try_from(handle - 1)
+        .ok()
+        .and_then(|i| table.get_mut(i))
+    else {
+        set_errno(super::EBADF);
+        return -1;
+    };
+    let Some(e) = l.entries.get(l.next) else {
+        set_errno(ENOENT);
+        return -1;
+    };
+    l.next += 1;
+    // SAFETY: the title's structure.
+    unsafe { fill_find(out, e, wide_name, wide_size) };
+    0
+}
+
+pub extern "system" fn _findfirst64i32(path: *const u8, out: *mut u8) -> isize {
+    find_first(narrow_name(path).0, out, false, false)
+}
+
+pub extern "system" fn _findfirst64(path: *const u8, out: *mut u8) -> isize {
+    find_first(narrow_name(path).0, out, false, true)
+}
+
+pub extern "system" fn _wfindfirst64i32(path: *const u16, out: *mut u8) -> isize {
+    find_first(wide_name(path).0, out, true, false)
+}
+
+pub extern "system" fn _wfindfirst64(path: *const u16, out: *mut u8) -> isize {
+    find_first(wide_name(path).0, out, true, true)
+}
+
+pub extern "system" fn _findnext64i32(handle: isize, out: *mut u8) -> i32 {
+    find_next(handle, out, false, false)
+}
+
+pub extern "system" fn _findnext64(handle: isize, out: *mut u8) -> i32 {
+    find_next(handle, out, false, true)
+}
+
+pub extern "system" fn _wfindnext64i32(handle: isize, out: *mut u8) -> i32 {
+    find_next(handle, out, true, false)
+}
+
+pub extern "system" fn _wfindnext64(handle: isize, out: *mut u8) -> i32 {
+    find_next(handle, out, true, true)
+}
+
+pub extern "system" fn _findclose(handle: isize) -> i32 {
+    let mut table = finds();
+    match usize::try_from(handle - 1)
+        .ok()
+        .and_then(|i| table.get_mut(i))
+    {
+        Some(slot @ Some(_)) => {
+            *slot = None;
+            0
+        }
+        _ => {
+            set_errno(super::EBADF);
+            -1
+        }
+    }
+}
+
 exports!(pub(super) fn lookup;
     _stat64, _stat64i32, _wstat64, _wstat64i32, _access, _waccess, _access_s, _waccess_s, _mkdir,
     _wmkdir, _rmdir, _wrmdir, _chdir, _wchdir, remove, _wremove, rename, _wrename, _chmod,
     _wchmod, _fstat64, _fstat64i32, _getcwd, _fullpath, _splitpath, _wsplitpath, _splitpath_s,
-    _wsplitpath_s, _makepath, _wmakepath, _makepath_s, _wmakepath_s;
+    _wsplitpath_s, _makepath, _wmakepath, _makepath_s, _wmakepath_s, _findfirst64i32,
+    _findfirst64, _wfindfirst64i32, _wfindfirst64, _findnext64i32, _findnext64,
+    _wfindnext64i32, _wfindnext64, _findclose;
     "_unlink" => remove, "_wunlink" => _wremove, "_stati64" => _stat64, "_wstati64" => _wstat64);
 
 #[cfg(test)]
@@ -646,6 +831,48 @@ mod tests {
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(remove(gp.as_ptr()), -1);
         assert_eq!(_rmdir(dp.as_ptr()), 0);
+    }
+
+    #[test]
+    fn findfirst_lists_by_wildcard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"12").unwrap();
+        std::fs::write(dir.path().join("b.bin"), b"1").unwrap();
+        std::fs::create_dir(dir.path().join("sub.txt")).unwrap();
+        let pattern = c(&format!("{}/*.txt", dir.path().to_str().unwrap()));
+        let mut data = [0u8; 304];
+        let h = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(h > 0);
+        let mut seen = Vec::new();
+        loop {
+            let name = text(&data[36..]);
+            let attrib = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            let size = u32::from_le_bytes(data[32..36].try_into().unwrap());
+            seen.push((name, attrib & 0x10 != 0, size));
+            if _findnext64i32(h, data.as_mut_ptr()) != 0 {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            [("a.txt".into(), false, 2), ("sub.txt".into(), true, 0)]
+        );
+        assert_eq!(super::super::errno(), ENOENT);
+        assert_eq!(_findclose(h), 0);
+        assert_eq!(_findclose(h), -1);
+        let none = c(&format!("{}/*.zzz", dir.path().to_str().unwrap()));
+        assert_eq!(_findfirst64i32(none.as_ptr(), data.as_mut_ptr()), -1);
+        // `.` and `..` match `*`; the wide, 64-bit-size form has its name at 40.
+        let all: Vec<u16> = format!("{}/*", dir.path().to_str().unwrap())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut wdata = [0u8; 560];
+        let h = _wfindfirst64(all.as_ptr(), wdata.as_mut_ptr());
+        assert!(h > 0);
+        assert_eq!(wdata[40], b'.');
+        assert_eq!(_findclose(h), 0);
     }
 
     #[test]

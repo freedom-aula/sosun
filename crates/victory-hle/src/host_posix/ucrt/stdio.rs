@@ -495,6 +495,7 @@ pub extern "system" fn fclose(file: *mut c_void) -> i32 {
     }
     // SAFETY: the block this module allocated for `fopen`.
     if !st.std_files.contains(&(file as usize)) {
+        // SAFETY: the block `new_file` leaked.
         drop(unsafe { Box::from_raw(file.cast::<[u64; 2]>()) });
     }
     0
@@ -1094,6 +1095,22 @@ pub(super) fn fstat(fd: i32, out: *mut u8, wide_size: bool) -> i32 {
     }
 }
 
+pub extern "system" fn _dup2(fd: i32, to: i32) -> i32 {
+    let (Some(s), Ok(to_i)) = (fd_of(fd), usize::try_from(to)) else {
+        return err(EBADF);
+    };
+    let mut st = state();
+    if !(3..8192).contains(&to_i) {
+        drop(st);
+        return err(EBADF);
+    }
+    if st.fds.len() <= to_i {
+        st.fds.resize(to_i + 1, None);
+    }
+    st.fds[to_i] = Some(s);
+    0
+}
+
 // printf and scanf.
 
 /// Delivers formatted output to a buffer by `__stdio_common_vsprintf`'s rules.
@@ -1486,11 +1503,12 @@ exports!(pub(super) fn lookup;
     setvbuf, setbuf, _fileno, __acrt_iob_func, _lock_file, _unlock_file,
     _get_stream_buffer_pointers, tmpfile, _open, _wopen, _sopen_s, _wsopen_s, _close, _read,
     _write, _lseeki64, _lseek, _telli64, _tell, _filelengthi64, _filelength, _eof, _isatty,
-    _setmode, _commit, _chsize_s, _dup, __stdio_common_vsprintf, __stdio_common_vswprintf,
+    _setmode, _commit, _chsize_s, _dup, _dup2, __stdio_common_vsprintf, __stdio_common_vswprintf,
     __stdio_common_vsprintf_s, __stdio_common_vswprintf_s, __stdio_common_vsnprintf_s,
     __stdio_common_vsnwprintf_s, __stdio_common_vfprintf, __stdio_common_vfwprintf,
     __stdio_common_vsscanf, __stdio_common_vswscanf, __stdio_common_vfscanf,
     __stdio_common_vfwscanf;
+    "_fsopen" => fopen, "_wfsopen" => _wfopen, "getwc" => fgetwc, "putwc" => fputwc,
     "getc" => fgetc, "putc" => fputc, "_getc_nolock" => fgetc, "_fgetc_nolock" => fgetc,
     "_putc_nolock" => fputc, "_fputc_nolock" => fputc, "_fread_nolock" => fread,
     "_fwrite_nolock" => fwrite, "_fseeki64_nolock" => _fseeki64, "_ftelli64_nolock" => _ftelli64,

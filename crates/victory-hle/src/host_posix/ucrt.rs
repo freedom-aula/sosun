@@ -15,6 +15,14 @@
 //! (no fast-fail), text-mode files strip `\r` on reads and write `\n` as is.
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::approx_constant,
+        clippy::manual_c_str_literals,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 use std::cell::UnsafeCell;
 
@@ -253,7 +261,7 @@ mod tests {
                 continue;
             };
             checked += 1;
-            if lookup(&dll, name).is_none() {
+            if lookup(dll, name).is_none() {
                 missing.push(item.to_string());
             }
         }

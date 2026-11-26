@@ -83,7 +83,7 @@ pub(super) unsafe fn parse_int<C: Ch>(
         Kind::U64 => (0, u128::from(u64::MAX)),
     };
     let signed = matches!(kind, Kind::I32 | Kind::I64);
-    let r = if signed {
+    if signed {
         let limit = if negative { hi + 1 } else { hi };
         if overflow || value > limit {
             set_errno(ERANGE);
@@ -108,8 +108,7 @@ pub(super) unsafe fn parse_int<C: Ch>(
         } else {
             value as u64
         }
-    };
-    r
+    }
 }
 
 macro_rules! int_fns {
