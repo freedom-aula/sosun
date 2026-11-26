@@ -824,6 +824,14 @@ native host's own path: the container made from the title's pieces, the host's o
 story-load log of issue #110 (Series S) has three compute programs refused with the old message;
 nothing is lowered yet.
 
+A section of `v_mul_f32` steps is now followed: it is the product of the lanes
+(`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
+host waves of a console wave multiply their results (`split_wave_tests::
+a_whole_wave_product_multiplies_both_halves` runs it on Metal). As with the other float
+reductions, the host multiplies in its own order, so the last bits may differ from the console's.
+Prefix products and integer products (`v_mul_lo_u32`) are still refused. Whether any title shader
+needs a product is not known: no run log names the operation.
+
 ## Groups whose lanes are not a multiple of 64 (wave32 host)
 
 With `Options::wave32_host`, what crosses the two host waves of a console wave goes through the

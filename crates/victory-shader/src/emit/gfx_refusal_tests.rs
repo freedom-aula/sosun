@@ -2265,7 +2265,7 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
     };
     let prefix = "a whole-wave section step the simulation does not follow: ";
     for (step, why) in [
-        (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+        (&[0x0802_0100][..], "a VALU operation it does not model"), // v_sub_f32 v1, v0, v0
         // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
         (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
     ] {
@@ -2275,5 +2275,41 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
                 if what.strip_prefix(prefix) == Some(why)),
             "{err:?}"
         );
+    }
+}
+
+/// A `v_mul_f32` butterfly over the wave, as `WaveActiveProduct` expands, is
+/// the product of the lanes: it lowers like the sum and min/max sections.
+#[test]
+fn whole_wave_float_products_lower() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001,
+        0x000A_00F2, // v_cndmask_b32_e64 v1, 1.0, v0, s2
+        0x1002_02FA,
+        0xFF00_B101, // v_mul_f32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x1002_02FA,
+        0xFF00_4E01, // v_mul_f32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x1002_02FA,
+        0xFF01_4101, // v_mul_f32_dpp v1, v1, v1 row_half_mirror
+        0x1002_02FA,
+        0xFF01_4001, // v_mul_f32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    let container = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+    if let Err(e) = translate_with(&container, Options::default()) {
+        panic!("{e}");
     }
 }

@@ -221,6 +221,47 @@ fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
     assert_eq!(got[64..], [(64..96).sum::<u32>() - 1; 32]);
 }
 
+/// A whole-wave product (`WaveActiveProduct`): lanes 0..34 hold 2.0, the rest 1.0, so both
+/// halves contribute and every lane must see 2^35.
+#[test]
+fn a_whole_wave_product_multiplies_both_halves() {
+    let mut w = vec![
+        0x7D88_00A3, // v_cmp_gt_u32 vcc, 35, v0
+        0xD501_0004,
+        0x01A9_E8F2, // v_cndmask_b32_e64 v4, 1.0, 2.0, vcc
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_08F2, // v_cndmask_b32_e64 v1, 1.0, v4, s[8:9]
+        0x1002_02FA,
+        0xFF00_B101, // v_mul_f32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x1002_02FA,
+        0xFF00_4E01, // v_mul_f32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x1002_02FA,
+        0xFF01_4101, // v_mul_f32_dpp v1, v1, v1 row_half_mirror
+        0x1002_02FA,
+        0xFF01_4001, // v_mul_f32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+        0xD760_0004,
+        0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005,
+        0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD508_0003,
+        0x0200_0A04, // v_mul_f32_e64 v3, s4, s5
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+    ];
+    w.push(S_ENDPGM);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, [2f32.powi(35).to_bits(); 64]);
+}
+
 /// A dispatch of thread counts (`DispatchX` with thread dimensions, `Options::thread_counts`) of
 /// `count` threads in x, in groups of `per` lanes of 64-lane waves (`wave64`) or 32: the first
 /// `slots` dwords of `dst`. `s5` is the group id.

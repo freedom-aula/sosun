@@ -21,6 +21,7 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    MulF,
     MinU,
     MaxU,
     MinI,
@@ -40,6 +41,7 @@ impl Op {
             // The low dwords of a 64-bit sum (the carry is not followed).
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_mul_f32" => Op::MulF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -58,6 +60,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::MulF => k == 0x3F80_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -69,7 +72,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
+        matches!(self, Op::AddU | Op::AddF | Op::MulF | Op::Xor | Op::AddH)
     }
 }
 
