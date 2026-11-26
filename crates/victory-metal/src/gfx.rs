@@ -124,6 +124,8 @@ pub struct RenderPipeline {
     raster: Raster,
     /// The pipeline's target has a stencil plane (the pass attaches it too).
     stencil: bool,
+    /// A mesh pipeline: its thread-group size (the converter's reflection of the mesh shader).
+    mesh: Option<MTLSize>,
     /// Each stage's static samplers, which the stage's argument buffer points at.
     vs_static: Option<StaticSamplers>,
     ps_static: Option<StaticSamplers>,
@@ -594,12 +596,13 @@ impl Metal {
         }))
     }
 
+    /// The converted function of a stage and the converter's stage number (`IRShaderStage`).
     fn stage_function(
         &self,
         dxil: &[u8],
         layout: Option<&victory_backend::backend::RootLayout>,
-    ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
-        let (_, lib) = self
+    ) -> Result<(i32, Retained<ProtocolObject<dyn MTLFunction>>), String> {
+        let (stage, lib) = self
             .msc()?
             .convert_with(dxil, None, layout)
             .map_err(|e| e.to_string())?;
@@ -609,8 +612,7 @@ impl Metal {
             .iter()
             .next()
             .ok_or("converted library is empty")?;
-        l.newFunctionWithName(&name)
-            .ok_or_else(|| "no function".into())
+        Ok((stage, l.newFunctionWithName(&name).ok_or("no function")?))
     }
 
     fn bind_root_compute(
@@ -982,81 +984,31 @@ impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
-        let vf = self.stage_function(d.vs, d.vs_layout)?;
-        let pd = MTLRenderPipelineDescriptor::new();
-        pd.setVertexFunction(Some(&vf));
-        if let Some(ps) = d.ps {
-            pd.setFragmentFunction(Some(&*self.stage_function(ps, d.ps_layout)?));
-        }
-        // The converter's stage-in function takes its inputs at attribute indices from
-        // `kIRStageInAttributeStartIndex`, in input-signature order; buffers from `kIRVertexBufferBindPoint`.
-        let vd = MTLVertexDescriptor::new();
-        // SAFETY: indices are below the attribute and buffer limits for sane layouts; plain sizes.
-        unsafe {
-            for (i, a) in d.attributes.iter().enumerate() {
-                let at = vd
-                    .attributes()
-                    .objectAtIndexedSubscript(STAGE_IN_ATTRIBUTES + i);
-                at.setFormat(vertex_format(a.format));
-                at.setOffset(a.offset);
-                at.setBufferIndex(VERTEX_BUFFERS + a.slot);
+        let (stage, vf) = self.stage_function(d.vs, d.vs_layout)?;
+        let ff = d.ps.map(|ps| self.stage_function(ps, d.ps_layout)).transpose()?.map(|f| f.1);
+        let has_stencil = d.depth == Some(Format::D32FloatS8);
+        let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
+            let [x, y, z] = self.msc()?.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;
+            let md = MTLMeshRenderPipelineDescriptor::new();
+            // SAFETY: both functions are the converter's, of the stages they are set as.
+            unsafe {
+                md.setMeshFunction(Some(&vf));
+                md.setFragmentFunction(ff.as_deref());
             }
-            for s in d.streams {
-                let l = vd
-                    .layouts()
-                    .objectAtIndexedSubscript(VERTEX_BUFFERS + s.slot);
-                l.setStride(s.stride);
-                l.setStepFunction(if s.per_instance {
-                    MTLVertexStepFunction::PerInstance
-                } else {
-                    MTLVertexStepFunction::PerVertex
-                });
-            }
-        }
-        pd.setVertexDescriptor(Some(&vd));
-        for (i, f) in d.color.iter().enumerate() {
-            // SAFETY: colour attachment index below 8.
-            let a = unsafe { pd.colorAttachments().objectAtIndexedSubscript(i) };
-            a.setPixelFormat(pixel_format(*f));
-            let state = d.color_state.get(i).copied().unwrap_or_default();
-            let mut mask = MTLColorWriteMask::empty();
-            for (bit, channel) in [
-                MTLColorWriteMask::Red,
-                MTLColorWriteMask::Green,
-                MTLColorWriteMask::Blue,
-                MTLColorWriteMask::Alpha,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if state.write_mask >> bit & 1 != 0 {
-                    mask |= channel;
+            color_attachments(&md.colorAttachments(), d);
+            if let Some(f) = d.depth {
+                md.setDepthAttachmentPixelFormat(pixel_format(f));
+                if has_stencil {
+                    md.setStencilAttachmentPixelFormat(pixel_format(f));
                 }
             }
-            a.setWriteMask(mask);
-            if let Some(b) = state.blend.filter(|_| !f.is_integer()) {
-                a.setBlendingEnabled(true);
-                a.setSourceRGBBlendFactor(blend_factor(b.src));
-                a.setDestinationRGBBlendFactor(blend_factor(b.dst));
-                a.setRgbBlendOperation(blend_op(b.op));
-                a.setSourceAlphaBlendFactor(blend_factor(b.src_alpha));
-                a.setDestinationAlphaBlendFactor(blend_factor(b.dst_alpha));
-                a.setAlphaBlendOperation(blend_op(b.op_alpha));
-            }
-        }
-        let has_stencil = d.depth == Some(Format::D32FloatS8);
-        if let Some(f) = d.depth {
-            pd.setDepthAttachmentPixelFormat(pixel_format(f));
-            if has_stencil {
-                pd.setStencilAttachmentPixelFormat(pixel_format(f));
-            }
-        }
-        let pso = match self.archive() {
-            Some(a) => a.render(&self.dev, &pd)?,
-            None => self
+            let pso = self
                 .dev
-                .newRenderPipelineStateWithDescriptor_error(&pd)
-                .map_err(|e| e.localizedDescription().to_string())?,
+                .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&md, MTLPipelineOption::None, None)
+                .map_err(|e| e.localizedDescription().to_string())?;
+            (pso, Some(size([x as usize, y as usize, z as usize])))
+        } else {
+            (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
         };
         let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
@@ -1082,6 +1034,7 @@ impl GraphicsBackend for Metal {
             cull,
             raster: d.raster,
             stencil: has_stencil,
+            mesh,
             vs_static: self.static_samplers(d.vs_layout)?,
             ps_static: if d.ps.is_some() {
                 self.static_samplers(d.ps_layout)?
@@ -1207,6 +1160,101 @@ impl GraphicsBackend for Metal {
         match refused {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+}
+
+impl RenderPipeline {
+    /// A mesh pipeline's thread-group size (else `None`: a vertex pipeline).
+    pub fn mesh_threads(&self) -> Option<[usize; 3]> {
+        self.mesh.map(|m| [m.width, m.height, m.depth])
+    }
+}
+
+/// Formats, write masks and blending of the colour targets.
+fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &RenderPipelineDesc<'_>) {
+    for (i, f) in d.color.iter().enumerate() {
+        // SAFETY: colour attachment index below 8.
+        let a = unsafe { arr.objectAtIndexedSubscript(i) };
+        a.setPixelFormat(pixel_format(*f));
+        let state = d.color_state.get(i).copied().unwrap_or_default();
+        let mut mask = MTLColorWriteMask::empty();
+        for (bit, channel) in [
+            MTLColorWriteMask::Red,
+            MTLColorWriteMask::Green,
+            MTLColorWriteMask::Blue,
+            MTLColorWriteMask::Alpha,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if state.write_mask >> bit & 1 != 0 {
+                mask |= channel;
+            }
+        }
+        a.setWriteMask(mask);
+        if let Some(b) = state.blend.filter(|_| !f.is_integer()) {
+            a.setBlendingEnabled(true);
+            a.setSourceRGBBlendFactor(blend_factor(b.src));
+            a.setDestinationRGBBlendFactor(blend_factor(b.dst));
+            a.setRgbBlendOperation(blend_op(b.op));
+            a.setSourceAlphaBlendFactor(blend_factor(b.src_alpha));
+            a.setDestinationAlphaBlendFactor(blend_factor(b.dst_alpha));
+            a.setAlphaBlendOperation(blend_op(b.op_alpha));
+        }
+    }
+}
+
+impl Metal {
+    /// The render pipeline state of a vertex and fragment function, with the stage-in layout.
+    fn vertex_pipeline(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+        vf: &ProtocolObject<dyn MTLFunction>,
+        ff: Option<&ProtocolObject<dyn MTLFunction>>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+        let pd = MTLRenderPipelineDescriptor::new();
+        pd.setVertexFunction(Some(vf));
+        pd.setFragmentFunction(ff);
+        // The converter's stage-in function takes its inputs at attribute indices from
+        // `kIRStageInAttributeStartIndex`, in input-signature order; buffers from `kIRVertexBufferBindPoint`.
+        let vd = MTLVertexDescriptor::new();
+        // SAFETY: indices are below the attribute and buffer limits for sane layouts; plain sizes.
+        unsafe {
+            for (i, a) in d.attributes.iter().enumerate() {
+                let at = vd
+                    .attributes()
+                    .objectAtIndexedSubscript(STAGE_IN_ATTRIBUTES + i);
+                at.setFormat(vertex_format(a.format));
+                at.setOffset(a.offset);
+                at.setBufferIndex(VERTEX_BUFFERS + a.slot);
+            }
+            for s in d.streams {
+                let l = vd
+                    .layouts()
+                    .objectAtIndexedSubscript(VERTEX_BUFFERS + s.slot);
+                l.setStride(s.stride);
+                l.setStepFunction(if s.per_instance {
+                    MTLVertexStepFunction::PerInstance
+                } else {
+                    MTLVertexStepFunction::PerVertex
+                });
+            }
+        }
+        pd.setVertexDescriptor(Some(&vd));
+        color_attachments(&pd.colorAttachments(), d);
+        if let Some(f) = d.depth {
+            pd.setDepthAttachmentPixelFormat(pixel_format(f));
+            if d.depth == Some(Format::D32FloatS8) {
+                pd.setStencilAttachmentPixelFormat(pixel_format(f));
+            }
+        }
+        match self.archive() {
+            Some(a) => a.render(&self.dev, &pd),
+            None => self
+                .dev
+                .newRenderPipelineStateWithDescriptor_error(&pd)
+                .map_err(|e| e.localizedDescription().to_string()),
         }
     }
 }

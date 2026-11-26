@@ -457,9 +457,17 @@ heaps are exercised by a draw too.
 
 Not covered: blending and colour write masks, stencil, multiple render targets (the code takes several,
 untested), MSAA, viewport/scissor from the list (full target only), instancing with a per-instance stream,
-topologies beyond triangle lists, primitive restart, mesh and amplification pipelines,
+topologies beyond triangle lists, primitive restart, amplification pipelines,
 hull/domain/geometry emulation, stream-out, indirect draws, UAV writes from pixel shaders,
 `ExecuteIndirect`, queries, pipeline caching.
+
+**Mesh pipelines.** When the converter makes a mesh function of the "vertex" DXIL (`IRShaderStageMesh`,
+5: the translator's `ms_6_6` output for mesh-style console programs), `create_render_pipeline` makes an
+`MTLMeshRenderPipelineDescriptor` with that function and the pixel shader's, the same colour and depth
+formats, blend and write masks, and no vertex descriptor. Its thread-group size is the converter's
+reflection of the mesh shader (`IRShaderReflectionCopyMeshInfo`, `Msc::mesh_threads`, cached on disk
+as conversions are), kept on the pipeline (`RenderPipeline::mesh_threads`) for the draw.
+Test: `victory-gpu` `native::tests::mesh_tests::a_mesh_style_vertex_program_makes_a_mesh_pipeline`.
 
 ### Mapping into victory-gpu (not done; victory-gpu is untouched)
 

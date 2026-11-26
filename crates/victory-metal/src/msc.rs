@@ -21,6 +21,24 @@ type Payload = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -> *mut c_void;
 type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
 type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
+type GetReflection = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> bool;
+type CopyMeshInfo = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
+type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
+
+/// `IRShaderStageMesh`.
+pub const STAGE_MESH: i32 = 5;
+
+/// `IRVersionedMSInfo` holding `IRMSInfo_1_0`.
+#[repr(C)]
+#[derive(Default)]
+struct MeshInfo {
+    version: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    topology: u32,
+    payload: u32,
+    threads: [u32; 3],
+}
 
 /// `IRRootParameter1`: type, a 16-byte union (constants `{register, space, count}`, descriptor
 /// `{register, space, flags}`), shader visibility (all).
@@ -271,12 +289,82 @@ impl Msc {
         Ok((stage, lib))
     }
 
+    /// The thread-group size of a mesh shader, from the converter's reflection of it (cached on
+    /// disk as conversions are).
+    pub fn mesh_threads(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<[u32; 3], ConvError> {
+        let layout_text = format!("{layout:?}");
+        let dir = crate::disk::dir();
+        let key = crate::disk::key(&[b"mesh threads", dxil, layout_text.as_bytes(), self.id.as_bytes()]);
+        if let Some(t) = dir.and_then(|d| crate::disk::read(d, &key)).and_then(|b| {
+            let w = |k: usize| Some(u32::from_le_bytes(b.get(k * 4..k * 4 + 4)?.try_into().ok()?));
+            Some([w(0)?, w(1)?, w(2)?])
+        }) {
+            return Ok(t);
+        }
+        let h = self.h;
+        let threads = self.compiled(dxil, None, layout, |out| {
+            // SAFETY: the converter's documented C API (`IRShaderReflection*`, `IRObjectGetReflection`,
+            // `IRShaderReflectionCopyMeshInfo` with `IRReflectionVersion_1_0`); the reflection is
+            // destroyed before returning.
+            unsafe {
+                let r = sym::<Create>(h, "IRShaderReflectionCreate")();
+                let mut info = MeshInfo::default();
+                let ok = sym::<GetReflection>(h, "IRObjectGetReflection")(out, STAGE_MESH, r)
+                    && sym::<CopyMeshInfo>(h, "IRShaderReflectionCopyMeshInfo")(r, 1, &mut info);
+                if ok {
+                    sym::<ReleaseMeshInfo>(h, "IRShaderReflectionReleaseMeshInfo")(&mut info);
+                }
+                sym::<Destroy>(h, "IRShaderReflectionDestroy")(r);
+                if ok {
+                    Ok(info.threads)
+                } else {
+                    Err(ConvError { code: u32::MAX, msg: "no mesh reflection".into() })
+                }
+            }
+        })?;
+        if let Some(d) = dir {
+            crate::disk::write(d, &key, &threads.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+        }
+        Ok(threads)
+    }
+
     fn convert_uncached(
         &self,
         dxil: &[u8],
         entry: Option<&str>,
         layout: Option<&RootLayout>,
     ) -> Result<(i32, Vec<u8>), ConvError> {
+        let h = self.h;
+        self.compiled(dxil, entry, layout, |out| {
+            // SAFETY: the converter's documented C API; the binary is destroyed below.
+            unsafe {
+                let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
+                let lib = sym::<Create>(h, "IRMetalLibBinaryCreate")();
+                let r = if sym::<GetLib>(h, "IRObjectGetMetalLibBinary")(out, stage, lib) {
+                    let n = sym::<LibSize>(h, "IRMetalLibGetBytecodeSize")(lib);
+                    let mut v = vec![0u8; n];
+                    sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
+                    Ok((stage, v))
+                } else {
+                    Err(ConvError {
+                        code: u32::MAX,
+                        msg: "no metallib for stage".into(),
+                    })
+                };
+                sym::<Destroy>(h, "IRMetalLibBinaryDestroy")(lib);
+                r
+            }
+        })
+    }
+
+    /// Compiles `dxil` and hands the converter's output object to `f`.
+    fn compiled<T>(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+        f: impl FnOnce(*mut c_void) -> Result<T, ConvError>,
+    ) -> Result<T, ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
@@ -326,20 +414,7 @@ impl Msc {
                 };
                 Err(ConvError { code, msg })
             } else {
-                let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
-                let lib = sym::<Create>(h, "IRMetalLibBinaryCreate")();
-                let r = if sym::<GetLib>(h, "IRObjectGetMetalLibBinary")(out, stage, lib) {
-                    let n = sym::<LibSize>(h, "IRMetalLibGetBytecodeSize")(lib);
-                    let mut v = vec![0u8; n];
-                    sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
-                    Ok((stage, v))
-                } else {
-                    Err(ConvError {
-                        code: u32::MAX,
-                        msg: "no metallib for stage".into(),
-                    })
-                };
-                sym::<Destroy>(h, "IRMetalLibBinaryDestroy")(lib);
+                let r = f(out);
                 sym::<Destroy>(h, "IRObjectDestroy")(out);
                 r
             };

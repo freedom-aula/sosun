@@ -16,6 +16,8 @@ use victory_metal::metal::Metal;
 
 #[path = "addr_tests.rs"]
 mod addr_tests;
+#[path = "mesh_tests.rs"]
+mod mesh_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
 #[path = "split_wave_tests.rs"]
