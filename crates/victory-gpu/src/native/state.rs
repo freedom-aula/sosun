@@ -302,7 +302,7 @@ impl Graphics {
             }
         }
         // Debugging: the blend alone, the rest guessed as before.
-        if std::env::var_os("VICTORY_GUESS_BLEND_ONLY").is_some() {
+        if env_set!("VICTORY_GUESS_BLEND_ONLY") {
             return g;
         }
         // The registers before the blend ones (same offsets in every image): PA_SU_SC_MODE_CNTL,
@@ -497,7 +497,7 @@ impl Graphics {
 
     pub fn depth_test(&self) -> Option<(bool, Compare)> {
         // Debugging: no depth test at all.
-        if self.guess.is_some() && std::env::var_os("VICTORY_DEBUG_NO_DEPTH").is_some() {
+        if self.guess.is_some() && env_set!("VICTORY_DEBUG_NO_DEPTH") {
             return None;
         }
         self.depth_enable

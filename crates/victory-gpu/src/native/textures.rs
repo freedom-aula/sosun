@@ -419,7 +419,7 @@ impl<B: PresentBackend> Title<B> {
         start_scanner();
         // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
         // was never drawn into, and a black one was drawn black.
-        if info.render_target() && std::env::var_os("VICTORY_MAGENTA").is_some() {
+        if info.render_target() && env_set!("VICTORY_MAGENTA") {
             let m = &info.layout.mips[0];
             let n = info.layout.desc.element_bytes as usize;
             let row = m.width as usize * n;

@@ -683,7 +683,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, dispatch: bool) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
-        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
+        if !env_set!("VICTORY_TRACE_TARGETS") || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
             return;
         }
         self.trace_args(root, binding);
@@ -756,15 +756,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let start = START.get_or_init(std::time::Instant::now);
-        let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
         // `<dir>[,<seconds>[,<format>]]`: from that many seconds after the first draw on; with a
         // format, only the draws into render targets of that title format, boot passes included.
-        let v = v.to_string_lossy().into_owned();
-        let mut parts = v.split(',');
-        let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
-        let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let only: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        static OPTIONS: std::sync::OnceLock<Option<(std::path::PathBuf, u64, Option<u32>)>> = std::sync::OnceLock::new();
+        let Some((dir, after, only)) = OPTIONS.get_or_init(|| {
+            let v = std::env::var_os("VICTORY_TRACE_CONTENT")?.to_string_lossy().into_owned();
+            let mut parts = v.split(',');
+            let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
+            let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            Some((dir, after, parts.next().and_then(|s| s.parse().ok())))
+        }) else {
+            return;
+        };
+        let (after, only) = (*after, *only);
+        let start = START.get_or_init(std::time::Instant::now);
         if start.elapsed().as_secs() < after {
             return;
         }
@@ -926,7 +931,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     p.count = Some((b, at, *index));
                 }
                 tracing::debug!(?groups, "dispatch");
-                if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
+                if env_set!("VICTORY_TRACE_TARGETS") {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                         tracing::info!(?groups, threads = ?pso.threads, "dispatch");
@@ -1032,7 +1037,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
             _ => false,
         };
-        let trace = std::env::var_os("VICTORY_TRACE_TARGETS").is_some();
+        let trace = env_set!("VICTORY_TRACE_TARGETS");
         let mut cmds: Vec<&Cmd<B>> = Vec::new();
         let mut preps = Vec::new();
         // Whether a pass ends before the kept command of that index, and the commands dropped since

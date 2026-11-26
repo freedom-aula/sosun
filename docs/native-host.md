@@ -357,7 +357,7 @@ result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_
 
 ## Bring-up diagnostics (native path)
 
-Off by default, environment variables of the host process:
+Off by default, environment variables of the host process. The native host's switches that draws and submissions check are read once, at their first check (`env_set!`, and `VICTORY_TRACE_CONTENT`'s options), so setting one after the process started has no effect:
 
 - `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels copied out after it is drawn (`victory_metal::present`); a frame whose pixels are mostly pure green (zero YCbCr planes, a movie frame sampled blank) is counted. Once a second stderr gets `present pacing t=<s> presents=<n> longest_ms=<gap> green=<n> partly_green=<n> green_total=<n>`: presents in that second, the longest gap between two, and green frames. Costs one small blit a frame.
 - `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
