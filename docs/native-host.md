@@ -332,6 +332,12 @@ lowered: the next tester log tells which forms to lower (a V# base address moved
 dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
 `pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
 path: the container made from the title's pieces, the host's options.
+A mask or merge by a scalar ALU instruction names it and its constant operands (for a 64-bit one,
+the half the dword is), for example "dword 1 masked or merged (s_and_b32 with 0x3fffffff)", or
+"with computed values" when none is constant: a real run's 78 refusals at dword 1 (base address
+bits 47:32, stride, swizzle in a buffer V#, RDNA2 ISA 8.1.5) need the exact form. These texts are
+made at run time; refusals are `&'static str`, so each distinct one is kept for the program's life
+(`resource::interned`).
 
 ## Known limits of this slice
 

@@ -1313,7 +1313,49 @@ impl<'a> Tracer<'a> {
                 Some(_) => Change::Computed,
             },
         };
+        if let (Change::Masked, Term::Value(v)) = (kind, *word)
+            && let Some(inst) = self.def(v)
+        {
+            return self.masked_why(k, inst, v);
+        }
         changed_why(k, kind)
+    }
+
+    /// The refusal of dword `k` masked or merged by `inst` (writing `v`): the operation and its
+    /// constant operands, the half of a 64-bit one that `v` is, so a log tells the exact form.
+    fn masked_why(&self, k: usize, inst: &Inst, v: Value) -> &'static str {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return changed_why(k, Change::Masked);
+        };
+        // Which dword of a 64-bit result `v` is.
+        let half = match (dst, inst.writes.iter().find(|w| w.1 == v)) {
+            (Some(Operand::Scalar { code, .. }), Some(&(Reg::S(r), _))) => r.wrapping_sub(*code),
+            _ => 0,
+        };
+        let constants: Vec<String> = src
+            .iter()
+            .filter_map(|op| match *op {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    match self.origin(inst.read(Reg::S(code + half))?) {
+                        Term::Const(c) => Some(format!("{c:#x}")),
+                        Term::Value(_) => None,
+                    }
+                }
+                _ => match self.term(inst, op)? {
+                    Term::Const(c) => Some(format!("{c:#x}")),
+                    Term::Value(_) => None,
+                },
+            })
+            .collect();
+        let with = if constants.is_empty() {
+            "computed values".to_string()
+        } else {
+            constants.join(" and ")
+        };
+        interned(format!(
+            "a descriptor changed after loading: dword {k} masked or merged ({} with {with})",
+            inst.name()
+        ))
     }
 
     /// Bits that may be set in a built buffer descriptor's high dword.
@@ -2240,6 +2282,22 @@ impl<'a> Tracer<'a> {
     }
 }
 
+/// `text` as a refusal reason, which is `&'static str` throughout the tracer: each distinct text
+/// is kept once for the program's life.
+// shortcut: formatted reasons are leaked, one per distinct text (a handful per title); give
+// refusals an owned reason if that ever grows.
+fn interned(text: String) -> &'static str {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&s) = seen.get(text.as_str()) {
+        return s;
+    }
+    let s: &'static str = Box::leak(text.into_boxed_str());
+    seen.insert(s);
+    s
+}
+
 /// What a dword of a descriptor that is no load's is instead (see `Tracer::changed`).
 #[derive(Clone, Copy)]
 enum Change {
@@ -3051,6 +3109,17 @@ pub(crate) mod tests {
             run(&[0x8008_9008, 0x8209_8009]), // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
             "a descriptor changed after loading: dword 0 added to (s_add, s_sub...)"
         );
+        // A mask or merge names the operation and its constant operands, if any.
+        assert_eq!(
+            run(&[0x8709_FF09, 0x3FFF_FFFF]), // s_and_b32 s9, s9, 0x3fffffff
+            "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 with \
+             0x3fffffff)"
+        );
+        assert_eq!(
+            run(&[0x8809_0409]), // s_or_b32 s9, s9, s4 (a program input)
+            "a descriptor changed after loading: dword 1 masked or merged (s_or_b32 with \
+             computed values)"
+        );
     }
 
     /// The FidelityFX upscaler's byte accesses make a loaded buffer
@@ -3093,8 +3162,8 @@ pub(crate) mod tests {
             run(0xC000_FFFE).unwrap_err(),
             ShaderError::Unsupported {
                 offset: 0x3c,
-                what: "a descriptor changed after loading: dword 1 masked or merged (s_and, s_or, \
-                       s_bfi...)"
+                what: "a descriptor changed after loading: dword 1 masked or merged (s_and_b32 \
+                       with 0xc000fffe)"
             }
         );
     }
