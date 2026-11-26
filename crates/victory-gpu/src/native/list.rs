@@ -6,7 +6,7 @@
 //! which time the pool observer has told us about every mapping the title made.
 
 use std::rc::Rc;
-use victory_backend::resources::{DrawCall, GraphicsBackend, HeapKind, Topology};
+use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
 
 /// A heap the title wrote views into: `start` is its descriptor memory (title addresses).
 pub struct NativeHeap<B: GraphicsBackend> {
@@ -16,10 +16,40 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub count: usize,
 }
 
+/// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
+/// one block of root constants for the user data, then the root constant, shader resource and
+/// unordered access views it reads, as addresses. Without it, the title's root parameters go to the
+/// shader as they are, in order (shaders compiled for the native host).
+#[derive(Clone, Debug, Default)]
+pub struct Binding {
+    /// Dwords of the user-data block (a multiple of 4).
+    pub dwords: usize,
+    pub user_data: Vec<victory_shader::emit::UserData>,
+    /// Title root parameter indices of the root CBVs, SRVs and UAVs, in this order.
+    pub views: Vec<u8>,
+}
+
+impl Binding {
+    pub fn of(shader: &victory_shader::emit::HostShader) -> Binding {
+        Binding {
+            dwords: shader.user_data_dwords() as usize,
+            user_data: shader.user_data.clone(),
+            views: shader
+                .root_cbvs
+                .iter()
+                .chain(&shader.root_srvs)
+                .chain(&shader.root_uavs)
+                .copied()
+                .collect(),
+        }
+    }
+}
+
 /// A compute pipeline and the group size its shader was written with (`numthreads`).
 pub struct ComputePso<B: GraphicsBackend> {
     pub pso: B::Pipeline,
     pub threads: [usize; 3],
+    pub binding: Option<Binding>,
 }
 
 /// One root parameter as the title set it.
@@ -96,12 +126,14 @@ pub enum Cmd<B: GraphicsBackend> {
     },
     Draw {
         pso: Rc<B::RenderPipeline>,
+        binding: Option<Rc<Binding>>,
         topology: Topology,
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         targets: Targets<B>,
         vertex: Vec<u64>,
         index: Option<(u64, bool)>,
+        state: DrawState,
         call: DrawCall,
     },
 }
@@ -136,21 +168,25 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
             },
             Cmd::Draw {
                 pso,
+                binding,
                 topology,
                 root,
                 heaps,
                 targets,
                 vertex,
                 index,
+                state,
                 call,
             } => Cmd::Draw {
                 pso: pso.clone(),
+                binding: binding.clone(),
                 topology: *topology,
                 root: root.clone(),
                 heaps: heaps.clone(),
                 targets: targets.clone(),
                 vertex: vertex.clone(),
                 index: *index,
+                state: *state,
                 call: *call,
             },
         }
@@ -161,12 +197,14 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
 struct State<B: GraphicsBackend> {
     compute: Option<Rc<ComputePso<B>>>,
     graphics: Option<(Rc<B::RenderPipeline>, Topology)>,
+    graphics_binding: Option<Rc<Binding>>,
     compute_root: Vec<Option<Root<B>>>,
     graphics_root: Vec<Option<Root<B>>>,
     heaps: Heaps<B>,
     targets: Targets<B>,
     vertex: Vec<u64>,
     index: Option<(u64, bool)>,
+    draw: DrawState,
 }
 
 pub struct NativeList<B: GraphicsBackend> {
@@ -188,6 +226,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
             state: State {
                 compute: None,
                 graphics: None,
+                graphics_binding: None,
                 compute_root: Vec::new(),
                 graphics_root: Vec::new(),
                 heaps: (None, None),
@@ -197,6 +236,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
                 },
                 vertex: Vec::new(),
                 index: None,
+                draw: DrawState::default(),
             },
         }
     }
@@ -252,6 +292,12 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     pub fn set_graphics_pipeline(&mut self, pso: &Rc<B::RenderPipeline>, topology: Topology) {
         self.state.graphics = Some((pso.clone(), topology));
+        self.state.graphics_binding = None;
+    }
+
+    /// The argument layout of the graphics pipeline set last (a translated title shader's).
+    pub fn set_graphics_binding(&mut self, binding: Option<Rc<Binding>>) {
+        self.state.graphics_binding = binding;
     }
 
     /// `SetComputeRoot32BitConstants` (the whole parameter).
@@ -366,6 +412,26 @@ impl<B: GraphicsBackend> NativeList<B> {
         });
     }
 
+    /// `RSSetViewports` (the first viewport; the host draws into one).
+    pub fn set_viewport(&mut self, viewport: Option<Viewport>) {
+        self.state.draw.viewport = viewport;
+    }
+
+    /// `RSSetScissorRects` (the first rectangle): left, top, right, bottom.
+    pub fn set_scissor(&mut self, rect: Option<[i32; 4]>) {
+        self.state.draw.scissor = rect;
+    }
+
+    /// `OMSetStencilRef`.
+    pub fn set_stencil_ref(&mut self, reference: u32) {
+        self.state.draw.stencil_ref = reference;
+    }
+
+    /// `OMSetBlendFactor`.
+    pub fn set_blend_factor(&mut self, factor: [f32; 4]) {
+        self.state.draw.blend_factor = factor;
+    }
+
     /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
     pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
         if self.state.vertex.len() <= slot {
@@ -378,6 +444,10 @@ impl<B: GraphicsBackend> NativeList<B> {
         self.state.index = Some((address, wide));
     }
 
+    pub fn clear_index_buffer(&mut self) {
+        self.state.index = None;
+    }
+
     fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
         let (pso, topology) = self
             .state
@@ -386,12 +456,14 @@ impl<B: GraphicsBackend> NativeList<B> {
             .ok_or("draw without a graphics pipeline")?;
         self.cmds.push(Cmd::Draw {
             pso,
+            binding: self.state.graphics_binding.clone(),
             topology,
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
             vertex: self.state.vertex.clone(),
             index: self.state.index,
+            state: self.state.draw,
             call,
         });
         Ok(())

@@ -11,7 +11,7 @@
 //! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order.
 
 use super::host::NativeHost;
-use super::list::{ComputePso, NativeList};
+use super::list::{Binding, ComputePso, NativeList};
 use super::memory::PoolTable;
 use crate::hold::{Held, Item, ValueWait, World};
 use std::collections::HashMap;
@@ -116,7 +116,8 @@ pub struct Stats {
 /// What a title pipeline object became on the host.
 pub enum Pipe<B: GraphicsBackend> {
     Compute(Rc<ComputePso<B>>),
-    Render(Rc<B::RenderPipeline>),
+    /// With the argument layout of its translated shaders (none: the title's root as it is).
+    Render(Rc<B::RenderPipeline>, Option<Rc<Binding>>),
     /// The host refused it (the reason is logged and counted once); work using it is dropped.
     Refused,
 }
@@ -125,7 +126,7 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
     fn clone(&self) -> Self {
         match self {
             Pipe::Compute(p) => Pipe::Compute(p.clone()),
-            Pipe::Render(p) => Pipe::Render(p.clone()),
+            Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
             Pipe::Refused => Pipe::Refused,
         }
     }
@@ -135,6 +136,9 @@ pub struct Title<B: GraphicsBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
+    /// What the shader path did, and refused.
+    pub shaders: super::shaders::ShaderStats,
+    pub(super) libraries: super::shaders::Libraries<B>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
@@ -149,6 +153,8 @@ impl<B: GraphicsBackend> Title<B> {
         Title {
             host: NativeHost::with_memory(backend, memory),
             pipelines: HashMap::new(),
+            shaders: Default::default(),
+            libraries: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             held: Held::new(),

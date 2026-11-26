@@ -66,6 +66,7 @@ impl<'a> Scene<'a> {
                 depth: Some(Format::D32Float),
                 depth_test,
                 cull: Cull::None,
+                ..Default::default()
             })
             .unwrap();
         let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
@@ -112,6 +113,7 @@ impl<'a> Scene<'a> {
         Draw {
             pipeline: &self.pipe,
             topology: Topology::Triangles,
+            state: DrawState::default(),
             root: self.root(z),
             heaps: Heaps {
                 resource: Some(&self.res),

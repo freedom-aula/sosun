@@ -52,6 +52,9 @@ pub struct RenderPipeline {
     pso: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     depth: Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>>,
     cull: MTLCullMode,
+    raster: Raster,
+    /// The pipeline's target has a stencil plane (the pass attaches it too).
+    stencil: bool,
 }
 
 fn pixel_format(f: Format) -> MTLPixelFormat {
@@ -62,6 +65,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::D32Float => MTLPixelFormat::Depth32Float,
+        Format::D32FloatS8 => MTLPixelFormat::Depth32Float_Stencil8,
         Format::Bc1 => MTLPixelFormat::BC1_RGBA,
         Format::Bc2 => MTLPixelFormat::BC2_RGBA,
         Format::Bc3 => MTLPixelFormat::BC3_RGBA,
@@ -91,6 +95,62 @@ fn compare(c: Compare) -> MTLCompareFunction {
         Compare::GreaterEqual => MTLCompareFunction::GreaterEqual,
         Compare::Always => MTLCompareFunction::Always,
     }
+}
+
+fn blend_factor(f: BlendFactor) -> MTLBlendFactor {
+    match f {
+        BlendFactor::Zero => MTLBlendFactor::Zero,
+        BlendFactor::One => MTLBlendFactor::One,
+        BlendFactor::SrcColor => MTLBlendFactor::SourceColor,
+        BlendFactor::InvSrcColor => MTLBlendFactor::OneMinusSourceColor,
+        BlendFactor::SrcAlpha => MTLBlendFactor::SourceAlpha,
+        BlendFactor::InvSrcAlpha => MTLBlendFactor::OneMinusSourceAlpha,
+        BlendFactor::DestAlpha => MTLBlendFactor::DestinationAlpha,
+        BlendFactor::InvDestAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
+        BlendFactor::DestColor => MTLBlendFactor::DestinationColor,
+        BlendFactor::InvDestColor => MTLBlendFactor::OneMinusDestinationColor,
+        BlendFactor::SrcAlphaSat => MTLBlendFactor::SourceAlphaSaturated,
+        BlendFactor::Constant => MTLBlendFactor::BlendColor,
+        BlendFactor::InvConstant => MTLBlendFactor::OneMinusBlendColor,
+        BlendFactor::Src1Color => MTLBlendFactor::Source1Color,
+        BlendFactor::InvSrc1Color => MTLBlendFactor::OneMinusSource1Color,
+        BlendFactor::Src1Alpha => MTLBlendFactor::Source1Alpha,
+        BlendFactor::InvSrc1Alpha => MTLBlendFactor::OneMinusSource1Alpha,
+    }
+}
+
+fn blend_op(o: BlendOp) -> MTLBlendOperation {
+    match o {
+        BlendOp::Add => MTLBlendOperation::Add,
+        BlendOp::Subtract => MTLBlendOperation::Subtract,
+        BlendOp::ReverseSubtract => MTLBlendOperation::ReverseSubtract,
+        BlendOp::Min => MTLBlendOperation::Min,
+        BlendOp::Max => MTLBlendOperation::Max,
+    }
+}
+
+fn stencil_op(o: StencilOp) -> MTLStencilOperation {
+    match o {
+        StencilOp::Keep => MTLStencilOperation::Keep,
+        StencilOp::Zero => MTLStencilOperation::Zero,
+        StencilOp::Replace => MTLStencilOperation::Replace,
+        StencilOp::IncrementClamp => MTLStencilOperation::IncrementClamp,
+        StencilOp::DecrementClamp => MTLStencilOperation::DecrementClamp,
+        StencilOp::Invert => MTLStencilOperation::Invert,
+        StencilOp::IncrementWrap => MTLStencilOperation::IncrementWrap,
+        StencilOp::DecrementWrap => MTLStencilOperation::DecrementWrap,
+    }
+}
+
+fn stencil_face(f: &StencilFace, s: &StencilState) -> Retained<MTLStencilDescriptor> {
+    let d = MTLStencilDescriptor::new();
+    d.setStencilFailureOperation(stencil_op(f.fail));
+    d.setDepthFailureOperation(stencil_op(f.depth_fail));
+    d.setDepthStencilPassOperation(stencil_op(f.pass));
+    d.setStencilCompareFunction(compare(f.compare));
+    d.setReadMask(u32::from(s.read_mask));
+    d.setWriteMask(u32::from(s.write_mask));
+    d
 }
 
 fn address(a: Address) -> MTLSamplerAddressMode {
@@ -543,20 +603,54 @@ impl GraphicsBackend for Metal {
         pd.setVertexDescriptor(Some(&vd));
         for (i, f) in d.color.iter().enumerate() {
             // SAFETY: colour attachment index below 8.
-            unsafe { pd.colorAttachments().objectAtIndexedSubscript(i) }
-                .setPixelFormat(pixel_format(*f));
+            let a = unsafe { pd.colorAttachments().objectAtIndexedSubscript(i) };
+            a.setPixelFormat(pixel_format(*f));
+            let state = d.color_state.get(i).copied().unwrap_or_default();
+            let mut mask = MTLColorWriteMask::empty();
+            for (bit, channel) in [
+                MTLColorWriteMask::Red,
+                MTLColorWriteMask::Green,
+                MTLColorWriteMask::Blue,
+                MTLColorWriteMask::Alpha,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if state.write_mask >> bit & 1 != 0 {
+                    mask |= channel;
+                }
+            }
+            a.setWriteMask(mask);
+            if let Some(b) = state.blend {
+                a.setBlendingEnabled(true);
+                a.setSourceRGBBlendFactor(blend_factor(b.src));
+                a.setDestinationRGBBlendFactor(blend_factor(b.dst));
+                a.setRgbBlendOperation(blend_op(b.op));
+                a.setSourceAlphaBlendFactor(blend_factor(b.src_alpha));
+                a.setDestinationAlphaBlendFactor(blend_factor(b.dst_alpha));
+                a.setAlphaBlendOperation(blend_op(b.op_alpha));
+            }
         }
+        let has_stencil = d.depth == Some(Format::D32FloatS8);
         if let Some(f) = d.depth {
             pd.setDepthAttachmentPixelFormat(pixel_format(f));
+            if has_stencil {
+                pd.setStencilAttachmentPixelFormat(pixel_format(f));
+            }
         }
         let pso = self
             .dev
             .newRenderPipelineStateWithDescriptor_error(&pd)
             .map_err(|e| e.localizedDescription().to_string())?;
-        let depth = d.depth_test.map(|(write, cmp)| {
+        let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
+            let (write, cmp) = d.depth_test.unwrap_or((false, Compare::Always));
             dd.setDepthCompareFunction(compare(cmp));
             dd.setDepthWriteEnabled(write);
+            if let Some(s) = d.stencil.filter(|_| has_stencil) {
+                dd.setFrontFaceStencil(Some(&stencil_face(&s.front, &s)));
+                dd.setBackFaceStencil(Some(&stencil_face(&s.back, &s)));
+            }
             self.dev
                 .newDepthStencilStateWithDescriptor(&dd)
                 .expect("depth state")
@@ -566,7 +660,13 @@ impl GraphicsBackend for Metal {
             Cull::Front => MTLCullMode::Front,
             Cull::Back => MTLCullMode::Back,
         };
-        Ok(RenderPipeline { pso, depth, cull })
+        Ok(RenderPipeline {
+            pso,
+            depth,
+            cull,
+            raster: d.raster,
+            stencil: has_stencil,
+        })
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
@@ -685,19 +785,97 @@ impl Metal {
                 }
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
+            // A combined depth and stencil texture is attached as both.
+            if dp.texture.tex.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 {
+                let a = desc.stencilAttachment();
+                a.setTexture(Some(&dp.texture.tex));
+                a.setStoreAction(MTLStoreAction::Store);
+                match dp.clear {
+                    Some(_) => {
+                        a.setLoadAction(MTLLoadAction::Clear);
+                        a.setClearStencil(0);
+                    }
+                    None => a.setLoadAction(MTLLoadAction::Load),
+                }
+            }
         }
         let e = cb
             .renderCommandEncoderWithDescriptor(&desc)
             .ok_or("no render encoder")?;
+        let rt_size = rp
+            .color
+            .first()
+            .map(|c| &c.texture.tex)
+            .or(rp.depth.as_ref().map(|d| &d.texture.tex))
+            .map_or((0, 0), |t| (t.width(), t.height()));
         for d in &rp.draws {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
             }
             e.setRenderPipelineState(&d.pipeline.pso);
             e.setCullMode(d.pipeline.cull);
+            let r = &d.pipeline.raster;
+            e.setFrontFacingWinding(if r.front_ccw {
+                MTLWinding::CounterClockwise
+            } else {
+                MTLWinding::Clockwise
+            });
+            e.setTriangleFillMode(if r.wireframe {
+                MTLTriangleFillMode::Lines
+            } else {
+                MTLTriangleFillMode::Fill
+            });
+            e.setDepthClipMode(if r.depth_clip {
+                MTLDepthClipMode::Clip
+            } else {
+                MTLDepthClipMode::Clamp
+            });
+            if r.depth_bias != (0.0, 0.0, 0.0) {
+                e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
+            }
             if let Some(ds) = &d.pipeline.depth {
                 e.setDepthStencilState(Some(ds));
             }
+            if d.pipeline.stencil {
+                e.setStencilReferenceValue(d.state.stencil_ref);
+            }
+            let [r, g, b, a] = d.state.blend_factor;
+            e.setBlendColorRed_green_blue_alpha(r, g, b, a);
+            // The target's size bounds the scissor (Metal refuses a rectangle outside it).
+            let (tw, th) = rt_size;
+            if let Some(v) = d.state.viewport {
+                e.setViewport(MTLViewport {
+                    originX: v.x as f64,
+                    originY: v.y as f64,
+                    width: v.width as f64,
+                    height: v.height as f64,
+                    znear: v.min_depth as f64,
+                    zfar: v.max_depth as f64,
+                });
+            }
+            let scissor = match d.state.scissor {
+                Some([l, t, r, b]) => {
+                    let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
+                    let (r, b) = (r.clamp(0, tw as i32) as usize, b.clamp(0, th as i32) as usize);
+                    MTLScissorRect {
+                        x: l,
+                        y: t,
+                        width: r.saturating_sub(l),
+                        height: b.saturating_sub(t),
+                    }
+                }
+                None => MTLScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: tw,
+                    height: th,
+                },
+            };
+            if scissor.width == 0 || scissor.height == 0 {
+                // Nothing of the target is inside the rectangle: nothing is drawn.
+                continue;
+            }
+            e.setScissorRect(scissor);
             self.bind_root_render(&e, &d.root, &d.heaps);
             for b in &d.resources {
                 e.useResource_usage_stages(
@@ -722,6 +900,7 @@ impl Metal {
                 Topology::Triangles => MTLPrimitiveType::Triangle,
                 Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
                 Topology::Lines => MTLPrimitiveType::Line,
+                Topology::LineStrip => MTLPrimitiveType::LineStrip,
                 Topology::Points => MTLPrimitiveType::Point,
             };
             // What `IRRuntimeDrawPrimitives` / `IRRuntimeDrawIndexedPrimitives` do: draw arguments

@@ -292,9 +292,45 @@ fn dropped() {
     DROPPED.fetch_add(1, Ordering::Relaxed);
 }
 
-fn make_pipe(_t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
-    tracing::warn!(pipeline = key, "title pipeline without a host pipeline; its work is dropped");
-    Pipe::Refused
+/// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
+fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
+        return Pipe::Refused;
+    };
+    let name = stages
+        .iter()
+        .map(|(stage, s)| format!("{stage} {}", s.hash))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut hosts = Vec::new();
+    for (stage, shader) in &stages {
+        match shader.native() {
+            Ok(h) => hosts.push((*stage, h.clone())),
+            Err(e) => {
+                t.refused_translation(&name, e.to_string());
+                return Pipe::Refused;
+            }
+        }
+    }
+    let find = |stage: &str| hosts.iter().find(|h| h.0 == stage).map(|h| &*h.1);
+    match graphics {
+        None => match find("compute") {
+            Some(cs) => t.compute_pipe(cs, &name),
+            None => Pipe::Refused,
+        },
+        Some(g) => match find("vertex") {
+            Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
+            None => {
+                t.refused_translation(&name, "a graphics pipeline without a vertex shader".into());
+                Pipe::Refused
+            }
+        },
+    }
+}
+
+/// The shader path's counters: pipelines made and cached, refusals by reason.
+pub fn shader_stats() -> Option<super::shaders::ShaderStats> {
+    with_title(|t| t.shaders.clone())
 }
 
 /// Makes title pipeline `key` the compute pipeline of a pre-translated DXIL container with the
@@ -317,6 +353,91 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
             }
         }
         _ => dropped(),
+    });
+}
+
+/// `IASetPrimitiveTopology`.
+pub(crate) fn topology(this: This, topology: u32) {
+    with_list(this, |_, l| l.topology = topology);
+}
+
+/// `RSSetViewports`: the first one.
+pub(crate) fn viewports(this: This, first: Option<[f32; 6]>) {
+    with_list(this, |_, l| {
+        l.list.set_viewport(first.map(|v| victory_backend::resources::Viewport {
+            x: v[0],
+            y: v[1],
+            width: v[2],
+            height: v[3],
+            min_depth: v[4],
+            max_depth: v[5],
+        }))
+    });
+}
+
+/// `RSSetScissorRects`: the first one (left, top, right, bottom).
+pub(crate) fn scissors(this: This, first: Option<[i32; 4]>) {
+    with_list(this, |_, l| l.list.set_scissor(first));
+}
+
+pub(crate) fn blend_factor(this: This, factor: Option<[f32; 4]>) {
+    with_list(this, |_, l| l.list.set_blend_factor(factor.unwrap_or([1.0; 4])));
+}
+
+pub(crate) fn stencil_ref(this: This, reference: u32) {
+    with_list(this, |_, l| l.list.set_stencil_ref(reference));
+}
+
+/// `IASetIndexBuffer`: the buffer's address and whether its indices are 32 bits.
+pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
+    with_list(this, |_, l| match view {
+        Some((address, wide)) => l.list.set_index_buffer(address, wide),
+        None => l.list.clear_index_buffer(),
+    });
+}
+
+/// `IASetVertexBuffers`: the addresses of the streams from `start`.
+pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64]) {
+    with_list(this, |_, l| {
+        for (i, a) in addresses.iter().enumerate() {
+            l.list.set_vertex_buffer(start as usize + i, *a);
+        }
+    });
+}
+
+/// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
+/// counted) when there is nothing to draw with.
+fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
+    let Pipe::Render(pso, binding) = pipe(t, l.pipeline) else {
+        dropped();
+        return false;
+    };
+    let Some(topology) = super::state::topology(l.topology) else {
+        dropped();
+        return false;
+    };
+    l.list.set_graphics_pipeline(&pso, topology);
+    l.list.set_graphics_binding(binding);
+    true
+}
+
+pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    with_list(this, |t, l| {
+        if graphics(t, l)
+            && let Err(e) = l.list.draw_instanced(vertices, instances, first, first_instance)
+        {
+            tracing::warn!(error = %e, "draw");
+        }
+    });
+}
+
+pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
+    with_list(this, |t, l| {
+        if graphics(t, l)
+            && let Err(e) = l.list.draw_indexed_instanced(indices, instances, first, base, first_instance)
+        {
+            tracing::warn!(error = %e, "indexed draw");
+        }
     });
 }
 

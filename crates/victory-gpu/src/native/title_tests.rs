@@ -159,6 +159,9 @@ impl List {
             self.0, address, comparison, reference, u32::MAX, 0,
         );
     }
+    fn set_pipeline(&self, pso: This) {
+        slot::<extern "system" fn(This, This)>(self.0, 0xc8)(self.0, pso);
+    }
     fn close(&self) {
         assert_eq!(slot::<extern "system" fn(This) -> HResult>(self.0, 0x48)(self.0), S_OK);
     }
@@ -360,4 +363,38 @@ fn a_copy_runs_in_order_with_the_dispatch_it_feeds() {
     q.signal(&f, 1);
     assert_eq!(f.wait(1), S_OK);
     assert!(pool.read::<u32>(dst, N).iter().enumerate().all(|(i, v)| *v == i as u32 + 9));
+}
+
+/// A title pipeline the host refuses (here a container that does not translate) drops the work
+/// that uses it and counts the refusal; the submission, the list's other work and the fence go on.
+#[test]
+fn a_refused_pipeline_drops_its_work_and_nothing_else() {
+    if !available() {
+        return;
+    }
+    let pool = pool(9006, 4);
+    let (src, dropped, dst, flag) = (0, 8192, 16384, 24576);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dropped, &[0xAAAA_AAAAu32; N]);
+    pool.write(dst, &[0u32; N]);
+    let (bad, good) = (crate::pipeline::test_compute(b"not a container"), pipeline());
+    let (q, f) = (Queue::new(), Fence::new(0));
+    let list = List::new(bad);
+    affine(&list, 1, 1, pool.va(src), pool.va(dropped));
+    list.set_pipeline(good);
+    affine(&list, 1, 2, pool.va(src), pool.va(dst));
+    list.write32(pool.va(flag), 7);
+    list.close();
+    q.execute(&[&list]);
+    q.signal(&f, 1);
+    assert_eq!(f.wait(1), S_OK);
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 + 2));
+    assert_eq!(pool.read::<u32>(flag, 1), [7]);
+    assert_eq!(pool.read::<u32>(dropped, 1), [0xAAAA_AAAA], "the refused pipeline's dispatch did not run");
+    let stats = glue::shader_stats().unwrap();
+    assert!(
+        stats.refused.iter().any(|(why, n)| why.contains("translation") && *n >= 1),
+        "{stats:?}"
+    );
 }

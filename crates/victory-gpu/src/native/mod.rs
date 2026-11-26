@@ -19,6 +19,8 @@ pub(crate) mod glue;
 pub mod host;
 pub mod list;
 pub mod memory;
+pub mod shaders;
+pub mod state;
 pub mod title;
 
 #[cfg(target_os = "macos")]

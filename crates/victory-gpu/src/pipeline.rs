@@ -66,10 +66,13 @@ pub(crate) struct Shader {
     /// refusal) and let it go: a run holds one per distinct shader its title
     /// passes, and nothing reads it after. Off Windows nothing translates,
     /// so only tests keep it.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, target_os = "macos"))]
     container: Mutex<Vec<u8>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Its translation for the native host (container let go once made).
+    #[cfg(target_os = "macos")]
+    native: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -98,11 +101,27 @@ impl Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             size: bytes.len(),
-            #[cfg(any(windows, test))]
+            #[cfg(any(windows, test, target_os = "macos"))]
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            native: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The translation for the native host, made on first use; the reason if there is none.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.native
+            .get_or_init(|| {
+                let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                let made = crate::native::shaders::translate(&container).map(Arc::new);
+                *container = Vec::new();
+                made
+            })
+            .as_ref()
+            .map_err(String::as_str)
     }
 }
 
@@ -225,8 +244,24 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Its graphics state, for the native host (streams only).
+    #[cfg(target_os = "macos")]
+    graphics: Option<Box<crate::native::state::Graphics>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// A title pipeline's stages (name, shader) and graphics state, for the native host.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_stages(
+    this: This,
+) -> Option<(Vec<(&'static str, Arc<Shader>)>, Option<crate::native::state::Graphics>)> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let stages = p.shaders.iter().map(|s| (s.stage, s.clone())).collect();
+    Some((stages, p.graphics.as_deref().cloned()))
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -378,6 +413,7 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(target_os = "macos")] graphics: Option<Box<crate::native::state::Graphics>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -391,6 +427,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(target_os = "macos")]
+        graphics,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -414,6 +452,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(target_os = "macos")]
+        None,
         iid,
         out,
     )
@@ -433,6 +473,8 @@ pub(crate) extern "system" fn create_compute(
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
+        None,
+        #[cfg(target_os = "macos")]
         None,
         iid,
         out,
@@ -513,6 +555,8 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(target_os = "macos")]
+        Some(Box::new(graphics)),
         iid,
         out,
     )
@@ -520,7 +564,9 @@ pub(crate) extern "system" fn create_stream(
 
 #[cfg(windows)]
 type Graphics = host::GraphicsState;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+type Graphics = crate::native::state::Graphics;
+#[cfg(not(any(windows, target_os = "macos")))]
 type Graphics = ();
 
 /// A stream's shaders (each made by `shader` from its stage and bytecode)
@@ -552,7 +598,7 @@ fn read_stream(
             let code = unsafe { &*stream.as_ptr().add(at + 8).cast::<Bytecode>() };
             shaders.extend(shader(stage, code));
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
             graphics.read(kind, stream.as_ptr().add(at))

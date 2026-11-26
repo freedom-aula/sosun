@@ -14,6 +14,10 @@ use victory_backend::resources::*;
 use victory_metal::mem::{Alias, page_size};
 use victory_metal::metal::Metal;
 
+#[path = "shader_tests.rs"]
+mod shader_tests;
+#[path = "state_tests.rs"]
+mod state_tests;
 #[path = "title_tests.rs"]
 mod title_tests;
 
@@ -238,6 +242,7 @@ fn clear_and_draw_into_render_target() {
             depth: None,
             depth_test: None,
             cull: Cull::None,
+            ..Default::default()
         })
         .unwrap();
     let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);

@@ -21,6 +21,9 @@ pub enum Format {
     Rgba16Float,
     R32Float,
     D32Float,
+    /// 32-bit depth and 8-bit stencil (DXGI `D32_FLOAT_S8X24_UINT`, and the console's 24-bit
+    /// depth formats, which Apple GPUs do not have).
+    D32FloatS8,
     Bc1,
     Bc2,
     Bc3,
@@ -36,6 +39,7 @@ impl Format {
         use Format::*;
         match self {
             Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
+            D32FloatS8 => (1, 8),
             Rgba16Float => (1, 8),
             Bc1 | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc5 | Bc6h | Bc7 => (4, 16),
@@ -218,11 +222,123 @@ pub struct VertexStream {
     pub per_instance: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Cull {
     None,
     Front,
+    #[default]
     Back,
+}
+
+/// `D3D12_BLEND`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    InvSrcColor,
+    SrcAlpha,
+    InvSrcAlpha,
+    DestAlpha,
+    InvDestAlpha,
+    DestColor,
+    InvDestColor,
+    SrcAlphaSat,
+    /// The constant of `OMSetBlendFactor`.
+    Constant,
+    InvConstant,
+    Src1Color,
+    InvSrc1Color,
+    Src1Alpha,
+    InvSrc1Alpha,
+}
+
+/// `D3D12_BLEND_OP`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+/// The blend equation of one colour target (`D3D12_RENDER_TARGET_BLEND_DESC` with blending on).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Blend {
+    pub src: BlendFactor,
+    pub dst: BlendFactor,
+    pub op: BlendOp,
+    pub src_alpha: BlendFactor,
+    pub dst_alpha: BlendFactor,
+    pub op_alpha: BlendOp,
+}
+
+/// One colour target's output state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ColorState {
+    pub blend: Option<Blend>,
+    /// Channels written, bit 0 red to bit 3 alpha.
+    pub write_mask: u8,
+}
+
+impl Default for ColorState {
+    fn default() -> Self {
+        ColorState {
+            blend: None,
+            write_mask: 0xf,
+        }
+    }
+}
+
+/// `D3D12_STENCIL_OP`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StencilOp {
+    Keep,
+    Zero,
+    Replace,
+    IncrementClamp,
+    DecrementClamp,
+    Invert,
+    IncrementWrap,
+    DecrementWrap,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StencilFace {
+    pub fail: StencilOp,
+    pub depth_fail: StencilOp,
+    pub pass: StencilOp,
+    pub compare: Compare,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StencilState {
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+/// Rasterizer state beyond culling (`D3D12_RASTERIZER_DESC`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Raster {
+    pub front_ccw: bool,
+    pub wireframe: bool,
+    pub depth_clip: bool,
+    /// Constant bias in depth units, slope scale, clamp; 0 0 0 is none.
+    pub depth_bias: (f32, f32, f32),
+}
+
+impl Default for Raster {
+    fn default() -> Self {
+        Raster {
+            front_ccw: false,
+            wireframe: false,
+            depth_clip: true,
+            depth_bias: (0.0, 0.0, 0.0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,9 +346,11 @@ pub enum Topology {
     Triangles,
     TriangleStrip,
     Lines,
+    LineStrip,
     Points,
 }
 
+#[derive(Default)]
 pub struct RenderPipelineDesc<'a> {
     pub vs: &'a [u8],
     pub ps: Option<&'a [u8]>,
@@ -243,6 +361,10 @@ pub struct RenderPipelineDesc<'a> {
     /// Depth test `(write, compare)`; `None` = off.
     pub depth_test: Option<(bool, Compare)>,
     pub cull: Cull,
+    /// Blend and write mask per colour target; targets past the end are opaque, all channels.
+    pub color_state: &'a [ColorState],
+    pub stencil: Option<StencilState>,
+    pub raster: Raster,
 }
 
 pub struct ColorTarget<'a, B: GraphicsBackend + ?Sized> {
@@ -275,9 +397,31 @@ pub enum DrawCall {
     },
 }
 
+/// A viewport as `RSSetViewports` takes it: top left, size, depth range.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min_depth: f32,
+    pub max_depth: f32,
+}
+
+/// Per-draw state a title sets with its own calls. `None` / zero: the whole target, no constant.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct DrawState {
+    pub viewport: Option<Viewport>,
+    /// `RSSetScissorRects`: left, top, right, bottom (texels); clipped to the target.
+    pub scissor: Option<[i32; 4]>,
+    pub stencil_ref: u32,
+    pub blend_factor: [f32; 4],
+}
+
 pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub pipeline: &'a B::RenderPipeline,
     pub topology: Topology,
+    pub state: DrawState,
     pub root: RootArgs,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,

@@ -6,7 +6,7 @@
 //! per pool (see [`super::memory`]); nothing is copied to or from it.
 
 use super::descriptors::{Decoded, decode};
-use super::list::{Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
+use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -108,6 +108,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(Rc::new(ComputePso {
             pso: self.backend.create_compute_pipeline(dxil)?,
             threads,
+            binding: None,
         }))
     }
 
@@ -240,6 +241,55 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(true)
     }
 
+    /// The arguments of a translated title shader: its user-data block, then its root views.
+    fn translated_args(
+        &self,
+        root: &[Option<Root<B>>],
+        b: &Binding,
+        p: &mut Prep<B>,
+    ) -> Result<(), String> {
+        use victory_shader::RootType;
+        let set = |slot: u8| {
+            root.get(usize::from(slot))
+                .and_then(|r| r.as_ref())
+                .ok_or_else(|| format!("root parameter {slot} was never set"))
+        };
+        let mut args = std::mem::take(&mut p.root);
+        if b.dwords > 0 {
+            let mut values = vec![0u32; b.dwords];
+            for u in &b.user_data {
+                values[u.index as usize] = match (u.root, set(u.slot)?) {
+                    (RootType::Constants, Root::Constants(c)) => {
+                        c.get(u.dword as usize).copied().unwrap_or(0)
+                    }
+                    // The byte offset of the table's first entry in its heap.
+                    (RootType::Table, Root::Table(h, at)) => (*at as u64 * Self::step(h.kind)) as u32,
+                    (RootType::Descriptor, Root::View(a)) if u.dword < 2 => {
+                        (a >> (32 * u.dword)) as u32
+                    }
+                    (kind, _) => {
+                        return Err(format!(
+                            "root parameter {} is not what the shader reads it as ({kind:?}, dword {})",
+                            u.slot, u.dword
+                        ));
+                    }
+                };
+            }
+            args = args.constants(&values);
+        }
+        for &slot in &b.views {
+            let Root::View(a) = set(slot)? else {
+                return Err(format!("root parameter {slot} is not a root view"));
+            };
+            let (buf, ptr) = self.resolve(*a, 1)?;
+            let gpu = self.backend.gpu_address(&buf, ptr);
+            p.bufs.push(buf);
+            args = args.address(gpu);
+        }
+        p.root = args;
+        Ok(())
+    }
+
     fn root_args(&self, root: &[Option<Root<B>>], p: &mut Prep<B>) -> Result<(), String> {
         for (i, r) in root.iter().enumerate() {
             let args = std::mem::take(&mut p.root);
@@ -269,14 +319,21 @@ impl<B: GraphicsBackend> NativeHost<B> {
             blit: vec![],
         };
         match cmd {
-            Cmd::Dispatch { root, .. } => self.root_args(root, &mut p)?,
+            Cmd::Dispatch { root, pso, .. } => match &pso.binding {
+                Some(b) => self.translated_args(root, b, &mut p)?,
+                None => self.root_args(root, &mut p)?,
+            },
             Cmd::Draw {
                 root,
+                binding,
                 vertex,
                 index,
                 ..
             } => {
-                self.root_args(root, &mut p)?;
+                match binding {
+                    Some(b) => self.translated_args(root, b, &mut p)?,
+                    None => self.root_args(root, &mut p)?,
+                }
                 for a in vertex {
                     p.vertex.push(self.resolve(*a, 1)?);
                 }
@@ -434,6 +491,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     pso,
                                     topology,
                                     heaps: h,
+                                    state,
                                     call,
                                     ..
                                 } = cmds[k]
@@ -443,6 +501,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 Draw {
                                     pipeline: &**pso,
                                     topology: *topology,
+                                    state: *state,
                                     root: preps[k].root.clone(),
                                     heaps: heaps(h),
                                     resources: preps[k].bufs.iter().map(|b| &**b).collect(),

@@ -66,6 +66,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         10 => Format::Rgba16Float,
         41 => Format::R32Float,
         40 => Format::D32Float,
+        20 | 45 => Format::D32FloatS8,
         71 => Format::Bc1,
         74 => Format::Bc2,
         77 => Format::Bc3,

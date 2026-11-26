@@ -1668,20 +1668,60 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    pub(super) use super::draw;
     pub(super) use super::draw as dispatch_mesh;
     pub(super) use super::draw as dispatch_mesh_x;
-    pub(super) use super::draw as draw_indexed;
-    pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
-    pub(super) use super::ignored_state as index_buffer;
-    pub(super) use super::ignored_state as scissors;
-    pub(super) use super::ignored_state as stencil_ref;
     pub(super) use super::ignored_state as targets;
-    pub(super) use super::ignored_state as topology;
-    pub(super) use super::ignored_state as vertex_buffers;
-    pub(super) use super::ignored_state as viewports;
+
+    pub(super) extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+        super::count_draw();
+        glue::draw(this, vertices, instances, first, first_instance);
+    }
+    pub(super) extern "system" fn draw_indexed(
+        this: This,
+        indices: u32,
+        instances: u32,
+        first: u32,
+        base: i32,
+        first_instance: u32,
+    ) {
+        super::count_draw();
+        glue::draw_indexed(this, indices, instances, first, base, first_instance);
+    }
+    pub(super) extern "system" fn topology(this: This, topology: u32) {
+        glue::topology(this, topology);
+    }
+    /// `D3D12_VIEWPORT`: top left, size, depth range.
+    pub(super) extern "system" fn viewports(this: This, count: u32, viewports: *const [f32; 6]) {
+        glue::viewports(this, items(viewports, count).first().copied());
+    }
+    /// `D3D12_RECT`: left, top, right, bottom.
+    pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const [i32; 4]) {
+        glue::scissors(this, items(rects, count).first().copied());
+    }
+    pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+        // SAFETY: the title passes four floats or null.
+        glue::blend_factor(this, unsafe { factor.as_ref() }.copied());
+    }
+    pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+        glue::stencil_ref(this, reference);
+    }
+    /// `D3D12_INDEX_BUFFER_VIEW`: address, size, format (DXGI `R32_UINT` is 42).
+    pub(super) extern "system" fn index_buffer(this: This, view: *const (u64, u32, u32)) {
+        // SAFETY: the title passes a view or null.
+        glue::index_buffer(this, unsafe { view.as_ref() }.map(|v| (v.0, v.2 == 42)));
+    }
+    /// `D3D12_VERTEX_BUFFER_VIEW`: address, size, stride.
+    pub(super) extern "system" fn vertex_buffers(
+        this: This,
+        start: u32,
+        count: u32,
+        views: *const (u64, u32, u32),
+    ) {
+        let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
+        glue::vertex_buffers(this, start, &addresses);
+    }
 
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
