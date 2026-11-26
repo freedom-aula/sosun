@@ -516,10 +516,9 @@ impl<B: PresentBackend> Title<B> {
         if info.flags & UNORDERED_ACCESS == 0 || info.render_target() {
             return;
         }
-        let first = self.back.logged.insert(key);
         let described = (info.format, info.width, info.height, info.depth_or_layers, info.size);
         if info.size > BACK_LIMIT {
-            if first {
+            if self.back.logged.insert(key) {
                 tracing::info!(texture = key, ?described, "a GPU-written texture is too large to copy back");
             }
             return;
@@ -531,7 +530,7 @@ impl<B: PresentBackend> Title<B> {
             return;
         }
         if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
-            if first {
+            if self.back.logged.insert(key) {
                 tracing::warn!(texture = key, ?described, %error, "a GPU-written texture was not copied back");
             }
             return;
@@ -546,7 +545,7 @@ impl<B: PresentBackend> Title<B> {
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.
         t.last = Some(hash);
-        if first {
+        if self.back.logged.insert(key) {
             tracing::info!(texture = key, ?described, layout = ?info.layout.desc, "a GPU-written texture is copied back into title memory");
         }
     }
@@ -776,6 +775,70 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
+    /// element sizes 1 to 8, the shapes a world run names (#46).
+    #[test]
+    fn download_undoes_upload_for_every_mip_and_slice() {
+        use victory_formats::texture::{Desc, Swizzle};
+        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        use Dimension::{Tex1d, Tex2d, Tex3d};
+        // (dimension, DXGI format, element bytes, width, height, depth or layers, mips)
+        let shapes = [
+            (Tex1d, 28, 4, 256, 1, 1, 1),
+            (Tex2d, 61, 1, 128, 64, 1, 5),
+            (Tex2d, 10, 8, 256, 256, 1, 9),
+            (Tex2d, 41, 4, 64, 64, 4, 6),
+            (Tex3d, 41, 4, 256, 256, 16, 1),
+            (Tex3d, 17, 8, 64, 64, 64, 1),
+            (Tex3d, 28, 4, 32, 32, 32, 6),
+        ];
+        let mut ran = 0;
+        for (dimension, format, element_bytes, width, height, depth, mips) in shapes {
+            for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D_X] {
+                let what = format!("{dimension:?} {format} {width}x{height}x{depth} mips {mips} {swizzle:?}");
+                let desc = Desc { dimension, width, height, depth, mips, element_bytes, block: 1, samples: 1, swizzle };
+                // Not every mode exists for every shape.
+                let Ok(layout) = Layout::new(&desc) else { continue };
+                let mut want = vec![0u8; layout.size as usize];
+                let slices = if dimension == Tex3d { 1 } else { layout.slices };
+                let tiled = (0..layout.mips.len() as u32).all(|mip| {
+                    let m = &layout.mips[mip as usize];
+                    let row = (m.width * element_bytes) as usize;
+                    let pitch = row * m.height as usize;
+                    (0..slices).all(|slice| {
+                        let n = pitch * layout.subresource_depth(mip).max(1) as usize;
+                        let linear: Vec<u8> = (0..n).map(|i| (i % 251) as u8 ^ (mip * 37 + slice * 11) as u8).collect();
+                        layout.tile(&mut want, mip, slice, &linear, row, pitch).is_ok()
+                    })
+                });
+                if !tiled {
+                    continue;
+                }
+                let info = TextureInfo {
+                    dimension,
+                    format,
+                    width,
+                    height,
+                    depth_or_layers: depth,
+                    flags: UNORDERED_ACCESS,
+                    size: want.len(),
+                    layout,
+                    memory: std::ptr::null(),
+                };
+                let tex = metal.create_texture(&info.desc().unwrap()).unwrap();
+                upload(&metal, &tex, &info, &want).unwrap();
+                let mut got = vec![0u8; want.len()];
+                download(&metal, &tex, &info, &mut got).unwrap();
+                let at = got.iter().zip(&want).position(|(a, b)| a != b);
+                assert!(at.is_none(), "{what}: differs first at byte {at:?}");
+                eprintln!("round trip: {what}");
+                ran += 1;
+            }
+        }
+        // Linear at least, for each shape.
+        assert!(ran >= shapes.len(), "{ran}");
+    }
 
     #[test]
     fn from_host_undoes_to_host() {

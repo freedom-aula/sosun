@@ -796,7 +796,9 @@ Host textures are Metal's own allocations in Apple's layout, so what a compute p
 * **Not seen:** UAVs a shader reaches by indexing the descriptor heap itself, pixel shader UAV writes, and GPU copies into textures.
 * **Cost.** CPU read, retile and two hashes per written texture per submission, under the title lock. A compute retile on the GPU is the next step if a profile shows it.
 
-Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D texture in `LINEAR`, `SW_4KB_S` and `SW_64KB_D_X`. Not tested: mip chains, arrays, 3D, other element sizes, and the game itself.
+Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D texture in `LINEAR`, `SW_4KB_S` and `SW_64KB_D_X`. A second test sends tiled bytes up into a host texture and back down for 1D, 2D with 5 and 9 mips, a 2D array with mips, and 3D with and without mips (element sizes 1, 4 and 8, the same three modes plus `SW_64KB_S`): every mip, array slice and depth slice comes back where it was. It shows nothing is dropped, not that the console's layout equations are right (both directions use them). Not tested: a dispatch writing those shapes.
+
+A world run on an M5 Pro (Series S, windowed, reported on [#151](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/151)) named 22 textures as copied back (15 2D, 4 3D, 3 1D; the largest 256x256x16, 4 MiB), none too large, with no frame rate change beyond run-to-run noise up to the first world frame. The run then crashed (image+0x55e56f8, also without the switch), so whether boats float is still unknown. That count may be low: a texture skipped on its first completion was not logged then (fixed since).
 
 #### Texture formats the host lacked
 
