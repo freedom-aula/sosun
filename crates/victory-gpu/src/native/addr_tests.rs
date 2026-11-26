@@ -444,3 +444,114 @@ fn a_wave64_mask_joined_with_data_takes_each_lanes_bit_on_the_gpu() {
     assert_eq!(f.get(0x2_0000, 64), want);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+/// LDS by M0 and by lane (RDNA2 ISA 12.13): 20 of 32 lanes `ds_append` twice to the dword at
+/// M0 = 8 (one atomic add of 20 each, the old value to every lane), then all 32 `ds_consume` it;
+/// `ds_write_addtid_b32` with M0 = 64 and offset 4 puts each lane's id at 68 + 4 × lane, read
+/// back by address and by `ds_read_addtid_b32`. Stored to `s[0:1]` + 0, 512, 768, 256 and 384.
+const LDS_BY_M0: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x7E04_0280, // v_mov_b32_e32 v2, 0
+    0x7E06_02C1, // v_mov_b32_e32 v3, -1
+    0x7E0C_02C1, // v_mov_b32_e32 v6, -1
+    0xD834_0008, 0x0000_0202, // ds_write_b32 v2, v2 offset:8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7D88_0094, // v_cmp_gt_u32_e32 vcc_lo, 20, v0
+    0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+    0xBEFC_0388, // s_mov_b32 m0, 8
+    0xD8F8_0000, 0x0300_0000, // ds_append v3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8F8_0000, 0x0600_0000, // ds_append v6
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x887E_047E, // s_or_b32 exec_lo, exec_lo, s4
+    0xDC70_8000, 0x0000_0301, // global_store_dword v1, v3, s[0:1]
+    0xDC70_8200, 0x0000_0601, // global_store_dword v1, v6, s[0:1] offset:512
+    0xD8F4_0000, 0x0900_0000, // ds_consume v9
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xDC70_8300, 0x0000_0901, // global_store_dword v1, v9, s[0:1] offset:768
+    0xBEFC_03C0, // s_mov_b32 m0, 64
+    0xDAC0_0004, 0x0000_0000, // ds_write_addtid_b32 v0 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0044, 0x0700_0001, // ds_read_b32 v7, v1 offset:68
+    0xDAC4_0004, 0x0500_0000, // ds_read_addtid_b32 v5 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xDC70_8100, 0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:256
+    0xDC70_8180, 0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:384
+    0xBF81_0000, // s_endpgm
+];
+
+/// `ds_write_addtid_b32` and `ds_read_addtid_b32` in a wave64 group of 64 (two host waves on
+/// Metal): each lane's dword is at 68 + 4 × its console lane, read back by address too. Stored to
+/// `s[0:1]` + 1024 and 1280.
+const ADDTID_WAVE64: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xBEFC_03C0, // s_mov_b32 m0, 64
+    0xDAC0_0004, 0x0000_0000, // ds_write_addtid_b32 v0 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD8D8_0044, 0x0700_0001, // ds_read_b32 v7, v1 offset:68
+    0xDAC4_0004, 0x0500_0000, // ds_read_addtid_b32 v5 offset:4
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xDC70_8400, 0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:1024
+    0xDC70_8500, 0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:1280
+    0xBF81_0000, // s_endpgm
+];
+
+/// `words` as one compute group of `threads` with 512 bytes of LDS and `s[0:1]` a root constant
+/// pair, translated with the host's options, run once with `s[0:1]` = `VA_A`.
+fn run_with_lds(t: &mut Title<Metal>, words: &[u32], wave64: bool, threads: u32) {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [threads, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty).expect("container");
+    let cs = emit_with(&c, &native, &p, &st, &io, &res, shaders::options()).expect("emit");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "lds") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &halves(VA_A));
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+}
+
+#[test]
+fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    run_with_lds(&mut t, LDS_BY_M0, false, 32);
+    let first: Vec<u32> = (0..32).map(|i| if i < 20 { 0 } else { u32::MAX }).collect();
+    assert_eq!(f.get(0x2_0000, 32), first, "the first ds_append");
+    let second: Vec<u32> = (0..32).map(|i| if i < 20 { 20 } else { u32::MAX }).collect();
+    assert_eq!(f.get(0x2_0000 + 512, 32), second, "the second ds_append");
+    assert_eq!(f.get(0x2_0000 + 768, 32), vec![40; 32], "ds_consume");
+    let ids: Vec<u32> = (0..32).collect();
+    assert_eq!(f.get(0x2_0000 + 256, 32), ids, "ds_write_addtid_b32");
+    assert_eq!(f.get(0x2_0000 + 384, 32), ids, "ds_read_addtid_b32");
+    run_with_lds(&mut t, ADDTID_WAVE64, true, 64);
+    let ids: Vec<u32> = (0..64).collect();
+    assert_eq!(f.get(0x2_0000 + 1024, 64), ids, "wave64 ds_write_addtid_b32");
+    assert_eq!(f.get(0x2_0000 + 1280, 64), ids, "wave64 ds_read_addtid_b32");
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
