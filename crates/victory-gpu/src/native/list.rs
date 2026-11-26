@@ -1,0 +1,509 @@
+//! A command list on the native host: the calls a title makes on its list (`SetPipelineState`,
+//! `SetComputeRoot*`, `Dispatch`, `CopyBufferRegion`, `ClearRenderTargetView`, `DrawInstanced`, ...)
+//! recorded as they arrive and turned into backend passes at submission ([`super::host::NativeHost::execute`]).
+//!
+//! Title addresses are kept as addresses: they resolve to GPU buffers when the list is submitted, by
+//! which time the pool observer has told us about every mapping the title made.
+
+use std::rc::Rc;
+use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
+
+/// A heap the title wrote views into: `start` is its descriptor memory (title addresses).
+pub struct NativeHeap<B: GraphicsBackend> {
+    pub heap: B::Heap,
+    pub kind: HeapKind,
+    pub start: u64,
+    pub count: usize,
+}
+
+/// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
+/// one block of root constants for the user data, then the root constant, shader resource and
+/// unordered access views it reads, as addresses. Without it, the title's root parameters go to the
+/// shader as they are, in order (shaders compiled for the native host).
+#[derive(Clone, Debug, Default)]
+pub struct Binding {
+    /// Dwords of the user-data block (a multiple of 4).
+    pub dwords: usize,
+    pub user_data: Vec<victory_shader::emit::UserData>,
+    /// Title root parameter indices of the root CBVs, SRVs and UAVs, in this order.
+    pub views: Vec<u8>,
+}
+
+impl Binding {
+    pub fn of(shader: &victory_shader::emit::HostShader) -> Binding {
+        Binding {
+            dwords: shader.user_data_dwords() as usize,
+            user_data: shader.user_data.clone(),
+            views: shader
+                .root_cbvs
+                .iter()
+                .chain(&shader.root_srvs)
+                .chain(&shader.root_uavs)
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+/// A compute pipeline and the group size its shader was written with (`numthreads`).
+pub struct ComputePso<B: GraphicsBackend> {
+    pub pso: B::Pipeline,
+    pub threads: [usize; 3],
+    pub binding: Option<Binding>,
+}
+
+/// One root parameter as the title set it.
+pub enum Root<B: GraphicsBackend> {
+    Constants(Vec<u32>),
+    /// A root SRV, UAV or CBV: a title address.
+    View(u64),
+    /// A descriptor table: heap and the index of its first entry.
+    Table(Rc<NativeHeap<B>>, usize),
+}
+
+impl<B: GraphicsBackend> Clone for Root<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Root::Constants(c) => Root::Constants(c.clone()),
+            Root::View(a) => Root::View(*a),
+            Root::Table(h, i) => Root::Table(h.clone(), *i),
+        }
+    }
+}
+
+type Heaps<B> = (Option<Rc<NativeHeap<B>>>, Option<Rc<NativeHeap<B>>>);
+
+pub struct Targets<B: GraphicsBackend> {
+    pub color: Vec<Rc<B::Texture>>,
+    pub depth: Option<Rc<B::Texture>>,
+}
+
+impl<B: GraphicsBackend> Clone for Targets<B> {
+    fn clone(&self) -> Self {
+        Targets {
+            color: self.color.clone(),
+            depth: self.depth.clone(),
+        }
+    }
+}
+
+impl<B: GraphicsBackend> Targets<B> {
+    pub(super) fn same(&self, o: &Targets<B>) -> bool {
+        self.color.len() == o.color.len()
+            && self
+                .color
+                .iter()
+                .zip(&o.color)
+                .all(|(a, b)| Rc::ptr_eq(a, b))
+            && match (&self.depth, &o.depth) {
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+pub enum Cmd<B: GraphicsBackend> {
+    Dispatch {
+        pso: Rc<ComputePso<B>>,
+        root: Vec<Option<Root<B>>>,
+        heaps: Heaps<B>,
+        groups: [usize; 3],
+    },
+    Copy {
+        dst: u64,
+        src: u64,
+        len: usize,
+    },
+    Fill {
+        dst: u64,
+        len: usize,
+        value: u8,
+    },
+    Clear {
+        color: Option<(Rc<B::Texture>, [f32; 4])>,
+        depth: Option<(Rc<B::Texture>, f32)>,
+    },
+    Draw {
+        pso: Rc<B::RenderPipeline>,
+        binding: Option<Rc<Binding>>,
+        topology: Topology,
+        root: Vec<Option<Root<B>>>,
+        heaps: Heaps<B>,
+        targets: Targets<B>,
+        vertex: Vec<u64>,
+        index: Option<(u64, bool)>,
+        state: DrawState,
+        call: DrawCall,
+    },
+}
+
+impl<B: GraphicsBackend> Clone for Cmd<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Cmd::Dispatch {
+                pso,
+                root,
+                heaps,
+                groups,
+            } => Cmd::Dispatch {
+                pso: pso.clone(),
+                root: root.clone(),
+                heaps: heaps.clone(),
+                groups: *groups,
+            },
+            Cmd::Copy { dst, src, len } => Cmd::Copy {
+                dst: *dst,
+                src: *src,
+                len: *len,
+            },
+            Cmd::Fill { dst, len, value } => Cmd::Fill {
+                dst: *dst,
+                len: *len,
+                value: *value,
+            },
+            Cmd::Clear { color, depth } => Cmd::Clear {
+                color: color.clone(),
+                depth: depth.clone(),
+            },
+            Cmd::Draw {
+                pso,
+                binding,
+                topology,
+                root,
+                heaps,
+                targets,
+                vertex,
+                index,
+                state,
+                call,
+            } => Cmd::Draw {
+                pso: pso.clone(),
+                binding: binding.clone(),
+                topology: *topology,
+                root: root.clone(),
+                heaps: heaps.clone(),
+                targets: targets.clone(),
+                vertex: vertex.clone(),
+                index: *index,
+                state: *state,
+                call: *call,
+            },
+        }
+    }
+}
+
+/// The state a title sets between commands.
+struct State<B: GraphicsBackend> {
+    compute: Option<Rc<ComputePso<B>>>,
+    graphics: Option<(Rc<B::RenderPipeline>, Topology)>,
+    graphics_binding: Option<Rc<Binding>>,
+    compute_root: Vec<Option<Root<B>>>,
+    graphics_root: Vec<Option<Root<B>>>,
+    heaps: Heaps<B>,
+    targets: Targets<B>,
+    vertex: Vec<u64>,
+    index: Option<(u64, bool)>,
+    draw: DrawState,
+}
+
+pub struct NativeList<B: GraphicsBackend> {
+    pub(super) cmds: Vec<Cmd<B>>,
+    state: State<B>,
+}
+
+fn set<B: GraphicsBackend>(root: &mut Vec<Option<Root<B>>>, slot: usize, value: Root<B>) {
+    if root.len() <= slot {
+        root.resize_with(slot + 1, || None);
+    }
+    root[slot] = Some(value);
+}
+
+impl<B: GraphicsBackend> Default for NativeList<B> {
+    fn default() -> Self {
+        NativeList {
+            cmds: Vec::new(),
+            state: State {
+                compute: None,
+                graphics: None,
+                graphics_binding: None,
+                compute_root: Vec::new(),
+                graphics_root: Vec::new(),
+                heaps: (None, None),
+                targets: Targets {
+                    color: Vec::new(),
+                    depth: None,
+                },
+                vertex: Vec::new(),
+                index: None,
+                draw: DrawState::default(),
+            },
+        }
+    }
+}
+
+impl<B: GraphicsBackend> NativeList<B> {
+    /// `Reset`: forget everything recorded and set.
+    pub fn reset(&mut self) {
+        *self = NativeList::default();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cmds.is_empty()
+    }
+
+    /// What was recorded so far as a list of its own, leaving this one empty with its state kept
+    /// (the title goes on recording after a wait with the pipeline and root arguments it had set).
+    pub fn cut(&mut self) -> NativeList<B> {
+        NativeList {
+            cmds: std::mem::take(&mut self.cmds),
+            ..NativeList::default()
+        }
+    }
+
+    /// A copy of the recorded commands (a title may reset and re-record a list it submitted).
+    pub fn snapshot(&self) -> NativeList<B> {
+        NativeList {
+            cmds: self.cmds.clone(),
+            ..NativeList::default()
+        }
+    }
+
+    /// A write of `value`'s low `bytes` (little endian) at title address `at`, in order with the
+    /// rest of the list on the GPU (bottom-of-pipe value writes): byte fills.
+    pub fn write_value(&mut self, at: u64, value: u64, bytes: usize) {
+        for (i, b) in value.to_le_bytes().iter().take(bytes).enumerate() {
+            self.fill(at + i as u64, 1, *b);
+        }
+    }
+
+    /// `SetDescriptorHeaps`.
+    pub fn set_heaps(
+        &mut self,
+        resource: Option<&Rc<NativeHeap<B>>>,
+        sampler: Option<&Rc<NativeHeap<B>>>,
+    ) {
+        self.state.heaps = (resource.cloned(), sampler.cloned());
+    }
+
+    pub fn set_compute_pipeline(&mut self, pso: &Rc<ComputePso<B>>) {
+        self.state.compute = Some(pso.clone());
+    }
+
+    pub fn set_graphics_pipeline(&mut self, pso: &Rc<B::RenderPipeline>, topology: Topology) {
+        self.state.graphics = Some((pso.clone(), topology));
+        self.state.graphics_binding = None;
+    }
+
+    /// The argument layout of the graphics pipeline set last (a translated title shader's).
+    pub fn set_graphics_binding(&mut self, binding: Option<Rc<Binding>>) {
+        self.state.graphics_binding = binding;
+    }
+
+    /// `SetComputeRoot32BitConstants` (the whole parameter).
+    pub fn set_compute_root_constants(&mut self, slot: usize, words: &[u32]) {
+        set(
+            &mut self.state.compute_root,
+            slot,
+            Root::Constants(words.to_vec()),
+        );
+    }
+
+    /// `SetComputeRoot32BitConstant(s)` / `SetGraphicsRoot32BitConstant(s)` at `offset` words into
+    /// the parameter: the words before it keep what was set (zero if nothing was).
+    pub fn set_root_constants_at(&mut self, compute: bool, slot: usize, offset: usize, words: &[u32]) {
+        let root = if compute {
+            &mut self.state.compute_root
+        } else {
+            &mut self.state.graphics_root
+        };
+        let mut all = match root.get(slot) {
+            Some(Some(Root::Constants(c))) => c.clone(),
+            _ => Vec::new(),
+        };
+        if all.len() < offset + words.len() {
+            all.resize(offset + words.len(), 0);
+        }
+        all[offset..offset + words.len()].copy_from_slice(words);
+        set(root, slot, Root::Constants(all));
+    }
+
+    /// `SetComputeRootShaderResourceView` / `UnorderedAccessView` / `ConstantBufferView`.
+    pub fn set_compute_root_view(&mut self, slot: usize, address: u64) {
+        set(&mut self.state.compute_root, slot, Root::View(address));
+    }
+
+    /// `SetComputeRootDescriptorTable`.
+    pub fn set_compute_root_table(&mut self, slot: usize, heap: &Rc<NativeHeap<B>>, index: usize) {
+        set(
+            &mut self.state.compute_root,
+            slot,
+            Root::Table(heap.clone(), index),
+        );
+    }
+
+    pub fn set_graphics_root_constants(&mut self, slot: usize, words: &[u32]) {
+        set(
+            &mut self.state.graphics_root,
+            slot,
+            Root::Constants(words.to_vec()),
+        );
+    }
+
+    pub fn set_graphics_root_view(&mut self, slot: usize, address: u64) {
+        set(&mut self.state.graphics_root, slot, Root::View(address));
+    }
+
+    pub fn set_graphics_root_table(&mut self, slot: usize, heap: &Rc<NativeHeap<B>>, index: usize) {
+        set(
+            &mut self.state.graphics_root,
+            slot,
+            Root::Table(heap.clone(), index),
+        );
+    }
+
+    /// `Dispatch`. Needs the compute pipeline set.
+    pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
+        let pso = self
+            .state
+            .compute
+            .clone()
+            .ok_or("dispatch without a compute pipeline")?;
+        self.cmds.push(Cmd::Dispatch {
+            pso,
+            root: self.state.compute_root.clone(),
+            heaps: self.state.heaps.clone(),
+            groups: [x as usize, y as usize, z as usize],
+        });
+        Ok(())
+    }
+
+    /// `CopyBufferRegion` between title addresses. Runs on the GPU, in order with the rest.
+    pub fn copy_buffer_region(&mut self, dst: u64, src: u64, len: usize) {
+        self.cmds.push(Cmd::Copy { dst, src, len });
+    }
+
+    /// A byte fill of title memory (the console's `FillMemoryX`).
+    pub fn fill(&mut self, dst: u64, len: usize, value: u8) {
+        self.cmds.push(Cmd::Fill { dst, len, value });
+    }
+
+    /// `OMSetRenderTargets`.
+    pub fn set_render_targets(&mut self, color: &[Rc<B::Texture>], depth: Option<&Rc<B::Texture>>) {
+        self.state.targets = Targets {
+            color: color.to_vec(),
+            depth: depth.cloned(),
+        };
+    }
+
+    /// `ClearRenderTargetView`. shortcut: each clear is a render pass of its own (load action
+    /// clear); folding it into the following draws' pass saves one pass per clear.
+    pub fn clear_render_target(&mut self, target: &Rc<B::Texture>, color: [f32; 4]) {
+        self.cmds.push(Cmd::Clear {
+            color: Some((target.clone(), color)),
+            depth: None,
+        });
+    }
+
+    pub fn clear_depth(&mut self, target: &Rc<B::Texture>, depth: f32) {
+        self.cmds.push(Cmd::Clear {
+            color: None,
+            depth: Some((target.clone(), depth)),
+        });
+    }
+
+    /// `RSSetViewports` (the first viewport; the host draws into one).
+    pub fn set_viewport(&mut self, viewport: Option<Viewport>) {
+        self.state.draw.viewport = viewport;
+    }
+
+    /// `RSSetScissorRects` (the first rectangle): left, top, right, bottom.
+    pub fn set_scissor(&mut self, rect: Option<[i32; 4]>) {
+        self.state.draw.scissor = rect;
+    }
+
+    /// `OMSetStencilRef`.
+    pub fn set_stencil_ref(&mut self, reference: u32) {
+        self.state.draw.stencil_ref = reference;
+    }
+
+    /// `OMSetBlendFactor`.
+    pub fn set_blend_factor(&mut self, factor: [f32; 4]) {
+        self.state.draw.blend_factor = factor;
+    }
+
+    /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
+    pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
+        if self.state.vertex.len() <= slot {
+            self.state.vertex.resize(slot + 1, 0);
+        }
+        self.state.vertex[slot] = address;
+    }
+
+    pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
+        self.state.index = Some((address, wide));
+    }
+
+    pub fn clear_index_buffer(&mut self) {
+        self.state.index = None;
+    }
+
+    fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
+        let (pso, topology) = self
+            .state
+            .graphics
+            .clone()
+            .ok_or("draw without a graphics pipeline")?;
+        self.cmds.push(Cmd::Draw {
+            pso,
+            binding: self.state.graphics_binding.clone(),
+            topology,
+            root: self.state.graphics_root.clone(),
+            heaps: self.state.heaps.clone(),
+            targets: self.state.targets.clone(),
+            vertex: self.state.vertex.clone(),
+            index: self.state.index,
+            state: self.state.draw,
+            call,
+        });
+        Ok(())
+    }
+
+    pub fn draw_instanced(
+        &mut self,
+        vertices: u32,
+        instances: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) -> Result<(), String> {
+        self.draw_call(DrawCall::Arrays {
+            vertex_count: vertices,
+            instance_count: instances,
+            first_vertex,
+            first_instance,
+        })
+    }
+
+    pub fn draw_indexed_instanced(
+        &mut self,
+        indices: u32,
+        instances: u32,
+        first_index: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    ) -> Result<(), String> {
+        let wide = self
+            .state
+            .index
+            .ok_or("indexed draw without an index buffer")?
+            .1;
+        self.draw_call(DrawCall::Indexed {
+            index_count: indices,
+            instance_count: instances,
+            first_index,
+            base_vertex,
+            first_instance,
+            wide,
+        })
+    }
+}

@@ -55,6 +55,7 @@
 *.ktx2
 *.dxbc
 *.dxil
+!crates/victory-metal/tests/**/*.dxil
 *.cso
 *.spv
 *.wav

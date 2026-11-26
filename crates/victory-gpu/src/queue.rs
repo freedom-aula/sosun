@@ -2,7 +2,9 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(not(target_os = "macos"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -53,8 +55,12 @@ pub(crate) extern "system" fn create(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "command queue");
+    new_queue(crate::device::newer(), desc, iid, out)
+}
+
+fn new_queue(newer: bool, desc: QueueDesc, iid: *const Iid, out: *mut This) -> HRESULT {
     let queue = Box::new(Queue {
-        object: if crate::device::newer() {
+        object: if newer {
             Object::new(&NEWER_FUNCTIONS)
         } else {
             Object::new(&FUNCTIONS)
@@ -63,6 +69,20 @@ pub(crate) extern "system" fn create(
         desc,
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
+}
+
+/// A compute queue with the older titles' layout, or the newer ones'.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_queue(newer: bool) -> This {
+    let desc = QueueDesc {
+        kind: 2,
+        priority: 0,
+        flags: 0,
+        nodes: 1,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(new_queue(newer, desc, &QUEUE_IIDS[0], &mut out), S_OK);
+    out
 }
 
 /// The console's queue description: an engine or pipe and a queue on it
@@ -107,6 +127,10 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(target_os = "macos")]
+    if !this.is_null() && object::refs(this) == 1 {
+        crate::native::glue::queue_released(this);
+    }
     object::release_boxed::<Queue>(this)
 }
 
@@ -131,9 +155,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         pump(&mut held, Why::Submission);
         return;
     }
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the title passes `count` lists.
+        let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        crate::native::glue::submit(this, lists);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            tracing::warn!(count, "command lists submitted; no host GPU runs them");
+        }
     }
 }
 
@@ -387,7 +420,10 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    // The GPU signals it after the queue's work; the title's copy of the value follows.
+    crate::native::glue::queue_signal(this, fence, value);
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = this;
         crate::fence::set(fence, value);
@@ -408,7 +444,9 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         held.push(this as usize, Item::FenceWait(fence as usize, value));
         pump(&mut held, Why::Wait);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    crate::native::glue::queue_wait(this, fence, value);
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, value);
     S_OK
 }
@@ -437,15 +475,7 @@ pub(crate) enum Written {
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
-        let value = match self {
-            Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
-            Written::SystemTimestamp => system_timestamp(),
-        };
+        let value = self.value();
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -453,6 +483,19 @@ impl Written {
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
+        }
+    }
+
+    /// The value as of now.
+    pub(crate) fn value(self) -> u64 {
+        match self {
+            Written::Value(v) => v,
+            Written::GpuTimestamp => {
+                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+            }
+            Written::SystemTimestamp => system_timestamp(),
         }
     }
 }
@@ -476,16 +519,42 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Bytes of this process's memory, false if they cannot be read.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn read_bytes(at: usize, out: &mut [u8]) -> bool {
+    #[cfg(windows)]
+    return crate::host::read_into(at as *const u8, out);
+    #[cfg(not(windows))]
+    return crate::native::safe_read(at as *const u8, out);
+}
+
+/// The plane to show on the native host: `VICTORY_PRESENT_PLANE` or the one whose first resource
+/// has the most pixels.
+#[cfg(target_os = "macos")]
+fn shown_plane(found: &[Vec<This>]) -> usize {
+    let want = std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok());
+    let areas: Vec<u64> = found
+        .iter()
+        .map(|plane| {
+            plane
+                .first()
+                .and_then(|&r| crate::resource::texture_info(r))
+                .map_or(0, |t| u64::from(t.width) * u64::from(t.height))
+        })
+        .collect();
+    pick_plane(want, &areas)
+}
+
 /// Every plane's resources. Only the start of a plane description is
 /// known (token, count, resources), so the planes after the first are
 /// found by their stride: the first offset past the first plane where the
 /// same frame token is followed by a count of 1 to 16 and a list whose
 /// first entry is one of our resources. All reads there are checked.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn plane_resources(planes: u32, plane: *const Plane) -> Vec<Vec<This>> {
     let read_u64 = |at: usize| {
         let mut b = [0u8; 8];
-        crate::host::read_into(at as *const u8, &mut b).then(|| u64::from_le_bytes(b))
+        read_bytes(at, &mut b).then(|| u64::from_le_bytes(b))
     };
     let list = |at: usize| -> Option<Vec<This>> {
         let count = read_u64(at + 8)? as u32;
@@ -587,7 +656,7 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 
 /// The plane to show given an override and each plane's first resource
 /// area (0 when unknown): the override when in range, else the largest.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
         && w < areas.len()
@@ -609,11 +678,13 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(not(target_os = "macos"))]
+    let _ = this;
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
@@ -693,7 +764,16 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
-    #[cfg(not(windows))]
+    // On the native host: the first resource of the shown plane goes to the app's layer.
+    #[cfg(target_os = "macos")]
+    {
+        let found = plane_resources(planes, plane_parameters);
+        let shown = shown_plane(&found);
+        if let Some(&resource) = found.get(shown).and_then(|p| p.first()) {
+            crate::native::glue::present(this, resource);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (planes, plane_parameters);
     S_OK
 }
@@ -961,10 +1041,13 @@ mod tests {
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
-        assert_eq!(
-            slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
-            7
-        );
+        // On the native host the GPU signals it, a moment after the queue's (here no) work.
+        let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+        let start = std::time::Instant::now();
+        while completed(fence) != 7 && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(completed(fence), 7);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 

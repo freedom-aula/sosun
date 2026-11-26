@@ -201,6 +201,7 @@ fn build(
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        wave32_host: false,
         view_marks: false,
     })
     .expect("lower");

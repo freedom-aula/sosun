@@ -58,7 +58,6 @@ pub mod queue;
 mod ranges;
 pub mod resource;
 pub mod root;
-#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -66,6 +65,7 @@ pub mod shader_cache;
 mod shadow;
 pub mod signature;
 mod switch;
+pub mod native;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]

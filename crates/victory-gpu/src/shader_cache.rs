@@ -168,6 +168,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         atomic_locks: atomic_locks(),
         bias_as_gradients: bias_as_gradients(),
         narrow_waves: narrow_waves(),
+        // The host's waves are the console's size.
+        wave32_host: false,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());

@@ -1,0 +1,392 @@
+//! What the title-facing objects (`queue.rs`, `fence.rs`, `list.rs`) need from the native host,
+//! generic over the backend: queues and fences by the title's object address, title lists cut at
+//! memory-value waits, and `hold.rs`'s per-queue FIFO of held work in front of
+//! [`NativeHost::execute`]. The macOS glue (`glue.rs`) instantiates it once with Metal.
+//!
+//! Ordering. Work on one title queue is one backend queue, so submissions run in the order they
+//! were made. A list segment that waits for a memory value another queue's list writes stays on
+//! the CPU side until the value is there (`hold.rs`; the GPU's own writes into title memory are
+//! visible to the CPU as they land, there is no copy); everything else goes to the GPU at once and
+//! is never waited for. Fence signals and waits that need no CPU decision are encoded on the GPU
+//! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order.
+
+use super::host::NativeHost;
+use super::list::{Binding, ComputePso, NativeList};
+use super::memory::PoolTable;
+use crate::hold::{Held, Item, ValueWait, World};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use victory_backend::resources::{GraphicsBackend, PresentBackend};
+
+/// A wait for a memory value (`Wait32BitValueX`, `Wait64BitValueX`): the value at `address`
+/// (`bytes` 4 or 8, masked) compared with `reference` by a D3D12 comparison function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wait {
+    pub address: u64,
+    pub bytes: u8,
+    pub comparison: u32,
+    pub reference: u64,
+    pub mask: u64,
+}
+
+impl From<Wait> for ValueWait {
+    fn from(w: Wait) -> ValueWait {
+        ValueWait {
+            address: w.address,
+            bytes: w.bytes,
+            comparison: w.comparison,
+            reference: w.reference,
+            mask: w.mask,
+        }
+    }
+}
+
+/// A title list: the recording [`NativeList`] plus the segments cut off it at waits recorded after
+/// commands, each with the waits at its start.
+pub struct TitleList<B: GraphicsBackend> {
+    done: Vec<(NativeList<B>, Vec<Wait>)>,
+    /// The list the calls record into, and the waits at its start.
+    pub list: NativeList<B>,
+    waits: Vec<Wait>,
+    /// Waits recorded: the ones that cut a segment.
+    pub cuts: u32,
+    /// The title pipeline object `SetPipelineState` named last (0: none), and the primitive
+    /// topology set (the console's `D3D_PRIMITIVE_TOPOLOGY`).
+    pub pipeline: usize,
+    pub topology: u32,
+}
+
+impl<B: GraphicsBackend> Default for TitleList<B> {
+    fn default() -> Self {
+        TitleList {
+            done: Vec::new(),
+            list: NativeList::default(),
+            waits: Vec::new(),
+            cuts: 0,
+            pipeline: 0,
+            topology: 0,
+        }
+    }
+}
+
+impl<B: GraphicsBackend> TitleList<B> {
+    /// `Reset`.
+    pub fn reset(&mut self) {
+        *self = TitleList::default();
+    }
+
+    /// A wait recorded at the current position: at the start of the segment if it has no commands
+    /// yet, else the segment ends here and the wait starts the next one (state carries over).
+    pub fn wait(&mut self, w: Wait) {
+        if !self.list.is_empty() {
+            let segment = self.list.cut();
+            self.done
+                .push((segment, std::mem::replace(&mut self.waits, vec![w])));
+            self.cuts += 1;
+        } else {
+            self.waits.push(w);
+        }
+    }
+
+    /// The segments a submission runs, in order (copies: the title may reset and re-record).
+    pub fn segments(&self) -> Vec<(NativeList<B>, Vec<Wait>)> {
+        self.done
+            .iter()
+            .map(|(l, w)| (l.snapshot(), w.clone()))
+            .chain([(self.list.snapshot(), self.waits.clone())])
+            .collect()
+    }
+}
+
+/// Counters for the frame line and the tests.
+#[derive(Default, Debug, Clone)]
+pub struct Stats {
+    /// Segments queued by `ExecuteCommandLists`.
+    pub segments: u64,
+    /// Groups of segments handed to the GPU (a piece is what `hold` runs together).
+    pub pieces: u64,
+    /// Pieces the host refused (an address outside the mapped pools, ...): logged, their fences
+    /// are signalled all the same.
+    pub refused: u64,
+    /// Segments that waited for a memory value before they ran.
+    pub waited: u64,
+    /// Title textures detiled (again) because their memory changed.
+    pub detiles: u64,
+    /// Textures whose layout the host cannot detile (counted once per content).
+    pub undetilable: u64,
+}
+
+/// What a title pipeline object became on the host.
+pub enum Pipe<B: GraphicsBackend> {
+    Compute(Rc<ComputePso<B>>),
+    /// With the argument layout of its translated shaders (none: the title's root as it is).
+    Render(Rc<B::RenderPipeline>, Option<Rc<Binding>>),
+    /// The host refused it (the reason is logged and counted once); work using it is dropped.
+    Refused,
+}
+
+impl<B: GraphicsBackend> Clone for Pipe<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Pipe::Compute(p) => Pipe::Compute(p.clone()),
+            Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
+            Pipe::Refused => Pipe::Refused,
+        }
+    }
+}
+
+pub struct Title<B: PresentBackend> {
+    pub host: NativeHost<B>,
+    /// Host pipelines by title pipeline object, made at first use.
+    pub pipelines: HashMap<usize, Pipe<B>>,
+    /// What the shader path did, and refused.
+    pub shaders: super::shaders::ShaderStats,
+    pub(super) libraries: super::shaders::Libraries<B>,
+    pub(super) textures: super::textures::Textures<B>,
+    /// Where `Present` shows frames, if the app gave a layer.
+    pub(super) surface: Option<B::Surface>,
+    /// Title textures no view has named yet.
+    pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
+    queues: HashMap<usize, Rc<B::Queue>>,
+    fences: HashMap<usize, Rc<B::Fence>>,
+    held: Held<Rc<NativeList<B>>>,
+    /// Signals held behind work: the queue, fence and value, by the number the held item carries.
+    signals: HashMap<usize, (usize, usize, u64)>,
+    next_signal: usize,
+    pub stats: Stats,
+}
+
+impl<B: PresentBackend> Title<B> {
+    pub fn new(backend: B, memory: Arc<PoolTable>) -> Self {
+        Title {
+            host: NativeHost::with_memory(backend, memory),
+            pipelines: HashMap::new(),
+            shaders: Default::default(),
+            libraries: Default::default(),
+            textures: Default::default(),
+            surface: None,
+            pending: HashMap::new(),
+            queues: HashMap::new(),
+            fences: HashMap::new(),
+            held: Held::new(),
+            signals: HashMap::new(),
+            next_signal: 0,
+            stats: Stats::default(),
+        }
+    }
+
+    fn queue(&mut self, key: usize) -> Result<Rc<B::Queue>, String> {
+        if let Some(q) = self.queues.get(&key) {
+            return Ok(q.clone());
+        }
+        let q = Rc::new(self.host.backend.create_queue()?);
+        self.queues.insert(key, q.clone());
+        Ok(q)
+    }
+
+    /// The backend fence of title fence `key`, made with `initial` the first time.
+    pub fn fence(&mut self, key: usize, initial: u64) -> Result<Rc<B::Fence>, String> {
+        if let Some(f) = self.fences.get(&key) {
+            return Ok(f.clone());
+        }
+        let f = Rc::new(self.host.backend.create_fence(initial)?);
+        self.fences.insert(key, f.clone());
+        Ok(f)
+    }
+
+    /// The title released fence `key`.
+    pub fn forget_fence(&mut self, key: usize) {
+        self.fences.remove(&key);
+    }
+
+    /// The title released queue `key`; held work stays held (the title does not do it).
+    pub fn forget_queue(&mut self, key: usize) {
+        self.queues.remove(&key);
+    }
+
+    /// Every title fence with a backend fence and the value it has completed: what the title's own
+    /// copy of the value (read from memory) is raised to.
+    pub fn completed(&self) -> Vec<(usize, u64)> {
+        self.fences
+            .iter()
+            .map(|(k, f)| (*k, self.host.backend.completed(f)))
+            .collect()
+    }
+
+    /// Fence `key`'s completed value (made with `initial` if it has no backend fence yet).
+    pub fn fence_value(&mut self, key: usize, initial: u64) -> u64 {
+        match self.fence(key, initial) {
+            Ok(f) => self.host.backend.completed(&f).max(initial),
+            Err(_) => initial,
+        }
+    }
+
+    /// `ID3D12Fence::Signal`: the value is reached now; queues waiting for it go on.
+    pub fn signal_cpu(&mut self, key: usize, initial: u64, value: u64) {
+        if let Ok(f) = self.fence(key, initial) {
+            self.host.backend.signal(&f, value);
+        }
+        self.pump();
+    }
+
+    /// Whether fence `key` reached `value`; pumps held work first, so that a wait for a fence
+    /// signalled behind a memory-value wait can make progress when the caller polls.
+    pub fn try_wait(&mut self, key: usize, initial: u64, value: u64) -> bool {
+        self.pump();
+        self.fence_value(key, initial) >= value
+    }
+
+    /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
+    /// and whatever may run goes to the GPU.
+    pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
+        self.sync_textures();
+        for (list, waits) in segments {
+            self.stats.segments += 1;
+            let waits: Vec<ValueWait> = waits.into_iter().map(Into::into).collect();
+            self.held.push(queue, Item::Segment(Rc::new(list), waits));
+        }
+        self.pump();
+    }
+
+    /// `ID3D12CommandQueue::Signal`: behind work the queue still holds, else on the GPU at once
+    /// (after the work already submitted to its queue).
+    pub fn signal_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
+        if self.held.holds_work(queue) {
+            let n = self.next_signal;
+            self.next_signal += 1;
+            self.signals.insert(n, (queue, fence, value));
+            // Make the backend fence now: `initial` is its value until the signal runs.
+            let _ = self.fence(fence, initial);
+            self.held.push(queue, Item::Signal(n, 0));
+        } else {
+            self.signal_gpu(queue, fence, initial, value);
+        }
+        self.pump();
+    }
+
+    fn signal_gpu(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
+        let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else {
+            return;
+        };
+        if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
+            tracing::warn!(error = %e, "a fence signal was not queued");
+        }
+    }
+
+    /// `ID3D12CommandQueue::Wait`: later work on the queue starts once the fence has the value.
+    pub fn wait_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
+        if self.held.holds_work(queue) {
+            let _ = self.fence(fence, initial);
+            self.held.push(queue, Item::FenceWait(fence, value));
+        } else if let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial))
+            && let Err(e) = self.host.execute(&q, &[], &[(&*f, value)], &[])
+        {
+            tracing::warn!(error = %e, "a fence wait was not queued");
+        }
+        self.pump();
+    }
+
+    /// Runs the heads of held queues that may run, until none can.
+    pub fn pump(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let Title {
+            host,
+            queues,
+            fences,
+            held,
+            signals,
+            stats,
+            ..
+        } = self;
+        let memory = host.memory();
+        let read = |address: u64, bytes: u8| read_title(&memory, address, bytes);
+        let fence = |f: usize| {
+            fences
+                .get(&f)
+                .map_or(u64::MAX, |fence| host.backend.completed(fence))
+        };
+        let mut run = |queue: usize, lists: Vec<Rc<NativeList<B>>>| {
+            stats.pieces += 1;
+            let Some(q) = queues.get(&queue).cloned() else {
+                return;
+            };
+            let refs: Vec<&NativeList<B>> = lists.iter().map(|l| &**l).collect();
+            if let Err(e) = host.execute(&q, &refs, &[], &[]) {
+                stats.refused += 1;
+                tracing::warn!(error = %e, "a piece of title work was refused");
+            }
+        };
+        let mut signal = |n: usize, _: u64| {
+            let Some((queue, fence, value)) = signals.remove(&n) else {
+                return;
+            };
+            if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence))
+                && let Err(e) = host.execute(q, &[], &[], &[(&**f, value)])
+            {
+                tracing::warn!(error = %e, "a held fence signal was not queued");
+            }
+        };
+        let done = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        stats.waited += done.waited.len() as u64;
+    }
+
+    /// Gives the host the app's drawable layer (`CAMetalLayer` on Metal, by address): frames the
+    /// title presents are shown there from now on.
+    pub fn set_surface(&mut self, layer: *mut std::ffi::c_void) -> Result<(), String> {
+        self.surface = Some(self.host.backend.create_surface(layer)?);
+        Ok(())
+    }
+
+    /// `PresentX`: title texture `key` shown over the surface, after the work queue `queue` has
+    /// been given. shortcut: not behind work the queue still holds back (the frame is shown as
+    /// far as it ran); `Ok(false)` when there is no surface or the title has no such texture.
+    pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
+        self.pump();
+        if self.surface.is_none() {
+            return Ok(false);
+        }
+        let Some(tex) = self.texture_of(key) else {
+            return Ok(false);
+        };
+        let q = self.queue(queue)?;
+        if let Some(surface) = &self.surface {
+            self.host.backend.present(&q, surface, &tex)?;
+        }
+        Ok(true)
+    }
+
+    /// The surface presented to (to read the frame counter, say).
+    pub fn surface(&self) -> Option<&B::Surface> {
+        self.surface.as_ref()
+    }
+
+    /// Whether any queue holds work (a timer should test it again soon).
+    pub fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Makes sure title queue `key` has a backend queue before work is held for it.
+    pub fn ensure_queue(&mut self, key: usize) -> Result<(), String> {
+        self.queue(key).map(|_| ())
+    }
+}
+
+/// The value a wait tests: from the pool when the address lies in one, else read from the
+/// process's own memory (which may fault-free fail: the read is checked by the kernel).
+fn read_title(memory: &PoolTable, address: u64, bytes: u8) -> Option<u64> {
+    let n = usize::from(bytes.min(8));
+    let at = match memory.resolve(address, n as u64) {
+        Some((_, p)) => p,
+        None => address as *const u8,
+    };
+    let mut v = [0u8; 8];
+    crate::native::safe_read(at, &mut v[..n]).then(|| u64::from_le_bytes(v))
+}

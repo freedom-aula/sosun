@@ -126,8 +126,18 @@ struct List {
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// The native host's recording of this list (macOS); taken after the host's lock.
+    #[cfg(target_os = "macos")]
+    native: std::sync::Mutex<crate::native::glue::MetalList>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
+
+/// A title list's recording on the native host.
+#[cfg(target_os = "macos")]
+pub(crate) fn native<'a>(this: This) -> &'a std::sync::Mutex<crate::native::glue::MetalList> {
+    // SAFETY: the title passes one of our lists.
+    unsafe { &(*this.cast::<List>()).native }
+}
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
@@ -216,7 +226,18 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
         }
         current.defer_wait(wait);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    crate::native::glue::wait_value(
+        this,
+        crate::native::title::Wait {
+            address: wait.address,
+            bytes: wait.bytes,
+            comparison: wait.comparison,
+            reference: wait.reference,
+            mask: wait.mask,
+        },
+    );
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, wait);
 }
 
@@ -363,12 +384,39 @@ fn new_list(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    new_list_as(crate::device::newer(), kind, allocator, pipeline, iid, out)
+}
+
+/// A list with the older titles' layout, or the newer ones'.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_list(newer: bool, pipeline: This) -> This {
+    let mut allocator = std::ptr::null();
+    assert_eq!(
+        create_allocator(std::ptr::null(), 2, &ALLOCATOR_IIDS[0], &mut allocator),
+        S_OK
+    );
+    let mut list = std::ptr::null();
+    assert_eq!(
+        new_list_as(newer, 2, allocator, pipeline, &LIST_IIDS[0], &mut list),
+        S_OK
+    );
+    list
+}
+
+fn new_list_as(
+    newer: bool,
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
     let list = Box::new(List {
-        object: if crate::device::newer() {
+        object: if newer {
             Object::new(&NEWER_LIST_FUNCTIONS)
         } else {
             Object::new(&LIST_FUNCTIONS)
@@ -381,6 +429,8 @@ fn new_list(
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        #[cfg(target_os = "macos")]
+        native: Default::default(),
         #[cfg(windows)]
         hosts: std::sync::Mutex::new(
             crate::host::host()
@@ -406,6 +456,12 @@ fn new_list(
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
         crate::pipeline::bound(pipeline);
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: handed out just now.
+            let made = unsafe { *out };
+            crate::native::glue::set_pipeline(made, pipeline);
+        }
     }
     hr
 }
@@ -441,7 +497,11 @@ extern "system" fn list_release(this: This) -> u32 {
             leave(held, uploads, state);
         }
     }
-    object::release_boxed::<List>(this)
+    // Its recording holds `Rc`s of the native host: dropped under the host's lock.
+    #[cfg(target_os = "macos")]
+    return crate::native::glue::locked(|| object::release_boxed::<List>(this));
+    #[cfg(not(target_os = "macos"))]
+    return object::release_boxed::<List>(this);
 }
 extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
@@ -475,7 +535,12 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     #[cfg(not(windows))]
     drop(uploads);
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::native::glue::reset_list(this);
+        crate::native::glue::set_pipeline(this, pipeline);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = this;
     S_OK
 }
@@ -638,7 +703,9 @@ extern "system" fn copy_buffer_region(
     {
         list.defer_copy(to, from, len as usize);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    crate::native::glue::copy_buffer(this, (dst, dst_offset), (src, src_offset), len);
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
@@ -669,7 +736,14 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    if let (Some((to, a)), Some((from, b))) = (
+        crate::resource::buffer_bytes(dst),
+        crate::resource::buffer_bytes(src),
+    ) {
+        crate::native::glue::copy_memory(this, to as u64, from as u64, a.min(b));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, dst, src);
 }
 
@@ -1048,7 +1122,15 @@ extern "system" fn clear_rtv(
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (count, rects);
+        // SAFETY: the title passes four floats (null is tolerated).
+        if let Some(&color) = unsafe { color.as_ref() } {
+            crate::native::glue::clear_rtv(this, handle, color);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, color, count, rects);
 }
 
@@ -1094,7 +1176,12 @@ extern "system" fn clear_dsv(
             )
         };
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (stencil, count, rects);
+        crate::native::glue::clear_dsv(this, handle, flags, depth);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
@@ -1123,7 +1210,11 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             });
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    if dst != 0 && src != 0 {
+        crate::native::glue::copy_memory(this, dst, src, len);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, dst, src, len);
 }
 
@@ -1137,7 +1228,12 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        count_dispatch();
+        crate::native::glue::dispatch(this, x, y, z);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (this, x, y, z);
         count_dispatch();
@@ -1210,7 +1306,9 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    crate::native::glue::set_pipeline(this, pipeline);
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = this;
 }
 
@@ -1568,8 +1666,143 @@ mod state {
     }
 }
 
+/// On the native host: the calls it runs are recorded, the rest is ignored.
+#[cfg(target_os = "macos")]
+mod state {
+    use super::This;
+    use crate::native::glue;
+
+    /// `count` items at `items`, or none.
+    fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
+        if items.is_null() || count == 0 {
+            return &[];
+        }
+        // SAFETY: the title passes `count` items.
+        unsafe { std::slice::from_raw_parts(items, count as usize) }
+    }
+
+    pub(super) use super::draw as dispatch_mesh;
+    pub(super) use super::draw as dispatch_mesh_x;
+    pub(super) use super::ignored_state as clear_unordered_float;
+    pub(super) use super::ignored_state as clear_unordered_uint;
+
+    /// `(count, handles, one range, depth)`: with one range, the handles follow the first at the
+    /// render target view size (128 bytes).
+    pub(super) extern "system" fn targets(
+        this: This,
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+        depth: *const u64,
+    ) {
+        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+            // SAFETY: the title passes the first handle.
+            let first = unsafe { *handles };
+            (0..u64::from(count)).map(|i| first + 128 * i).collect()
+        } else {
+            items(handles, count).to_vec()
+        };
+        // SAFETY: the title passes a handle or null.
+        let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
+        glue::targets(this, &handles, depth);
+    }
+
+    pub(super) extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+        super::count_draw();
+        glue::draw(this, vertices, instances, first, first_instance);
+    }
+    pub(super) extern "system" fn draw_indexed(
+        this: This,
+        indices: u32,
+        instances: u32,
+        first: u32,
+        base: i32,
+        first_instance: u32,
+    ) {
+        super::count_draw();
+        glue::draw_indexed(this, indices, instances, first, base, first_instance);
+    }
+    pub(super) extern "system" fn topology(this: This, topology: u32) {
+        glue::topology(this, topology);
+    }
+    /// `D3D12_VIEWPORT`: top left, size, depth range.
+    pub(super) extern "system" fn viewports(this: This, count: u32, viewports: *const [f32; 6]) {
+        glue::viewports(this, items(viewports, count).first().copied());
+    }
+    /// `D3D12_RECT`: left, top, right, bottom.
+    pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const [i32; 4]) {
+        glue::scissors(this, items(rects, count).first().copied());
+    }
+    pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+        // SAFETY: the title passes four floats or null.
+        glue::blend_factor(this, unsafe { factor.as_ref() }.copied());
+    }
+    pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+        glue::stencil_ref(this, reference);
+    }
+    /// `D3D12_INDEX_BUFFER_VIEW`: address, size, format (DXGI `R32_UINT` is 42).
+    pub(super) extern "system" fn index_buffer(this: This, view: *const (u64, u32, u32)) {
+        // SAFETY: the title passes a view or null.
+        glue::index_buffer(this, unsafe { view.as_ref() }.map(|v| (v.0, v.2 == 42)));
+    }
+    /// `D3D12_VERTEX_BUFFER_VIEW`: address, size, stride.
+    pub(super) extern "system" fn vertex_buffers(
+        this: This,
+        start: u32,
+        count: u32,
+        views: *const (u64, u32, u32),
+    ) {
+        let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
+        glue::vertex_buffers(this, start, &addresses);
+    }
+
+    pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        glue::dispatch(this, x, y, z);
+    }
+    pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+        glue::set_heaps(this, items(heaps, count));
+    }
+    pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        glue::root_table(this, true, slot, handle);
+    }
+    pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        glue::root_table(this, false, slot, handle);
+    }
+    pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        glue::root_constants(this, true, slot, offset, &[value]);
+    }
+    pub(super) extern "system" fn graphics_constant(this: This, slot: u32, value: u32, offset: u32) {
+        glue::root_constants(this, false, slot, offset, &[value]);
+    }
+    pub(super) extern "system" fn compute_constants(
+        this: This,
+        slot: u32,
+        count: u32,
+        values: *const u32,
+        offset: u32,
+    ) {
+        glue::root_constants(this, true, slot, offset, items(values, count));
+    }
+    pub(super) extern "system" fn graphics_constants(
+        this: This,
+        slot: u32,
+        count: u32,
+        values: *const u32,
+        offset: u32,
+    ) {
+        glue::root_constants(this, false, slot, offset, items(values, count));
+    }
+    pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        glue::root_view(this, true, slot, address);
+    }
+    pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        glue::root_view(this, false, slot, address);
+    }
+}
+
 /// Without a host GPU every draw state call is ignored.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
@@ -1683,7 +1916,7 @@ static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 extern "system" fn dispatch(_: This) {
     count_dispatch();
 }
@@ -1750,6 +1983,11 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
+        return;
+    }
+    // On the native host the write runs on the GPU in order with the list's other work.
+    #[cfg(target_os = "macos")]
+    if crate::native::glue::write_value(this, address, what.value(), bytes) {
         return;
     }
     let _ = this;

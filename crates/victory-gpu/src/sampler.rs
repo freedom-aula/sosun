@@ -3,29 +3,33 @@
 //! fields. (Immediate samplers in shader code come decoded with the
 //! translation.)
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::*;
 
-/// The fields both forms share.
+/// The fields both forms share. Platform neutral: the host D3D12 description ([`Fields::host`]) and
+/// the native backend's (`crate::native`) are both made from it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Fields {
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct Fields {
     /// Point 0, bilinear 1, anisotropic point 2, anisotropic bilinear 3.
-    mag: u32,
-    min: u32,
+    pub(crate) mag: u32,
+    pub(crate) min: u32,
     /// None 0, point 1, linear 2.
-    mip: u32,
+    pub(crate) mip: u32,
     /// Plain 0, minimum 1, maximum 2.
-    mode: u32,
+    pub(crate) mode: u32,
     /// Host address modes.
-    address: [u32; 3],
-    anisotropy: u32,
+    pub(crate) address: [u32; 3],
+    pub(crate) anisotropy: u32,
     /// Host comparison function.
-    compare: u32,
-    min_lod: f32,
-    max_lod: f32,
-    bias: f32,
-    border: [f32; 4],
+    pub(crate) compare: u32,
+    pub(crate) min_lod: f32,
+    pub(crate) max_lod: f32,
+    pub(crate) bias: f32,
+    pub(crate) border: [f32; 4],
 }
 
+#[cfg(windows)]
 impl Fields {
     fn host(&self) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
@@ -82,6 +86,7 @@ impl Fields {
     }
 }
 
+#[cfg(windows)]
 /// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
 fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     match mode {
@@ -90,6 +95,7 @@ fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
     }
 }
 
+#[cfg(windows)]
 /// Sanitizes an LOD bound for D3D12, substituting `fallback` for `NaN` and clamping infinities.
 fn finite_lod(value: f32, fallback: f32) -> f32 {
     if value.is_nan() {
@@ -103,7 +109,13 @@ fn finite_lod(value: f32, fallback: f32) -> f32 {
 /// minification, mip and depth filters, filter mode, three address modes,
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
 /// and threshold, comparison, border color, then tuning words.
+#[cfg(windows)]
 pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+    console_fields(words).host()
+}
+
+/// The fields of a console sampler description.
+pub(crate) fn console_fields(words: &[u32; 27]) -> Fields {
     let f = |i: usize| f32::from_bits(words[i]);
     Fields {
         mag: words[1],
@@ -118,10 +130,9 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
         compare: words[16],
         border: [f(17), f(18), f(19), f(20)],
     }
-    .host()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
