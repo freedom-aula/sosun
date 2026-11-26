@@ -92,7 +92,7 @@ fn infer(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<(NativeProgram, Sig
         .iter()
         .any(|i| i.text(false).contains("exec_lo") || i.text(false).contains("vcc_lo"));
     let list = crate::gfx10::decode(code)?;
-    let (mut layout, used) = metadata_resources(meta, RECORDS)?;
+    let (mut layout, used) = metadata_resources(meta, RECORDS, true)?;
     // The sampler heap's address follows the last user data of the title's root signature by one
     // dword (observed: the pixel shaders' root constants of the sampler index at s9, the heap at
     // s11, the primitive mask at s12).
