@@ -11771,7 +11771,9 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
             l.i32_of(v)
         };
-        let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
+        // A descriptor whose stride the program cleared adds no index (`Resources::unstrided`).
+        let unstrided = self.x.res.unstrided.contains(&(b, i));
+        let index = if *idxen && !unstrided { Some(vaddr(self, 0)?) } else { None };
         let voffset = if *offen { Some(vaddr(self, u8::from(*idxen))?) } else { None };
         let so = if !matches!(
             soffset,

@@ -140,6 +140,10 @@ pub struct Resources {
     /// ([`MEMORY`]).
     pub memory_inputs: Vec<u8>,
     pub waterfall: Waterfall,
+    /// Buffer accesses through a loaded descriptor whose stride the program cleared
+    /// (`Tracer::stride_cleared`): the index adds nothing to the address (index × stride, RDNA2
+    /// ISA 8.1.5).
+    pub unstrided: Vec<Site>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -254,7 +258,10 @@ pub(crate) fn track_graphics(
                 // descriptor. Lowering one is a no-op on the host, so there
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    descriptor(rsrc, Role::Resource)?;
+                    if t.stride_cleared(inst, rsrc).is_some() {
+                        out.unstrided.push(site);
+                    }
                 }
                 Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
@@ -1180,6 +1187,9 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
+        if let Some(loaded) = self.stride_cleared(inst, op) {
+            words = loaded;
+        }
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
         self.classify(&words, &mut Vec::new(), &mut known)
@@ -1688,6 +1698,40 @@ impl<'a> Tracer<'a> {
             return None;
         };
         (x == d1).then_some([w0, d1, d2, d3])
+    }
+
+    /// The loaded words of a buffer descriptor whose dword 1 is the load's ANDed with a constant
+    /// that clears stride bits alone (bits 16-29; the base address bits 0-15 and the swizzle
+    /// bits 30-31 kept), for a buffer access that is not typed. With stride 0 the address is
+    /// base + offsets (the index times the stride adds nothing, RDNA2 ISA 8.1.5), which the
+    /// loaded view's raw access gives once the index is dropped (`Resources::unstrided`).
+    // Guess: the bounds stay the host view's size. That is the console's when the title's V#
+    // checks raw bounds in bytes (OOB_SELECT 3, no swizzle: offset + payload > num_records, in
+    // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range.
+    fn stride_cleared(&self, inst: &Inst, op: &Operand) -> Option<Vec<Term>> {
+        let Fields::Buffer { format: None, .. } = inst.fields else {
+            return None;
+        };
+        if inst.name().contains("format") {
+            return None;
+        }
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return None;
+        };
+        let mut words = (0..4)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>()?;
+        let Term::Value(w1) = words[1] else {
+            return None;
+        };
+        const STRIDE: u32 = 0x3FFF_0000;
+        let loaded = match self.sop2(w1, &["s_and_b32"])?.1 {
+            [x, Term::Const(c)] | [Term::Const(c), x] if !c & !STRIDE == 0 && c != u32::MAX => x,
+            _ => return None,
+        };
+        words[1] = loaded;
+        self.loaded(&words)?;
+        Some(words)
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.

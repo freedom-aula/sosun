@@ -941,6 +941,50 @@ fn lds_instructions_addressed_by_m0_translate() {
     );
 }
 
+/// A loaded buffer descriptor whose stride the program clears (`s_and_b32` of dword 1 with
+/// 0xc000ffff, a title's form) is the loaded view read raw, the index adding nothing (RDNA2 ISA
+/// 8.1.5): its dword loads translate, by index or by offset. A mask that also clears base address
+/// bits, and a typed load, stay refused.
+#[test]
+fn a_descriptor_with_its_stride_cleared_reads_the_loaded_view_raw() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |mask: u32, load: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x870D_FF0D,
+            mask, // s_and_b32 s13, s13, mask
+            load,
+            0x8003_0100, // buffer_load_* v1, v0, s[12:15], 0 (idxen or offen)
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // A raw UAV at table dword 0, the buffer read at dword 8.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+    };
+    let (idxen, offen, typed) = (0xE030_2000, 0xE030_1000, 0xE000_2000);
+    program(0xC000_FFFF, idxen).unwrap();
+    program(0xC000_FFFF, offen).unwrap();
+    program(0xC03F_FFFF, idxen).unwrap(); // part of the stride
+    let refused = |r: Result<_, ShaderError>| match r {
+        Err(ShaderError::Unsupported { what, .. }) => what,
+        Ok(_) => panic!("translated"),
+        Err(e) => panic!("{e}"),
+    };
+    let base = refused(program(0xC000_FFFE, idxen));
+    assert!(base.contains("dword 1 masked or merged"), "{base}");
+    let format = refused(program(0xC000_FFFF, typed));
+    assert!(format.contains("dword 1 masked or merged"), "{format}");
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [
