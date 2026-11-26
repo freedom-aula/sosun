@@ -145,6 +145,11 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
         t.submit(queue as usize, segments);
+        // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
+        // interval, so the title's first store into each is seen.
+        if super::descriptor_trace::sites() {
+            victory_platform::watch::watch(&t.host.heap_ranges());
+        }
     });
 }
 

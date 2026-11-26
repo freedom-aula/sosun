@@ -254,6 +254,25 @@ fn cache_hint_len(code: &[u8]) -> Option<usize> {
 /// # Safety
 /// Called by the kernel with a valid `siginfo_t` and `ucontext_t`.
 unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
+    // A write into a page the diagnostic write watch keeps read-only (`VICTORY_TRACE_DESCRIPTORS
+    // =sites`), whoever wrote: the watch reopens the page and the store runs again. Title and host
+    // code alike, so a host write there is not fatal. Off, this is one relaxed load.
+    if (signal == SIGSEGV || signal == SIGBUS) && victory_platform::watch::active() {
+        // SAFETY: the kernel's `siginfo_t` and machine context for this signal.
+        let (err, fault, si_addr, rip) = unsafe {
+            let mc = uc.add(UC_MCONTEXT).cast::<*mut u8>().read();
+            (
+                mc.add(MC_ERR).cast::<u32>().read(),
+                mc.add(MC_FAULT_ADDR).cast::<u64>().read(),
+                info.add(INFO_ADDR).cast::<usize>().read(),
+                mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().read(),
+            )
+        };
+        let at = if fault != 0 { fault as usize } else { si_addr };
+        if err & 2 != 0 && victory_platform::watch::on_write_fault(at, rip as usize) {
+            return;
+        }
+    }
     if !gs_is_teb() {
         // SAFETY: the same arguments.
         return unsafe { chain(signal, info, uc) };
@@ -590,5 +609,111 @@ mod tests {
         ); // rip+disp32
         assert_eq!(cache_hint_len(&[0x0F, 0xAE, 0x31]), None); // no 66: not ours
         assert_eq!(cache_hint_len(&[0x66, 0x0F, 0xAE, 0xF0]), None); // register form
+    }
+}
+
+/// The write watch through the real handler: a host (Rust) store into a watched page lands, the
+/// page is writable after it, and only a store inside a watched range counts as a site.
+#[cfg(all(test, not(windows)))]
+mod watch_tests {
+    use victory_platform::mem::{self, Protect};
+    use victory_platform::watch;
+
+    fn protection(at: usize) -> Protect {
+        mem::query(at).expect("mapped").protect
+    }
+
+    fn stores() -> u64 {
+        watch::sites().0.iter().map(|s| s.1).sum()
+    }
+
+    /// The watch is one per process: its tests take turns.
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_store_into_a_watched_page_lands_and_reopens_it() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        super::install();
+        let page = mem::page_size();
+        // SAFETY: fresh memory of this test's.
+        let p = unsafe { mem::alloc(None, 2 * page, Protect::READ_WRITE) }.unwrap() as usize;
+        // Any instruction counts as the title's here, so this test's own stores are sites.
+        watch::set_image(0, usize::MAX);
+        let range = (p + 16, p + 48);
+        watch::watch(&[range]);
+        assert_eq!(protection(p), Protect::READ);
+        let before = stores();
+        // SAFETY: inside the allocation; the watch reopens the page for the store.
+        unsafe { ((p + 16) as *mut u64).write_volatile(0x1122_3344) };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { ((p + 16) as *const u64).read_volatile() },
+            0x1122_3344
+        );
+        assert_eq!(protection(p), Protect::READ_WRITE, "reopened by the store");
+        assert_eq!(stores(), before + 1, "a store into the range is a site");
+        // The page stays open until the next watch: no second fault, no second count.
+        // SAFETY: as above.
+        unsafe { ((p + 24) as *mut u64).write_volatile(1) };
+        assert_eq!(stores(), before + 1);
+
+        // Closed again: a store to the same page outside the range only reopens it.
+        watch::watch(&[range]);
+        assert_eq!(protection(p), Protect::READ);
+        // SAFETY: as above.
+        unsafe { ((p + 104) as *mut u64).write_volatile(7) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((p + 104) as *const u64).read_volatile() }, 7);
+        assert_eq!(protection(p), Protect::READ_WRITE);
+        assert_eq!(stores(), before + 1, "outside the range: not a site");
+
+        // The end of the watch leaves the pages writable.
+        watch::watch(&[range]);
+        watch::watch(&[]);
+        assert!(!watch::active());
+        assert_eq!(protection(p), Protect::READ_WRITE);
+        // SAFETY: the allocation above.
+        unsafe { mem::release(p as *mut u8, 2 * page) }.unwrap();
+    }
+
+    /// Stores into pages two alternating range sets share, while another thread swaps the sets
+    /// as fast as it can: every fault must be the watch's. One that is not goes down the
+    /// exception chain, which ends this test process (an update used to empty the published
+    /// ranges while their pages were still read-only).
+    #[test]
+    fn stores_during_updates_never_escape_the_watch() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        super::install();
+        let page = mem::page_size();
+        // SAFETY: fresh memory of this test's.
+        let p = unsafe { mem::alloc(None, 2 * page, Protect::READ_WRITE) }.unwrap() as usize;
+        watch::set_image(0, usize::MAX);
+        let sets = [
+            [(p, p + 64), (p + page, p + page + 64)],
+            [(p + 128, p + 192), (p + page + 128, p + page + 192)],
+        ];
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..20_000 {
+                    watch::watch(&sets[i % 2]);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let mut n = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for at in [p + 8, p + 136, p + page + 8, p + page + 136] {
+                    // SAFETY: inside the allocation; a fault reopens the page.
+                    unsafe { (at as *mut u64).write_volatile(n) };
+                }
+                n += 1;
+            }
+        });
+        watch::watch(&[]);
+        assert!(!watch::active());
+        assert_eq!(protection(p), Protect::READ_WRITE);
+        assert_eq!(protection(p + page), Protect::READ_WRITE);
+        // SAFETY: the allocation above.
+        unsafe { mem::release(p as *mut u8, 2 * page) }.unwrap();
     }
 }
