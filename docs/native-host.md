@@ -567,6 +567,7 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 50 | R8G8_UINT | 64x64 | RG8Uint |
 | 51 | R8G8_SNORM | 1024x1024 | RG8Snorm |
 | 54 | R16_FLOAT | 512x512 | R16Float |
+| 91 | B8G8R8A8_UNORM_SRGB | 1024x512, sampled (named once a windowed run reached the world load) | BGRA8Unorm_sRGB |
 
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
 
