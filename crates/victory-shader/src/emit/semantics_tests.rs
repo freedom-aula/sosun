@@ -304,6 +304,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     .map_err(e)?;
     Ok(HostShader {
         splits: Vec::new(),
+        table_entries: lowered.table_entries,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

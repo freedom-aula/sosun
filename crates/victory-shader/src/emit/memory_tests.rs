@@ -202,6 +202,7 @@ fn program() -> HostShader {
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
         splits: Vec::new(),
+        table_entries: l.table_entries,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -445,6 +446,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
     let shader = HostShader {
         splits: Vec::new(),
+        table_entries: l.table_entries,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -588,6 +590,7 @@ fn writes_through_views_mark_their_pages() {
     assert!(l.view_marks && !l.memory, "marks without the page table");
     let shader = HostShader {
         splits: Vec::new(),
+        table_entries: l.table_entries,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -729,6 +732,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         splits: Vec::new(),
+        table_entries: l.table_entries,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,

@@ -346,6 +346,8 @@ pub struct HostShader {
     /// Pixel inputs split off an input the code reads two ways: (original, new) `TEXCOORD`
     /// indices. The vertex shader must write the new one with the original's values.
     pub splits: Vec<(u32, u32)>,
+    /// Minimum descriptor-table entries needed for each `RootType::Table` root slot: `(slot, count)`.
+    pub table_entries: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -631,6 +633,7 @@ pub fn emit_with(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         splits: l.splits,
+        table_entries: l.table_entries,
     })
 }
 
@@ -1153,6 +1156,7 @@ mod tests {
         };
         let ps = super::HostShader {
             splits: Vec::new(),
+            table_entries: Vec::new(),
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1171,6 +1175,7 @@ mod tests {
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
                 splits: Vec::new(),
+                table_entries: Vec::new(),
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),

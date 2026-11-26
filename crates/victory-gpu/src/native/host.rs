@@ -300,19 +300,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(true)
     }
 
-    /// Entries of each bound table checked at submission (shortcut: a shader that reads a table
-    /// past this many entries can still find a stale entry there; take the count from the
-    /// shader's metadata if one does).
+    /// Minimum entries of each bound table checked at submission when a shader has no
+    /// metadata for that table (or declares fewer entries).
     const TABLE_CHECK: usize = 16;
 
-    /// Mirrors again the first entries of each table `root` binds whose title record changed since
+    /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
     /// so their host entries stayed empty and the shaders read zeros.
-    fn remirror_tables(&self, root: &[Option<Root<B>>]) {
-        for r in root {
+    fn remirror_tables(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
-            for index in *at..(*at + Self::TABLE_CHECK).min(h.count) {
+            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            for index in *at..(*at + check).min(h.count) {
                 let handle = h.start + index as u64 * Self::step(h.kind);
                 let record = record_at(handle);
                 if h.mirrored.borrow().get(&index) == Some(&record) {
@@ -778,7 +778,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
-                self.remirror_tables(root);
+                self.remirror_tables(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
@@ -803,7 +803,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
-                self.remirror_tables(root);
+                self.remirror_tables(root, binding.as_deref());
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {
@@ -1067,4 +1067,50 @@ fn placed_info_of(address: u64, res: &[u32; 14]) -> Option<super::textures::Text
 #[cfg(not(target_os = "macos"))]
 fn placed_info_of(_: u64, _: &[u32; 14]) -> Option<super::textures::TextureInfo> {
     None
+}
+
+/// Entries of a bound table at root `slot` to check for plain-store updates at submission:
+/// at least `floor`, extended to cover any higher table entry declared or read by the bound
+/// shader(s).
+fn table_check_count(slot: usize, binding: Option<&Binding>, floor: usize) -> usize {
+    let mut count = floor;
+    let Ok(slot) = u8::try_from(slot) else {
+        return count;
+    };
+    let mut scan = |b: &Binding| {
+        for &(s, n) in &b.table_entries {
+            if s == slot {
+                count = count.max(n);
+            }
+        }
+    };
+    if let Some(b) = binding {
+        scan(b);
+        if let Some(ps) = &b.ps {
+            scan(ps);
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_check_count_uses_shader_metadata_above_default() {
+        assert_eq!(table_check_count(0, None, 16), 16);
+        let vs = Binding {
+            table_entries: vec![(0, 4), (2, 24)],
+            ps: Some(Rc::new(Binding {
+                table_entries: vec![(2, 30), (3, 19)],
+                ..Binding::default()
+            })),
+            ..Binding::default()
+        };
+        assert_eq!(table_check_count(0, Some(&vs), 16), 16);
+        assert_eq!(table_check_count(1, Some(&vs), 16), 16);
+        assert_eq!(table_check_count(2, Some(&vs), 16), 30);
+        assert_eq!(table_check_count(3, Some(&vs), 16), 19);
+    }
 }

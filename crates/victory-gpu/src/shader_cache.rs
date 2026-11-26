@@ -313,8 +313,9 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
-        // Pixel-input splits belong to the native host's guessed graphics path only.
+        // Pixel-input splits and table extents belong to the native host path only.
         splits: _,
+        table_entries: _,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -429,6 +430,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         splits: Vec::new(),
+        table_entries: Vec::new(),
         stage,
         dxil,
         user_data,
@@ -453,6 +455,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             splits: Vec::new(),
+            table_entries: Vec::new(),
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {

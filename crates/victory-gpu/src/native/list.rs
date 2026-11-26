@@ -48,6 +48,8 @@ pub struct Binding {
     pub root_views: bool,
     /// The shader's immediate samplers, as [`RootLayout::static_samplers`] declares them.
     pub static_samplers: Vec<[u32; 10]>,
+    /// Minimum descriptor-table entries needed per `RootType::Table` root slot: `(slot, count)`.
+    pub table_entries: Vec<(u8, usize)>,
 }
 
 /// A root view's kind.
@@ -85,6 +87,11 @@ impl Binding {
                     let [u, v, w] = s.address;
                     [s.filter_for_host(false), u, v, w, s.mip_lod_bias.to_bits(), s.max_anisotropy, s.comparison, s.border, s.min_lod.to_bits(), s.max_lod.to_bits()]
                 })
+                .collect(),
+            table_entries: shader
+                .table_entries
+                .iter()
+                .map(|&(slot, count)| (slot, count as usize))
                 .collect(),
         }
     }
