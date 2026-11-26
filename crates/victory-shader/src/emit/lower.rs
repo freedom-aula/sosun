@@ -10376,6 +10376,23 @@ impl<'a> Lower<'a> {
         reads > 0
     }
 
+    /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
+    /// `depth` deep) on edges where only an AND with an EXEC those lanes are not in reads it
+    /// (`anded_off_on_edge`), so the wave can hold any bits there.
+    fn never_seen(&self, value: Value, depth: u32) -> bool {
+        let p = self.x.p;
+        if depth == 0 || p.blocks.iter().any(|b| b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == value))) {
+            return false;
+        }
+        p.blocks.iter().enumerate().all(|(bb, blk)| {
+            blk.phis.iter().all(|phi| {
+                phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
+                    self.anded_off_on_edge(bb, phi.value, k) || self.never_seen(phi.value, depth - 1)
+                })
+            })
+        })
+    }
+
     /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
     /// only successor, is a move in `q` of an inline 0 (`false`: no lane) or -1 (`true`: every
     /// lane), both dwords at once in a wave64 program. The wave holds that constant on the edge
@@ -13575,10 +13592,11 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.bool(false)
                     }
-                    // Read only ANDed with an EXEC those lanes are not in: any bit will do.
-                    (None, Some(Val::I32(_))) if self.anded_off_on_edge(b, phi.value, n) => {
-                        self.s.m.bool(false)
-                    }
+                    // Read only ANDed with an EXEC those lanes are not in, or not read at all
+                    // but by such joins: any bit will do, so what the edge brings (data, or a
+                    // value not made) is not needed.
+                    (None, _) if self.anded_off_on_edge(b, phi.value, n) => self.s.m.bool(false),
+                    (None, _) if self.never_seen(phi.value, 4) => self.s.m.bool(false),
                     // No lanes or every lane, moved just before the edge: each lane's bit,
                     // whatever the lane layout and whichever lanes take the edge.
                     (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {

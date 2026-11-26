@@ -424,3 +424,36 @@ fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
     assert_eq!(got[..10], [1; 10]);
     assert_eq!(got[10..], [0; 54]);
 }
+
+#[test]
+fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
+    // `s[8:9]` holds a mask (the lanes below 50) that lanes 0..39 replace with loaded data; the
+    // first join (data for lanes 0..39) is read only by a second join, where lanes 20..63 skip in holding it and
+    // the only read is an AND with an EXEC they are not in. No lane sees the first join's bits
+    // (the title's 1280x720 compute pass; was refused: "data, ...").
+    let w = [
+        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(3),
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        0x8788_7E08, // second join: s_and_b64 s[8:9], s[8:9], exec
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..5], [1; 5]);
+    assert_eq!(got[5..], [0; 59]);
+}
