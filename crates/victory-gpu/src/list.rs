@@ -1855,8 +1855,8 @@ mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
+    pub(super) use super::dropped_mesh as dispatch_mesh;
+    pub(super) use super::dropped_mesh_x as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
@@ -1888,6 +1888,41 @@ fn count_draw() {
 #[cfg(not(windows))]
 extern "system" fn draw(_: This) {
     count_draw();
+}
+
+/// Commands the native host drops, by kind: mesh dispatches, indirect mesh dispatches, indirect
+/// executions, texture copies and resolves.
+#[cfg(target_os = "macos")]
+pub(crate) static DROPPED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The totals of [`DROPPED_KINDS`].
+#[cfg(target_os = "macos")]
+pub(crate) fn dropped_kinds() -> (u64, u64, u64, u64, u64) {
+    let n = |i: usize| DROPPED_KINDS[i].load(std::sync::atomic::Ordering::Relaxed);
+    (n(0), n(1), n(2), n(3), n(4))
+}
+
+/// Indirect executions dropped so far.
+#[cfg(target_os = "macos")]
+pub(crate) fn indirect_dropped() -> u64 {
+    INDIRECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+fn drop_kind(kind: usize) {
+    DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
+    drop_kind(0);
+    draw(this);
+}
+
+#[cfg(target_os = "macos")]
+extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u64, _payload: u64) {
+    drop_kind(if indirect != 0 { 1 } else { 0 });
+    draw(this);
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,

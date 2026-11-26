@@ -81,6 +81,8 @@ struct Guess {
     colors: Vec<Format>,
     depth: Option<Format>,
     strides: Vec<u32>,
+    /// A rectangle-list draw: every attribute is read for three corners, one instance a rectangle.
+    rect: bool,
 }
 
 impl Default for Graphics {
@@ -231,6 +233,7 @@ impl Graphics {
         depth: Option<Format>,
         strides: Vec<u32>,
         reads: &[(String, u32)],
+        rect: bool,
     ) -> Graphics {
         let mut g = Graphics { cull: 1, depth_func: 4, ..Graphics::default() };
         for (name, index) in reads {
@@ -244,16 +247,19 @@ impl Graphics {
                 (Some(b'N'), _) => 28,
                 _ => continue,
             };
+            // Index: corner << 28 | slot << 16 | byte offset (corner 0 unless a rectangle list).
+            let (corner, slot) = (index >> 28, (index >> 16 & 0xfff).min(31));
+            let stride = strides.get(slot as usize).copied().unwrap_or(0);
             g.inputs.push(Input {
                 name: name.clone(),
                 index: *index,
                 format,
-                slot: (index >> 16).min(31),
-                offset: index & 0xffff,
-                per_instance: false,
+                slot,
+                offset: (index & 0xffff) + corner * stride,
+                per_instance: rect,
             });
         }
-        g.guess = Some(Guess { colors, depth, strides });
+        g.guess = Some(Guess { colors, depth, strides, rect });
         g
     }
 
@@ -321,7 +327,11 @@ impl Graphics {
             s.stride = s.stride.next_multiple_of(4);
             // A guessed pipeline's streams have the strides of the buffers bound.
             if let Some(&bound) = self.guess.as_ref().and_then(|g| g.strides.get(s.slot)) {
-                s.stride = s.stride.max(bound as usize);
+                s.stride = if self.guess.as_ref().is_some_and(|g| g.rect) {
+                    3 * bound as usize
+                } else {
+                    s.stride.max(bound as usize)
+                };
             }
         }
         Some((attributes, streams))
@@ -626,6 +636,16 @@ mod tests {
             [(0, 24, false), (1, 32, true)]
         );
         assert!(g.vertex_layout(&[("NORMAL".to_owned(), 0)]).is_none());
+    }
+
+    #[test]
+    fn a_rectangle_list_reads_three_corners_per_instance() {
+        // One float3 at slot 0 offset 0 of a 24-byte vertex, read at corners 0 to 2.
+        let reads: Vec<(String, u32)> = (0..3).map(|c| ("VBF3".to_owned(), c << 28)).collect();
+        let g = Graphics::guessed(vec![Format::Rgba8Unorm], None, vec![24], &reads, true);
+        let (attrs, streams) = g.vertex_layout(&reads).unwrap();
+        assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 24, 48]);
+        assert_eq!((streams[0].stride, streams[0].per_instance), (72, true));
     }
 
     #[test]

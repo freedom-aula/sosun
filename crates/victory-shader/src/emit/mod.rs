@@ -418,6 +418,10 @@ pub struct Options {
     /// pages it writes. Memory no view holds reads 0 and its writes are dropped, unrecorded,
     /// if the host's null view is bounds-checked. Off for D3D12.
     pub zero_copy_memory: bool,
+    /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
+    /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
+    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being v1 + v2 - v0.
+    pub rect_list: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -547,6 +551,7 @@ pub fn emit_with(
         narrow_waves: options.narrow_waves,
         wave32_host: options.wave32_host,
         zero_copy_memory: options.zero_copy_memory,
+        rect_list: options.rect_list,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

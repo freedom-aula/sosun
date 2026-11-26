@@ -267,6 +267,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
 
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
+    crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
     if tracing_targets() {
         DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
     }
@@ -540,6 +541,7 @@ fn make_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
         },
         Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
             Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
+                vs_source: stages.iter().find(|s| s.0 == "vertex").expect("a vertex stage").1.clone(),
                 vs: vs.clone(),
                 ps: hosts.iter().find(|h| h.0 == "pixel").map(|h| h.1.clone()),
                 name,
@@ -646,51 +648,62 @@ pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides:
 }
 
 /// The host pipeline of a guessed pipeline for the targets and vertex buffers the list has bound.
-fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>) -> Pipe<Metal> {
-    let key = format!("{:?}{:?}", l.target_formats, l.strides);
+fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> Pipe<Metal> {
+    let key = format!("{:?}{:?}{rect}", l.target_formats, l.strides);
+    let rect_vs = if rect {
+        match g.vs_source.native_rect() {
+            Ok(h) => Some(h.clone()),
+            Err(e) => {
+                t.refused_translation(&g.name, format!("rectangle list: {e}"));
+                return Pipe::Refused;
+            }
+        }
+    } else {
+        None
+    };
+    let vs = rect_vs.as_deref().unwrap_or(&g.vs);
     if let Some(p) = g.made.borrow().get(&key) {
         return p.clone();
     }
-    let reads = super::state::vertex_inputs(&g.vs.dxil).unwrap_or_default();
+    let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     let (colors, depth) = l.target_formats.clone();
     tracing::info!(name = %g.name, ?reads, ?colors, ?depth, strides = ?l.strides, "guessed pipeline");
-    let state = Graphics::guessed(colors, depth, l.strides.clone(), &reads);
-    let made = t.render_pipe(&g.vs, g.ps.as_deref(), &state, &g.name);
+    let state = Graphics::guessed(colors, depth, l.strides.clone(), &reads, rect);
+    let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
     g.made.borrow_mut().insert(key, made.clone());
     made
 }
 
 /// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
 /// counted) when there is nothing to draw with.
-fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> bool {
-    let mut rects = false;
+fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+    // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
+    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
+    let rect = l.topology == 17;
     let made = match pipe(t, l.pipeline) {
-        Pipe::Guess(g) => {
-            rects = true;
-            guess(t, l, &g)
-        }
+        Pipe::Guess(g) => guess(t, l, &g, rect),
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {
         dropped();
-        return false;
+        return None;
     };
-    // shortcut: a guessed pipeline's rectangle list (topology 17, three corners a rectangle) is
-    // drawn as the triangle its corners make, half the rectangle; the fourth corner needs a
-    // geometry stage the host lacks.
-    let topology = super::state::topology(l.topology)
-        .or_else(|| (rects && l.topology == 17).then_some(victory_backend::resources::Topology::Triangles));
+    let topology = if rect {
+        Some(victory_backend::resources::Topology::TriangleStrip)
+    } else {
+        super::state::topology(l.topology)
+    };
     let Some(topology) = topology else {
         static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if l.topology < 64 && SEEN.fetch_or(1 << l.topology, Ordering::Relaxed) >> l.topology & 1 == 0 {
             tracing::info!(topology = l.topology, "a draw dropped for its primitive topology");
         }
         dropped();
-        return false;
+        return None;
     };
     l.list.set_graphics_pipeline(&pso, topology);
     l.list.set_graphics_binding(binding);
-    true
+    Some(rect)
 }
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
@@ -707,8 +720,13 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         }
     }
     with_list(this, |t, l| {
-        if graphics(t, l) {
-            match l.list.draw_instanced(vertices, instances, first, first_instance) {
+        if let Some(rect) = graphics(t, l) {
+            let call = if rect {
+                l.list.draw_instanced(4, vertices / 3, 0, first / 3)
+            } else {
+                l.list.draw_instanced(vertices, instances, first, first_instance)
+            };
+            match call {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
@@ -722,7 +740,12 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if graphics(t, l) {
+        if let Some(rect) = graphics(t, l) {
+            if rect {
+                // shortcut: indexed rectangle lists are not drawn.
+                dropped();
+                return;
+            }
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);

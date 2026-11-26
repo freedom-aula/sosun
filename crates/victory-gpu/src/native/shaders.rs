@@ -34,6 +34,11 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
 }
 
+/// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
+pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute shaders).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {

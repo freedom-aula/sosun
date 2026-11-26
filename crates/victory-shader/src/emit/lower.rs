@@ -108,6 +108,8 @@ pub(crate) struct Parts<'a> {
     pub wave32_host: bool,
     /// See [`Options::zero_copy_memory`](super::Options).
     pub zero_copy_memory: bool,
+    /// See [`Options::rect_list`](super::Options).
+    pub rect_list: bool,
 }
 
 enum Stop {
@@ -9674,13 +9676,16 @@ impl<'a> Lower<'a> {
             _ => return Err("a vertex fetch format the host's vertex layout lacks"),
         };
         let name = format!("VB{kind}{count}");
-        let index = slot << 16 | u32::from(offset);
+        let corners = if self.x.rect_list { 3 } else { 1 };
+        let mut ids = Vec::new();
+        for corner in 0..corners {
+        let index = corner << 28 | slot << 16 | u32::from(offset);
         let id = match self.s.inputs.iter().position(|e| e.name == name && e.index == index) {
             Some(id) => id,
             None => {
                 let row = self.s.inputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
                 self.s.inputs.push(SigElement {
-                    name,
+                    name: name.clone(),
                     index,
                     kind: 0,
                     comp,
@@ -9694,11 +9699,39 @@ impl<'a> Lower<'a> {
                 self.s.inputs.len() - 1
             }
         };
+        ids.push(id);
+        }
         for k in 0..count {
-            let Val::I32(x) = self.load_any_input(id, k as u8) else {
-                return Err("a vertex input");
-            };
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            let mut x = [None; 3];
+            for (corner, &id) in ids.iter().enumerate() {
+                let Val::I32(v) = self.load_any_input(id, k as u8) else {
+                    return Err("a vertex input");
+                };
+                x[corner] = Some(v);
+            }
+            let Some(mut v) = x[0] else { return Err("a vertex input") };
+            if let [Some(a), Some(b), Some(d)] = x {
+                // Rectangle corner by vertex id: 1 and 2 are the stored ones, 3 is b + d - a.
+                let Val::I32(vid) = self.input(Input::VertexId) else { return Err("a vertex id") };
+                let c = self.cur;
+                let is = |l: &mut Self, n: u32| {
+                    let n = l.s.m.i32(n);
+                    l.s.m.cmp(c, pred::EQ, vid, n)
+                };
+                let ex = if kind == 'U' {
+                    d
+                } else {
+                    let (fa, fb, fd) = (self.as_float(a), self.as_float(b), self.as_float(d));
+                    let sum = self.s.m.bin(c, Bin::Add, fb, fd);
+                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fa);
+                    self.as_int(fourth)
+                };
+                let (c1, c2, c3) = (is(self, 1), is(self, 2), is(self, 3));
+                v = self.s.m.select(c, c1, b, a);
+                v = self.s.m.select(c, c2, d, v);
+                v = self.s.m.select(c, c3, ex, v);
+            }
+            self.write(inst, Reg::V(reg + k as u8), v, guard);
         }
         Ok(())
     }
@@ -11408,6 +11441,7 @@ mod tests {
             narrow_waves: false,
             wave32_host: false,
             zero_copy_memory: false,
+            rect_list: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -11464,6 +11498,7 @@ mod tests {
             narrow_waves: false,
             wave32_host: false,
             zero_copy_memory: false,
+            rect_list: false,
             view_marks: false,
         })
     }
@@ -11665,6 +11700,7 @@ mod tests {
             narrow_waves: false,
             wave32_host: false,
             zero_copy_memory: false,
+            rect_list: false,
             view_marks: false,
         })
         .unwrap();
@@ -12500,6 +12536,7 @@ mod tests {
             narrow_waves,
             wave32_host,
             zero_copy_memory: false,
+            rect_list: false,
             view_marks: false,
         })
         .expect("lower")

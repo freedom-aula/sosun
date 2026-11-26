@@ -73,6 +73,9 @@ pub(crate) struct Shader {
     /// Its translation for the native host (container let go once made).
     #[cfg(target_os = "macos")]
     native: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
+    /// Its translation for rectangle lists (guessed vertex shaders; made at the first such draw).
+    #[cfg(target_os = "macos")]
+    rect: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -107,6 +110,8 @@ impl Shader {
             translated: OnceLock::new(),
             #[cfg(target_os = "macos")]
             native: std::sync::OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            rect: std::sync::OnceLock::new(),
         }
     }
 
@@ -117,8 +122,25 @@ impl Shader {
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
-                *container = Vec::new();
+                // A vertex shader keeps its container: a rectangle-list draw translates it again.
+                if self.stage != "vertex" {
+                    *container = Vec::new();
+                }
                 made
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Shader {
+    /// The translation for rectangle-list draws, made on first use.
+    pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.rect
+            .get_or_init(|| {
+                let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                crate::native::shaders::translate_rect(&container).map(Arc::new)
             })
             .as_ref()
             .map_err(String::as_str)
@@ -501,7 +523,7 @@ pub(crate) extern "system" fn create_unread_1c8(
     {
         return hand_out(
             stages,
-            Some(Box::new(crate::native::state::Graphics::guessed(Vec::new(), None, Vec::new(), &[]))),
+            Some(Box::new(crate::native::state::Graphics::guessed(Vec::new(), None, Vec::new(), &[], false))),
             iid,
             out,
         );
