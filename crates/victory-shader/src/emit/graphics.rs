@@ -251,6 +251,18 @@ fn infer(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<(NativeProgram, Sig
                 left -= 1;
             }
         }
+        // The system values the VGPRs carry are signature elements too.
+        let mut ins = ins;
+        let mut row = ins.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        if addr & 0xf00 != 0 {
+            ins.push(element("SV_Position", 0, 3, row, 0xf));
+            row += 1;
+        }
+        if addr & 1 << 12 != 0 {
+            let mut e = element("SV_IsFrontFace", 0, 13, row, 1);
+            e.comp = 5;
+            ins.push(e);
+        }
         (
             StageIo::Ps { inputs, input_addr: addr, db_shader_control: 0, patches: Vec::new() },
             (ins, outs),
