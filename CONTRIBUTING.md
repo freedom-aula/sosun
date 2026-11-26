@@ -65,3 +65,7 @@ Every diagnostic is an environment variable, documented in [docs/native-host.md]
 ## Be kind
 
 Be patient with newcomers, assume good faith, and keep discussion about the code. Harassment of any kind isn't tolerated.
+
+## Using an AI coding agent
+
+`AGENTS.md` (read by Codex and most agents; `CLAUDE.md` imports it for Claude Code) has the build, check and run commands and the hard rules. `.claude/skills/` has step-by-step skills: `run-game`, `debug-graphics` and `add-hle-function`.
