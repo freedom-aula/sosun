@@ -190,7 +190,8 @@ pub(crate) fn track_graphics(
     computed_buffers: bool,
 ) -> Result<Resources, ShaderError> {
     let mut t = Tracer::new(p, layout, stage, lanes)?;
-    t.computed_buffers = computed_buffers && matches!(stage, HwStage::Ps | HwStage::Cs);
+    t.computed_buffers =
+        computed_buffers && matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs);
     let mut out = Resources {
         params: p
             .inputs
