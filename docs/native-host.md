@@ -4,6 +4,22 @@ This is the design and status of the host that runs VIctory on macOS with no Win
 
 Wine-based work continues on the `test/run-C*` branches. This branch (`native/host-2`) only adds code beside it. On Windows and Wine the loader and runtime behave as before.
 
+## macOS setup and launcher paths
+
+`native-setup.sh` and `run-native.sh` use Cargo's resolved `target_directory`
+from `cargo metadata --format-version 1 --no-deps --offline`. This honors
+`CARGO_TARGET_DIR` and local/global `build.target-dir` configuration, including
+paths with spaces (the setup finding in [#13](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/13)).
+Both select `x86_64-apple-darwin/release/victory` within that directory. Use the
+same Cargo configuration when building and launching; a one-off build with
+`--target-dir` must be matched by configuration or an environment override when
+launching. The launcher needs Cargo available and reports configuration errors
+rather than falling back to a possibly stale default binary.
+
+Game-free regressions use real Cargo resolution and fixture executables under
+stock macOS Bash 3.2: `/bin/bash tools/macos/tests/target-directory.sh`.
+Setup prerequisites and its build are stubbed; no game or SDK files are needed.
+
 ## Status
 
 | Piece | State |
@@ -220,7 +236,7 @@ Goal: `victory-gpu`'s Metal backend wraps title memory pages as `MTLBuffer` obje
 2. **Stable addresses.** A mapping stays at its address until the title unmaps or remaps it. The title's virtual addresses are the CPU's virtual addresses (identity), so a GPU address the title holds is already a pointer. Remapping a range (`XMemMapPhysicalPages` over mapped pages) replaces the pages at that address, which is the moment a backend must drop and rebuild any `MTLBuffer` over it (`title_memory_remapped` in `victory-gpu`).
 3. **Alignment.** Map at and in multiples of 16 KiB (`vm_kernel_page_size`, also under Rosetta, where `getpagesize()` says 4 KiB). Checked on an M5 Pro with macOS 27 (a short Objective-C program, not in the repository, built for arm64 and for x86-64 under Rosetta): `newBufferWithBytesNoCopy` over a pool mapping returns a buffer whose `contents` is the same pointer, for the whole mapping, for a 4 KiB-aligned and a 16 KiB-aligned sub-range, and for a mapping of a sub-range of the pool at another address. A write through a buffer over mapping B is seen through mapping A at once (one VM object). Only the 16 KiB multiple is guaranteed to stay valid on other OS versions.
 4. **What the backend may assume.** Memory is `MTLStorageModeShared`. CPU and GPU see one copy, so the shadow copies and the copy-back disappear, and so does `victory-gpu/src/watch.rs` (write-guard tracking and its page-tracking lock). Ordering is by command buffers and fences only: a CPU write the title makes before it submits is visible to that submission, and the title's own fences order the rest. Create buffers with `hazardTrackingModeUntracked`; the title already tracks hazards.
-5. **Sizes.** `device.maxBufferLength` bounds one `MTLBuffer`; wrap each pool mapping (or each large allocation's mapping) separately and keep an address-to-buffer interval map keyed by the mapping's start. Pool mappings that are contiguous in address are still separate VM entries, so a buffer cannot span two mappings; the backend should ask for allocations large enough that they are one mapping (`XMemVirtualAlloc` of a range is).
+5. **Sizes.** `device.maxBufferLength` bounds one `MTLBuffer`; wrap each pool mapping (or each large allocation's mapping) separately and keep an address-to-buffer interval map keyed by the mapping's start. Pool mappings that are contiguous in address are still separate VM entries, so a buffer cannot span two mappings; the backend should ask for allocations large enough that they are one mapping (`XMemVirtualAlloc` of a range is). The native host does not wrap title mappings: it wraps each pool's own mapping once (`native/memory.rs`), so a title range may run over several title mappings when each follows the one before it both in title memory and in the same pool, which is how the 64 KiB pages of one allocation are reported. `PoolTable::resolve` follows such mappings and gives one pointer into the pool; a range over a gap, an empty mapping, two pools, or mappings that are not next to each other in the pool is refused.
 6. **Protection.** The CPU side can set a mapping `READ` while a buffer over it is live; `PagePool::map(.., Protect::READ)` makes a read-only alias (for CPU-side guards or for the GPU's read-only use) of pages another mapping writes.
 
 Provided (`victory_hle::modules::xmem_physical`, branch `native/host-mem`):
@@ -278,11 +294,13 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 `api-ms-win-crt-*.dll` and `ucrtbase.dll` resolve to Rust functions over libSystem, tried before kernel32's table. `vcruntime140*` and `msvcp140*` are not served by name: the title's own copies (C++ runtime, `__CxxFrameHandler`) are loaded from its folder; only `vcruntime140`'s kernel-table functions (`__C_specific_handler`) fall back to the host when the title ships none. The HLE `exit` runs the `atexit`/`onexit` handlers and flushes streams before ending the process on this path (`abort`/`terminate` do not). A title linked against the dynamic UCRT needs nothing else of it. The rules that matter:
 
 - `wchar_t` is two bytes: wide strings are UTF-16 and the host's `wcs*` is never called. Narrow strings are UTF-8; `mbstowcs` and `wcstombs` convert, and fail with `EILSEQ` on a bad sequence or a lone surrogate.
+- The counted copies (`strncpy`, `strncat`, their `wcs` and `_s` forms) read no further than their count: a counted source need not hold a NUL within it, such as a fixed-size field. The `_s` forms also stop at the room left in the destination (that many units without a NUL is already `ERANGE`), and an error empties the whole destination, as the CRT does, so a failed `strcat_s` leaves no old string.
 - `printf` and `scanf` are our own engine (`ucrt/format.rs`), not macOS's. `__stdio_common_v{s,sn,f}{w,}printf[_s]` and `...v{s,f}{w,}scanf` read the Windows `va_list` (a pointer to 8-byte slots, floats as doubles), honour the MSVC option bits (standard `snprintf` behaviour, legacy NUL termination, ISO wide specifiers) and the `_s` buffer rules, and format `%ls %hs %S %C %I64d %I32d %zu %p %a`, `inf`, `-nan(ind)` as the CRT does.
+- `long double` is a 64-bit `double` in the Windows x64 ABI, so the `l` math forms and `nexttoward`'s target are doubles (`nexttowardf` steps toward its double target, not one rounded to a float).
 - A function with a `float` or `double` argument is `extern "win64"` and declared to the bridge (`declare_win64`) when looked up; everything else is `extern "system"`. `lldiv` returns through the hidden pointer Windows passes in `rcx`.
 - Callbacks (`qsort`, `bsearch`, `_initterm`, `_execute_onexit_table`, `signal`/`raise`, the invalid-parameter handler) are title functions called with `call_win64`. `qsort` is a merge sort over a copy, so an inconsistent comparator cannot panic the host.
 - `FILE*` is a leaked 16-byte block the title never reads; behind it is a stream shared with the descriptor `_fileno` returns, over `files::translate` paths (so `G:\` works). Reads are buffered, writes are not. Text mode drops `\r` before `\n` on reads and writes `\n` unchanged.
-- `errno` is per thread (`_errno()`), with the Windows numbers (`EDOM` 33, `ERANGE` 34, `STRUNCATE` 80). The math functions set `EDOM` for a NaN from numbers and `ERANGE` for an infinity from finite ones.
+- `errno` is per thread (`_errno()`), with the Windows numbers (`EDOM` 33, `ERANGE` 34, `STRUNCATE` 80). The math functions set `EDOM` for a NaN from numbers and `ERANGE` for an infinity from finite ones. `remquo` stores the sign of `x / y` and the low three bits of the quotient's magnitude (taken from `|x| mod 8|y|`, so they hold for huge quotients too). The checked `float` wrappers (the `unary!`/`binary!` forms such as `expf` and `powf`) and `ldexpf` check the result after rounding it to a float, so a float overflow sets `ERANGE`; `fdimf`, `scalbnf` and `scalblnf` do not set `errno` yet.
 - `rand` is the CRT's linear generator, per thread, seed 1: `srand(1)` gives 41, 18467, 6334 as on Windows.
 - `argv`, `argc`, the command line and the environment come from the host process, or from `victory_hle::posix::set_command_line` (call it before the title's start-up code runs).
 
@@ -337,13 +355,13 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 * **State.** Blend from the register image (`Graphics::guess_from`, below); no culling, depth less-equal with writes, formats from the targets bound at the draw, strides from the vertex buffers bound; the host pipeline is made at the draw (`Pipe::Guess`, cached per formats and strides). Topology 17 (rectangle list) is drawn as a triangle list, so half of each rectangle: the fourth corner needs a geometry stage.
 * **Vertex user data.** If a v2 vertex stage has a nonzero first user-data dword and a 0x41 register index below it, try those record indices relative to the header's start. Accept that layout only when it resolves an otherwise unbound address to a declared table or root view and agrees with existing root-address uses. The title's root slot and descriptor table offsets come from the record. Absolute indices remain the default until the register image is decoded.
 * **Pixel primitive mask.** Scalar masks, shifts and unsigned bit-field extraction (`s_bfe_u32`) may feed M0 for interpolation. When the resulting value and SCC have no other use, the inferred primitive-mask SGPR anchors the existing POPS collision-id mapping in the next SGPR. A hand-assembled regression covers extraction and rejects exports of either the original or extracted mask, as well as observable SCC. This extends the guessed-path heuristic; it has not been verified against the seven remaining title shaders in issue #4.
-* **Computed pixel buffers.** Scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for the fragment stage, as for compute. The translator requires proof that the descriptor's swizzle flags are clear. Vector byte/halfword loads (`buffer_load_ubyte`, `sbyte`, `ushort`, `sshort`) also use this path, with zero/sign extension and bounds checked at the element width. Each byte is resolved separately, so halfwords can cross dword/page boundaries and carry into the address high word. Bounds mode 0 checks each component's starting offset against the stride; mode 3 checks its end. Bounds mode 2 skips range checks but still treats a zero record count as out of bounds. Alignment is a guess: these subword reads assume `SH_MEM_CONFIG.alignment_mode = UNALIGNED`; the register is not yet decoded, so DWORD/strict modes are not emulated. See the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture), sections 8.1.5 and 8.1.7 and the MUBUF opcode table. Hand-assembled translation tests and Windows GPU/WARP value tests cover this extension; it is not evidence that any of issue #4's seven title shaders now works.
+* **Computed pixel buffers.** Scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for the fragment stage, as for compute. The translator requires proof that the descriptor's swizzle flags are clear. Vector byte/halfword loads (`buffer_load_ubyte`, `sbyte`, `ushort`, `sshort`) also use this path, with zero/sign extension and bounds checked at the element width. Each byte is resolved separately, so halfwords can cross dword/page boundaries and carry into the address high word. Bounds mode 0 checks each component's starting offset against the stride; mode 3 checks its end. Bounds mode 2 skips range checks but still treats a zero record count as out of bounds. Alignment is a guess: these subword reads assume `SH_MEM_CONFIG.alignment_mode = UNALIGNED`; the register is not yet decoded, so DWORD/strict modes are not emulated. See the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture), sections 8.1.5 and 8.1.7 and the MUBUF opcode table. Hand-assembled translation tests and Windows GPU/WARP value tests cover this extension; it is not evidence that any of issue #4's seven title shaders now works. Any four SGPR dwords the translator cannot trace (last dword constant) are classed this way, so an image instruction can meet one too: as its sampler it is refused with "a sampler built from computed words", as a 128-bit image descriptor with "a computed buffer descriptor used as a view". Buffer accesses never give the second message. A refusal of an instruction without side effects is reported at the first instruction that needs its result, not at the image instruction.
 * **Missing vertex stage.** When both vertex piece pairs are empty, skip the slot. A vertex-only slot can still draw depth. Mesh pipelines still need their stage registers decoded. Pixel shaders with opaque lane masks, system inputs the signature lacks, and vertex fetches with other formats are refused (see the frame log).
 * **Debugging.** `cargo run -p victory-shader --example disasm` (`VICTORY_PIECE=<piece>`) disassembles a dumped code piece; `--example guess` (`VICTORY_STAGE=vs|ps VICTORY_CODE VICTORY_META`) runs the guessed translation on a pair.
 
 ### Why guessed draws leave the target black (findings)
 
-Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which title textures were drawn to or cleared (address, format, size) and which was presented, plus texture copies and resolves the host drops; `VICTORY_DUMP_TARGETS=<dir>,<seconds>` writes the 8-bit colour targets drawn since the last present as PPMs; `VICTORY_DEBUG_PS_RED=1` makes every translated pixel shader write red, `VICTORY_DEBUG_VS_TRI=1` makes every translated vertex shader position a triangle covering the target (translator debugging, `emit/lower.rs`).
+Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which title textures were drawn to or cleared (address, format, size) and which was presented, plus texture copies and resolves the host drops, and a warning the first time a draw, dispatch or clear is dropped at submission ("Dropped work is logged loudly" below); `VICTORY_DUMP_TARGETS=<dir>,<seconds>` writes the 8-bit colour targets drawn since the last present as PPMs; `VICTORY_DEBUG_PS_RED=1` makes every translated pixel shader write red, `VICTORY_DEBUG_VS_TRI=1` makes every translated vertex shader position a triangle covering the target (translator debugging, `emit/lower.rs`).
 
 * The first frames are 3840x2160, one MRT draw per frame into the swapchain buffer, a second RGBA8 target and a depth target; no texture copy or resolve was ever dropped, no UAV or compute work touches them before frame ~700. The presented buffer is the one drawn to.
 * Host textures are separate host allocations (`Textures::realize`), not views of pool memory; only sampled textures are uploaded from title memory, render targets never are.
@@ -456,6 +474,24 @@ per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
 
+Two more kinds are dropped one command at a time when a piece is submitted
+(`NativeHost::execute`), where the whole piece used to be refused: a draw or
+dispatch that reads a root parameter the title never set, and a draw or clear
+none of whose targets has a host texture (Metal opens no render pass without
+an attachment). The rest of the piece still runs, and so do its value writes
+and fence signals: a queue waiting for one of those values used to be held for
+good. A dropped command still ends the pass it would have ended. Two draws
+into the same targets with a dropped dispatch between them stay two render
+passes (likewise two dispatches around a dropped draw, and blits), so the
+backend still orders their pool-buffer accesses; a dropped command of the same
+kind as both its neighbours parts nothing, as before. These two are counted
+per host (`NativeHost::unset_roots`, `NativeHost::no_targets`), not in the
+"native draws so far" line, and they warn (once each, "native host drops work:
+...") only with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console gives a
+shader in a root slot the title set nothing in. A title shader's metadata can
+name such a slot (255 observed); the host draws nothing for it, which is a
+fallback, not the console's behaviour.
+
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
@@ -522,9 +558,11 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 | 99, 72, 78 | BC7, BC1, BC3 UNORM_SRGB | 512x512, 32x32, 512x512 | the `_sRGB` BC formats |
 | 53 | R16_TYPELESS | 2048x8192 depth (a shadow map) | Depth16Unorm (R16Unorm when not depth) |
 | 55 | D16_UNORM | (its depth views) | Depth16Unorm |
-| 3, 17, 36, 51, 57 | R32G32B32A32, R32G32, R16G16, R8G8, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
+| 3, 17, 36, 57 | R32G32B32A32, R32G32, R16G16, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
 | 11, 13 | R16G16B16A16_UNORM, _SNORM | 128x4, 256x256 | RGBA16Unorm, RGBA16Snorm |
-| 49, 50 | R8G8_TYPELESS, _UNORM | 16x16, 64x64 | RG8Unorm |
+| 49 | R8G8_UNORM | 16x16 | RG8Unorm |
+| 50 | R8G8_UINT | 64x64 | RG8Uint |
+| 51 | R8G8_SNORM | 1024x1024 | RG8Snorm |
 | 54 | R16_FLOAT | 512x512 | R16Float |
 
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.

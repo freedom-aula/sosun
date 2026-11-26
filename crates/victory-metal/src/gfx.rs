@@ -131,6 +131,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rg16Uint => MTLPixelFormat::RG16Uint,
         Format::Rg8Unorm => MTLPixelFormat::RG8Unorm,
         Format::Rg8Uint => MTLPixelFormat::RG8Uint,
+        Format::Rg8Snorm => MTLPixelFormat::RG8Snorm,
         Format::R16Float => MTLPixelFormat::R16Float,
         Format::R16Uint => MTLPixelFormat::R16Uint,
         Format::D16Unorm => MTLPixelFormat::Depth16Unorm,

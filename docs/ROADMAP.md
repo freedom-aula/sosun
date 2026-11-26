@@ -30,6 +30,7 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 Seven shader shapes are still refused, on the guessed path:
 - pixel: "a computed buffer descriptor used as a view" ×3, "a hardware SGPR input" ×1;
+  (the first comes only from image instructions: a sampler whose state words are computed, now reported as "a sampler built from computed words", or a 128-bit image descriptor built in code; the address logged is the first use of the result, see docs/native-host.md, "Computed pixel buffers");
 - vertex: "an address in an SGPR that is no root parameter" ×3.
 
 **Start here:** `crates/victory-shader/src/emit/`. Tests use hand-assembled GFX10 code (`gfx_refusal_tests.rs`).

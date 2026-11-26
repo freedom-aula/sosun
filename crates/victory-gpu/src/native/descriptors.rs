@@ -95,8 +95,9 @@ pub fn format(dxgi: u32) -> Option<Format> {
         13 => Format::Rgba16Snorm,
         17 => Format::Rg32Uint,
         36 => Format::Rg16Uint,
-        49 | 50 => Format::Rg8Unorm,
-        51 => Format::Rg8Uint,
+        49 => Format::Rg8Unorm,
+        50 => Format::Rg8Uint,
+        51 => Format::Rg8Snorm,
         54 => Format::R16Float,
         // R16_TYPELESS: a depth target when the texture is one (`TextureInfo::desc`).
         53 => Format::R16Unorm,
@@ -240,6 +241,16 @@ mod tests {
             assert_eq!(f.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
         }
         assert!(super::format(42).unwrap().is_integer() && !super::format(26).unwrap().is_integer());
+    }
+
+    #[test]
+    fn r8g8_formats_keep_their_numeric_kind() {
+        use victory_backend::resources::Format;
+        assert_eq!(super::format(49), Some(Format::Rg8Unorm));
+        assert_eq!(super::format(50), Some(Format::Rg8Uint));
+        assert_eq!(super::format(51), Some(Format::Rg8Snorm));
+        assert!(super::format(50).unwrap().is_integer());
+        assert!(!super::format(51).unwrap().is_integer());
     }
 
     #[test]
