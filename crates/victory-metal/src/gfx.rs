@@ -968,7 +968,22 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
+            match d.indirect {
+                Some((b, title)) => {
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                    }
+                    // SAFETY: the caller resolved three words at `title` inside the live buffer.
+                    unsafe {
+                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &b.buf,
+                            title as usize - b.base as usize,
+                            size(d.threads_per_group),
+                        )
+                    };
+                }
+                None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
@@ -1141,6 +1156,51 @@ impl Metal {
             // What `IRRuntimeDrawPrimitives` / `IRRuntimeDrawIndexedPrimitives` do: draw arguments
             // (`IRRuntimeDrawParams`, 5 words) at slot 4 and the index type at slot 5 (0 = not indexed,
             // else Metal's index type + 1), then the draw itself.
+            if let Some((ab, title)) = d.indirect {
+                // What the converter runtime's indirect `IRRuntimeDraw(Indexed)Primitives` do: the
+                // argument record itself is the shader's draw arguments (D3D12's records are
+                // `IRRuntimeDraw(Indexed)Argument`s and Metal's indirect ones, word for word).
+                let at = title as usize - ab.base as usize;
+                if self.names(ab, set_on_queue) {
+                    e.useResource_usage_stages(
+                        ProtocolObject::from_ref(&*ab.buf),
+                        MTLResourceUsage::Read,
+                        MTLRenderStages::Vertex,
+                    );
+                }
+                // SAFETY: the record is inside the live buffer (the caller resolved it).
+                unsafe { e.setVertexBuffer_offset_atIndex(Some(&ab.buf), at, DRAW_ARGUMENTS) };
+                match (d.call, d.index_buffer) {
+                    (DrawCall::Arrays { .. }, _) => {
+                        set_index_type(&e, 0);
+                        // SAFETY: as above.
+                        unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, &ab.buf, at) };
+                    }
+                    (DrawCall::Indexed { wide, .. }, Some((b, title))) => {
+                        set_index_type(&e, if wide { 2 } else { 1 });
+                        if self.names(b, set_on_queue) {
+                            e.useResource_usage_stages(
+                                ProtocolObject::from_ref(&*b.buf),
+                                MTLResourceUsage::Read,
+                                MTLRenderStages::Vertex,
+                            );
+                        }
+                        // SAFETY: both buffers are live; the record's start index counts from `title`.
+                        unsafe {
+                            e.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                                prim,
+                                if wide { MTLIndexType::UInt32 } else { MTLIndexType::UInt16 },
+                                &b.buf,
+                                title as usize - b.base as usize,
+                                &ab.buf,
+                                at,
+                            )
+                        };
+                    }
+                    (DrawCall::Indexed { .. }, None) => return Err("indexed draw without an index buffer".into()),
+                }
+                continue;
+            }
             let mut dp = [0u32; 5];
             let ib: u16;
             match d.call {
@@ -1231,6 +1291,14 @@ fn set_draw_bytes(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, dp: &[u32; 5]
             20,
             DRAW_ARGUMENTS,
         );
+    }
+    set_index_type(e, index_type);
+}
+
+/// The converter's index type word (0 = not indexed, else Metal's index type + 1).
+fn set_index_type(e: &ProtocolObject<dyn MTLRenderCommandEncoder>, index_type: u16) {
+    // SAFETY: setVertexBytes copies the bytes before returning.
+    unsafe {
         e.setVertexBytes_length_atIndex(
             NonNull::new((&raw const index_type).cast_mut().cast()).unwrap(),
             2,

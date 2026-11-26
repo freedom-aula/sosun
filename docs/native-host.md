@@ -588,3 +588,28 @@ The title's texture formats are DXGI numbers (`resource::pc_format` only renames
 Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
 
 A render target view whose host texture cannot be made keeps its attachment slot: `glue::targets` binds nothing for that pass and refuses the draws that follow, instead of moving the later targets into earlier slots.
+
+## ExecuteIndirect on the native host
+
+The prologue world load (frame ~2112) is the first place the title uses `ExecuteIndirect`. It creates five command signatures, each with one argument and no count buffer, and passes `max` 1 every time:
+
+| Stride | Argument type | Record | Native host |
+|---|---|---|---|
+| 12 | 2, `DISPATCH` | `D3D12_DISPATCH_ARGUMENTS`: three group counts | `dispatchThreadgroupsWithIndirectBuffer` |
+| 12 | 105, console single-pass dispatch | three group counts (guess, below) | as `DISPATCH` |
+| 16 | 0, `DRAW` | `D3D12_DRAW_ARGUMENTS` | `drawPrimitives:indirectBuffer:` |
+| 20 | 1, `DRAW_INDEXED` | `D3D12_DRAW_INDEXED_ARGUMENTS` | `drawIndexedPrimitives:...indirectBuffer:` |
+| 12 | 10, `DISPATCH_MESH` | three group counts | dropped: the host has no mesh pipelines |
+
+The words the log prints after a dispatch's type (`[2, 1, 0, 0]`, `[105, 0, 60000, 0]`) are not part of its argument description; only root-constant, view and vertex-buffer arguments use them.
+
+How it runs (`signature::command`, `native::glue::execute_indirect`): each of the `max` records becomes one draw or dispatch command whose counts are the title address `arguments + offset + i * stride`. At submission that address is resolved to its pool buffer like any other (`NativeHost::resolve`), and Metal reads the record on the GPU when the command runs, so records a culling pass writes earlier in the same submission are honoured, and nothing is copied on the CPU. D3D12's draw, indexed-draw and dispatch records are word for word Metal's `MTLDrawPrimitivesIndirectArguments`, `MTLDrawIndexedPrimitivesIndirectArguments` and `MTLDispatchThreadgroupsIndirectArguments`, and Metal's base vertex and base instance semantics are D3D12's (Metal adds the base instance to `instance_id` and D3D12 does not add it to `SV_InstanceID`; the converted shader corrects for that from the draw arguments it reads, below). The converted vertex shader reads the draw's own arguments from buffer 4 (`IRRuntimeDrawParams`), so an indirect draw binds the record itself there, which is what the converter runtime's indirect `IRRuntimeDrawPrimitives` does; direct draws keep writing their counts with `setVertexBytes`. An indexed record's start index counts from the bound index buffer's address. GPU tests: `victory-metal` `indirect_draws_read_their_records_from_title_memory` and `indirect_dispatch_reads_its_group_counts_from_title_memory`, and `victory-gpu` `an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu`.
+
+Still dropped, each logged once per signature ("indirect execution dropped"):
+
+- A count buffer. D3D12 runs `min(count, max)` records; doing that needs a small compute pass that zeroes the records past the count (or an indirect command buffer) before the draws. None of the title's signatures has one yet.
+- Signatures with more than one argument: root constants, root views, vertex or index buffers changed per record. Their values are per record in GPU memory, so they cannot be read on the CPU at submission time. None seen yet.
+- Mesh dispatches (type 10), as direct mesh dispatches are.
+- Indirect draws into a rectangle list (topology 17): the host draws a rectangle list as instances of four vertices, which needs the record's counts rewritten first.
+
+Guess: type 105 is not a D3D12 argument type. It is taken to be the console's single-pass dispatch, with the same three-word record as `DISPATCH` (its flags live in the signature, the title passes none); its stride, 12, fits that.

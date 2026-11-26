@@ -199,6 +199,8 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         groups: [usize; 3],
+        /// `ExecuteIndirect`: the title address of the group counts, read on the GPU.
+        indirect: Option<u64>,
     },
     Copy {
         dst: u64,
@@ -225,6 +227,9 @@ pub enum Cmd<B: GraphicsBackend> {
         index: Option<(u64, bool)>,
         state: DrawState,
         call: DrawCall,
+        /// `ExecuteIndirect`: the title address of the argument record, read on the GPU (`call`
+        /// gives only its kind).
+        indirect: Option<u64>,
     },
 }
 
@@ -236,11 +241,13 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root,
                 heaps,
                 groups,
+                indirect,
             } => Cmd::Dispatch {
                 pso: pso.clone(),
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
+                indirect: *indirect,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -267,6 +274,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 index,
                 state,
                 call,
+                indirect,
             } => Cmd::Draw {
                 pso: pso.clone(),
                 binding: binding.clone(),
@@ -278,6 +286,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 index: *index,
                 state: *state,
                 call: *call,
+                indirect: *indirect,
             },
         }
     }
@@ -454,6 +463,16 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `Dispatch`. Needs the compute pipeline set.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
+        self.dispatch_from([x as usize, y as usize, z as usize], None)
+    }
+
+    /// One dispatch of `ExecuteIndirect`: its group counts are the three words at title address
+    /// `record`, read on the GPU.
+    pub fn dispatch_indirect(&mut self, record: u64) -> Result<(), String> {
+        self.dispatch_from([0; 3], Some(record))
+    }
+
+    fn dispatch_from(&mut self, groups: [usize; 3], indirect: Option<u64>) -> Result<(), String> {
         let pso = self
             .state
             .compute
@@ -463,7 +482,8 @@ impl<B: GraphicsBackend> NativeList<B> {
             pso,
             root: self.state.compute_root.clone(),
             heaps: self.state.heaps.clone(),
-            groups: [x as usize, y as usize, z as usize],
+            groups,
+            indirect,
         });
         Ok(())
     }
@@ -556,6 +576,37 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
+        self.draw_from(call, None)
+    }
+
+    /// One draw of `ExecuteIndirect`: its counts are the record at title address `record`
+    /// (`D3D12_DRAW_INDEXED_ARGUMENTS` when `indexed`, else `D3D12_DRAW_ARGUMENTS`), read on the GPU.
+    pub fn draw_indirect(&mut self, record: u64, indexed: bool) -> Result<(), String> {
+        let call = if indexed {
+            DrawCall::Indexed {
+                index_count: 0,
+                instance_count: 0,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                wide: self
+                    .state
+                    .index
+                    .ok_or("indexed draw without an index buffer")?
+                    .1,
+            }
+        } else {
+            DrawCall::Arrays {
+                vertex_count: 0,
+                instance_count: 0,
+                first_vertex: 0,
+                first_instance: 0,
+            }
+        };
+        self.draw_from(call, Some(record))
+    }
+
+    fn draw_from(&mut self, call: DrawCall, indirect: Option<u64>) -> Result<(), String> {
         let (pso, topology) = self
             .state
             .graphics
@@ -572,6 +623,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             index: self.state.index,
             state: self.state.draw,
             call,
+            indirect,
         });
         Ok(())
     }

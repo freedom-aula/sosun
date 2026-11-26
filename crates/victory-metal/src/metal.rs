@@ -335,6 +335,7 @@ mod tests {
             heaps: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
         }
     }
 

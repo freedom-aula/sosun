@@ -76,6 +76,47 @@ pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     Some((s.stride, &s.arguments))
 }
 
+/// What one `ExecuteIndirect` record does, for the signatures the native host runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum Command {
+    /// `D3D12_DRAW_ARGUMENTS`, 16 bytes.
+    Draw,
+    /// `D3D12_DRAW_INDEXED_ARGUMENTS`, 20 bytes.
+    DrawIndexed,
+    /// `D3D12_DISPATCH_ARGUMENTS`, 12 bytes.
+    Dispatch,
+    /// `D3D12_DISPATCH_MESH_ARGUMENTS`, 12 bytes.
+    DispatchMesh,
+}
+
+impl Command {
+    /// The bytes of its record.
+    pub(crate) fn size(self) -> u32 {
+        match self {
+            Command::Draw => 16,
+            Command::DrawIndexed => 20,
+            Command::Dispatch | Command::DispatchMesh => 12,
+        }
+    }
+}
+
+/// The command of a signature whose only argument is a draw or dispatch (types 0, 1, 2 and 10 of
+/// `D3D12_INDIRECT_ARGUMENT_TYPE`, and the console's 105, a dispatch whose record is the three
+/// group counts: a guess, see `docs/native-host.md`), and whose stride holds the record. `None`
+/// for any other signature: one that also changes root arguments, vertex or index buffers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn command(stride: u32, arguments: &[[u32; 4]]) -> Option<Command> {
+    let command = match arguments {
+        [[0, ..]] => Command::Draw,
+        [[1, ..]] => Command::DrawIndexed,
+        [[2 | 105, ..]] => Command::Dispatch,
+        [[10, ..]] => Command::DispatchMesh,
+        _ => return None,
+    };
+    (stride >= command.size()).then_some(command)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)
@@ -96,6 +137,28 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_titles_five_signatures_decode() {
+        // The five signatures of the prologue world load (2026-11-27), fields as logged: the
+        // words after a dispatch's type are not part of its description.
+        assert_eq!(command(12, &[[2, 1, 0, 0]]), Some(Command::Dispatch));
+        assert_eq!(command(12, &[[10, 0, 2149590408, 1]]), Some(Command::DispatchMesh));
+        assert_eq!(command(12, &[[105, 0, 60000, 0]]), Some(Command::Dispatch));
+        assert_eq!(command(20, &[[1, 0, 1106733220, 1]]), Some(Command::DrawIndexed));
+        assert_eq!(command(16, &[[0, 1, 8, 0]]), Some(Command::Draw));
+    }
+
+    #[test]
+    fn signatures_the_host_cannot_run_do_not_decode() {
+        // A root constant before the draw, a vertex buffer view, nothing, a stride too short.
+        assert_eq!(command(24, &[[5, 0, 0, 2], [0, 0, 0, 0]]), None);
+        assert_eq!(command(16, &[[3, 0, 0, 0]]), None);
+        assert_eq!(command(16, &[]), None);
+        assert_eq!(command(16, &[[1, 0, 0, 0]]), None);
+        // A longer stride than the record (padding between records) is fine.
+        assert_eq!(command(32, &[[0, 0, 0, 0]]).map(Command::size), Some(16));
+    }
     use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
 
     #[test]

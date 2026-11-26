@@ -1012,6 +1012,53 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
     });
 }
 
+/// `ExecuteIndirect` of a single-command signature without a count buffer: `max` draws or
+/// dispatches, record `i` at title address `records + i * stride`, each read on the GPU. False
+/// when the host cannot run it (mesh dispatches, rectangle lists); the caller logs that.
+pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, stride: u32, max: u32, records: u64) -> bool {
+    use crate::signature::Command;
+    let at = |i: u32| records + u64::from(i) * u64::from(stride);
+    match command {
+        Command::DispatchMesh => false,
+        Command::Dispatch => {
+            with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+                Pipe::Compute(pso) => {
+                    l.list.set_compute_pipeline(&pso);
+                    for i in 0..max {
+                        if let Err(e) = l.list.dispatch_indirect(at(i)) {
+                            tracing::warn!(error = %e, "indirect dispatch");
+                        }
+                    }
+                }
+                _ => dropped("a dispatch without a host compute pipeline"),
+            });
+            true
+        }
+        Command::Draw | Command::DrawIndexed => {
+            RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
+            with_list(this, |t, l| match graphics(t, l) {
+                // shortcut: a rectangle list's records count vertices of three-corner rectangles;
+                // drawing them needs the counts rewritten on the GPU first.
+                Some(true) => false,
+                Some(false) => {
+                    for i in 0..max {
+                        match l.list.draw_indirect(at(i), command == Command::DrawIndexed) {
+                            Ok(()) => {
+                                ENCODED.fetch_add(1, Ordering::Relaxed);
+                                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                            }
+                            Err(e) => tracing::warn!(error = %e, "indirect draw"),
+                        }
+                    }
+                    true
+                }
+                None => true,
+            })
+            .unwrap_or(true)
+        }
+    }
+}
+
 pub(crate) fn root_constants(this: This, compute: bool, slot: u32, offset: u32, words: &[u32]) {
     with_list(this, |_, l| {
         l.list
