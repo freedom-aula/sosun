@@ -1071,6 +1071,7 @@ const DENORMAL: &str = "denormal operands of min, max and float selects are the 
 const F16_ROUND: &str = "f16 results round toward zero";
 const F16_TWICE: &str = "f16 arithmetic rounds in f32 first, as the host chooses";
 const SCC_MIN_MAX: &str = "s_min and s_max set SCC from the result";
+const SCC_LSHL_ADD: &str = "s_lshl<n>_add_u32 set SCC from the result";
 const FLOOR_CVT: &str = "v_cvt_flr and v_cvt_rpi: NaN and the half";
 const MED3_ZERO: &str = "v_med3_f32 orders -0 and +0 as the host does";
 const CONSTANT_CMP: &str = "a constant compare removes the WARP device";
@@ -2584,6 +2585,36 @@ fn scalar_probes() -> Vec<Probe> {
             f
         }
     };
+    // s_lshl<n>_add_u32 (SOP2 46-49): SCC is whether (S0 << n) + S1, in
+    // 64 bits, reaches 2^32, bits shifted out included (RDNA2 ISA).
+    let mut shift_adds = ab.clone();
+    shift_adds.extend(
+        [
+            (1, 2),
+            (0x8000_0000, 0),
+            (0x7FFF_FFFF, 2),
+            (0x3FFF_FFFF, 0),
+            (0x1000_0000, 0),
+            (0x0FFF_FFFF, 0x10),
+            (0xFFFF_FFFF, 0xFFFF_FFFF),
+        ]
+        .map(|(a, b)| [a, b, 0, OLD]),
+    );
+    let shift_add = |n: u16| {
+        let wide = move |i: [u32; 4]| (u64::from(i[0]) << n) + u64::from(i[1]);
+        scalar_out(
+            sop2(0x2D + n, 20, s(16), s(17)),
+            shift_adds.clone(),
+            move |i| {
+                let w = wide(i);
+                (w as u32, Some(w >> 32 != 0))
+            },
+        )
+        .shows(SCC_LSHL_ADD, move |i| {
+            let w = wide(i);
+            (w >> 32 != 0) != (w as u32 != 0)
+        })
+    };
     let mut p = vec![
         // (SCC of the adds, their carry or overflow, the lowering refuses.)
         sop2_probe(0x02, ab.clone(), |a, b| (a.wrapping_add(b), None)),
@@ -2617,6 +2648,10 @@ fn scalar_probes() -> Vec<Probe> {
         .shows(SCC_MIN_MAX, |i| {
             ((i[0] as i32) > (i[1] as i32)) != ((i[0] as i32).max(i[1] as i32) != 0)
         }),
+        shift_add(1),
+        shift_add(2),
+        shift_add(3),
+        shift_add(4),
         sop2_probe(0x1E, shifts.clone(), |a, n| {
             (a << (n & 31), Some(a << (n & 31) != 0))
         }),
@@ -2818,6 +2853,15 @@ fn f16_arithmetic_rounds_once() {
 #[test]
 fn scalar_min_max_set_scc_from_the_compare() {
     defect(scalar_probes(), SCC_MIN_MAX);
+}
+
+/// `s_lshl<n>_add_u32` set SCC to whether `(S0 << n) + S1` reaches 2^32 in
+/// 64 bits (RDNA2 ISA): `s_lshl1_add_u32 1, 2` gives 4 and SCC 0,
+/// `s_lshl4_add_u32 0x10000000, 0` gives 0 and SCC 1. Was a defect: SCC
+/// was `result != 0`.
+#[test]
+fn scalar_shift_adds_set_scc_from_the_overflow() {
+    defect(scalar_probes(), SCC_LSHL_ADD);
 }
 
 /// `v_cvt_flr_i32_f32`/`v_cvt_rpi_i32_f32` saturate a NaN by its sign and

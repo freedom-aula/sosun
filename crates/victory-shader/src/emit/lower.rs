@@ -5137,10 +5137,19 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC: whether (S0 << N) + S1, taken in 64 bits, reaches
+                // 2^32 (RDNA2 ISA, SOP2 46-49): the add's carry, or a bit
+                // the shift moved out. Mesa ACO ignores the latter.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let (r, carry) = self.add_sub_carry(c, true, t, b, None);
+                let k = self.s.m.i32(32 - n);
+                let out = self.s.m.bin(c, Bin::LShr, a, k);
+                let z = self.s.m.i32(0);
+                let out = self.s.m.cmp(c, pred::NE, out, z);
+                (r, Some(self.s.m.bin(c, Bin::Or, carry, out)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
