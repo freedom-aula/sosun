@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use victory_platform::mem::{self, PagePool, Protect, Window};
@@ -108,6 +108,8 @@ pub fn pools() -> Vec<PoolInfo> {
 struct Pool {
     pool: PagePool,
     info: PoolInfo,
+    /// Who allocated it (`VICTORY_TRACE_OWNERS`).
+    owner: Option<Owner>,
 }
 
 impl Pool {
@@ -145,7 +147,11 @@ impl Pool {
         if let Some(observer) = observer() {
             observer.pool_created(&info);
         }
-        Ok(Pool { pool, info })
+        Ok(Pool {
+            pool,
+            info,
+            owner: tracing_owners().then(Owner::now),
+        })
     }
 }
 
@@ -179,6 +185,8 @@ struct Physical {
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Addresses>,
+    /// Who made each view, by address (`VICTORY_TRACE_OWNERS` only).
+    owners: BTreeMap<usize, Owner>,
 }
 
 enum Addresses {
@@ -305,6 +313,192 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// `VICTORY_TRACE_OWNERS=1` (docs/native-host.md, "Bring-up diagnostics"): who made the views,
+// pools and regions that come to share pages, logged when they do (#15).
+
+/// Whether owners are kept and conflicts logged: the switch, and always in this crate's tests.
+pub(crate) fn tracing_owners() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_TRACE_OWNERS").is_some());
+    cfg!(test) || *ON
+}
+
+thread_local! {
+    /// The outermost public call this thread is in, for [`Owner::now`].
+    static CALL: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Names the public call owners made on this thread come from, while it lives.
+pub(crate) struct Entered(bool);
+
+/// Enters `call` (an outer call keeps its name).
+pub(crate) fn enter(call: &'static str) -> Entered {
+    Entered(
+        tracing_owners()
+            && CALL.with(|c| {
+                let outermost = c.get().is_empty();
+                if outermost {
+                    c.set(call);
+                }
+                outermost
+            }),
+    )
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        if self.0 {
+            CALL.with(|c| c.set(""));
+        }
+    }
+}
+
+/// Who made a view, a pool or a region.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Owner {
+    call: &'static str,
+    /// Order of making, over all owners.
+    seq: u64,
+    /// The title's return address from the host call (0 if none).
+    ret: usize,
+}
+
+impl Owner {
+    pub(crate) fn now() -> Owner {
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        Owner {
+            call: CALL.with(std::cell::Cell::get),
+            seq: SEQ.fetch_add(1, Ordering::Relaxed),
+            ret: title_return(),
+        }
+    }
+}
+
+/// Where title code called the host call this thread is in, as the bridge left it.
+fn title_return() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        use victory_loader::native::teb;
+        // SAFETY: a word inside the calling thread's TEB block.
+        unsafe {
+            teb::current()
+                .add(teb::OFF_IN_HOST_RET)
+                .cast::<usize>()
+                .read_volatile()
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    0
+}
+
+/// One side of a conflict: `[base, base + len)` (for pages: the first number and the count),
+/// what holds it and who made that.
+pub(crate) struct Held {
+    pub(crate) what: &'static str,
+    pub(crate) owner: Option<Owner>,
+    pub(crate) base: usize,
+    pub(crate) len: usize,
+    /// [`PoolInfo::id`], 0 for none.
+    pub(crate) pool: usize,
+    pub(crate) index: usize,
+}
+
+impl Held {
+    fn view(owner: Option<Owner>, base: usize, len: usize, slice: &Slice) -> Held {
+        Held {
+            what: "view",
+            owner,
+            base,
+            len,
+            pool: slice.pool.info.id,
+            index: slice.index,
+        }
+    }
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} [{:#x}, +{:#x})", self.what, self.base, self.len)?;
+        if self.pool != 0 {
+            write!(f, " pool {} page {}", self.pool, self.index)?;
+        }
+        match self.owner {
+            Some(o) => {
+                write!(f, " made by {} #{}", if o.call.is_empty() { "?" } else { o.call }, o.seq)?;
+                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+                if let Some(image) = victory_loader::native::seh::unwind::image_base_of(o.ret) {
+                    return write!(f, " from {image:#x}+{:#x}", o.ret - image);
+                }
+                write!(f, " from {:#x}", o.ret)
+            }
+            None if self.len == 0 => Ok(()),
+            None => write!(f, " made before tracing"),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The conflicts this thread logged: case, and the pools of both sides.
+    pub(crate) static TRIPS: std::cell::RefCell<Vec<(&'static str, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The pool of a page (tests compare pools, not addresses other tests may reuse).
+#[cfg(test)]
+pub(crate) fn pool_of(page: usize) -> usize {
+    physical().pages[&page].pool.info.id
+}
+
+/// Logs two owners that come to share pages.
+pub(crate) fn conflict(case: &'static str, first: &Held, second: &Held) {
+    #[cfg(test)]
+    TRIPS.with(|t| t.borrow_mut().push((case, first.pool, second.pool)));
+    tracing::warn!(case, %first, %second, "VICTORY_TRACE_OWNERS");
+}
+
+/// The first view overlapping `[base, base + len)`.
+fn overlapping(physical: &Physical, base: usize, len: usize) -> Option<(usize, usize, &Slice)> {
+    let end = base.saturating_add(len);
+    physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .or_else(|| physical.views.range(base..end).next())
+        .map(|(&at, (size, slice))| (at, *size, slice))
+}
+
+/// The page number Grand Theft Auto VI rebuilds from `number` (21 bits of `number >> 4`, then
+/// `<< 4`, see [`FRAMES`]) when that is another number.
+fn number_kept(number: usize) -> Option<usize> {
+    let kept = number & ((1 << 25) - 1);
+    (kept != number).then_some(kept)
+}
+
+/// `VirtualFree` of `region` (`case` says how): logs the first view still in it.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(crate) fn freeing(case: &'static str, region: &Held) {
+    let physical = physical();
+    if let Some((at, size, slice)) = overlapping(&physical, region.base, region.len) {
+        let view = Held::view(physical.owners.get(&at).copied(), at, size, slice);
+        conflict(case, region, &view);
+    }
+}
+
+/// A title mapping of `slice` at `[base, base + len)` outside every region `VirtualAlloc` or
+/// `XMemVirtualAlloc` made: logs it and the nearest region below.
+fn check_region(base: usize, len: usize, slice: &Slice) {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if tracing_owners()
+        && let Err(near) = crate::host_posix::region_of(base, len)
+    {
+        let view = Held::view(Some(Owner::now()), base, len, slice);
+        conflict("a mapping outside every region", &view, &near);
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    let _ = (base, len, slice);
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -314,6 +508,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if count.is_null() || pages.is_null() {
         return 0;
     }
+    let _call = enter("XMemAllocatePhysicalPages");
     // SAFETY: checked non-null.
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
@@ -336,6 +531,30 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
+    if tracing_owners()
+        && let Some((number, kept)) = (0..n)
+            .map(|i| first + i * FRAMES)
+            .find_map(|number| number_kept(number).map(|kept| (number, kept)))
+    {
+        let new = Held {
+            what: "page numbers",
+            owner: pool.owner,
+            base: number,
+            len: n - (number - first) / FRAMES,
+            pool: pool.info.id,
+            index: (number - first) / FRAMES,
+        };
+        let old = physical.pages.get(&kept);
+        let old = Held {
+            what: "the page number kept",
+            owner: old.and_then(|s| s.pool.owner),
+            base: kept,
+            len: 1,
+            pool: old.map_or(0, |s| s.pool.info.id),
+            index: old.map_or(0, |s| s.index),
+        };
+        conflict("a page number past 25 bits", &new, &old);
+    }
     for index in 0..n {
         let slice = Slice {
             pool: pool.clone(),
@@ -396,7 +615,7 @@ pub(super) fn release_pool_backing(base: usize, len: usize) {
 
 /// The pool a physical-page view shows at `at`, if any (its id: a new pool never has an old one's).
 #[cfg(all(test, not(windows)))]
-pub(super) fn pool_shown_at(at: usize) -> Option<usize> {
+pub(crate) fn pool_shown_at(at: usize) -> Option<usize> {
     let physical = physical();
     let (&base, (len, slice)) = physical.views.range(..=at).next_back()?;
     (at < base + len).then_some(slice.pool.info.id)
@@ -545,6 +764,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let _call = enter("XMemMapPhysicalPages");
     let base = address as usize;
     // A title reserves 64 KiB pages on 64 KiB boundaries (Windows insists).
     if !base.is_multiple_of(PAGE) {
@@ -585,6 +805,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
+        check_region(base + i * PAGE, run * PAGE, &first);
         if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
             return std::ptr::null_mut();
         }
@@ -603,6 +824,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    let _call = enter("XMemMapPhysicalPagesScatter");
     let mut i = 0;
     while i < n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` page numbers.
@@ -699,6 +921,7 @@ fn map_fresh_scatter(addresses: &[*mut c_void], pages: &[usize]) -> Option<(usiz
         pool: first.pool.clone(),
         index: first.index + k,
     };
+    check_region(base, run * PAGE, &first);
     // If the host rejects the run, retry one page at a time so a failing scatter keeps
     // its successful prefix. Each destination retains its own view and observer events.
     if host_map(base, run * PAGE, &first).is_err() {
@@ -717,6 +940,7 @@ fn map_fresh_scatter(addresses: &[*mut c_void], pages: &[usize]) -> Option<(usiz
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    let _call = enter("map_alias");
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     if from != 0
@@ -734,6 +958,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         let Some(slice) = slice_at(&physical, from + k) else {
             return false;
         };
+        check_region(to + k, PAGE, &slice);
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
@@ -772,6 +997,14 @@ fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
 /// Records `slice` and the slices after it as the view at `[base, base + len)`
 /// and where each page shows.
 fn record(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
+    if tracing_owners() {
+        let owner = Owner::now();
+        if let Some((at, size, other)) = overlapping(physical, base, len) {
+            let old = Held::view(physical.owners.get(&at).copied(), at, size, other);
+            conflict("a view over another", &Held::view(Some(owner), base, len, &slice), &old);
+        }
+        physical.owners.insert(base, owner);
+    }
     for k in 0..len / PAGE {
         let at = base + k * PAGE;
         match physical.shown.entry(slice.key(k)) {
@@ -880,6 +1113,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .or_else(|| physical.views.range(base..end).next().map(|(&at, _)| at))
     {
         let (size, slice) = physical.views.remove(&at).expect("overlapping view");
+        let owner = if tracing_owners() {
+            physical.owners.remove(&at)
+        } else {
+            None
+        };
         // A Windows view goes whole and what lies outside the range is
         // mapped again; a Mach mapping is cut where the range is.
         let (from, to) = if cfg!(windows) {
@@ -909,6 +1147,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             remap(physical, (end, at + size - end, Slice { index, ..slice }));
+        }
+        // What stays of the view keeps its owner.
+        for (keep, from) in [(at < base, at), (at + size > end, end)] {
+            if let Some(owner) = owner.filter(|_| keep) {
+                physical.owners.insert(from, owner);
+            }
         }
     }
 }
@@ -1598,5 +1842,44 @@ mod tests {
             [format!("released {}", 7 * PAGE)]
         );
         assert!(pools().iter().all(|p| p.id != info.id));
+    }
+
+    /// The conflicts of `case` this thread logged: the pools of both sides.
+    fn trips(case: &str) -> Vec<(usize, usize)> {
+        TRIPS.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|(c, ..)| *c == case)
+                .map(|&(_, first, second)| (first, second))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn owners_name_a_view_mapped_over_another() {
+        let p = reserve(2) as usize;
+        let (a, b) = (allocate(2), allocate(1));
+        let (first, second) = (pool_of(a[0]), pool_of(b[0]));
+        {
+            let mut physical = physical();
+            let slice = |page| physical.pages[&page].clone();
+            let (old, new) = (slice(a[0]), slice(b[0]));
+            assert!(map(&mut physical, p, 2 * PAGE, old));
+            assert!(trips("a view over another").is_empty());
+            // Over the second page of the first view: the mapping paths unmap first, this does not.
+            assert!(map(&mut physical, p + PAGE, PAGE, new));
+            unmap(&mut physical, p, 2 * PAGE);
+        }
+        assert_eq!(trips("a view over another"), [(second, first)]);
+        assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn page_numbers_past_25_bits_are_named() {
+        assert_eq!(number_kept(0x10_0000), None);
+        assert_eq!(number_kept((1 << 25) - FRAMES), None);
+        assert_eq!(number_kept(1 << 25), Some(0));
+        assert_eq!(number_kept((1 << 25) + 0x10_0000), Some(0x10_0000));
     }
 }
