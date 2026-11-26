@@ -601,6 +601,10 @@ have partly run, and its source may have changed since). Guess: the console has 
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
 policy, not console behaviour.
 
+#### Heap samplers live as long as the backend
+
+A sampler heap entry holds only the sampler's resource ID. The host used to drop its `MTLSamplerState` right after writing the entry, and Metal gives a freed sampler's ID to the next sampler made, so an older entry then sampled with a newer descriptor's filter and address modes. `create_sampler` now keeps every sampler it makes, one per distinct `SamplerDesc` (few exist), and hands the same one back for the same descriptor.
+
 #### CPU texture transfers are bounds-checked
 
 `upload_texture` and `read_texture` compute what the mip needs from the texture's format (blocks wide times bytes per block, rows, slice pitch) and skip the Metal call, with a warning naming the format, region, pitches and buffer length (and a backtrace the first time), when the row pitch, slice pitch or buffer is too small. Metal's `AGX: Texture read/write assertion failed: bytes_per_row >= used_bytes_per_row` was seen 0.6-2 s before a burst of title-heap corruption, so a short pitch is suspected to let the driver run past the buffer; the check keeps that out of host memory (hypothesis, not yet proven).

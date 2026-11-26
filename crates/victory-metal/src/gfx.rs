@@ -953,6 +953,9 @@ impl ResourceBackend for Metal {
     }
 
     fn create_sampler(&self, d: &SamplerDesc) -> Result<Sampler, String> {
+        if let Some((_, s)) = self.samplers.borrow().iter().find(|(k, _)| k == d) {
+            return Ok(Sampler(s.clone()));
+        }
         let sd = MTLSamplerDescriptor::new();
         sd.setMinFilter(filter(d.min_mag));
         sd.setMagFilter(filter(d.min_mag));
@@ -970,6 +973,7 @@ impl ResourceBackend for Metal {
             .dev
             .newSamplerStateWithDescriptor(&sd)
             .ok_or("newSamplerState failed")?;
+        self.samplers.borrow_mut().push((*d, s.clone()));
         Ok(Sampler(s))
     }
 }
@@ -2040,5 +2044,27 @@ mod owed_tests {
         // A normal submission after it still completes: the queue is not stuck behind the order value.
         m.submit_passes(&q, &sub(&s9)).unwrap();
         assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    #[test]
+    fn a_sampler_in_a_heap_keeps_its_id() {
+        let m = Metal::new().unwrap();
+        let desc = |min_mag| SamplerDesc {
+            min_mag,
+            mip: Filter::Nearest,
+            address: [Address::Clamp; 3],
+            max_anisotropy: 1,
+        };
+        let id = |s: &Sampler| resource_id(s.0.gpuResourceID());
+        // The host drops its sampler once the ID is in the heap; a later one must not take that ID.
+        let first = id(&m.create_sampler(&desc(Filter::Nearest)).unwrap());
+        let second = id(&m.create_sampler(&desc(Filter::Linear)).unwrap());
+        assert_ne!(first, second, "a freed sampler's ID was reused while a heap still names it");
+        assert_eq!(id(&m.create_sampler(&desc(Filter::Nearest)).unwrap()), first, "samplers are shared by descriptor");
     }
 }

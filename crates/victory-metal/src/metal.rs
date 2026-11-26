@@ -33,6 +33,12 @@ pub struct Metal {
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
+    /// Every sampler made, by descriptor: a heap entry holds only the sampler's ID, which Metal
+    /// hands to a new sampler once the old one is freed. Few distinct descriptors exist.
+    #[allow(clippy::type_complexity)]
+    pub(crate) samplers: std::cell::RefCell<
+        Vec<(crate::resources::SamplerDesc, Retained<ProtocolObject<dyn MTLSamplerState>>)>,
+    >,
 }
 
 /// Seconds since the first `Metal::new` (about process start), for the failure trace.
@@ -147,6 +153,7 @@ impl Metal {
             pipe_names: Default::default(),
             trace_enc: Default::default(),
             gate: Default::default(),
+            samplers: Default::default(),
         })
     }
 
