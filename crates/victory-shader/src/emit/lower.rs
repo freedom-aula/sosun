@@ -10284,6 +10284,27 @@ impl<'a> Lower<'a> {
     /// the console compiler's if/else always skips into its join that way.
     /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
     /// edge into its header; the others take the wave's.
+    /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
+    /// only successor, is a move in `q` of an inline 0 (`false`: no lane) or -1 (`true`: every
+    /// lane), both dwords at once in a wave64 program. The wave holds that constant on the edge
+    /// whichever lanes run `q`, as nothing after the move runs before the join.
+    fn constant_mask(&self, low: Value, q: usize) -> Option<bool> {
+        let block = &self.x.p.blocks[q];
+        if block.exit.successors().len() != 1 {
+            return None;
+        }
+        let op = if self.x.native.wave64 { "s_mov_b64" } else { "s_mov_b32" };
+        let (_, [src]) = scalar_def::<1>(block, low, op)?;
+        match src {
+            Operand::Const(code) => match crate::resource::inline(code)? {
+                0 => Some(false),
+                u32::MAX => Some(true),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn uniform_join(&self, b: usize) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
@@ -13459,6 +13480,11 @@ impl<'a> Lower<'a> {
                         if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) =>
                     {
                         self.s.m.bool(false)
+                    }
+                    // No lanes or every lane, moved just before the edge: each lane's bit,
+                    // whatever the lane layout and whichever lanes take the edge.
+                    (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
+                        self.s.m.bool(all)
                     }
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
