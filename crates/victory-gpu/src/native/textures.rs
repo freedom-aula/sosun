@@ -198,15 +198,18 @@ pub struct Tracked<B: ResourceBackend> {
 /// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
 /// further change.
 const HOT: u32 = 600;
-/// Maximum hot textures probed synchronously on a single submission. Boot movies and UI glyph
-/// caches have ~12 hot textures (all checked every submission); when world streaming realizes
-/// thousands of blank textures at once, this bounds per-submission probing to O(1) while the
-/// background scanner thread catches the rest off the host lock.
+/// Time one submission spends probing hot textures. Boot movies and UI glyph caches have a few
+/// hundred hot textures (the movie's planes among them, blank until the title decodes into them),
+/// all of which a submission must reach: a count limit left a plane's first frames unseen (solid
+/// green) for hot / limit submissions. When world streaming realizes thousands of blank textures
+/// the time bounds the probing and the cursor resumes where the last submission stopped, while
+/// the scanner thread catches the rest off the host lock.
 ///
-/// shortcut: a title write to a hot texture can take up to `ceil(hot / MAX_SYNC_HOT)`
-/// submissions to be noticed synchronously (unless the scanner catches it first); raise this if
-/// more than 32 textures need same-submission updates (e.g. many simultaneous streaming UI atlases).
-const MAX_SYNC_HOT: usize = 32;
+/// shortcut: past a few thousand hot textures a write is noticed a few submissions late (unless
+/// the scanner catches it first); at least `MIN_SYNC_HOT` are probed whatever the time.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+/// Hot textures a submission probes at least, however long the probes take.
+const MIN_SYNC_HOT: usize = 32;
 /// Pages of a large hot texture's memory a probe reads, spread over it.
 const PROBE_PAGES: usize = 8;
 /// Bytes sampled per page when probing a large hot texture.
@@ -374,11 +377,17 @@ impl<B: PresentBackend> Title<B> {
     /// found changed since.
     pub fn sync_dirty(&mut self) {
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
-        // Hot textures (a movie's planes, a glyph cache) are probed synchronously in O(1) bounded
-        // batches so world streaming (thousands of blank textures) never stalls submissions.
-        let mut budget = self.hot_keys.len().min(MAX_SYNC_HOT);
+        // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
+        // a time budget so world streaming (thousands of blank textures) never stalls submissions.
+        let start = std::time::Instant::now();
+        let mut budget = self.hot_keys.len();
+        let mut probed = 0;
         while budget > 0 && !self.hot_keys.is_empty() {
+            if probed >= MIN_SYNC_HOT && start.elapsed() >= PROBE_BUDGET {
+                break;
+            }
             budget -= 1;
+            probed += 1;
             let idx = self.hot_cursor % self.hot_keys.len();
             let key = self.hot_keys[idx];
             let Some(t) = self.textures.get_mut(&key) else {

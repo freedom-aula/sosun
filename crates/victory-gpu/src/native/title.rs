@@ -203,7 +203,7 @@ pub struct Title<B: PresentBackend> {
     pub(super) unloaded: std::collections::HashSet<usize>,
     /// Keys of textures currently in the fast per-submission probe set (`hot > 0`).
     pub(super) hot_keys: Vec<usize>,
-    /// Round-robin cursor into `hot_keys` when more than `MAX_SYNC_HOT` textures are hot.
+    /// Round-robin cursor into `hot_keys` when the time budget ends before all are probed.
     pub(super) hot_cursor: usize,
     /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
     pub(super) probe_buf: Vec<u8>,

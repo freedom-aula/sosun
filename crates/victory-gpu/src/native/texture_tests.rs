@@ -135,6 +135,35 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     });
 }
 
+/// A movie plane uploaded blank among hundreds of other hot textures (a title streaming) is still
+/// probed at the next submission: a count limit on the probes left its first frames green.
+/// (Every texture is written, so which one a limited probe reaches first does not matter.)
+#[test]
+fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
+    const N: usize = 200;
+    const STRIDE: usize = 64 << 10;
+    let Some(pool) = pool(9121, N * STRIDE / page_size() + 1) else { return };
+    let keys: Vec<usize> = (0..N)
+        .map(|i| crate::resource::test_texture_at(pool.va(i * STRIDE), (64, 64), 1, 28, Swizzle::LINEAR.0, 0) as usize)
+        .collect();
+    let size = crate::resource::texture_info(keys[0] as _).unwrap().size;
+    with_title(|t| {
+        for &k in &keys {
+            assert!(t.realize(k));
+        }
+        t.sync_dirty();
+        assert!(keys.iter().all(|&k| t.uploads_of(k) == 1), "every blank upload");
+    });
+    for i in 0..N {
+        pool.write(i * STRIDE, &vec![0xABu8; size]);
+    }
+    with_title(|t| {
+        t.sync_dirty();
+        let seen = keys.iter().filter(|&&k| t.uploads_of(k) == 2).count();
+        assert_eq!(seen, N, "all {N} hot textures written, seen at the next submission");
+    });
+}
+
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
 #[test]
 fn a_block_compressed_title_texture_is_detiled_as_blocks() {
