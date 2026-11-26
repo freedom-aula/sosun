@@ -176,12 +176,20 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
     match m.exports.iter().find(|e| e.name == name) {
-        Some(e) => e.address as *mut c_void,
+        Some(e) => title_callable(e.address as usize),
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
             std::ptr::null_mut()
         }
     }
+}
+
+/// Natively our functions run with the host's GS, so title code calls them
+/// through a bridge stub; elsewhere the address itself.
+fn title_callable(address: usize) -> *mut c_void {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let address = crate::host_posix::fake_dll::bridged(address).unwrap_or(0);
+    address as *mut c_void
 }
 
 /// What a host module's `name` (or ordinal) is bound to at import binding

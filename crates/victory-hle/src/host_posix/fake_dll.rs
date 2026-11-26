@@ -119,6 +119,18 @@ pub(crate) fn proc_address(module: *mut c_void, symbol: ImportSymbol) -> Option<
     Some(stub as *mut c_void)
 }
 
+/// A callable win64 entry for one of our own functions (behind a console
+/// pseudo module): title code must reach it through the GS-swapping bridge.
+pub(crate) fn bridged(address: usize) -> Option<usize> {
+    let key = (0, format!("{address:#x}"));
+    if let Some(&stub) = lock(&PROCS).get(&key) {
+        return Some(stub);
+    }
+    let stub = bridge::stub_for(address).ok()?;
+    lock(&PROCS).insert(key, stub);
+    Some(stub)
+}
+
 /// `C:\Windows\System32\<name>` as UTF-16, no NUL.
 pub(crate) fn path(module: *mut c_void) -> Option<Vec<u16>> {
     let name = name_of(module)?;
