@@ -454,6 +454,15 @@ static COLLECTION: LazyLock<Vec<usize>> = LazyLock::new(|| {
         collection_item
     ])
 });
+static EMPTY_COLLECTION: LazyLock<Vec<usize>> = LazyLock::new(|| {
+    table(&methods![
+        simple_query,
+        simple_add_ref,
+        simple_release,
+        empty_collection_count,
+        empty_collection_item
+    ])
+});
 static PROPERTIES: LazyLock<Vec<usize>> = LazyLock::new(|| {
     table(&methods![
         simple_query,
@@ -521,18 +530,37 @@ extern "win64" fn simple_release(this: *mut Simple) -> u32 {
     unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel).saturating_sub(1) }
 }
 
-/// Writes a new object at `out`.
-fn give(out: *mut *mut c_void, object: *mut Simple) -> HRESULT {
-    put(out, object.cast())
+/// Writes a new object at `out`, allocating only if `out` is non-null.
+fn give(out: *mut *mut c_void, make: impl FnOnce() -> *mut Simple) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    put(out, make().cast())
 }
+
+const DATA_FLOW_CAPTURE: u32 = 1;
+const DATA_FLOW_ALL: u32 = 2;
+const DEVICE_STATE_ACTIVE: u32 = 1;
 
 extern "win64" fn enum_endpoints(
     _this: *mut Simple,
-    _flow: u32,
-    _mask: u32,
+    flow: u32,
+    mask: u32,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&COLLECTION, IID_COLLECTION))
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if flow > DATA_FLOW_ALL {
+        put(out, std::ptr::null_mut());
+        return E_INVALIDARG;
+    }
+    let vtable = if flow == DATA_FLOW_CAPTURE || mask & DEVICE_STATE_ACTIVE == 0 {
+        &EMPTY_COLLECTION
+    } else {
+        &COLLECTION
+    };
+    give(out, || simple(vtable, IID_COLLECTION))
 }
 
 extern "win64" fn default_endpoint(
@@ -546,7 +574,7 @@ extern "win64" fn default_endpoint(
         put(out, std::ptr::null_mut());
         return E_NOTFOUND;
     }
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
 }
 
 extern "win64" fn get_device(
@@ -554,7 +582,7 @@ extern "win64" fn get_device(
     _id: *const u16,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
 }
 
 extern "win64" fn register_notification(_this: *mut Simple, _callback: *mut c_void) -> HRESULT {
@@ -573,7 +601,19 @@ extern "win64" fn collection_item(
     if index != 0 {
         return E_INVALIDARG;
     }
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
+}
+
+extern "win64" fn empty_collection_count(_this: *mut Simple, count: *mut u32) -> HRESULT {
+    put(count, 0)
+}
+
+extern "win64" fn empty_collection_item(
+    _this: *mut Simple,
+    _index: u32,
+    _out: *mut *mut c_void,
+) -> HRESULT {
+    E_INVALIDARG
 }
 
 extern "win64" fn device_activate(
@@ -608,7 +648,7 @@ extern "win64" fn device_properties(
     _access: u32,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&PROPERTIES, IID_PROPERTY_STORE))
+    give(out, || simple(&PROPERTIES, IID_PROPERTY_STORE))
 }
 
 extern "win64" fn device_id(_this: *mut Simple, out: *mut *mut u16) -> HRESULT {
@@ -988,6 +1028,9 @@ extern "win64" fn client_service(
     iid: *const c_void,
     out: *mut *mut c_void,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
     let iid = read_guid(iid);
     let shared = match shared_of(this) {
         Ok(s) => s,
@@ -999,6 +1042,7 @@ extern "win64" fn client_service(
         CLOCK.as_ptr()
     } else {
         warn_once(format!("IAudioClient::GetService of {iid:02x?}"));
+        put(out, std::ptr::null_mut());
         return E_NOINTERFACE;
     };
     let sub = leak(Sub { vtable, refs: AtomicU32::new(1), iid, shared });
@@ -1041,9 +1085,13 @@ extern "win64" fn client_engine_period(
 
 extern "win64" fn client_current_period(
     _this: *mut Client,
-    _wave: *mut *mut u8,
+    wave: *mut *mut u8,
     period: *mut u32,
 ) -> HRESULT {
+    if wave.is_null() || period.is_null() {
+        return E_POINTER;
+    }
+    put(wave, mix_format());
     put(period, MIX_RATE / 100)
 }
 
@@ -1094,6 +1142,9 @@ extern "win64" fn sub_release(this: *mut Sub) -> u32 {
 }
 
 extern "win64" fn render_get_buffer(this: *mut Sub, frames: u32, out: *mut *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     match unsafe { &*this }.shared.get_buffer(frames as usize) {
         Ok(p) => put(out, p),
@@ -1112,6 +1163,9 @@ extern "win64" fn clock_frequency(this: *mut Sub, out: *mut u64) -> HRESULT {
 }
 
 extern "win64" fn clock_position(this: *mut Sub, position: *mut u64, qpc: *mut u64) -> HRESULT {
+    if position.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     let played = lock(&unsafe { &*this }.shared.state).position;
     if !qpc.is_null() {
@@ -1274,5 +1328,81 @@ mod tests {
         assert_eq!(ring.pull(&mut out), 2);
         assert_eq!(out, [0.1, 0.2, 0.3, 0.4, 0.0, 0.0]);
         assert_eq!(ring.frames(), 0);
+    }
+
+    #[test]
+    fn enum_endpoints_respects_data_flow_and_state_mask() {
+        let mut col = std::ptr::null_mut();
+        assert_eq!(enum_endpoints(std::ptr::null_mut(), 0, DEVICE_STATE_ACTIVE, &mut col), S_OK);
+        let mut count = 99u32;
+        // SAFETY: `col` is a `Simple` whose vtable is `COLLECTION`.
+        let vt = unsafe { (*(col as *const Simple)).vtable };
+        // SAFETY: slot 3 of `COLLECTION` is `collection_count`.
+        let get_count: extern "win64" fn(*mut Simple, *mut u32) -> HRESULT =
+            unsafe { std::mem::transmute(*vt.add(3)) };
+        assert_eq!(get_count(col.cast(), &mut count), S_OK);
+        assert_eq!(count, 1);
+
+        // Capture endpoints and inactive masks produce an empty collection.
+        for (flow, mask) in [(DATA_FLOW_CAPTURE, DEVICE_STATE_ACTIVE), (0, 0x2)] {
+            let mut empty = std::ptr::null_mut();
+            assert_eq!(enum_endpoints(std::ptr::null_mut(), flow, mask, &mut empty), S_OK);
+            // SAFETY: `empty` is a `Simple` whose vtable is `EMPTY_COLLECTION`.
+            let vt = unsafe { (*(empty as *const Simple)).vtable };
+            // SAFETY: slot 3 of `EMPTY_COLLECTION` is `empty_collection_count`.
+            let get_count: extern "win64" fn(*mut Simple, *mut u32) -> HRESULT =
+                unsafe { std::mem::transmute(*vt.add(3)) };
+            // SAFETY: slot 4 of `EMPTY_COLLECTION` is `empty_collection_item`.
+            let get_item: extern "win64" fn(*mut Simple, u32, *mut *mut c_void) -> HRESULT =
+                unsafe { std::mem::transmute(*vt.add(4)) };
+            let mut n = 99u32;
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(get_count(empty.cast(), &mut n), S_OK);
+            assert_eq!(n, 0);
+            assert_eq!(get_item(empty.cast(), 0, &mut dev), E_INVALIDARG);
+        }
+        assert_eq!(
+            enum_endpoints(std::ptr::null_mut(), 3, DEVICE_STATE_ACTIVE, &mut col),
+            E_INVALIDARG
+        );
+        assert!(col.is_null());
+        assert_eq!(
+            enum_endpoints(std::ptr::null_mut(), 0, DEVICE_STATE_ACTIVE, std::ptr::null_mut()),
+            E_POINTER
+        );
+    }
+
+    #[test]
+    fn current_period_populates_format_and_render_get_buffer_guards_null_out() {
+        let mut wave = std::ptr::null_mut();
+        let mut period = 0u32;
+        assert_eq!(
+            client_current_period(std::ptr::null_mut(), std::ptr::null_mut(), &mut period),
+            E_POINTER
+        );
+        assert_eq!(
+            client_current_period(std::ptr::null_mut(), &mut wave, std::ptr::null_mut()),
+            E_POINTER
+        );
+        assert_eq!(client_current_period(std::ptr::null_mut(), &mut wave, &mut period), S_OK);
+        assert!(!wave.is_null());
+        assert_eq!(period, MIX_RATE / 100);
+        let fmt = parse_format(wave).expect("valid mix format");
+        assert_eq!((fmt.channels, fmt.rate, fmt.bits, fmt.float), (2, MIX_RATE, 32, true));
+
+        // A null out pointer on GetBuffer must not leave staging locked.
+        let shared = Shared::new(STEREO_F32, 100, 48);
+        let sub = leak(Sub {
+            vtable: RENDER.as_ptr(),
+            refs: AtomicU32::new(1),
+            iid: IID_RENDER,
+            shared,
+        });
+        assert_eq!(render_get_buffer(sub, 10, std::ptr::null_mut()), E_POINTER);
+        let mut ptr = std::ptr::null_mut();
+        assert_eq!(render_get_buffer(sub, 10, &mut ptr), S_OK);
+        assert!(!ptr.is_null());
+        assert_eq!(render_release_buffer(sub, 10, 0), S_OK);
+        assert_eq!(sub_release(sub), 0);
     }
 }
