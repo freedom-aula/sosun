@@ -332,6 +332,45 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
+            // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
+            // the faulting image.
+            if let (Ok(list), Some(base)) = (
+                std::env::var("VICTORY_PEEK"),
+                unwind::image_base_of(c.rip as usize),
+            ) {
+                for rva in list.split(',').filter_map(|v| usize::from_str_radix(v.trim(), 16).ok()) {
+                    let v = ((base + rva) as *const u64).read_unaligned();
+                    tracing::warn!("peek image+{rva:#x} = {v:#x}");
+                }
+                // A call chain by the unwind tables (return addresses, as
+                // offsets into the faulting image).
+                let bounds = stack_bounds();
+                let mut u = *c;
+                let mut chain = vec![u.rip as usize - base];
+                for _ in 0..24 {
+                    let pc = if chain.len() == 1 { u.rip } else { u.rip.wrapping_sub(1) } as usize;
+                    if !stack_ok(&u, bounds) {
+                        break;
+                    }
+                    match unwind::lookup(pc) {
+                        Some((b, entry)) => {
+                            if unwind::virtual_unwind(0, b, pc, entry, &mut u, bounds).is_none() {
+                                break;
+                            }
+                        }
+                        None => {
+                            let rsp = u.gpr[RSP];
+                            u.rip = read_stack(rsp, bounds);
+                            u.gpr[RSP] = rsp + 8;
+                        }
+                    }
+                    if u.rip == 0 {
+                        break;
+                    }
+                    chain.push((u.rip as usize).wrapping_sub(base));
+                }
+                tracing::warn!("call chain image+ {chain:x?}");
+            }
         }
     }
     let mut ptrs = ExceptionPointers {

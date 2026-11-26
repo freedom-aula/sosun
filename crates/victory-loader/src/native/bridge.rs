@@ -276,16 +276,39 @@ core::arch::global_asm!(
 struct Traced {
     area: &'static str,
     slot: usize,
+    /// An import's symbol (the area is its DLL); those log every call.
+    name: &'static str,
+}
+
+/// The context word that makes a stub log its results: `area!name` imports
+/// when `VICTORY_TRACE_IMPORTS` is set (see [`trace_imports`]).
+pub(crate) fn traced_import(dll: &str, symbol: &str) -> usize {
+    let leak = |s: &str| &*Box::leak(s.to_string().into_boxed_str());
+    let info = Box::leak(Box::new(Traced {
+        area: leak(dll),
+        slot: 0,
+        name: leak(symbol),
+    }));
+    info as *const Traced as usize | 1
+}
+
+/// Whether to log every call of every import (`VICTORY_TRACE_IMPORTS=1`).
+pub(crate) fn trace_imports() -> bool {
+    std::env::var_os("VICTORY_TRACE_IMPORTS").is_some_and(|v| v != "0")
 }
 
 extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
-    if hr < 0 || trace_level() == 2 {
+    if hr < 0 || trace_level() == 2 || !info.name.is_empty() {
         tracing::warn!(
             area = info.area,
+            name = info.name,
             slot = format_args!("{:#x}", info.slot * 8),
             this = format_args!("{this:#x}"),
             hr = format_args!("{:#010x}", hr as u32),
-            from = format_args!("{:#x?}", super::seh::unwind::image_base_of(ret).map(|b| ret - b)),
+            from = format_args!(
+                "{:#x?}",
+                super::seh::unwind::image_base_of(ret).map(|b| ret - b)
+            ),
             "title -> host method returned"
         );
     }
@@ -455,7 +478,11 @@ pub unsafe fn bridged_table(
                 copy.push(0);
                 continue;
             }
-            let info = Box::leak(Box::new(Traced { area, slot }));
+            let info = Box::leak(Box::new(Traced {
+                area,
+                slot,
+                name: "",
+            }));
             let ctx = info as *const Traced as usize | 1;
             let win64 = is_win64(s as usize);
             // win64 targets skip the remapping and cannot be traced.

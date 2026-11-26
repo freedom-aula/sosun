@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 
-use super::bridge::{StubBlock, is_direct, is_win64};
+use super::bridge::{StubBlock, is_direct, is_win64, trace_imports, traced_import};
 use super::image::NativeImage;
 use crate::{
     BindReport, ImportResolver, MissingImport, Provenance, Resolution, UnimplementedPolicy,
@@ -74,7 +74,14 @@ pub fn bind_imports(
                     if is_direct(address) {
                         address
                     } else {
-                        block.emit(address, 0, is_win64(address))?
+                        let win64 = is_win64(address);
+                        // win64 functions skip the remapping, and the trace.
+                        let context = if trace_imports() && !win64 {
+                            traced_import(&module.dll, &entry.symbol.to_string())
+                        } else {
+                            0
+                        };
+                        block.emit(address, context, win64)?
                     }
                 }
                 Resolution::Missing => {
