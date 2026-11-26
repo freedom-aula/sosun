@@ -148,15 +148,16 @@ fn virtual_key(code: u16) -> Option<u8> {
 /// Hands a key-down or key-up to the stand-in pad. True when it was one (Command shortcuts
 /// such as Cmd+Q are left to AppKit), so the caller does not forward it, and AppKit does not beep.
 unsafe fn key_event(event: *mut AnyObject) -> bool {
-    // SAFETY: `event` is a live NSEvent; these are its plain getters.
-    let (kind, code, flags): (usize, u16, usize) = unsafe {
-        (
-            msg_send![event, type],
-            msg_send![event, keyCode],
-            msg_send![event, modifierFlags],
-        )
-    };
-    if !matches!(kind, 10 | 11) || flags & (1 << 20) != 0 {
+    // SAFETY: `event` is a live NSEvent; `type` is valid for every event.
+    let kind: usize = unsafe { msg_send![event, type] };
+    if !matches!(kind, 10 | 11) {
+        return false;
+    }
+    // Only key events have a key code: NSEvent raises for any other kind.
+    // SAFETY: a key-down or key-up NSEvent; these are its plain getters.
+    let (code, flags): (u16, usize) =
+        unsafe { (msg_send![event, keyCode], msg_send![event, modifierFlags]) };
+    if flags & (1 << 20) != 0 {
         return false;
     }
     if let Some(vk) = virtual_key(code) {
