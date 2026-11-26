@@ -31,7 +31,15 @@ pub struct NativeHost<B: GraphicsBackend> {
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
+    /// Draws and dispatches dropped because they read a root parameter the title never set.
+    unset_roots: std::cell::Cell<u64>,
+    /// Draws and clears dropped because none of their targets has a host texture.
+    no_targets: std::cell::Cell<u64>,
 }
+
+/// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
+/// drops that draw or dispatch alone).
+const NEVER_SET: &str = "was never set";
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
@@ -109,7 +117,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
+            unset_roots: std::cell::Cell::new(0),
+            no_targets: std::cell::Cell::new(0),
         }
+    }
+
+    /// Draws and clears dropped so far because none of their targets has a host texture.
+    pub fn no_targets(&self) -> u64 {
+        self.no_targets.get()
+    }
+
+    /// Draws and dispatches dropped so far because they read a root parameter never set.
+    pub fn unset_roots(&self) -> u64 {
+        self.unset_roots.get()
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -342,7 +362,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let set = |slot: u8| {
             root.get(usize::from(slot))
                 .and_then(|r| r.as_ref())
-                .ok_or_else(|| format!("root parameter {slot} was never set"))
+                .ok_or_else(|| format!("root parameter {slot} {NEVER_SET}"))
         };
         let mut args = std::mem::take(&mut p.root);
         if b.dwords > 0 {
@@ -532,7 +552,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let args = std::mem::take(&mut p.root);
             p.root = match r
                 .as_ref()
-                .ok_or_else(|| format!("root parameter {i} was never set"))?
+                .ok_or_else(|| format!("root parameter {i} {NEVER_SET}"))?
             {
                 Root::Constants(w) => args.constants(w),
                 Root::View(a) => {
@@ -853,11 +873,48 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
-        let cmds: Vec<&Cmd<B>> = lists.iter().flat_map(|l| l.cmds.iter()).collect();
-        let preps = cmds
-            .iter()
-            .map(|c| self.prep(c))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
+        // refusing the whole piece for it also dropped the piece's value writes, and a queue that
+        // waits for one of those then holds everything behind it for good. (A title shader's
+        // metadata can name a root slot the title sets nothing in, 255 observed; what the console
+        // gives such a shader there is not known.) Any other error still refuses the piece.
+        let mut cmds: Vec<&Cmd<B>> = Vec::new();
+        let mut preps = Vec::new();
+        for c in lists.iter().flat_map(|l| l.cmds.iter()) {
+            // A draw or clear left with no target (the title's targets have formats the host does
+            // not represent, so none was realized) cannot open a render pass: Metal gives no
+            // encoder for a pass without attachments, and that refused the whole piece.
+            let no_target = match c {
+                Cmd::Draw { targets, .. } => targets.color.is_empty() && targets.depth.is_none(),
+                Cmd::Clear { color, depth } => color.is_none() && depth.is_none(),
+                _ => false,
+            };
+            if no_target {
+                self.no_targets.set(self.no_targets.get() + 1);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!("native host drops work: a draw or clear with no render target the host represents (first time)");
+                });
+                continue;
+            }
+            match self.prep(c) {
+                Ok(p) => {
+                    cmds.push(c);
+                    preps.push(p);
+                }
+                Err(e)
+                    if e.ends_with(NEVER_SET)
+                        && matches!(c, Cmd::Draw { .. } | Cmd::Dispatch { .. }) =>
+                {
+                    self.unset_roots.set(self.unset_roots.get() + 1);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "native host drops work: a draw or dispatch that reads a root parameter the title never set (first time)");
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         let mut groups = vec![];
         let mut i = 0;

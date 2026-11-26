@@ -341,6 +341,74 @@ fn clear_and_draw_into_render_target() {
     drop((views, smp));
 }
 
+/// A draw left with no render target (the title's targets were of formats the host does not
+/// represent) is dropped by itself: Metal opens no pass without an attachment, and the value
+/// write recorded with it still runs.
+#[test]
+fn a_draw_with_no_render_target_is_dropped_alone() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    let pool = Pool::new(&h, 2);
+    pool.write(
+        0,
+        &[
+            vertex(-0.5, -0.5, [1.0, 0.0, 0.0, 1.0]),
+            vertex(0.5, -0.5, [1.0, 0.0, 0.0, 1.0]),
+            vertex(0.0, 0.5, [1.0, 0.0, 0.0, 1.0]),
+        ],
+    );
+
+    let attrs = [
+        VertexAttr {
+            format: VertexFormat::Float2,
+            slot: 0,
+            offset: 0,
+        },
+        VertexAttr {
+            format: VertexFormat::Float2,
+            slot: 0,
+            offset: 8,
+        },
+        VertexAttr {
+            format: VertexFormat::Float4,
+            slot: 0,
+            offset: 16,
+        },
+    ];
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let flag = 16384;
+    pool.write(flag, &[0u64]);
+    let mut l = NativeList::default();
+    l.set_render_targets(&[], None);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_vertex_buffer(0, pool.va(0));
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    l.write_value(pool.va(flag), 0xD6D, 8);
+    run(&h, &[&l]);
+
+    assert_eq!(h.no_targets(), 1);
+    assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
+}
+
 /// An address outside every mapped pool is an error at submission, not a GPU fault.
 #[test]
 fn unmapped_title_address_is_refused() {
@@ -355,6 +423,35 @@ fn unmapped_title_address_is_refused() {
     let q = h.backend.create_queue().unwrap();
     let err = h.execute(&q, &[&l], &[], &[]).unwrap_err();
     assert!(err.contains("not in a mapped pool"), "{err}");
+}
+
+/// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value
+/// write recorded before it and the dispatch after it still run (a queue may wait for that value).
+#[test]
+fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, flag) = (0, 16384, 32768);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0xEEEE_EEEEu32; N]);
+    pool.write(flag, &[0u64]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.write_value(pool.va(flag), 0xD6D, 8);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    // Root parameter 1 is not set yet: this dispatch cannot be given its arguments.
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    l.set_compute_root_view(1, pool.va(src));
+    l.dispatch((N / 64) as u32, 1, 1).unwrap();
+    run(&h, &[&l]);
+
+    assert_eq!(h.unset_roots(), 1);
+    assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
+    let out: Vec<u32> = pool.read(dst, N);
+    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
 }
 
 /// Pool buffers are made resident through one `MTLResidencySet`, added to each queue once, instead
