@@ -21,8 +21,13 @@ pub extern "system" fn malloc(size: usize) -> *mut c_void {
 }
 
 pub extern "system" fn calloc(count: usize, size: usize) -> *mut c_void {
+    let (count, size) = if count == 0 || size == 0 {
+        (1, 1)
+    } else {
+        (count, size)
+    };
     // SAFETY: plain allocation (overflow gives null).
-    checked(unsafe { libc::calloc(count.max(1), size.max(1)) })
+    checked(unsafe { libc::calloc(count, size) })
 }
 
 pub extern "system" fn realloc(p: *mut c_void, size: usize) -> *mut c_void {
@@ -48,13 +53,21 @@ pub extern "system" fn _recalloc(p: *mut c_void, count: usize, size: usize) -> *
         set_errno(ENOMEM);
         return std::ptr::null_mut();
     };
+    if total == 0 {
+        return if p.is_null() {
+            calloc(1, 1)
+        } else {
+            free(p);
+            std::ptr::null_mut()
+        };
+    }
     let old = if p.is_null() {
         0
     } else {
         // SAFETY: the title's own allocation.
         unsafe { libc::malloc_size(p) }
     };
-    let q = realloc(p, total.max(1));
+    let q = realloc(p, total);
     if !q.is_null() && total > old {
         // SAFETY: the new tail of the block just resized.
         unsafe { q.cast::<u8>().add(old).write_bytes(0, total - old) };
@@ -195,5 +208,28 @@ mod tests {
         assert!(_aligned_malloc(8, 3).is_null());
         assert_eq!(_set_new_mode(1), 0);
         assert_eq!(_set_new_mode(0), 1);
+    }
+
+    #[test]
+    fn calloc_and_recalloc_handle_zero_counts_and_sizes() {
+        let a = calloc(0, usize::MAX);
+        assert!(!a.is_null());
+        free(a);
+        let b = calloc(usize::MAX, 0);
+        assert!(!b.is_null());
+        free(b);
+
+        let p = calloc(4, 8);
+        assert!(!p.is_null());
+        assert!(_recalloc(p, 0, 8).is_null());
+        let p = calloc(4, 8);
+        assert!(!p.is_null());
+        assert!(_recalloc(p, 4, 0).is_null());
+
+        let z = _recalloc(std::ptr::null_mut(), 0, 8);
+        assert!(!z.is_null());
+        // SAFETY: one zeroed byte was allocated.
+        assert_eq!(unsafe { z.cast::<u8>().read() }, 0);
+        free(z);
     }
 }

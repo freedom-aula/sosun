@@ -152,6 +152,7 @@ binary! {
     fmod, fmodf => libm::fmod;
     hypot, hypotf => f64::hypot;
     remainder, remainderf => libm::remainder;
+    fdim, fdimf => |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else if x > y { x - y } else { 0.0 };
 }
 
 macro_rules! simple2 {
@@ -171,11 +172,14 @@ simple2! {
     copysign, copysignf => f64::copysign;
     fmax, fmaxf => f64::max;
     fmin, fminf => f64::min;
-    fdim, fdimf => |x, y| if x.is_nan() || y.is_nan() { f64::NAN } else if x > y { x - y } else { 0.0 };
 }
 
 pub extern "win64" fn nextafter(x: f64, y: f64) -> f64 {
-    libm::nextafter(x, y)
+    let r = libm::nextafter(x, y);
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 /// `long double` is `double` on this ABI.
@@ -184,7 +188,11 @@ pub extern "win64" fn nexttoward(x: f64, y: f64) -> f64 {
 }
 
 pub extern "win64" fn nextafterf(x: f32, y: f32) -> f32 {
-    libm::nextafterf(x, y)
+    let r = libm::nextafterf(x, y);
+    if r.is_infinite() && x.is_finite() {
+        set_errno(ERANGE);
+    }
+    r
 }
 
 pub extern "win64" fn nexttowardf(x: f32, y: f64) -> f32 {
@@ -261,7 +269,8 @@ pub extern "win64" fn _scalb(x: f64, e: i32) -> f64 {
 }
 
 pub extern "win64" fn ilogb(x: f64) -> i32 {
-    libm::ilogb(x)
+    // The CRT's FP_ILOGBNAN is INT_MAX, as for an infinity; macOS gives a NaN FP_ILOGB0, INT_MIN.
+    if x.is_nan() { i32::MAX } else { libm::ilogb(x) }
 }
 
 pub extern "win64" fn ilogbf(x: f32) -> i32 {
@@ -633,6 +642,17 @@ mod tests {
     use crate::host_posix::ucrt::errno;
 
     #[test]
+    fn ilogb_gives_the_crts_special_values() {
+        // FP_ILOGBNAN (INT_MAX) for NaNs and infinities, FP_ILOGB0 (INT_MIN) for zeros.
+        for x in [f64::NAN, -f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ilogb(x), i32::MAX, "{x}");
+        }
+        assert_eq!((ilogb(0.0), ilogb(-0.0)), (i32::MIN, i32::MIN));
+        assert_eq!((ilogb(8.0), ilogb(0.75), ilogb(f64::from_bits(1))), (3, -1, -1074));
+        assert_eq!((ilogbf(f32::NAN), ilogbf(1024.0)), (i32::MAX, 10));
+    }
+
+    #[test]
     fn functions_match_libm() {
         assert!((sin(1.0) - 1f64.sin()).abs() < 1e-15);
         assert_eq!(pow(2.0, 10.0), 1024.0);
@@ -739,6 +759,35 @@ mod tests {
         assert!(scalbn(f64::INFINITY, 1).is_infinite());
         assert_eq!(scalbn(1.0, -2000), 0.0);
         assert_eq!(scalbnf(1.0, -200), 0.0);
+        assert_eq!(errno(), 7);
+    }
+
+    #[test]
+    fn fdim_and_nextafter_set_erange_on_overflow() {
+        fn overflows(what: &str, call: impl Fn() -> f64) {
+            set_errno(0);
+            assert!(call().is_infinite(), "{what}");
+            assert_eq!(errno(), ERANGE, "{what}");
+        }
+        overflows("fdim", || fdim(f64::MAX, -f64::MAX));
+        overflows("fdimf", || f64::from(fdimf(f32::MAX, -f32::MAX)));
+        overflows("nextafter +", || nextafter(f64::MAX, f64::INFINITY));
+        overflows("nextafter -", || nextafter(-f64::MAX, f64::NEG_INFINITY));
+        overflows("nexttoward +", || nexttoward(f64::MAX, f64::INFINITY));
+        overflows("nextafterf +", || {
+            f64::from(nextafterf(f32::MAX, f32::INFINITY))
+        });
+        overflows("nextafterf -", || {
+            f64::from(nextafterf(-f32::MAX, f32::NEG_INFINITY))
+        });
+        set_errno(7);
+        assert_eq!(fdim(5.0, 2.0), 3.0);
+        assert_eq!(fdim(1.0, 5.0), 0.0);
+        assert_eq!(fdimf(5.0, 2.0), 3.0);
+        assert!(fdim(f64::INFINITY, 1.0).is_infinite());
+        assert!(fdim(f64::NAN, 1.0).is_nan());
+        assert_eq!(nextafter(f64::INFINITY, f64::INFINITY), f64::INFINITY);
+        assert_eq!(nextafterf(f32::INFINITY, f32::INFINITY), f32::INFINITY);
         assert_eq!(errno(), 7);
     }
 

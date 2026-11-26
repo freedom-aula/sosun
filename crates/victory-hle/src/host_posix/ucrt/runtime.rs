@@ -688,15 +688,25 @@ pub extern "system" fn getenv(name: *const u8) -> *mut u8 {
     env_value(&name).map_or(std::ptr::null_mut(), |v| leaked_value(&v))
 }
 
+/// One leaked wide copy per distinct value, so repeated calls do not grow.
+fn leaked_wide_value(v: &str) -> *mut u16 {
+    static SEEN: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+    let mut seen = lock(&SEEN);
+    if let Some((_, p)) = seen.iter().find(|(s, _)| s == v) {
+        return *p as *mut u16;
+    }
+    let p = leak_wstr(&v.encode_utf16().collect::<Vec<_>>());
+    seen.push((v.to_string(), p as usize));
+    p
+}
+
 pub extern "system" fn _wgetenv(name: *const u16) -> *mut u16 {
     if name.is_null() {
         return std::ptr::null_mut();
     }
     // SAFETY: a NUL-terminated name.
     let name = String::from_utf16_lossy(unsafe { super::wide(name) });
-    env_value(&name).map_or(std::ptr::null_mut(), |v| {
-        leak_wstr(&v.encode_utf16().collect::<Vec<_>>())
-    })
+    env_value(&name).map_or(std::ptr::null_mut(), |v| leaked_wide_value(&v))
 }
 
 pub extern "system" fn getenv_s(
@@ -783,22 +793,25 @@ pub extern "system" fn _putenv(entry: *const u8) -> i32 {
     }
     // SAFETY: a NUL-terminated `NAME=value`.
     let text = String::from_utf8_lossy(unsafe { super::bytes(entry) }).into_owned();
-    match text.split_once('=') {
-        Some((n, v)) if set_env(n, v) == 0 => 0,
-        _ => -1,
-    }
+    let Some((n, v)) = text.split_once('=') else {
+        bad_param(EINVAL);
+        return -1;
+    };
+    if set_env(n, v) == 0 { 0 } else { -1 }
 }
 
 pub extern "system" fn _wputenv(entry: *const u16) -> i32 {
     if entry.is_null() {
+        bad_param(EINVAL);
         return -1;
     }
     // SAFETY: a NUL-terminated `NAME=value`.
     let text = String::from_utf16_lossy(unsafe { super::wide(entry) });
-    match text.split_once('=') {
-        Some((n, v)) if set_env(n, v) == 0 => 0,
-        _ => -1,
-    }
+    let Some((n, v)) = text.split_once('=') else {
+        bad_param(EINVAL);
+        return -1;
+    };
+    if set_env(n, v) == 0 { 0 } else { -1 }
 }
 
 pub extern "system" fn _putenv_s(name: *const u8, value: *const u8) -> i32 {
@@ -970,7 +983,21 @@ mod tests {
             ),
             super::super::ERANGE
         );
+        set_errno(0);
         assert_eq!(_putenv(c"NOEQUALS".as_ptr().cast()), -1);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_wputenv(std::ptr::null()), -1);
+        assert_eq!(errno(), EINVAL);
+        let no_eq_w: Vec<u16> = "NOEQUALS".encode_utf16().chain([0]).collect();
+        set_errno(0);
+        assert_eq!(_wputenv(no_eq_w.as_ptr()), -1);
+        assert_eq!(errno(), EINVAL);
+        let name_w: Vec<u16> = "VICTORY_UCRT_T".encode_utf16().chain([0]).collect();
+        let w1 = _wgetenv(name_w.as_ptr());
+        let w2 = _wgetenv(name_w.as_ptr());
+        assert!(!w1.is_null());
+        assert_eq!(w1, w2);
         assert_eq!(
             _putenv_s(c"VICTORY_UCRT_T".as_ptr().cast(), c"".as_ptr().cast()),
             0
