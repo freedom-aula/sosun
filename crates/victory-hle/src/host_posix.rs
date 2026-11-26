@@ -46,6 +46,7 @@ const MAXIMUM_WAIT_OBJECTS: u32 = 64;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INVALID_ADDRESS: u32 = 487;
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 const TLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
@@ -306,14 +307,29 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
         // SAFETY: a region this shim made.
         unsafe { mem::release(address.cast(), len) }.is_ok()
     } else if kind & MEM_DECOMMIT != 0 {
+        let at = address as usize;
+        // Size 0 is the rest of the region (all of it from its base), as on Windows; a range
+        // outside our regions is the host's, never decommitted.
+        let Some((base, len)) = region_at(at) else {
+            set_error(ERROR_INVALID_ADDRESS);
+            return 0;
+        };
+        let page = mem::page_size();
+        let start = at & !(page - 1);
+        let end = match size {
+            0 => base + len,
+            _ => at.saturating_add(size).next_multiple_of(page),
+        };
+        if region_of(start, end - start).is_err() {
+            set_error(ERROR_INVALID_ADDRESS);
+            return 0;
+        }
         if tracing_owners() {
-            let at = address as usize;
-            let owner_at = region_at(at).map_or(0, |(base, _)| base);
-            let range = region_held("decommitted range", (at, size), owner_at);
+            let range = region_held("decommitted range", (start, end - start), base);
             xmem_physical::freeing("VirtualFree(MEM_DECOMMIT) over views", &range);
         }
         // Physical-page views there stay, zeroed.
-        xmem_physical::decommit(address as usize, size.next_multiple_of(mem::page_size()))
+        xmem_physical::decommit(start, end - start)
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -1184,6 +1200,31 @@ mod memory_tests {
             assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         }
         assert_eq!(XMemFreePhysicalPages(1, page.as_ptr()), 1);
+    }
+
+    /// `VirtualFree(MEM_DECOMMIT)` with size 0 decommits the whole region from its base, and an
+    /// address outside our regions is refused (`ERROR_INVALID_ADDRESS`), not decommitted.
+    #[test]
+    fn decommit_takes_the_whole_region_and_only_ours() {
+        let size = 2 * GRANULARITY;
+        let p = VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, 0x04);
+        assert!(!p.is_null());
+        assert_eq!(VirtualFree(p, 0, MEM_DECOMMIT), 1);
+        let last = p as usize + size - 1;
+        assert_eq!(mem::query(last).map(|r| r.protect), Some(Protect::NO_ACCESS));
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+
+        let host = reserve_granular(None, GRANULARITY).expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::commit(host, GRANULARITY, Protect::READ_WRITE) }.expect("committed");
+        // SAFETY: committed read-write above.
+        unsafe { host.write(3) };
+        assert_eq!(VirtualFree(host.cast(), GRANULARITY, MEM_DECOMMIT), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_ADDRESS);
+        // SAFETY: still committed read-write.
+        assert_eq!(unsafe { host.read() }, 3, "the host's memory is left alone");
+        // SAFETY: the reservation made above.
+        unsafe { mem::release(host, GRANULARITY) }.expect("released");
     }
 
     /// `VICTORY_TRACE_OWNERS`: views left in a range `VirtualFree(MEM_DECOMMIT)` gives back, and
