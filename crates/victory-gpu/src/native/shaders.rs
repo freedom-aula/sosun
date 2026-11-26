@@ -150,10 +150,9 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
-        // shortcut: compute shaders indexing the heap itself stay refused (graphics ones run);
-        // lift it once a compute value test reads a heap-indexed view.
-        let why = unsupported(shader, true).or(shader.heap.then_some("indexes the descriptor heap itself"));
-        if let Some(why) = why {
+        // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
+        // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
+        if let Some(why) = unsupported(shader, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
