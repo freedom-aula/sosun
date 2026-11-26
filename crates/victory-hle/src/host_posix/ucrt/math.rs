@@ -624,7 +624,9 @@ exports64!(pub(super) fn lookup_float;
     _isnan, _isnanf, _chgsign, _dclass, _fdclass, _dtest, _fdtest, _dsign, _fdsign, _fpclass;
     "_hypot" => hypot, "_copysign" => copysign, "_nextafter" => nextafter, "_logb" => logb,
     "_hypotf" => hypotf, "_copysignf" => copysignf, "_nextafterf" => nextafterf,
-    "_logbf" => logbf, "finite" => _finite, "_fdnorm" => _fdclass);
+    "_logbf" => logbf, "finite" => _finite, "_fdnorm" => _fdclass,
+    // `long double` is `double` on this ABI.
+    "_ldsign" => _dsign);
 
 super::exports!(fn lookup_int;
     _clearfp, _statusfp, _fpreset, _controlfp, _control87, _controlfp_s, _set_FMA3_enable,
@@ -639,6 +641,13 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_double_sign_is_the_double_one() {
+        // `long double` is `double` on this ABI, and `_ldsign` is `_dsign`.
+        assert!(lookup("_ldsign").is_some());
+        assert_eq!(lookup("_ldsign"), lookup("_dsign"));
+    }
     use crate::host_posix::ucrt::errno;
 
     #[test]

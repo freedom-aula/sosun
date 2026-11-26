@@ -316,7 +316,7 @@ mod run {
     fn exceptions_reach_seh_scopes_and_vectored_handlers() {
         // The probe's vectored handler hears every thread's exceptions.
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-        assert_all(run_probe("probe_seh", 0), 0x7FFF, "probe_seh");
+        assert_all(run_probe("probe_seh", 0), 0x1_FFFF, "probe_seh");
     }
 
     /// The DLL the title ships: its `DllMain` and TLS callback ran in order
