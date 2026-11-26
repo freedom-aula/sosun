@@ -6847,7 +6847,7 @@ impl<'a> Lower<'a> {
             self.scalar
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
-                .is_some_and(|p| p.root == RootType::ResourceHeap)
+                .is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table))
         };
         let leaves = src.leaves();
         if leaves.is_empty()
@@ -11574,8 +11574,11 @@ impl<'a> Lower<'a> {
         // A heap-indexed buffer read by element has no used-resource entry,
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
+        // So is one from a table whose entry (FSPX metadata, which gives no
+        // stride) names none: the view's heap index is its table offset plus
+        // the load's, in the same heap.
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
+            Some(i) if used.is_none_or(|u| u.stride == 0) && !typed => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);

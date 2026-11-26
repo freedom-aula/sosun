@@ -1842,3 +1842,93 @@ fn compute_computed_buffer_loads_use_title_memory() {
     let l = computed_descriptor_cs(true).unwrap_or_else(|e| panic!("{e}"));
     assert!(!l.dxil.is_empty());
 }
+
+// =========================================================================
+// Compute: "a structured buffer of unknown stride"
+// =========================================================================
+
+/// A wave32 compute program: s0 a table with an SRV, s1 a table with a raw
+/// UAV. Each lane reads dword 1 of element `lane` of the SRV by index and
+/// stores it to dword `lane` of the UAV. `stride` is what the metadata says
+/// of the SRV (FSPX records say 0).
+fn indexed_srv_cs(stride: u32) -> Result<Lowered, ShaderError> {
+    let words = [
+        0xBE84_0300u32, // s_mov_b32 s4, s0
+        0xBE85_0380,    // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004,
+        0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let table = |user_data, slot| RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, user_data, slot, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![table(0, 0), table(1, 1)],
+        used: vec![used(ResourceType::Srv, 0, 0, stride), used(ResourceType::Uav, 1, 1, 0)],
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    })
+}
+
+/// A table SRV the metadata gives no stride is read by element at the
+/// stride of its view in the host's view-stride table, as a heap-indexed
+/// one is; one with a stride keeps it.
+#[test]
+fn indexed_table_buffers_without_a_stride_use_the_view_stride_table() {
+    for stride in [0, 16] {
+        let l = indexed_srv_cs(stride).unwrap_or_else(|e| panic!("stride {stride}: {e}"));
+        assert!(!l.dxil.is_empty());
+    }
+}
