@@ -254,7 +254,12 @@ fn an_undetilable_layout_is_counted_not_fatal() {
 /// window; its last drawable is read back.
 #[test]
 fn present_draws_the_back_buffer_over_the_apps_layer() {
-    let Some(pool) = pool(9106, 4) else { return };
+    check_present_order(false);
+    check_present_order(true);
+}
+
+fn check_present_order(held: bool) {
+    let Some(pool) = pool(if held { 9116 } else { 9106 }, 4) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_S.0, 1);
     let heap = crate::descriptor::test_heap(false, 4);
     let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
@@ -266,6 +271,11 @@ fn present_draws_the_back_buffer_over_the_apps_layer() {
         crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
         f
     });
+    let mut gate = std::ptr::null();
+    crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut gate);
+    if held {
+        glue::queue_wait(q, gate, 1);
+    }
     let list = crate::list::test_list(false, std::ptr::null());
     slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
         list,
@@ -302,9 +312,17 @@ fn present_draws_the_back_buffer_over_the_apps_layer() {
     let before = glue::frames_presented();
     let present = slot::<extern "system" fn(This, u32, *const Plane, *const u8) -> i32>(q, 0xf0);
     assert_eq!(present(q, 1, &plane, std::ptr::null()), 0);
-    assert_eq!(glue::frames_presented(), before + 1);
-    // A signal after the present: the frame is drawn when the fence is reached.
+    // A signal after the present must also stay behind it.
     slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    if held {
+        // Present must remain behind the unsignalled wait and the red clear.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(glue::frames_presented(), before, "present bypassed the fence wait");
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 0);
+        glue::fence_signal(gate, 1);
+    }
+    assert_eq!(glue::frames_presented(), before + 1);
+    // The frame is drawn when the fence is reached.
     assert_eq!(
         slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(f, 1, std::ptr::null_mut()),
         0

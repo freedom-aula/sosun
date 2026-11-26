@@ -180,6 +180,12 @@ pub struct Guessed<B: GraphicsBackend> {
     pub made: std::cell::RefCell<HashMap<String, Pipe<B>>>,
 }
 
+/// An operation that must keep its place between list submissions in the held FIFO.
+enum QueuedAction<B: PresentBackend> {
+    Signal(usize, usize, u64),
+    Present(Rc<B::Queue>, Rc<B::Surface>, Rc<B::Texture>),
+}
+
 pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
@@ -200,15 +206,15 @@ pub struct Title<B: PresentBackend> {
     /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
     pub(super) probe_buf: Vec<u8>,
     /// Where `Present` shows frames, if the app gave a layer.
-    pub(super) surface: Option<B::Surface>,
+    pub(super) surface: Option<Rc<B::Surface>>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
-    /// Signals held behind work: the queue, fence and value, by the number the held item carries.
-    signals: HashMap<usize, (usize, usize, u64)>,
-    next_signal: usize,
+    /// Operations held behind work, indexed by the token in a FIFO Signal item.
+    actions: HashMap<usize, QueuedAction<B>>,
+    next_action: usize,
     /// The highest value each fence was told to reach, and when that changed (diagnostics).
     requested: HashMap<usize, (u64, std::time::Instant)>,
     /// The highest value a signal already given to the GPU will set each fence to.
@@ -236,8 +242,8 @@ impl<B: PresentBackend> Title<B> {
             requested: HashMap::new(),
             on_gpu: HashMap::new(),
             held: Held::new(),
-            signals: HashMap::new(),
-            next_signal: 0,
+            actions: HashMap::new(),
+            next_action: 0,
             stats: Stats::default(),
         }
     }
@@ -328,9 +334,9 @@ impl<B: PresentBackend> Title<B> {
             *r = (value, std::time::Instant::now());
         }
         if self.held.holds_work(queue) {
-            let n = self.next_signal;
-            self.next_signal += 1;
-            self.signals.insert(n, (queue, fence, value));
+            let n = self.next_action;
+            self.next_action += 1;
+            self.actions.insert(n, QueuedAction::Signal(queue, fence, value));
             // Make the backend fence now: `initial` is its value until the signal runs.
             let _ = self.fence(fence, initial);
             self.held.push(queue, Item::Signal(n, 0));
@@ -378,7 +384,7 @@ impl<B: PresentBackend> Title<B> {
             queues,
             fences,
             held,
-            signals,
+            actions,
             on_gpu,
             stats,
             ..
@@ -402,14 +408,21 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         let mut signal = |n: usize, _: u64| {
-            let Some((queue, fence, value)) = signals.remove(&n) else {
-                return;
-            };
-            if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence)) {
-                match host.execute(q, &[], &[], &[(&**f, value)]) {
-                    Ok(_) => note_on_gpu(on_gpu, fence, value),
-                    Err(e) => tracing::warn!(error = %e, "a held fence signal was not queued"),
+            match actions.remove(&n) {
+                Some(QueuedAction::Signal(queue, fence, value)) => {
+                    if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence)) {
+                        match host.execute(q, &[], &[], &[(&**f, value)]) {
+                            Ok(_) => note_on_gpu(on_gpu, fence, value),
+                            Err(e) => tracing::warn!(error = %e, "a held fence signal was not queued"),
+                        }
+                    }
                 }
+                Some(QueuedAction::Present(queue, surface, texture)) => {
+                    if let Err(e) = host.backend.present(&queue, &surface, &texture) {
+                        tracing::warn!(error = %e, "a held present was not queued");
+                    }
+                }
+                None => {}
             }
         };
         let done = held.pump(&mut World {
@@ -463,13 +476,13 @@ impl<B: PresentBackend> Title<B> {
     /// Gives the host the app's drawable layer (`CAMetalLayer` on Metal, by address): frames the
     /// title presents are shown there from now on.
     pub fn set_surface(&mut self, layer: *mut std::ffi::c_void) -> Result<(), String> {
-        self.surface = Some(self.host.backend.create_surface(layer)?);
+        self.surface = Some(Rc::new(self.host.backend.create_surface(layer)?));
         Ok(())
     }
 
-    /// `PresentX`: title texture `key` shown over the surface, after the work queue `queue` has
-    /// been given. shortcut: not behind work the queue still holds back (the frame is shown as
-    /// far as it ran); `Ok(false)` when there is no surface or the title has no such texture.
+    /// `PresentX`: show title texture `key` after all earlier work on `queue`, including held
+    /// work. `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
+    /// `Ok(false)` when there is no surface or the title has no such texture.
     pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
         self.pump();
         if self.surface.is_none() {
@@ -480,14 +493,23 @@ impl<B: PresentBackend> Title<B> {
         };
         let q = self.queue(queue)?;
         if let Some(surface) = &self.surface {
-            self.host.backend.present(&q, surface, &tex)?;
+            if self.held.holds_work(queue) {
+                let n = self.next_action;
+                self.next_action += 1;
+                self.actions.insert(n, QueuedAction::Present(q, surface.clone(), tex));
+                // Signal items flush the preceding list piece before running the action, and
+                // keep subsequent lists and signals behind it. Retain the accepted resources.
+                self.held.push(queue, Item::Signal(n, 0));
+            } else {
+                self.host.backend.present(&q, surface, &tex)?;
+            }
         }
         Ok(true)
     }
 
     /// The surface presented to (to read the frame counter, say).
     pub fn surface(&self) -> Option<&B::Surface> {
-        self.surface.as_ref()
+        self.surface.as_deref()
     }
 
     /// Whether any queue holds work (a timer should test it again soon).
