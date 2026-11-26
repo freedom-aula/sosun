@@ -1884,7 +1884,22 @@ impl<'a> Lower<'a> {
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // Guess (RADV's reading of TG_SIZE): bits 0-5 the group's
+                // wave count, 6-11 this wave's index in it; the rest 0.
+                let f = if self.console_lanes { self.console_flat() } else { self.mesh_thread() };
+                let lanes: u32 = self.s.threads.expect("compute").iter().product();
+                let wave = self.wave();
+                let e = self.s.entry;
+                let (shift, k6, n) = (
+                    self.s.m.i32(wave.trailing_zeros()),
+                    self.s.m.i32(6),
+                    self.s.m.i32(lanes.div_ceil(wave)),
+                );
+                let w = self.s.m.bin(e, Bin::LShr, f, shift);
+                let w = self.s.m.bin(e, Bin::Shl, w, k6);
+                return Val::I32(self.s.m.bin(e, Bin::Or, w, n));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()

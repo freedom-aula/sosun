@@ -4,7 +4,7 @@
 //! the halves after part of the wave has left. `s[2:3]` is `dst`, `s4` a flag. Skipped without the
 //! Metal Shader Converter.
 
-use super::addr_tests::{CANARY, Fixture, VA_A, dispatch, halves, title, translate_lds};
+use super::addr_tests::{CANARY, Fixture, VA_A, dispatch, halves, title, translate_io};
 use crate::native::shaders;
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -23,13 +23,18 @@ const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F;
 const DST: usize = 0x6_0000;
 
 fn run(words: &[u32], lds: u32, flag: u32) -> Vec<u32> {
+    run_io(words, lds << 15, 64, flag)
+}
+
+/// [`run`] of `threads` in a group, with `rsrc2` bits of system SGPRs and LDS.
+fn run_io(words: &[u32], rsrc2: u32, threads: u32, flag: u32) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let cs = translate_lds(words, 5, lds, shaders::options());
+    let cs = translate_io(words, 5, rsrc2, threads, shaders::options());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[0, 0, c, d, flag], false);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
-    f.get(DST, 64)
+    f.get(DST, threads as usize)
 }
 
 #[test]
@@ -101,4 +106,29 @@ fn lds_shared_across_the_halves_behind_a_uniform_branch() {
     }
     assert_eq!(got, (0..64).rev().collect::<Vec<u32>>());
     assert_eq!(run(&w, 1, 0), [CANARY; 64]);
+}
+
+#[test]
+fn the_thread_group_info_sgpr_numbers_the_console_waves() {
+    // Two console waves of 64, four host waves. `s5`, the info SGPR (bit 10), holds the wave's
+    // index from bit 6 and the group's wave count; index * 64 plus the lane's count of lanes below
+    // it is the thread's index, so each slot is written once.
+    let w = [
+        0x8706_FF05,
+        0x0000_0FC0, // s_and_b32 s6, s5, 0xfc0
+        0xD765_0001,
+        0x0200_0CC1, // v_mbcnt_lo_u32_b32 v1, -1, s6
+        0xD766_0001,
+        0x0202_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x3404_0282, // v_lshlrev_b32 v2, 2, v1
+        0x7E06_0205, // v_mov_b32 v3, s5
+        0xDC70_8000,
+        0x0002_0302, // global_store_dword v2, v3, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run_io(&w, 1 << 10, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
 }

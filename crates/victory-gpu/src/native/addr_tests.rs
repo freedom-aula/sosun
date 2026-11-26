@@ -110,11 +110,18 @@ fn shader(words: &[u32], sgprs: u32) -> HostShader {
 }
 
 fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) -> HostShader {
-    translate_lds(words, sgprs, 0, options)
+    translate_io(words, sgprs, 0, 64, options)
 }
 
-/// [`translate`] with `lds` 512-byte blocks of LDS.
-pub(super) fn translate_lds(words: &[u32], sgprs: u32, lds: u32, options: victory_shader::emit::Options) -> HostShader {
+/// [`translate`] with more of `COMPUTE_PGM_RSRC2` set (`rsrc2`: LDS, system SGPRs) and `threads` in
+/// a group.
+pub(super) fn translate_io(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    options: victory_shader::emit::Options,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -129,8 +136,8 @@ pub(super) fn translate_lds(words: &[u32], sgprs: u32, lds: u32, options: victor
         }],
         used: vec![],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: sgprs << 1 | lds << 15,
-            threads: [64, 1, 1],
+            rsrc2: sgprs << 1 | rsrc2,
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -207,7 +214,7 @@ pub(super) fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], 
     let Pipe::Compute(pso) = t.compute_pipe(shader, "addr") else {
         panic!("not made: {:?}", t.shaders)
     };
-    assert_eq!(pso.threads, [64, 1, 1]);
+    assert_eq!(pso.threads[1..], [1, 1]);
     let mut l = NativeList::default();
     l.set_compute_pipeline(&pso);
     l.set_compute_root_constants(0, root);
