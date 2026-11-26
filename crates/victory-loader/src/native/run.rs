@@ -213,6 +213,7 @@ pub unsafe fn run_entry_with(
     teb::set_image_base(image.base());
     super::dump::start();
     super::dump::start_mem_watch();
+    super::dump::start_write_trap();
     super::bridge::start_profile();
     let dlls = dlls.to_vec();
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));

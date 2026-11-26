@@ -85,6 +85,15 @@ pub extern "system" fn GetCurrentProcessId() -> u32 {
     std::process::id()
 }
 
+/// Time since the epoch as the title sees it: `VICTORY_CLOCK_SLOW=<n>` runs the title's QPC and
+/// tick counts n times slower than real time (a diagnostic for finding which clock a limit uses).
+fn elapsed() -> Duration {
+    static SLOW: LazyLock<u32> = LazyLock::new(|| {
+        std::env::var("VICTORY_CLOCK_SLOW").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+    });
+    epoch().elapsed() / (*SLOW).max(1)
+}
+
 fn epoch() -> Instant {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     *START
@@ -98,14 +107,14 @@ pub extern "system" fn QueryPerformanceFrequency(out: *mut i64) -> i32 {
 
 pub extern "system" fn QueryPerformanceCounter(out: *mut i64) -> i32 {
     // One tick is a nanosecond; the epoch's first read is not zero.
-    let ticks = epoch().elapsed().as_nanos() as i64 + 1;
+    let ticks = elapsed().as_nanos() as i64 + 1;
     // SAFETY: the title passes a valid pointer.
     unsafe { out.write(ticks) };
     1
 }
 
 pub extern "system" fn GetTickCount64() -> u64 {
-    epoch().elapsed().as_millis() as u64
+    elapsed().as_millis() as u64
 }
 
 pub extern "system" fn GetTickCount() -> u32 {

@@ -60,6 +60,15 @@ pub fn start() {
             "clzero emulations so far: {}",
             super::seh::signal::EMULATED.load(std::sync::atomic::Ordering::Relaxed)
         );
+        if let Some((at, n)) = std::env::var("VICTORY_DUMP_MEM").ok().and_then(|v| {
+            let (a, n) = v.split_once(',')?;
+            Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse::<usize>().ok()?))
+        }) {
+            let words: Vec<String> = (0..n)
+                .map(|i| read_checked(at + 8 * i).map_or("-".into(), |x| format!("{x:x}")))
+                .collect();
+            tracing::warn!("memory at {at:#x}: {}", words.join(" "));
+        }
         for line in collect() {
             tracing::warn!("{line}");
         }
@@ -189,4 +198,56 @@ pub fn caller_chain() -> Vec<usize> {
 fn read_all_bases(chain: &[usize]) -> bool {
     let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
     !chain.iter().any(|&pc| pc.wrapping_sub(base) == 0x1d83996)
+}
+
+/// `VICTORY_TRAP_WRITES=<hex page address>,<hex watched address>,...`: the page is kept read-only
+/// and each title write to it faults here; a write to a watched address is logged with the
+/// writer's title call chain. The page is opened for the faulting write and closed again a moment
+/// later by a thread, so most writes are not seen (statistics only: look for rare writers).
+pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool {
+    use std::sync::OnceLock;
+    static SPEC: OnceLock<Option<(usize, Vec<usize>)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRAP_WRITES").ok()?;
+        let mut it = v.split(',').filter_map(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
+        let page = it.next()?;
+        Some((page & !0xfff, it.collect()))
+    });
+    let Some((page, watched)) = spec else { return false };
+    if r.code != 0xc000_0005 || r.information[0] != 1 || (r.information[1] as usize) & !0xfff != *page {
+        return false;
+    }
+    let at = r.information[1] as usize;
+    if watched.contains(&(at & !7)) {
+        let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
+        let chain = super::seh::backtrace(*c, None);
+        let chain: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
+        tracing::warn!("write to {at:#x} from image+ {:x?}", chain);
+    }
+    unsafe extern "C" {
+        fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
+    }
+    // SAFETY: the page is the image's own data.
+    unsafe { mprotect(*page as *mut _, 0x1000, 3) };
+    true
+}
+
+/// Starts the thread that closes the trapped page again.
+pub fn start_write_trap() {
+    let Some(page) = std::env::var("VICTORY_TRAP_WRITES")
+        .ok()
+        .and_then(|v| usize::from_str_radix(v.split(',').next()?.trim_start_matches("0x"), 16).ok())
+    else {
+        return;
+    };
+    unsafe extern "C" {
+        fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
+    }
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: the image's own data page.
+            unsafe { mprotect((page & !0xfff) as *mut _, 0x1000, 1) };
+            std::thread::sleep(Duration::from_micros(300));
+        }
+    });
 }

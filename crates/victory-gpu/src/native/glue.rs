@@ -935,6 +935,10 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
+    if std::env::var_os("VICTORY_TRACE_WRITES").is_some() {
+        let inside = pools().resolve(address, bytes as u64).is_some();
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+    }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 

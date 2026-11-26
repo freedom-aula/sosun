@@ -350,6 +350,11 @@ extern "C" fn raise_exception(
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
+    // SAFETY: both are ours for this dispatch.
+    if unsafe { super::super::dump::write_trap(&*ctx, &*rec) } {
+        // SAFETY: forwarded from the caller.
+        unsafe { resume(ctx) };
+    }
     // First-chance log: the title's own handlers may hide where a fault started.
     // SAFETY: both are ours for this dispatch.
     unsafe {

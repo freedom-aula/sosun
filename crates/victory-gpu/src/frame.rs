@@ -198,7 +198,51 @@ pub(crate) fn log() {
     tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
 }
 
+/// Device method (`GetFrameStatistics`): for the frame `token`, one 0x38-byte record per kind
+/// asked for in `kinds` (0x10000 flip, 0x1000 vblank, 0x100), `count` in as the room and out as
+/// the number written; the record's type is at +0, a "dropped" byte at +8, the token at +0x10
+/// and the event's time (nanoseconds, as the host's `QueryPerformanceCounter`) at +0x18.
+/// Grand Theft Auto VI feeds these to its frame-timing ring, and its load waits for the ring's
+/// current slot to complete, which no statistics never did. Taken to be now: the event happened
+/// no later than this call, and the frame is over (the title asks about frames it presented).
+/// shortcut: every kind answers at once, with the time of the call.
+#[cfg(target_os = "macos")]
+pub(crate) extern "system" fn statistics(
+    _: This,
+    token: u64,
+    kinds: u32,
+    count: *mut u32,
+    out: *mut u8,
+) -> HRESULT {
+    if count.is_null() || out.is_null() {
+        return S_OK;
+    }
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1;
+    // SAFETY: the title passes its count and room for that many records.
+    let room = unsafe { count.read() } as usize;
+    let mut written = 0;
+    for kind in [0x10000u32, 0x1000, 0x100] {
+        if kinds & kind == 0 || written == room {
+            continue;
+        }
+        // SAFETY: inside the `room` records the title passed.
+        unsafe {
+            let at = out.add(written * 0x38);
+            std::ptr::write_bytes(at, 0, 0x38);
+            at.cast::<u32>().write_unaligned(kind);
+            at.add(0x10).cast::<u64>().write_unaligned(token);
+            at.add(0x18).cast::<u64>().write_unaligned(now);
+        }
+        written += 1;
+    }
+    // SAFETY: as above.
+    unsafe { count.write(written as u32) };
+    S_OK
+}
+
 /// Device method: no statistics are kept, so none are returned.
+#[cfg(not(target_os = "macos"))]
 pub(crate) extern "system" fn statistics(
     _: This,
     _token: u64,
