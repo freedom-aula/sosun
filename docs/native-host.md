@@ -594,6 +594,16 @@ pools) and the next pool takes the first free one. The pairs carry an epoch that
 an existing pair changes; a heap whose pairs were written in another epoch writes them all again
 (a freed one as the null view). When all are taken the host warns once.
 
+#### Placed textures are released
+
+A texture the title places in its own memory (`CreateShaderResourceViewPlaced`) has no resource
+object, so nothing released it: its host texture and its entry in the scanner's watch list stayed
+for the whole run. The host now keeps the key it placed at each address
+(`Title::texture_placed`). When a view places another description at the same address, the old
+texture is released (guess: the title is done with it once it places another there; a view of the
+old description still in a heap would name a released texture). Every texture placed in a pool is
+released at the first submission after the pool is (`NativeHost::released_pools`).
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers

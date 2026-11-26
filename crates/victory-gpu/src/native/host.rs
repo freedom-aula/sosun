@@ -28,6 +28,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
+    /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
+    released: RefCell<Vec<usize>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
@@ -126,6 +128,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             backend,
             memory,
             buffers: RefCell::default(),
+            released: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
@@ -172,7 +175,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// Drops what the host keeps of pools released since the last call: their buffers, and their
-    /// view pairs (free for other pools from now on).
+    /// view pairs (free for other pools from now on). [`Self::released_pools`] lists them.
     fn forget_released(&self) {
         let gone = self.memory.take_released();
         if gone.is_empty() {
@@ -180,10 +183,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         let mut buffers = self.buffers.borrow_mut();
         let mut c = self.contract.borrow_mut();
-        for id in gone {
+        for &id in &gone {
             buffers.remove(&id);
             c.pairs.release(id);
         }
+        self.released.borrow_mut().extend(gone);
+    }
+
+    /// Pools released since the last call (for what the title side keeps of them).
+    pub(crate) fn released_pools(&self) -> Vec<usize> {
+        self.forget_released();
+        std::mem::take(&mut self.released.borrow_mut())
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.

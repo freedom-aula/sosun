@@ -640,7 +640,9 @@ pub(crate) fn mirror(handle: u64) {
                 let key = super::textures::placed_key(address, &res);
                 if !t.host.knows(key)
                     && let Some(info) = crate::resource::placed_info(address, &res)
+                    && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
+                    t.texture_placed(address, key, pool.id);
                     t.texture_created(key, info);
                     t.realize(key);
                 }

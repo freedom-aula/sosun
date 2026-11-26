@@ -475,6 +475,38 @@ impl<B: PresentBackend> Title<B> {
         });
     }
 
+    /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
+    /// release for it, so the texture another description placed at that address before goes
+    /// now (guess: the title is done with it once it places another there), and every texture
+    /// placed in a pool goes when the pool is released ([`Self::sync_dirty`]).
+    pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize) {
+        if let Some((old, _)) = self.placed.insert(address, (key, pool))
+            && old != key
+        {
+            self.host.forget_resource(old);
+            self.texture_released(old);
+        }
+    }
+
+    /// Releases the textures placed in pools the title released since the last call.
+    fn release_placed(&mut self) {
+        let gone = self.host.released_pools();
+        if gone.is_empty() {
+            return;
+        }
+        let dead: Vec<u64> = self
+            .placed
+            .iter()
+            .filter(|(_, (_, pool))| gone.contains(pool))
+            .map(|(&a, _)| a)
+            .collect();
+        for a in dead {
+            let (key, _) = self.placed.remove(&a).expect("listed above");
+            self.host.forget_resource(key);
+            self.texture_released(key);
+        }
+    }
+
     /// Brings the textures the host samples up to date with title memory: those whose memory
     /// changed since their last upload are detiled again.
     pub fn sync_textures(&mut self) {
@@ -490,6 +522,7 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
     /// found changed since.
     pub fn sync_dirty(&mut self) {
+        self.release_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         for key in &dirty {
             // Missed by the sampled probe, so read it whole while it stays hot.
