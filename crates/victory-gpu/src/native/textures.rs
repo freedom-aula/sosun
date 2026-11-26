@@ -165,6 +165,16 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
+        // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
+        // was never drawn into, and a black one was drawn black.
+        if info.render_target() && std::env::var_os("VICTORY_MAGENTA").is_some() {
+            let m = &info.layout.mips[0];
+            let n = info.layout.desc.element_bytes as usize;
+            let row = m.width as usize * n;
+            let pixel = [0xffu8, 0, 0xff, 0xff];
+            let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
+            self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
+        }
         self.textures.insert(
             key,
             Tracked {

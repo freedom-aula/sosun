@@ -564,18 +564,20 @@ unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
 fn dump_description(slot: usize, desc: *const u8) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let n = COUNTS[usize::from(slot == 0x218)].fetch_add(1, Ordering::Relaxed);
     if n >= 50 {
         return;
     }
     // SAFETY: a debugging read of the title's description and of what it points at.
     unsafe {
-        let words: Vec<u64> = (0..128).map(|i| desc.cast::<u64>().add(i).read_unaligned()).collect();
+        let words: Vec<u64> = (0..192).map(|i| desc.cast::<u64>().add(i).read_unaligned()).collect();
         eprintln!("DESC {slot:#x} #{n}");
         for (i, w) in words.chunks(4).enumerate() {
             eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
         }
-        for i in 0..127 {
+        for i in 0..191 {
             let (p, len) = (words[i], words[i + 1]);
             if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
                 let bytes = std::slice::from_raw_parts(p as *const u8, (len as usize).min(48));
@@ -1072,5 +1074,39 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod pieces_tests {
+    use super::*;
+
+    /// Four (pointer, size) pairs of a console compute description's record, as the title lays
+    /// them out: registers, hash, code, metadata.
+    #[test]
+    fn a_record_becomes_an_fspx_part_in_a_container() {
+        let pieces: [Vec<u8>; 4] = [vec![1; 0x1c], vec![2; 0x14], vec![3; 0x40], vec![4; 0x60]];
+        let mut record = Vec::new();
+        for p in &pieces {
+            record.extend((p.as_ptr() as u64).to_le_bytes());
+            record.extend((p.len() as u64).to_le_bytes());
+        }
+        // SAFETY: four pairs over live vectors.
+        let container = unsafe { compute_container(record.as_ptr()) }.expect("a container");
+        let parsed = victory_shader::Container::parse(&container).unwrap();
+        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(&part[..4], b"FSPX");
+        assert_eq!((word(4), word(8), word(12)), (1, 4, part.len()));
+        for (i, (kind, piece)) in [0u32, 1, 6, 7].into_iter().zip(&pieces).enumerate() {
+            let at = 0x10 + 16 * i;
+            assert_eq!(word(at), kind as usize);
+            let (offset, size) = (word(at + 4), word(at + 8));
+            assert_eq!(&part[offset..offset + size], &piece[..]);
+        }
+        // A missing piece is no container.
+        record[16..24].copy_from_slice(&0u64.to_le_bytes());
+        // SAFETY: as above.
+        assert!(unsafe { compute_container(record.as_ptr()) }.is_none());
     }
 }
