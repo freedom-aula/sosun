@@ -269,6 +269,8 @@ struct Lower<'a> {
     phi_at: Map<Value, (usize, usize)>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
+    /// [`Lower::unneeded_edges`], made at the first join that asks.
+    unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     data_phis: Vec<(V, usize, usize)>,
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
@@ -806,6 +808,7 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
+            unneeded: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
@@ -10335,6 +10338,91 @@ impl<'a> Lower<'a> {
         all
     }
 
+    /// Every (join value, edge) whose incoming value no lane of that edge sees, as the greatest
+    /// fixpoint: each instruction reading the join is an AND or NAND with EXEC (or an `s_orn2`
+    /// by EXEC) in the join's block, with no lane of the edge in that EXEC as the edge brings it
+    /// (those lanes' bits of the result are 0, or 1, whatever the join holds for them); and each
+    /// later join that takes it is on an edge those lanes do not take from the block, or is in
+    /// the set itself (a register the console compiler reuses on a path those lanes skip, as a
+    /// nested if's else part writes it again before any read; a loop passing it round).
+    fn unneeded_edges(&self) -> &Set<(Value, usize)> {
+        self.unneeded.get_or_init(|| {
+            let (p, st) = (self.x.p, self.x.st);
+            let mut reads: Map<Value, Vec<(usize, usize)>> = Map::default();
+            let mut uses: Map<Value, Vec<(usize, usize, usize)>> = Map::default();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for (i, inst) in blk.insts.iter().enumerate() {
+                    for r in &inst.reads {
+                        reads.entry(r.1).or_default().push((b, i));
+                    }
+                }
+                for (i, phi) in blk.phis.iter().enumerate() {
+                    for (k, &a) in phi.args.iter().enumerate() {
+                        uses.entry(a).or_default().push((b, i, k));
+                    }
+                }
+            }
+            let mut set = Set::default();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
+                    let reads = reads.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    for n in 0..blk.preds.len() {
+                        let off = reads.iter().all(|&(bb, i)| {
+                            let inst = &p.blocks[bb].insts[i];
+                            let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
+                                if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                            let masked = match inst.name() {
+                                "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
+                                "s_orn2_b32" | "s_orn2_b64" => by_exec,
+                                _ => false,
+                            };
+                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| bb == b && masked)
+                            else {
+                                return false;
+                            };
+                            let joined = blk.phis.iter().find(|ph| ph.value == exec);
+                            let exec = joined.map_or(exec, |ph| ph.args[n]);
+                            let Some(&m) = st.masks.get(&exec) else { return false };
+                            let mut lanes = self.lane_edge(blk.preds[n], b);
+                            lanes.push((m, true));
+                            !st.bools.meet(&lanes)
+                        });
+                        if off {
+                            set.insert((phi.value, n));
+                        }
+                    }
+                }
+            }
+            loop {
+                let before = set.len();
+                for (b, blk) in p.blocks.iter().enumerate() {
+                    for phi in &blk.phis {
+                        for n in 0..blk.preds.len() {
+                            if !set.contains(&(phi.value, n)) {
+                                continue;
+                            }
+                            let on_n = self.lane_edge(blk.preds[n], b);
+                            let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                            let ok = uses.iter().all(|&(e, i, k)| {
+                                set.contains(&(p.blocks[e].phis[i].value, k))
+                                    || p.blocks[e].preds[k] == b
+                                        && !st
+                                            .bools
+                                            .meet(&[on_n.clone(), self.lane_edge(b, e)].concat())
+                            });
+                            if !ok {
+                                set.remove(&(phi.value, n));
+                            }
+                        }
+                    }
+                }
+                if set.len() == before {
+                    return set;
+                }
+            }
+        })
+    }
+
     /// Whether every lane enters IR block `b` along the edge the console's
     /// wave takes, so that an SGPR joined there holds what that edge
     /// brought: every branch into it is uniform (SCC values). The wave runs
@@ -10343,129 +10431,6 @@ impl<'a> Lower<'a> {
     /// the console compiler's if/else always skips into its join that way.
     /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
     /// edge into its header; the others take the wave's.
-    /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
-    /// it and EXEC (or `s_nand` with EXEC, or `s_orn2` of it by EXEC) in `b`, with no lane of
-    /// edge `n` in that EXEC as the edge brings it: those lanes' bits of the result are 0 (1)
-    /// whatever the mask holds for them.
-    fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
-        let (p, st) = (self.x.p, self.x.st);
-        let block = &p.blocks[b];
-        let mut reads = 0;
-        for (bb, blk) in p.blocks.iter().enumerate() {
-            if blk.phis.iter().any(|phi| phi.args.contains(&value)) {
-                return false;
-            }
-            for inst in blk.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == value)) {
-                // `s_orn2 d, x, exec` sets the bits of lanes outside EXEC as `s_and` clears them.
-                let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
-                    && matches!(&inst.fields, Fields::Sop { src, .. }
-                        if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                // `s_nand` with EXEC sets those bits whatever it holds, as `s_and` clears them.
-                let and =
-                    matches!(inst.name(), "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64");
-                if bb != b || !(and || orn2_of_exec) {
-                    return false;
-                }
-                let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
-                let exec = block.phis.iter().find(|phi| phi.value == exec).map_or(exec, |phi| phi.args[n]);
-                let Some(&m) = st.masks.get(&exec) else { return false };
-                let mut lanes = self.lane_edge(block.preds[n], b);
-                lanes.push((m, true));
-                if st.bools.meet(&lanes) {
-                    return false;
-                }
-                reads += 1;
-            }
-        }
-        reads > 0
-    }
-
-    /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
-    /// `depth` deep) whose edge from it needs no value ([`Self::unneeded_arg`]), so the wave can
-    /// hold any bits there.
-    fn never_seen(&self, value: Value, depth: u32) -> bool {
-        let p = self.x.p;
-        depth > 0
-            && !self.read_by_code(value)
-            && p.blocks.iter().enumerate().all(|(e, blk)| {
-                blk.phis.iter().all(|phi| {
-                    phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
-                        self.unneeded_arg(e, phi, k, depth - 1)
-                    })
-                })
-            })
-    }
-
-    /// Whether an instruction (not a join) reads `value`.
-    fn read_by_code(&self, value: Value) -> bool {
-        let reads = |i: &Inst| i.reads.iter().any(|r| r.1 == value);
-        self.x.p.blocks.iter().any(|b| b.insts.iter().any(reads))
-    }
-
-    /// Whether no lane taking edge `n` into IR block `b` sees what that edge brings to `phi`:
-    /// only an AND with an EXEC those lanes are not in reads it ([`Self::anded_off_on_edge`]),
-    /// no lane sees the join at all, or (with nothing reading the join) those lanes leave `b`
-    /// only by edges whose joins do not take it or need no value there either (a register the
-    /// console compiler reuses on a path those lanes skip, as a nested if's else part writes
-    /// it again before any read).
-    fn unneeded_arg(&self, b: usize, phi: &Phi, n: usize, depth: u32) -> bool {
-        let p = self.x.p;
-        if self.anded_off_on_edge(b, phi.value, n) || self.never_seen(phi.value, depth) {
-            return true;
-        }
-        if depth == 0 || self.read_by_code(phi.value) {
-            return false;
-        }
-        let on_n = self.lane_edge(p.blocks[b].preds[n], b);
-        p.blocks.iter().enumerate().all(|(e, blk)| {
-            blk.phis.iter().all(|next| {
-                next.args.iter().enumerate().filter(|&(_, &a)| a == phi.value).all(|(k, _)| {
-                    let taken = || [on_n.clone(), self.lane_edge(b, e)].concat();
-                    (blk.preds[k] == b && !self.x.st.bools.meet(&taken()))
-                        || self.unneeded_arg(e, next, k, depth - 1)
-                })
-            })
-        })
-    }
-
-    /// The lane mask `low` (the low dword's value) as each lane's bit when it is a select in IR
-    /// block `q` of an inline -1 (every lane) or 0 (none) by SCC: SCC, the same for every lane.
-    fn scc_mask(&self, low: Value, q: usize) -> Option<V> {
-        let block = &self.x.p.blocks[q];
-        let op = if self.x.native.wave64 { "s_cselect_b64" } else { "s_cselect_b32" };
-        let (inst, [Operand::Const(a), Operand::Const(b)]) = scalar_def::<2>(block, low, op)? else {
-            return None;
-        };
-        if (crate::resource::inline(a)?, crate::resource::inline(b)?) != (u32::MAX, 0) {
-            return None;
-        }
-        match self.vals.get(&inst.read(Reg::Scc)?) {
-            Some(&Val::Bit(scc)) => Some(scc),
-            _ => None,
-        }
-    }
-
-    /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
-    /// only successor, is a move in `q` of an inline 0 (`false`: no lane) or -1 (`true`: every
-    /// lane), both dwords at once in a wave64 program. The wave holds that constant on the edge
-    /// whichever lanes run `q`, as nothing after the move runs before the join.
-    fn constant_mask(&self, low: Value, q: usize) -> Option<bool> {
-        let block = &self.x.p.blocks[q];
-        if block.exit.successors().len() != 1 {
-            return None;
-        }
-        let op = if self.x.native.wave64 { "s_mov_b64" } else { "s_mov_b32" };
-        let (_, [src]) = scalar_def::<1>(block, low, op)?;
-        match src {
-            Operand::Const(code) => match crate::resource::inline(code)? {
-                0 => Some(false),
-                u32::MAX => Some(true),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
     fn uniform_join(&self, b: usize) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
@@ -13645,18 +13610,21 @@ impl<'a> Lower<'a> {
                         self.s.m.bool(false)
                     }
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
-                    // but by such joins: any bit will do, so what the edge brings (data, or a
-                    // value not made) is not needed.
-                    // shortcut: the search repeats work along a chain of joins (fine at the
-                    // title's ~10 deep); memoise it if a program's translation gets slow.
-                    (None, _) if self.unneeded_arg(b, phi, n, 16) => self.s.m.bool(false),
-                    // No lanes or every lane, moved just before the edge: each lane's bit,
-                    // whatever the lane layout and whichever lanes take the edge.
-                    (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
-                        self.s.m.bool(all)
+                    // but by joins that do not need it: any bit will do, so what the edge brings
+                    // (data, or a value not made) is not needed.
+                    (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
+                        self.s.m.bool(false)
                     }
-                    // -1 or 0 by SCC: SCC is every lane's bit.
-                    (None, Some(Val::I32(_))) if let Some(scc) = self.scc_mask(arg, q) => scc,
+                    // A lane function the structure knows though no mask tracks it (a constant,
+                    // SCC, a join that resolved): each lane's bit of it.
+                    (None, _)
+                        if let Some(&m) = self.x.st.other.get(&arg)
+                            && !self.x.st.bools.support(m).iter().any(|a| {
+                                matches!(a, Atom::Opaque(_) | Atom::Quad(_))
+                            }) =>
+                    {
+                        self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    }
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
                     }
