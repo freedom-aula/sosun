@@ -126,6 +126,7 @@ impl<'a> Scene<'a> {
             vertex_buffers: vec![(&self.arena.buf, self.arena.at(verts))],
             index_buffer: idx.then(|| (&self.arena.buf, self.arena.at(4096) as *const u8)),
             call,
+            indirect: None,
         }
     }
 
@@ -281,6 +282,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
         },
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
+        indirect: None,
     }];
     s.submit(&[
         s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0]),
@@ -326,4 +328,59 @@ fn depth_test_rejects_a_draw_behind() {
     let (a, b) = (s.draw(0.25, call, 0, false), s.draw(0.75, call, 512, false));
     s.submit(&[s.pass(vec![a, b], [0.0, 0.0, 0.0, 1.0])]);
     assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]));
+}
+
+#[test]
+fn indirect_draws_read_their_records_from_title_memory() {
+    let Some(m) = backend() else { return };
+    let s = Scene::new(&m, Some((true, Compare::Less)));
+    // As `indexed_draw_with_depth_test_and_depth_sampling`, with the counts in D3D12 argument
+    // records (`D3D12_DRAW_INDEXED_ARGUMENTS`, `D3D12_DRAW_ARGUMENTS`) the GPU reads. A third
+    // record with no instances draws a red triangle over everything, or nothing.
+    s.arena.write(
+        0,
+        &[
+            v(-1.0, -1.0, GREEN),
+            v(0.0, -1.0, GREEN),
+            v(0.0, 1.0, GREEN),
+            v(-1.0, 1.0, GREEN),
+        ],
+    );
+    s.arena.write(4096, &[0u16, 1, 2, 0, 2, 3]);
+    s.arena.write(
+        512,
+        &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)],
+    );
+    s.arena.write(6144, &[6u32, 1, 0, 0, 0]);
+    s.arena.write(6164, &[3u32, 1, 0, 0]);
+    s.arena.write(6180, &[3u32, 0, 0, 0]);
+    let none = DrawCall::Arrays {
+        vertex_count: 0,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    let record = |at: usize| Some((&s.arena.buf, s.arena.at(at) as *const u8));
+    let mut quad = s.draw(
+        0.25,
+        DrawCall::Indexed {
+            index_count: 0,
+            instance_count: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+            wide: false,
+        },
+        0,
+        true,
+    );
+    quad.indirect = record(6144);
+    let mut tri = s.draw(0.75, none, 512, false);
+    tri.indirect = record(6164);
+    let mut skipped = s.draw(0.0, none, 512, false);
+    skipped.indirect = record(6180);
+    s.submit(&[s.pass(vec![quad, tri, skipped], [0.0, 0.0, 0.0, 1.0])]);
+    let p = s.pixels();
+    assert_eq!(px(&p, 4, 8), [0, 255, 0, 255], "indexed record (z 0.25) in front");
+    assert_eq!(px(&p, 12, 8), [255, 0, 0, 255], "plain record where only it covers");
 }
