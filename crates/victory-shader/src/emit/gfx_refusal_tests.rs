@@ -1419,7 +1419,12 @@ fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
 /// UAV: each lane stores registers from v1 on (copies of its lane number) to
 /// element `lane` with the typed store `store` (two words).
 fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
-    let words = [
+    typed_store_cs_after(&[], store)
+}
+
+/// [`typed_store_cs`] with the words `setup` run just before the store.
+fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    let mut words = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202,
@@ -1428,10 +1433,9 @@ fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
         0x7E04_0300, // v_mov_b32 v2, v0
         0x7E06_0300, // v_mov_b32 v3, v0
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        store[0],
-        store[1],
-        0xBF81_0000, // s_endpgm
     ];
+    words.extend_from_slice(setup);
+    words.extend([store[0], store[1], 0xBF81_0000]); // then s_endpgm
     let table = RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -1515,6 +1519,39 @@ fn typed_buffer_stores_at_an_offset_remain_refused() {
     ];
     for &(store, asm) in stores {
         let err = typed_store_cs(store).err().unwrap_or_else(|| panic!("{asm}: expected refusal"));
+        assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
+    }
+}
+
+/// A scalar offset register that provably holds 0 (a move of the constant) is
+/// no offset: the store lowers, whatever its channel count.
+#[test]
+fn typed_buffer_stores_at_a_zero_sgpr_offset_lower() {
+    let stores: &[(u32, &str)] = &[
+        (0xE01C_2000, "buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen"),
+        (0xE010_2000, "buffer_store_format_x v1, v0, s[8:11], s2 idxen"),
+    ];
+    for &(w0, asm) in stores {
+        // s_mov_b32 s2, 0
+        let l = typed_store_cs_after(&[0xBE82_0380], [w0, 0x0202_0100])
+            .unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+}
+
+/// A scalar offset register holding another constant, or a value that is not
+/// known, is an offset: refused, not dropped.
+#[test]
+fn typed_buffer_stores_at_a_nonzero_or_unknown_sgpr_offset_remain_refused() {
+    let setups: &[(u32, &str)] = &[
+        (0xBE82_0384, "s_mov_b32 s2, 4"),
+        (0xBE82_0300, "s_mov_b32 s2, s0"),
+    ];
+    for &(setup, asm) in setups {
+        // buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen
+        let err = typed_store_cs_after(&[setup], [0xE01C_2000, 0x0202_0100])
+            .err()
+            .unwrap_or_else(|| panic!("{asm}: expected refusal"));
         assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
     }
 }

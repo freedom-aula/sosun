@@ -11264,6 +11264,12 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
+        // A typed store's scalar offset register proved to hold 0 (moves of
+        // the constant) is no offset; any other makes `off` computed, which
+        // the typed store below refuses.
+        let so = so.filter(|_| {
+            !(typed && store && self.konst_operand(&HashMap::new(), inst, soffset) == Some(0))
+        });
         let src = self
             .descriptors
             .get(&(site, false))
@@ -11524,7 +11530,8 @@ impl<'a> Lower<'a> {
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // A typed view has no bytes inside an element to address.
+                // A typed view has no bytes inside an element to address: a
+                // computed offset is refused, as it is not known to be 0.
                 if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                     return Err("a typed buffer store at an offset");
                 }
