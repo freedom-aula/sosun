@@ -511,10 +511,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// `VICTORY_TRACE_TARGETS=1`: the root parameters of the first draws that have vertex buffers,
     /// and the title memory they name (descriptor words, then the first 64 bytes at the address a
     /// constant buffer descriptor holds).
-    fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+    fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, dispatch: bool) {
         use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N.fetch_add(1, Ordering::Relaxed) >= 6 {
+        static N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
             return;
         }
         let read = |at: u64, n: usize| {
@@ -543,6 +543,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 });
                                 tracing::info!(entry = k, resource = format!("{r:#x}"), desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), nonzero_bytes = nz, of = total, "table texture");
                             }
+                            Some(crate::descriptor::View::Unordered(r, counter, d)) => {
+                                let info = texture_info_of(r);
+                                let buffer = self.resources.borrow().get(&r).map(|b| match b {
+                                    Res::Buffer(a, n) => (*a, *n),
+                                    _ => (0, 0),
+                                });
+                                tracing::info!(entry = k, resource = format!("{r:#x}"), counter, desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), buffer = ?buffer, "table unordered view");
+                            }
                             Some(crate::descriptor::View::Placed(_, res, d)) => tracing::info!(entry = k, ?res, ?d, "table placed view"),
                             Some(v) => tracing::info!(entry = k, ?v, "table view"),
                             None => {}
@@ -569,8 +577,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, ..
-            } => match &pso.binding {
+                root, pso, heaps, groups, ..
+            } => {
+                tracing::debug!(?groups, "dispatch");
+                if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
+                    static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                        tracing::info!(?groups, threads = ?pso.threads, "dispatch");
+                    }
+                }
+                self.trace_draw(root, pso.binding.as_ref(), true);
+                match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
                     if b.memory {
@@ -580,7 +597,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 None => self.root_args(root, &mut p)?,
-            },
+            }},
             Cmd::Draw {
                 root,
                 binding,
@@ -590,7 +607,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if !vertex.is_empty() {
-                    self.trace_draw(root, binding.as_deref());
+                    self.trace_draw(root, binding.as_deref(), false);
                 }
                 match binding {
                     Some(b) => {
