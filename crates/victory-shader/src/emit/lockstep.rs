@@ -43,6 +43,8 @@ pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -
         && native.wave64
         && !st.lockstep
         && cs.threads.iter().product::<u32>() <= 64
+        // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
+        && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
 
 /// The lockstep translation of `p` (see the module).

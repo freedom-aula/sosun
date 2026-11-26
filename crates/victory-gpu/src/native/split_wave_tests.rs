@@ -588,3 +588,34 @@ fn a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep() {
     assert_eq!(got[..50], (0..50).map(|i| i * (i + 1) / 2).collect::<Vec<u32>>());
     assert_eq!(got[50..], [CANARY; 14]);
 }
+
+#[test]
+fn whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep() {
+    // Behind an EXEC branch, with every lane on: a DPP row shift (lane i takes lane i - 1 of its
+    // row of 16, 0 at a row's start) and lane 33's result read back, which no reduction or prefix
+    // describes. Lockstep runs the instructions as they are.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x7D88_00B2, // v_cmp_gt_u32 vcc, 50, v0
+        LANES_BELOW_40[1],
+        skip_execz(9),
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0x7E06_02FA,
+        0xFF09_1100, // v_mov_b32_dpp v3, v0 row_shr:1 bound_ctrl:1
+        0xD760_000A,
+        0x0201_4303, // v_readlane_b32 s10, v3, 33
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x4A06_060A, // v_add_nc_u32 v3, s10, v3
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ];
+    let got = run_lockstep(&w, 0, 64);
+    if got.is_empty() {
+        return;
+    }
+    let want: Vec<u32> = (0..50).map(|i| if i % 16 == 0 { 32 } else { i - 1 + 32 }).collect();
+    assert_eq!(got[..50], want);
+    assert_eq!(got[50..], [CANARY; 14]);
+}

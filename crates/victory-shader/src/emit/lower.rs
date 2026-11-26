@@ -1242,6 +1242,10 @@ impl<'a> Lower<'a> {
 
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
+        // Lockstep runs whole-wave code literally: every thread is there (`lockstep.rs`).
+        if self.x.st.lockstep {
+            return;
+        }
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
