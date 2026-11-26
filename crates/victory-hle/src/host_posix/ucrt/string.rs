@@ -190,7 +190,7 @@ unsafe fn g_cpy<C: Ch>(dst: *mut C, src: *const C) -> *mut C {
 unsafe fn g_ncpy<C: Ch>(dst: *mut C, src: *const C, n: usize) -> *mut C {
     // SAFETY: the title's buffers; pads with NULs as `strncpy` does.
     unsafe {
-        let len = units(src).len().min(n);
+        let len = len_max(src, n);
         std::ptr::copy(src, dst, len);
         for i in len..n {
             dst.add(i).write(C::default());
@@ -209,7 +209,7 @@ unsafe fn g_ncat<C: Ch>(dst: *mut C, src: *const C, n: usize) -> *mut C {
     // SAFETY: the title's buffers.
     unsafe {
         let end = dst.add(g_len(dst));
-        let len = units(src).len().min(n);
+        let len = len_max(src, n);
         std::ptr::copy(src, end, len);
         end.add(len).write(C::default());
     }
@@ -306,11 +306,14 @@ unsafe fn g_cpy_s<C: Ch>(dst: *mut C, size: usize, src: *const C, count: Option<
             dst.write(C::default());
             return bad_param(EINVAL);
         }
-        let len = units(src).len();
         let (take, truncating) = match count {
-            None => (len, false),
-            Some(TRUNCATE) => (len.min(size - 1), len > size - 1),
-            Some(n) => (len.min(n), false),
+            None => (units(src).len(), false),
+            // One unit more than fits tells a truncation.
+            Some(TRUNCATE) => {
+                let len = len_max(src, size);
+                (len.min(size - 1), len > size - 1)
+            }
+            Some(n) => (len_max(src, n), false),
         };
         if take >= size {
             dst.write(C::default());
@@ -349,6 +352,13 @@ unsafe fn g_cat_s<C: Ch>(dst: *mut C, size: usize, src: *const C, count: Option<
 unsafe fn units_in<C: Ch>(p: *const C, size: usize) -> Option<usize> {
     // SAFETY: a buffer of `size` units.
     (0..size).find(|&i| unsafe { p.add(i).read() }.get() == 0)
+}
+
+/// Length of `s`, reading no more than `max` units: the counted functions
+/// take sources that need no NUL within their count (a fixed-size field).
+unsafe fn len_max<C: Ch>(s: *const C, max: usize) -> usize {
+    // SAFETY: at least `max` units or a NUL before them.
+    unsafe { units_in(s, max) }.unwrap_or(max)
 }
 
 // Narrow.
@@ -1381,9 +1391,74 @@ exports!(pub(super) fn lookup;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_platform::mem::{self, Protect};
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    /// `n` units of `A` with no NUL after them: the last one ends where a
+    /// page nobody may read begins. With the mapping to release.
+    fn before_a_guard<C: Ch>(n: usize) -> (*const C, *mut u8, usize) {
+        const HALF: usize = 64 << 10;
+        // SAFETY: a fresh mapping of our own, written below its guard.
+        unsafe {
+            let base = mem::alloc(None, 2 * HALF, Protect::READ_WRITE).unwrap();
+            mem::protect(base.add(HALF), HALF, Protect::NO_ACCESS).unwrap();
+            let src = base.add(HALF).cast::<C>().sub(n);
+            for i in 0..n {
+                src.add(i).write(C::make(u32::from(b'A')));
+            }
+            (src, base, 2 * HALF)
+        }
+    }
+
+    #[test]
+    fn counted_copies_read_no_further_than_their_count() {
+        // A counted source need not hold a NUL within its count, so nothing
+        // past the count may be read: here that would be the guard page.
+        let (s, base, len) = before_a_guard::<u8>(8);
+        let mut d = [0u8; 16];
+        strncpy(d.as_mut_ptr(), s, 8);
+        assert_eq!(&d[..9], b"AAAAAAAA\0");
+        d = [0; 16];
+        strncat(d.as_mut_ptr(), s, 8);
+        assert_eq!(&d[..9], b"AAAAAAAA\0");
+        d = [0; 16];
+        assert_eq!(strncpy_s(d.as_mut_ptr(), d.len(), s, 8), 0);
+        assert_eq!(&d[..9], b"AAAAAAAA\0");
+        d = [0; 16];
+        assert_eq!(strncat_s(d.as_mut_ptr(), d.len(), s, 8), 0);
+        assert_eq!(&d[..9], b"AAAAAAAA\0");
+        // _TRUNCATE reads no more than fits.
+        d = [0; 16];
+        assert_eq!(strncpy_s(d.as_mut_ptr(), 4, s, TRUNCATE), STRUNCATE);
+        assert_eq!(&d[..4], b"AAA\0");
+        d = [0; 16];
+        assert_eq!(strncat_s(d.as_mut_ptr(), 4, s, TRUNCATE), STRUNCATE);
+        assert_eq!(&d[..4], b"AAA\0");
+        // SAFETY: our own mapping.
+        unsafe { mem::release(base, len).unwrap() };
+
+        let (s, base, len) = before_a_guard::<u16>(8);
+        let a8 = w("AAAAAAAA");
+        let mut d = [0u16; 16];
+        wcsncpy(d.as_mut_ptr(), s, 8);
+        assert_eq!(&d[..9], &a8[..]);
+        d = [0; 16];
+        wcsncat(d.as_mut_ptr(), s, 8);
+        assert_eq!(&d[..9], &a8[..]);
+        d = [0; 16];
+        assert_eq!(wcsncpy_s(d.as_mut_ptr(), d.len(), s, 8), 0);
+        assert_eq!(&d[..9], &a8[..]);
+        d = [0; 16];
+        assert_eq!(wcsncat_s(d.as_mut_ptr(), d.len(), s, 8), 0);
+        assert_eq!(&d[..9], &a8[..]);
+        d = [0; 16];
+        assert_eq!(wcsncpy_s(d.as_mut_ptr(), 4, s, TRUNCATE), STRUNCATE);
+        assert_eq!(&d[..4], &w("AAA")[..]);
+        // SAFETY: our own mapping.
+        unsafe { mem::release(base, len).unwrap() };
     }
 
     #[test]
