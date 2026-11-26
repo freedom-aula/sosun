@@ -12,8 +12,8 @@ Always start from evidence: dump what was drawn, then form one hypothesis. Keep 
 | Variable | What it does |
 |---|---|
 | `VICTORY_GUESS_GRAPHICS=1` | Builds Metal pipelines for draws (needed for anything to draw) |
-| `VICTORY_TRACE_TARGETS=1` | Logs per present which textures were drawn to or cleared and which was presented. Needed for the dumps below. |
-| `VICTORY_DUMP_TARGETS=<dir>,<seconds>[,<every>]` | Writes the 8-bit colour targets as PPM files from that second (repeating every N s): `t<n>_<second>_<address>.ppm`. The presented image is the swapchain address. |
+| `VICTORY_TRACE_TARGETS=1` | Logs per present which textures were drawn to, cleared or lost draws (`dropped`), which was presented, the work dropped since the last present by reason (`reasons=`), and each pipeline whose draws or indirect executions were dropped (`draws dropped (no host pipeline, or an indirect execution)`, with its shaders and targets). Needed for the dumps below. |
+| `VICTORY_DUMP_TARGETS=<dir>,<seconds>[,<every>]` | Writes the 8-bit colour targets as PPM files from that second (repeating every N s): `t<n>_<second>_<address>.ppm`. The presented image is the swapchain address. HDR and 10-bit targets (DXGI 2, 10, 24, 26) are tone-mapped into `..._f<format>.ppm`, with their maximum, mean and lit fraction logged (`target dumped`), so a black pass shows in the log without opening an image. |
 | `VICTORY_TRACE_CONTENT=<dir>,<seconds>,<format>` | Traces only draws into targets of one format, and dumps A8/R8 textures as grey images |
 | `VICTORY_TRACE_PIPES=1` | Logs each guessed pipeline's depth, stencil and blend state |
 | `VICTORY_DUMP_DESC_DIR=<dir>` | Writes each pipeline's register image (device slot 0x1c8) to a file |

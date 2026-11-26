@@ -407,6 +407,19 @@ fn texture_views_and_sampler_filters() {
     assert!(g.run(&t).iter().all(|c| near(c[0], 0.502)));
     assert!(g.run(&srgb).iter().all(|c| near(c[0], 0.2158)));
 
+    // A format Metal cannot cast the texture to is an error, not Metal's assertion (a title view
+    // left over a resource object the title made anew); one of the same texel size is a view.
+    let view = |format| m.create_texture_view(&t, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    for format in [Format::R8Unorm, Format::Bc1, Format::Rgba16Float, Format::D32Float] {
+        assert!(view(format).is_err(), "{format:?}");
+    }
+    for format in [Format::R32Uint, Format::Rgb10a2Unorm, Format::Bgra8Unorm] {
+        assert!(view(format).is_ok(), "{format:?}");
+    }
+    let bc = m.create_texture(&d2(Format::Bc7, 4, 4)).unwrap();
+    let view = |format| m.create_texture_view(&bc, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    assert!(view(Format::Bc7Srgb).is_ok() && view(Format::Bc3).is_err() && view(Format::Rgba32Float).is_err());
+
     // Filters: a 2x2 texture, red 0 | 255 (both rows), sampled on a 4x4 grid. Nearest only ever
     // returns the two texel values; linear blends between the texel centres.
     let t = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();

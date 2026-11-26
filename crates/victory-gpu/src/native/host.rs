@@ -10,7 +10,7 @@ use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
@@ -41,10 +41,25 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Heap entries cleared because the texture they showed was released.
+    cleared: std::cell::Cell<u64>,
     /// Commands dropped because the host could not prepare them for another reason.
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+}
+
+/// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
+/// list (or this queue's next segment) may wait for with no other way to go on.
+fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
+    // Once per page: a title writes the same unmapped words every frame.
+    static PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if let Cmd::Fill { dst, len, value } = c {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pages.len() < 50 && pages.insert(dst >> 12) {
+            tracing::warn!("native host drops a value write: byte {value:#x} x{len} at {dst:#x}: {why}");
+        }
+    }
 }
 
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
@@ -58,9 +73,6 @@ const NOT_MAPPED: &str = "is not in a mapped pool";
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
     pairs: Pairs,
-    /// Superseded tables, kept while submissions that read them may still run.
-    // shortcut: the GPU is assumed not to be more than `RETIRED` table rebuilds behind.
-    retired: VecDeque<Rc<Pages<B>>>,
     /// The memory the null view (pair 0) has, with size 0.
     null: Option<Rc<Pages<B>>>,
     /// A resource heap of the host's own, for shaders that need the pairs and the title bound none.
@@ -71,14 +83,11 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     fn default() -> Self {
         Contract {
             pairs: Pairs::default(),
-            retired: VecDeque::new(),
             null: None,
             heap: None,
         }
     }
 }
-
-const RETIRED: usize = 8;
 
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
@@ -140,6 +149,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
         }
@@ -253,6 +263,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
+        // The entries cleared when the texture last at this address was released are checked
+        // again: the record the title writes for the new one may equal the old one's.
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_gone(key) {
+                heap.mirrored.borrow_mut().remove(&index);
+            }
+        }
     }
 
     /// A shader-visible heap over the title's descriptor memory at `start` (zeroed memory the title
@@ -284,6 +301,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -319,6 +337,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);
+    }
+
+    /// The title released texture `key` for good (its object's last reference, or the pool it was
+    /// placed in): besides [`Self::forget_resource`], the heap entries that show it are cleared.
+    /// Left as they were, they kept the host texture alive and resident until the title happened
+    /// to write another view there, so the memory the GPU holds wired grew with play time.
+    /// A cleared entry is written again when the title writes another record there, or makes a
+    /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
+    /// name the next object at this address, of a format the view cannot be made over.
+    pub fn release_resource(&self, key: usize) {
+        let texture = matches!(self.resources.borrow_mut().remove(&key), Some(Res::Texture(_)));
+        if !texture {
+            return;
+        }
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_entries(key) {
+                self.backend.clear_entry(&heap.heap, index);
+                self.cleared.set(self.cleared.get() + 1);
+            }
+        }
+    }
+
+    /// Heap entries cleared so far because the texture they showed was released.
+    pub fn cleared(&self) -> u64 {
+        self.cleared.get()
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -376,6 +419,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                heap.shows(index, None);
             }
             Decoded::Image {
                 resource,
@@ -401,10 +445,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.shows(index, None);
             }
         }
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
@@ -455,14 +501,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The arguments of a translated title shader: its user-data block, then its root views.
+    /// `threads`: the dispatch's thread counts, for a shader that reads them.
     fn translated_args(
         &self,
         root: &[Option<Root<B>>],
         b: &Binding,
         heap: Option<&Rc<NativeHeap<B>>>,
+        threads: [u32; 3],
         p: &mut Prep<B>,
     ) -> Result<(), String> {
-        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
+        use victory_shader::emit::{DISPATCH_THREADS, ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET};
         use victory_shader::RootType;
         let set = |slot: u8| {
             root.get(usize::from(slot))
@@ -473,6 +521,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if b.dwords > 0 {
             let mut values = vec![0u32; b.dwords];
             for u in &b.user_data {
+                if u.slot == DISPATCH_THREADS {
+                    values[u.index as usize] = threads.get(u.dword as usize).copied().unwrap_or(u32::MAX);
+                    continue;
+                }
                 values[u.index as usize] = match (u.root, set(u.slot)?) {
                     (RootType::Constants, Root::Constants(c)) => {
                         c.get(u.dword as usize).copied().unwrap_or(0)
@@ -543,12 +595,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
         table.write(&words);
-        if let Some((_, old)) = heap.table.borrow_mut().replace((generation, table.clone())) {
-            c.retired.push_back(old);
-            while c.retired.len() > RETIRED {
-                c.retired.pop_front();
-            }
-        }
+        // The table it replaces stays with the submissions that read it ([`Pages`]).
+        *heap.table.borrow_mut() = Some((generation, table.clone()));
         Ok(table)
     }
 
@@ -652,6 +700,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -919,9 +968,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 pso,
                 heaps,
                 groups,
+                threads,
                 indirect,
                 count,
-                ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, 12)?);
@@ -941,7 +990,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.remirror_tables(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
-                    self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                    self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;
                     if b.memory {
                         self.memory_args(heaps.0.as_ref(), &mut p)?;
                     } else if let Some(h) = p.heap.clone() {
@@ -963,7 +1012,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, if matches!(call, DrawCall::Indexed { .. }) { 20 } else { 16 })?);
+                    p.indirect = Some(self.resolve(*a, match call { DrawCall::Indexed { .. } => 20, DrawCall::Mesh { .. } => 12, DrawCall::Arrays { .. } => 16 })?);
                 }
                 if let Some((a, index)) = count {
                     let (b, at) = self.resolve(*a, 4)?;
@@ -976,13 +1025,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {
-                        self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        self.translated_args(root, b, heaps.0.as_ref(), [u32::MAX; 3], &mut p)?;
                         if b.memory {
                             self.memory_args(heaps.0.as_ref(), &mut p)?;
                         }
                         if let Some(ps) = &b.ps {
                             let vs_args = std::mem::take(&mut p.root);
-                            self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            self.translated_args(root, ps, heaps.0.as_ref(), [u32::MAX; 3], &mut p)?;
                             if ps.memory {
                                 self.memory_args(heaps.0.as_ref(), &mut p)?;
                             }
@@ -1094,6 +1143,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
                 // Anything else the host cannot give one command (arguments that are not what the
@@ -1106,6 +1156,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
             }

@@ -19,6 +19,9 @@ pub struct Metal {
     pub(crate) msc: Result<Msc, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
+    /// The title's pool buffers in one set on every queue too (`VICTORY_METAL_RESIDENCY_SETS=1`);
+    /// off = named by the encoders that use them.
+    pub(crate) pool_sets: bool,
     /// The set of the title's pool buffers, made when the first one is.
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
@@ -58,6 +61,9 @@ pub struct ResidencyCounts {
     /// one heap named to an encoder.
     pub heap_entries: u64,
     pub heap_allocations: u64,
+    /// The most bytes one heap's set held when it was committed (the heap buffer and everything
+    /// its entries name: resident while a command buffer that uses the heap runs).
+    pub heap_set_bytes: u64,
     /// Buffers added to the pool set.
     pub added: u64,
     /// Queues the pool set was added to.
@@ -86,11 +92,12 @@ static LIBRARIES: AtomicU64 = AtomicU64::new(0);
 
 pub struct Queue(
     pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Whether the pool residency set was added to it.
+    /// Whether the host orders its work: residency sets are in use (the heaps' own, and the
+    /// pool's once it was added to the queue).
     pub(crate) std::cell::Cell<bool>,
-    /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
-    /// tracking cannot see those accesses: command buffers wait for the one before through this
-    /// event (and encoders within one through a fence), counted by `.3`.
+    /// With sets, encoders no longer name what they reach through a heap or by address, and
+    /// Metal's hazard tracking cannot see those accesses: command buffers wait for the one before
+    /// through this event (and encoders within one through a fence), counted by `.3`.
     /// A shared event, so that a command buffer the GPU fails can still be paid on the CPU.
     pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
@@ -125,24 +132,80 @@ impl Buffer {
     }
 }
 
+/// `MTLResidencySet` exists (macOS 15 and later).
+fn sets_supported(dev: &Dev) -> bool {
+    dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:))
+}
+
+/// The Mac's memory in bytes (`hw.memsize`), 0 if it cannot be read.
+fn physical_memory() -> u64 {
+    let (mut bytes, mut len) = (0u64, size_of::<u64>());
+    // SAFETY: `hw.memsize` is a 64-bit value, written into `bytes`.
+    let read = unsafe {
+        libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut bytes).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    if read == 0 { bytes } else { 0 }
+}
+
+/// `(the heaps' residency sets, the pool's set on the queues)` for `VICTORY_METAL_RESIDENCY_SETS`
+/// (`asked`) on a Mac with `memory` bytes.
+///
+/// What a descriptor heap names is resident through the heap's own set, given to each command
+/// buffer that uses the heap, so residency follows the frame. Naming it to every encoder with
+/// `useResource` instead (`0`) cost the kernel about 155 ms per drawing render pass in GTA VI's
+/// world, whose heap names 37,000 allocations. The title's pool buffers stay named by the
+/// encoders that use them: in a set on the queue (`1`) all of title memory (about 6.7 GB) is
+/// resident for the whole process, which on an 18 GB Mac preceded
+/// `kIOGPUCommandBufferCallbackErrorTimeout` and `...OutOfMemory`.
+///
+/// Guess: the heaps' sets are safe from 32 GiB. The world's heap set holds 17 to 18 GB, more
+/// than a 16 or 18 GB Mac has, and none has run it: until one has, a smaller Mac keeps
+/// `useResource` unless `heap` asks for the sets.
+fn residency_mode(asked: Option<&str>, supported: bool, memory: u64) -> (bool, bool) {
+    match asked {
+        Some("0") => (false, false),
+        Some("heap") => (supported, false),
+        Some(_) => (supported, supported),
+        None => (supported && memory >= 32 << 30, false),
+    }
+}
+
+impl Queue {
+    /// The value the queue's order event has reached and the number of command buffers encoded
+    /// with it: equal when every one of them has finished (0 and 0 when the host does not order).
+    pub fn order_state(&self) -> (u64, u64) {
+        (self.2.signaledValue(), self.3.get())
+    }
+}
+
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
     /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
     /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        // Residency is per encoder (`useResource`) unless `VICTORY_METAL_RESIDENCY_SETS=1`. A
-        // residency set keeps every allocation it was given resident for as long as the holder
-        // lives, and the title names thousands of textures and buffers in its descriptor heaps, so
-        // the set held all of title memory (about 6.7 GB here) plus the host's texture copies
-        // permanently. That is what preceded `kIOGPUCommandBufferCallbackErrorTimeout` (and, with
-        // the copies, `...OutOfMemory`). Per encoder, residency follows the frame instead.
-        let residency_sets = std::env::var_os("VICTORY_METAL_RESIDENCY_SETS").is_some()
-            && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
+        let asked = std::env::var("VICTORY_METAL_RESIDENCY_SETS").ok();
+        let memory = physical_memory();
+        let (residency_sets, pool_sets) = residency_mode(asked.as_deref(), sets_supported(&dev), memory);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let mode = match (residency_sets, pool_sets) {
+                (false, _) => "useResource per encoder",
+                (true, false) => "a set per heap",
+                (true, true) => "a set per heap and the pool's on the queues",
+            };
+            tracing::info!(
+                mode,
+                memory_gb = memory >> 30,
+                switch = asked.as_deref().unwrap_or("unset"),
+                "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
+            );
+        });
         Ok(Metal {
             dev,
             msc: Msc::try_open_default(),
             residency_sets,
+            pool_sets,
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
@@ -189,9 +252,18 @@ impl Metal {
         self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
-    /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
+    /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the
+    /// queues, where the system has sets) or `useResource` in every encoder (`false`).
     pub fn with_residency_sets(mut self, on: bool) -> Metal {
-        self.residency_sets = on;
+        self.residency_sets = on && sets_supported(&self.dev);
+        self.pool_sets = self.residency_sets;
+        self
+    }
+
+    /// The heaps' sets alone, whatever the Mac's memory: what [`Metal::new`] chooses on a large one.
+    pub fn with_heap_sets(mut self) -> Metal {
+        self.residency_sets = sets_supported(&self.dev);
+        self.pool_sets = false;
         self
     }
 
@@ -223,7 +295,10 @@ impl ComputeBackend for Metal {
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
         let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
-        Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
+        // With the heaps' sets alone the host orders the queue's work from the start; with the
+        // pool's set too, from when that set joins the queue (`make_resident`).
+        let ordered = self.residency_sets && !self.pool_sets;
+        Ok(Queue(q, std::cell::Cell::new(ordered), order, std::cell::Cell::new(0)))
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
@@ -252,8 +327,22 @@ impl ComputeBackend for Metal {
         })
     }
 
+    fn host_buffer(&self, len: usize) -> Result<(Buffer, *mut u8), String> {
+        let buf = self
+            .dev
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .ok_or("no host buffer")?;
+        let base = buf.contents().as_ptr().cast::<u8>();
+        let buffer = Buffer {
+            buf,
+            base,
+            resident: Default::default(),
+        };
+        Ok((buffer, base))
+    }
+
     fn make_resident(&self, queue: &Queue, buffers: &[&Buffer]) -> Result<(), String> {
-        if !self.residency_sets {
+        if !self.pool_sets {
             return Ok(());
         }
         let set = {
@@ -528,6 +617,21 @@ mod tests {
         );
         // SUBS is even: the last write is array 0.
         assert!((0..N).all(|i| mem.get(0, i) == SUBS as u32));
+    }
+
+    /// The heaps' sets are the default only from 32 GiB (the world's set holds 17 to 18 GB), `heap`
+    /// forces them on any Mac, `0` names everything per encoder and `1` adds the pool's queue set.
+    #[test]
+    fn the_default_residency_mode_follows_the_macs_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(residency_mode(None, true, 18 * GIB), (false, false));
+        assert_eq!(residency_mode(None, true, 32 * GIB), (true, false));
+        assert_eq!(residency_mode(None, false, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("heap"), true, 16 * GIB), (true, false));
+        assert_eq!(residency_mode(Some("heap"), false, 16 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("0"), true, 64 * GIB), (false, false));
+        assert_eq!(residency_mode(Some("1"), true, 16 * GIB), (true, true));
+        assert!(physical_memory() >= GIB);
     }
 
     #[test]

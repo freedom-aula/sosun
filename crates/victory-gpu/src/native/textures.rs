@@ -502,7 +502,7 @@ impl<B: PresentBackend> Title<B> {
             .collect();
         for a in dead {
             let (key, _) = self.placed.remove(&a).expect("listed above");
-            self.host.forget_resource(key);
+            self.host.release_resource(key);
             self.texture_released(key);
         }
     }

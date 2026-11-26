@@ -195,6 +195,9 @@ pub struct Title<B: PresentBackend> {
     /// Host pipelines of the console's pipelines (whose state names no target formats) by title
     /// pipeline object and the targets of the draw ([`super::console_state`]).
     pub console_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
+    /// Host pipelines of compute pipelines dispatched with thread counts (`DispatchX`), whose
+    /// shader is translated for that, by title pipeline object.
+    pub thread_pipes: HashMap<usize, Pipe<B>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
@@ -235,6 +238,7 @@ impl<B: PresentBackend> Title<B> {
             host: NativeHost::with_memory(backend, memory),
             pipelines: HashMap::new(),
             console_pipes: HashMap::new(),
+            thread_pipes: HashMap::new(),
             shaders: Default::default(),
             libraries: Default::default(),
             textures: Default::default(),
@@ -431,6 +435,11 @@ impl<B: PresentBackend> Title<B> {
         });
         stats.waited += done.waited.len() as u64;
         waiting.retain(|token, _| held.waits_for(*token));
+    }
+
+    /// The backend queue of each title queue made so far.
+    pub fn backend_queues(&self) -> impl Iterator<Item = (usize, &B::Queue)> {
+        self.queues.iter().map(|(k, q)| (*k, &**q))
     }
 
     /// Queues whose head has been held longer than `limit`: a line each, with the waits that do

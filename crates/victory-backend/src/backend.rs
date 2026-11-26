@@ -108,6 +108,10 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// A zeroed buffer of the host's own (`len` bytes) and where the CPU writes it. It lives
+    /// while the caller or work submitted with it holds it: memory the GPU reads after the
+    /// caller let go (a page table that was replaced) must not be the caller's to free.
+    fn host_buffer(&self, len: usize) -> Result<(Self::Buffer, *mut u8), String>;
     /// Makes `buffers` resident for everything submitted to `queue` from now on, so that dispatches
     /// and draws need not name them one by one (Metal: an `MTLResidencySet` of the title's pools,
     /// made once, committed when a pool joins, added to each queue once). Idempotent; a buffer

@@ -4,8 +4,10 @@
 //! the halves after part of the wave has left. `s[2:3]` is `dst`, `s4` a flag. Skipped without the
 //! Metal Shader Converter.
 
-use super::addr_tests::{CANARY, Fixture, VA_A, dispatch, halves, title, translate_io};
+use super::addr_tests::{CANARY, Fixture, VA_A, dispatch, halves, title, translate_io, translate_wave};
+use crate::native::list::NativeList;
 use crate::native::shaders;
+use crate::native::title::Pipe;
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 /// `v_cmp_gt_u32 vcc, 40, v0; s_and_saveexec_b64 s[4:5], vcc`: lanes 40 and up leave.
@@ -133,6 +135,40 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
     assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
 }
 
+/// `v_ldexp_f32` (a pixel shader of GTA VI's world was refused for it): `s0` scaled by two to
+/// the power `s1`, a signed integer, in range or past it.
+#[test]
+fn ldexp_scales_by_an_integer_power_of_two() {
+    let cases: &[(f32, i32, f32)] = &[
+        (1.5, 3, 12.0),
+        (3.0, -2, 0.75),
+        (1.0, 127, 2f32.powi(127)),
+        (2f32.powi(-126), 200, 2f32.powi(74)),
+        (2f32.powi(100), -200, 2f32.powi(-100)),
+        (1.0, 1000, f32::INFINITY),
+        (-1.0, 1000, f32::NEG_INFINITY),
+        (1.0, -1000, 0.0),
+    ];
+    for &(a, e, want) in cases {
+        let Some(mut t) = title() else { return };
+        let f = Fixture::new(&t);
+        let mut w = vec![
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xD762_0002, // v_ldexp_f32 v2, s0, v2
+            0x0002_0400,
+            V_LSHLREV_V1_2_V0,
+        ];
+        w.extend(GLOBAL_STORE_V2_AT_V1);
+        w.push(S_ENDPGM);
+        let cs = translate_io(&w, 5, 0, 64, shaders::options());
+        let [c, d] = halves(VA_A + 0x4_0000);
+        dispatch(&mut t, &cs, &[a.to_bits(), e as u32, c, d, 0], false);
+        assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+        let got = f.get(DST, 1)[0];
+        assert_eq!(got, want.to_bits(), "ldexp({a}, {e}) = {}, want {want}", f32::from_bits(got));
+    }
+}
+
 /// `v_mov_b32 v1, -1; v_readlane_b32 s7, v1, 0`: a lane read, which fills every thread's exchange
 /// slot with -1.
 const FILL_XCHG: [u32; 3] = [0x7E02_02C1, 0xD760_0007, 0x0201_0101];
@@ -183,4 +219,110 @@ fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
     let got = run_io(&w, 0, 96, 0);
     assert_eq!(got[..64], [(0..64).sum::<u32>() - 1; 64]);
     assert_eq!(got[64..], [(64..96).sum::<u32>() - 1; 32]);
+}
+
+/// A dispatch of thread counts (`DispatchX` with thread dimensions, `Options::thread_counts`) of
+/// `count` threads in x, in groups of `per` lanes of 64-lane waves (`wave64`) or 32: the first
+/// `slots` dwords of `dst`. `s5` is the group id.
+fn run_threads(words: &[u32], wave64: bool, per: u32, count: u32, slots: usize) -> Vec<u32> {
+    let Some(mut t) = title() else { return Vec::new() };
+    let f = Fixture::new(&t);
+    let options = victory_shader::emit::Options { thread_counts: true, ..shaders::options() };
+    let cs = translate_wave(words, 5, 1 << 7, per, wave64, options);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "threads") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    let [c, d] = halves(VA_A + 0x4_0000);
+    l.set_compute_root_constants(0, &[0, 0, c, d, 0]);
+    l.dispatch_threads([count, 1, 1]).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.get(DST, slots)
+}
+
+/// Each lane EXEC has on stores the count of EXEC's lanes at `dst[group * lanes + lane]`:
+/// `s_bcnt1_i32_b64 s6, exec` (`_b32`, `exec_lo` in 32-lane waves), `s_lshl_b32 s7, s5, 6` (5).
+fn count_of_exec(wave64: bool) -> Vec<u32> {
+    let (count, shift) = if wave64 { (0xBE86_107E, 0x8F07_8605) } else { (0xBE86_0F7E, 0x8F07_8505) };
+    let mut w = vec![
+        count,
+        0x7E04_0206, // v_mov_b32 v2, s6
+        shift,
+        0x4A02_0007, // v_add_nc_u32 v1, s7, v0
+        0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn a_dispatch_of_thread_counts_starts_the_lanes_past_them_off() {
+    // 100 threads in groups of 64: the second group's lanes from 36 on are not launched. They
+    // store nothing and the group's count of EXEC is 36 (the ray-tracing node writers of Grand
+    // Theft Auto VI count their nodes so; run as 100 groups they wrote 6,400).
+    let w = count_of_exec(true);
+    let got = run_threads(&w, true, 64, 100, 192);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [64; 64]);
+    assert_eq!(got[64..100], [36; 36]);
+    assert_eq!(got[100..], [CANARY; 92]);
+    // One host wave's worth: the upper half of the console wave has no lane on.
+    let got = run_threads(&w, true, 64, 21, 64);
+    assert_eq!(got[..21], [21; 21]);
+    assert_eq!(got[21..], [CANARY; 43]);
+    // A count that fills its groups leaves every lane on.
+    let got = run_threads(&w, true, 64, 128, 192);
+    assert_eq!(got[..128], [64; 128]);
+    assert_eq!(got[128..], [CANARY; 64]);
+}
+
+#[test]
+fn a_dispatch_of_thread_counts_in_32_lane_waves() {
+    // The title's third such shader runs 32-lane waves, one thread of one group.
+    let w = count_of_exec(false);
+    let got = run_threads(&w, false, 32, 1, 64);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[0], 1);
+    assert_eq!(got[1..], [CANARY; 63]);
+    let got = run_threads(&w, false, 32, 40, 64);
+    assert_eq!(got[..32], [32; 32]);
+    assert_eq!(got[32..40], [8; 8]);
+    assert_eq!(got[40..], [CANARY; 24]);
+}
+
+#[test]
+fn a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them() {
+    // The sum of the lanes' indices with every lane forced on, the lanes EXEC had off adding the
+    // 0 of the v_cndmask: the lanes past the count are such lanes, as on the console, where they
+    // run the section too.
+    let w = [
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x4A02_02FA, 0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA, 0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA, 0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA, 0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xD760_0004, 0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005, 0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD525_0003, 0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000, 0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run_threads(&w, true, 64, 45, 64);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..45], [(0..45).sum::<u32>(); 45]);
+    assert_eq!(got[45..], [CANARY; 19]);
 }

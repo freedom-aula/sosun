@@ -377,8 +377,8 @@ not needed to build:
 A root descriptor table is the **GPU address of its first entry** in the top-level argument buffer
 (`heap_address(heap, i)` pushed with `RootArgs::address`, like a root view); `DescriptorTable(SRV(t0),
 UAV(u0))` is two adjacent entries and a second `DescriptorTable(Sampler(s0))` points into the sampler
-heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]` (the
-tests only use tables). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
+heap. The heaps are also bound at slots 0 and 1 for shaders that index `ResourceDescriptorHeap[i]`, for
+every stage (`victory-gpu`'s `native::heap_tests` draw with vertex, mesh and pixel shaders that do). Typed buffer views (`IRBufferView.textureBufferView`, buffers read as
 `Buffer<T>`) are not written yet.
 
 Proven by `srv_and_uav_through_a_descriptor_table` (a compute shader reads an SRV and writes a UAV, both
@@ -389,18 +389,50 @@ next dispatch follows it) and by every sampling test below.
 
 Resources reached only through a heap entry are **not** resident unless named. Measured: with neither a
 residency set nor `useResource`, every heap test returns wrong data (Apple Silicon does not make an
-unnamed resource work by luck). A heap can carry its own `MTLResidencySet` holding the heap buffer and
-each resource written into it (`addAllocation` on every `write_*`, `commit` before the next command
-buffer that uses it, then `useResidencySet` on that command buffer), but it is **off by default**:
-a set never forgets an allocation, so with the title's thousands of heap-named textures and buffers it
-held all of title memory (about 6.7 GB here) plus the host's texture copies resident for the whole
-process, and command buffers began to time out (`kIOGPUCommandBufferCallbackErrorTimeout`) after the
-world load. `VICTORY_METAL_RESIDENCY_SETS=1` turns it on; by default every heap entry is named to every
-encoder with `useResource` instead, so residency follows the frame. The heap tests run in both modes
-(`common::backends()`). Not done: removing a replaced entry's old resource from the set (it stays
-resident until the heap is dropped); a set for the title pools (they are named with `useResource` per
-dispatch through `Dispatch::resources`, a handful of buffers; a queue-level `addResidencySet` is the
-cheaper end state); `useHeap` for `MTLHeap`-placed textures.
+unnamed resource work by luck).
+
+On a Mac with 32 GiB of memory or more (`hw.memsize`), and on any Mac with
+`VICTORY_METAL_RESIDENCY_SETS=heap`, a heap carries its own `MTLResidencySet`: the heap buffer and
+each allocation its entries name. An allocation is added when an entry first names it and removed (and the set committed) before
+the last entry naming it is overwritten or the heap is dropped; the set does not retain what it holds,
+the heap does. The set is committed when entries changed and given to each command buffer that uses
+the heap (`useResidencySet`), so what the heap names is resident while that command buffer runs:
+residency follows the frame, and nothing is rebuilt per command buffer. `clear_entry` empties an
+entry (zero bytes, nothing kept): the host clears the entries of a texture the title released, so
+what the heap keeps alive and wired does not grow with play time.
+
+`VICTORY_METAL_RESIDENCY_SETS=0` names every allocation a heap names to every encoder with
+`useResource` instead, which is also what a Mac with less than 32 GiB does when the switch is unset.
+The 32 GiB line is a guess, not a measurement: the world's heap set holds 17 to 18 GB (`heap_set_mb`
+on the frame line), more than all the memory of a 16 or 18 GB Mac, and no such Mac has run it yet;
+the process's footprint was the same either way on 48 GB, so it may well be safe, and `heap` is there
+to find out. The choice is logged once at start-up (`metal: residency of what descriptor heaps name`,
+with the mode, the Mac's memory and the switch). In GTA VI's world the heap names about 37,000
+allocations (130,000 entries), and the kernel took about 155 ms to take that list for each render pass
+that draws (10 ms for a compute pass), whatever the pass's shaders, with the GPU idle. Measured with
+each pass in its own command buffer: 164 drawing passes, 0.153 s each between the kernel taking the
+command buffer and the GPU starting it; with the sets, 0. The 35 drawing passes of a world frame's
+main submission were 5.4 s. With the same build and only the switch changed, world frames went from
+0.07 fps (15 frames in 218 s) to 0.47 fps (101 frames in 213 s; 0.6 once the world's pipelines are
+made) on an M5 Pro with 48 GB, and the process's footprint at the first world frame was 16 GB either
+way.
+
+`VICTORY_METAL_RESIDENCY_SETS=1` also puts the title's pool buffers in one set on every queue (below).
+That keeps all of title memory (about 6.7 GB on a Series S profile) resident for the whole process:
+on an M3 Pro with 18 GB, command buffers began to time out after the world load
+(`kIOGPUCommandBufferCallbackErrorTimeout`, and `...OutOfMemory` with the host's texture copies). So
+by default pool buffers are still named by the encoders that use them (`Dispatch::resources`, a
+handful per pass).
+
+With a heap's set, Metal's hazard tracking no longer sees what a pass reaches through the heap, so the
+host orders the queue's work itself (the queue event and the fence under **Residency** below).
+The heap tests run in all three modes (`common::backends()`).
+
+Not known: how the default does on a Mac with 16 or 18 GB; it was run with 48 GB. The frame line
+(`native draws so far`, every 64 frames) logs `heap_set_mb`, the most bytes one heap's set held
+(pool buffers its entries name count whole), and `heap_allocations`. Not done: an entry that names a
+texture the title has released keeps it, alive and in the set, until the title overwrites the entry,
+as naming per encoder did; `useHeap` for `MTLHeap`-placed textures.
 
 ### Textures and samplers
 
@@ -417,7 +449,9 @@ Findings:
   (an assertion abort, not an error return: "not castable"); a depth texture is written to the heap
   itself and the shader samples it as `Texture2D<float4>` (depth in `.x`), which works. So `twin.rs`'s
   colour twin is still the way to a UAV on depth, to be checked on real shaders. `create_texture_view`
-  should validate format compatibility before calling Metal.
+  refuses a format Metal cannot cast the texture to (`castable`: uncompressed formats of one texel
+  size, or a BC format and its sRGB or signed twin; checked: R32Uint, RGB10A2 and BGRA8 views of an
+  RGBA8 texture are made, R8, RGBA16F, BC1 and depth ones are errors).
 - Samplers: `MTLSamplerDescriptor` with `supportArgumentBuffers = true` (without it there is no resource
   ID). Linear blends and nearest does not, through a sampler heap.
 - **Textures over zero-copy memory**: `newTextureWithDescriptor:offset:bytesPerRow:` on the wrapped title
@@ -457,9 +491,25 @@ heaps are exercised by a draw too.
 
 Not covered: blending and colour write masks, stencil, multiple render targets (the code takes several,
 untested), MSAA, viewport/scissor from the list (full target only), instancing with a per-instance stream,
-topologies beyond triangle lists, primitive restart, mesh and amplification pipelines,
+topologies beyond triangle lists, primitive restart, amplification pipelines,
 hull/domain/geometry emulation, stream-out, indirect draws, UAV writes from pixel shaders,
 `ExecuteIndirect`, queries, pipeline caching.
+
+**Mesh pipelines.** When the converter makes a mesh function of the "vertex" DXIL (`IRShaderStageMesh`,
+5: the translator's `ms_6_6` output for mesh-style console programs), `create_render_pipeline` makes an
+`MTLMeshRenderPipelineDescriptor` with that function and the pixel shader's, the same colour and depth
+formats, blend and write masks, and no vertex descriptor. Its thread-group size is the converter's
+reflection of the mesh shader (`IRShaderReflectionCopyMeshInfo`, `Msc::mesh_threads`, cached on disk
+as conversions are), kept on the pipeline (`RenderPipeline::mesh_threads`) for the draw.
+Test: `victory-gpu` `native::tests::mesh_tests::a_mesh_style_vertex_program_makes_a_mesh_pipeline`.
+A mesh pipeline draws with `DrawCall::Mesh { groups }` (`NativeList::dispatch_mesh`):
+`drawMeshThreadgroups` with that thread-group size and no object stage, or, for an `ExecuteIndirect`
+record (three group counts, Metal's `MTLDispatchThreadgroupsIndirectArguments` word for word),
+`drawMeshThreadgroupsWithIndirectBuffer`; a counted record goes through the same gate as counted draws
+(three words). A mesh call of a vertex pipeline, or the reverse, is dropped. Test:
+`mesh_tests::a_mesh_draw_colours_the_target`. The mesh stage is bound as the vertex stage is: root
+arguments with `setMeshBytes` at slot 2, the heaps with `setMeshBuffer` at 0 and 1, and every resource
+and static-sampler table used for the mesh stage (`mesh_tests::a_mesh_shader_reads_its_root_constants`).
 
 ### Mapping into victory-gpu (not done; victory-gpu is untouched)
 
@@ -570,7 +620,8 @@ and raises fence values.
   winding, fill, depth bias, depth clip; per draw: viewport, scissor, stencil reference, blend factor).
   A shader the host cannot run is refused with a reason, counted (`glue::shader_stats()`) and its work
   dropped; the submission and its fences go on. Refused today: title memory read at computed addresses in
-  a graphics pipeline (compute shaders have it, below), heap indexing by the shader, root views as heap
+  a graphics pipeline (compute shaders have it, below), heap indexing by a compute shader (graphics
+  shaders may), root views as heap
   views, write marks and view addresses, a pixel stage with arguments of its own (one argument block
   serves a pipeline), multisampling, vertex inputs missing from the layout.
 - **Title memory at computed addresses: the pool-offset contract** (`native/addr.rs`, compute shaders). A
@@ -588,7 +639,9 @@ and raises fence values.
     0 and its writes are dropped. Each heap has a table of its own, since the table holds its view indices
     (heaps must have room below the translator's clamp of heap indices, 2^21 entries);
   - the table is built from `PoolTable::mappings()` into a buffer of its own whenever the pool table's
-    generation changed (never rewritten in place: the GPU may be reading the old one; the last 8 are kept)
+    generation changed (never rewritten in place: the GPU may be reading the old one, which is a buffer of
+    the backend's own that the submissions made with it keep until they have run; the host used to free a
+    table 8 rebuilds after it was replaced, and work a queue held meanwhile then wrote through freed memory)
     and bound as the last root parameter. shortcut: rebuilt whole, not incrementally (8 bytes a page: 2 MiB
     for 16 GiB of mappings); a 64 KiB title page not wholly inside one mapping of one pool is a null page;
     at most 255 view pairs;
@@ -609,12 +662,14 @@ and raises fence values.
 - **Present**: `native::set_layer(CAMetalLayer*)` (the app's, or `native::create_layer` for one without a
   window) and `PresentX` draws the first resource of the largest plane over the next drawable with a
   full-screen triangle, after the queue's earlier work (`PresentBackend`).
-- **Residency**: pool buffers join one `MTLResidencySet` when first used by a submission, the set is added
-  to each queue once, and encoders skip `useResource` for them; a buffer leaves the set when dropped.
-  `useResource` also told Metal's hazard tracking which buffers an encoder touches by GPU address; without
-  it nothing orders a copy before the dispatch that reads its result (the one flaky test that showed it), so
-  on a queue with the set every command buffer waits for the previous one through a queue `MTLEvent` and
-  every encoder for the one before through an `MTLFence`: work on a queue is serial. D3D12 barriers
+- **Residency**: with `VICTORY_METAL_RESIDENCY_SETS=1`, pool buffers join one `MTLResidencySet` when first
+  used by a submission, the set is added to each queue once, and encoders skip `useResource` for them; a
+  buffer leaves the set when dropped. By default they are named by the encoders (see "Residency (what a
+  heap needs)"). `useResource` also told Metal's hazard tracking which buffers an encoder touches by GPU
+  address; without it nothing orders a copy before the dispatch that reads its result (the one flaky test
+  that showed it), so on a queue whose work uses sets (the heaps' own by default, the pool's too with the
+  switch) every command buffer waits for the previous one through a queue `MTLEvent` and every encoder
+  for the one before through an `MTLFence`: work on a queue is serial. D3D12 barriers
   (`ResourceBarrier`) are still not translated; a title's UAV barriers are covered by that serialisation.
 
 ### What is left
@@ -623,7 +678,7 @@ and raises fence values.
    computed addresses (above), user data in root constants and root views. Not done: graphics pipelines
    with translator output (the page table, immediate samplers as static samplers of the converter's root
    signature, per-stage argument blocks: the D3D12 host's visibility has no equivalent in one argument
-   buffer), heap indexing by the shader, view addresses and write marks. The table is rebuilt whole when a
+   buffer), heap indexing by a compute shader, view addresses and write marks. The table is rebuilt whole when a
    mapping changes (incremental update is the next step), and the null view relies on the converter's
    bounds check, which was verified for loads and stores of a 64-lane compute shader only.
 2. Textures: the XOR modes are addressed by addrlib's RB+ equations (`victory_formats::texture`, tables
