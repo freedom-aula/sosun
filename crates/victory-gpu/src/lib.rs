@@ -20,6 +20,7 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+pub mod clock;
 #[cfg(windows)]
 #[cfg(windows)]
 mod composite;

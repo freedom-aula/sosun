@@ -778,18 +778,9 @@ struct State {
     capacity: usize,
     /// Messages lost to a full queue since the last one queued.
     dropped: u32,
-    since: Instant,
 }
 
 impl State {
-    fn usec(&self) -> u64 {
-        self.since.elapsed().as_micros() as u64
-    }
-
-    fn frame(&self) -> u32 {
-        (self.usec() * FRAMES_PER_SECOND / 1_000_000) as u32
-    }
-
     /// Queues a registered message; a full queue drops it and counts it in
     /// the next one that fits.
     fn post(&mut self, kind: u32, data: &[u8]) {
@@ -804,7 +795,7 @@ impl State {
         let mut message = Message {
             kind,
             dropped: std::mem::take(&mut self.dropped),
-            usec: self.usec() as u32,
+            usec: victory_gpu::clock::ticks(1_000_000) as u32,
             data: [0; 16],
         };
         message.data[..data.len()].copy_from_slice(data);
@@ -902,7 +893,8 @@ extern "system" fn submit(
         let mut done = [0u8; 16];
         done[..4].copy_from_slice(&command.to_le_bytes());
         done[4..12].copy_from_slice(&id.to_le_bytes());
-        done[12..].copy_from_slice(&state.frame().to_le_bytes());
+        let frame = victory_gpu::clock::ticks(FRAMES_PER_SECOND) as u32;
+        done[12..].copy_from_slice(&frame.to_le_bytes());
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
@@ -946,7 +938,6 @@ pub extern "system" fn AcpHalCreate(out: *mut *mut Acp) -> HRESULT {
             messages: VecDeque::new(),
             capacity: 0,
             dropped: 0,
-            since: Instant::now(),
         }),
     });
     let acp = Box::into_raw(acp);
@@ -1487,6 +1478,8 @@ mod tests {
 
     #[test]
     fn full_message_queues_count_drops() {
+        use victory_gpu::clock;
+
         let mut acp = std::ptr::null_mut();
         assert_eq!(AcpHalCreate(&mut acp), S_OK);
         // SAFETY: just created.
@@ -1504,9 +1497,11 @@ mod tests {
             ),
             S_OK
         );
+        let before = clock::counter();
         for id in 1..=4 {
             assert_eq!((m.submit)(acp, 12, id, u32::MAX, std::ptr::null(), 0), S_OK);
         }
+        let after = clock::counter();
         assert_eq!((m.message_count)(acp), 2);
         let mut message = Message {
             kind: 0,
@@ -1514,7 +1509,22 @@ mod tests {
             usec: 0,
             data: [0; 16],
         };
-        assert!((m.pop_message)(acp, &mut message) && (m.pop_message)(acp, &mut message));
+        let to_ticks = |count, hz| {
+            (u128::from(count) * hz / u128::from(clock::counter_frequency())) as u32
+        };
+        let since_before = |ticks: u32, hz| ticks.wrapping_sub(to_ticks(before, hz));
+        let mut previous = 0;
+        for _ in 0..2 {
+            assert!((m.pop_message)(acp, &mut message));
+            let usec = message.usec;
+            let frame = u32::from_le_bytes(message.data[12..].try_into().unwrap());
+            let elapsed = since_before(usec, 1_000_000);
+            assert!(elapsed <= since_before(to_ticks(after, 1_000_000), 1_000_000));
+            let hz = u128::from(FRAMES_PER_SECOND);
+            assert!(since_before(frame, hz) <= since_before(to_ticks(after, hz), hz));
+            assert!(elapsed >= previous);
+            previous = elapsed;
+        }
         assert_eq!((m.submit)(acp, 12, 5, u32::MAX, std::ptr::null(), 0), S_OK);
         assert!((m.pop_message)(acp, &mut message));
         let dropped = message.dropped;

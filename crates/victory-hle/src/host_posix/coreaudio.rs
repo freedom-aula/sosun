@@ -7,14 +7,15 @@
 //! device's thread with a buffer of interleaved 32-bit floats to fill, and
 //! stops being called when the output is dropped.
 
+use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Fills a buffer of interleaved float frames.
-pub type Render = Box<dyn FnMut(&mut [f32]) + Send>;
+/// Fills a buffer of interleaved float frames or handles an output failure.
+pub type Render = Box<dyn FnMut(io::Result<&mut [f32]>) + Send>;
 
 /// An open output: it plays until it is dropped.
 pub trait Output: Send {}
@@ -24,19 +25,17 @@ pub type Opener = fn(rate: u32, channels: u32, render: Render) -> io::Result<Box
 
 /// CoreAudio, or the silent clock if it cannot open.
 pub fn open_default(rate: u32, channels: u32, render: Render) -> io::Result<Box<dyn Output>> {
-    // The render function is moved into whichever opens; keep it shared
-    // until one has.
-    let shared = Arc::new(std::sync::Mutex::new(render));
-    let for_device = shared.clone();
-    let device: Render = Box::new(move |out| (for_device.lock().unwrap_or_else(|e| e.into_inner()))(out));
-    match CoreAudio::open(rate, channels, device) {
+    match CoreAudio::open(rate, channels, render) {
         Ok(output) => Ok(Box::new(output)),
-        Err(e) => {
+        Err((e, render)) => {
             tracing::warn!(error = %e, "no audio device: sound is mixed and dropped");
-            let silent: Render = Box::new(move |out| (shared.lock().unwrap_or_else(|e| e.into_inner()))(out));
-            Ok(Box::new(Silent::open(rate, channels, silent)))
+            Ok(Box::new(Silent::open(rate, channels, render)))
         }
     }
+}
+
+fn quantum_frames(rate: u32) -> u32 {
+    (rate / 100).max(1) // 10 ms
 }
 
 // AudioToolbox's AudioQueue.
@@ -100,15 +99,14 @@ unsafe extern "C" {
 /// `'lpcm'`, linear PCM; float, packed.
 const FORMAT_LINEAR_PCM: u32 = 0x6C70_636D;
 const FLAGS_FLOAT_PACKED: u32 = 1 | 8;
-/// Frames per buffer (about 21 ms at 48 kHz) and buffers in flight.
-const BUFFER_FRAMES: u32 = 1024;
 const BUFFERS: usize = 3;
 
 /// What the queue's callback reaches: boxed, so its address is stable.
 struct Shared {
-    render: Render,
-    channels: u32,
-    /// Set before the queue is stopped, so a late callback does nothing.
+    /// Mutated only by the queue's serial refill callback.
+    render: UnsafeCell<Render>,
+    bytes: u32,
+    started: AtomicBool,
     closing: AtomicBool,
 }
 
@@ -126,27 +124,36 @@ extern "C" fn refill(user: *mut c_void, queue: AudioQueueRef, buffer: *mut Audio
     // SAFETY: `user` is our `Shared`, alive until the queue is disposed;
     // `buffer` is one of ours.
     unsafe {
-        let shared = &mut *user.cast::<Shared>();
+        let shared = &*user.cast::<Shared>();
+        if shared.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let started = shared.started.load(Ordering::Acquire);
         let buffer = &mut *buffer;
         let samples = std::slice::from_raw_parts_mut(
             buffer.data.cast::<f32>(),
-            (BUFFER_FRAMES * shared.channels) as usize,
+            shared.bytes as usize / size_of::<f32>(),
         );
-        if shared.closing.load(Ordering::Acquire) {
-            samples.fill(0.0);
+        let render = &mut *shared.render.get();
+        if started {
+            render(Ok(samples));
         } else {
-            (shared.render)(samples);
+            samples.fill(0.0);
         }
-        buffer.byte_size = BUFFER_FRAMES * shared.channels * 4;
-        AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null());
+        buffer.byte_size = shared.bytes;
+        let status = AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null());
+        // shortcut: runtime output failure is detected on enqueue, monitor queue state if a device can stop without another refill.
+        if status != 0 && started && !shared.closing.swap(true, Ordering::AcqRel) {
+            render(Err(io::Error::other(format!(
+                "AudioQueueEnqueueBuffer failed with OSStatus {status}"
+            ))));
+        }
     }
 }
 
 impl CoreAudio {
-    pub fn open(rate: u32, channels: u32, render: Render) -> io::Result<CoreAudio> {
-        let fail = |what: &str, status: OSStatus| {
-            io::Error::other(format!("{what} failed with OSStatus {status}"))
-        };
+    fn open(rate: u32, channels: u32, render: Render) -> Result<CoreAudio, (io::Error, Render)> {
+        let bytes = quantum_frames(rate) * channels * 4;
         let format = AudioStreamBasicDescription {
             sample_rate: f64::from(rate),
             format_id: FORMAT_LINEAR_PCM,
@@ -159,8 +166,9 @@ impl CoreAudio {
             reserved: 0,
         };
         let shared = Box::into_raw(Box::new(Shared {
-            render,
-            channels,
+            render: UnsafeCell::new(render),
+            bytes,
+            started: AtomicBool::new(false),
             closing: AtomicBool::new(false),
         }));
         let mut queue: AudioQueueRef = std::ptr::null_mut();
@@ -176,38 +184,46 @@ impl CoreAudio {
                 &mut queue,
             )
         };
-        let free = |queue: AudioQueueRef| {
-            // SAFETY: made above; nothing runs on it yet or any more.
+        let fail = |queue: AudioQueueRef, what, status| {
+            // SAFETY: the queue is either unopened or disposed before reclamation.
             unsafe {
                 if !queue.is_null() {
                     AudioQueueDispose(queue, 1);
                 }
-                drop(Box::from_raw(shared));
+                let shared = Box::from_raw(shared);
+                (
+                    io::Error::other(format!("{what} failed with OSStatus {status}")),
+                    shared.render.into_inner(),
+                )
             }
         };
         if status != 0 {
-            free(std::ptr::null_mut());
-            return Err(fail("AudioQueueNewOutput", status));
+            return Err(fail(std::ptr::null_mut(), "AudioQueueNewOutput", status));
         }
         for _ in 0..BUFFERS {
             let mut buffer: *mut AudioQueueBuffer = std::ptr::null_mut();
             // SAFETY: the queue just made.
+            let status = unsafe { AudioQueueAllocateBuffer(queue, bytes, &mut buffer) };
+            if status != 0 {
+                return Err(fail(queue, "AudioQueueAllocateBuffer", status));
+            }
+            // Prime with silence. Title callbacks begin on the processing thread.
             let status = unsafe {
-                AudioQueueAllocateBuffer(queue, BUFFER_FRAMES * channels * 4, &mut buffer)
+                (*buffer).data.cast::<u8>().write_bytes(0, bytes as usize);
+                (*buffer).byte_size = bytes;
+                AudioQueueEnqueueBuffer(queue, buffer, 0, std::ptr::null())
             };
             if status != 0 {
-                free(queue);
-                return Err(fail("AudioQueueAllocateBuffer", status));
+                return Err(fail(queue, "AudioQueueEnqueueBuffer", status));
             }
-            // Primed with silence-or-sound by the same path as every refill.
-            refill(shared.cast(), queue, buffer);
         }
         // SAFETY: the queue just made.
         let status = unsafe { AudioQueueStart(queue, std::ptr::null()) };
         if status != 0 {
-            free(queue);
-            return Err(fail("AudioQueueStart", status));
+            return Err(fail(queue, "AudioQueueStart", status));
         }
+        // SAFETY: the state stays alive until the queue is disposed.
+        unsafe { (*shared).started.store(true, Ordering::Release) };
         Ok(CoreAudio { queue, shared })
     }
 }
@@ -237,13 +253,14 @@ impl Silent {
     pub fn open(rate: u32, channels: u32, mut render: Render) -> Silent {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let chunk = (rate / 100).max(1) as usize; // 10 ms
+        let chunk = quantum_frames(rate) as usize;
+        let period = Duration::from_secs_f64(chunk as f64 / f64::from(rate));
         let thread = std::thread::spawn(move || {
             let mut buffer = vec![0.0f32; chunk * channels as usize];
             let mut next = Instant::now();
             while !flag.load(Ordering::Acquire) {
-                render(&mut buffer);
-                next += Duration::from_millis(10);
+                render(Ok(&mut buffer));
+                next += period;
                 std::thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         });
@@ -273,6 +290,7 @@ mod tests {
         let pulled = Arc::new(AtomicUsize::new(0));
         let count = pulled.clone();
         let render: Render = Box::new(move |out| {
+            let out = out.unwrap();
             // A 440 Hz tone, as a title's mixer would give it.
             for (i, frame) in out.chunks_exact_mut(2).enumerate() {
                 let x = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.01;
@@ -282,10 +300,8 @@ mod tests {
         });
         match CoreAudio::open(48_000, 2, render) {
             Ok(device) => {
-                // The priming buffers are pulled at once; the device pulls
-                // more as it plays them.
-                assert!(pulled.load(Ordering::Relaxed) >= 3 * 1024);
                 std::thread::sleep(Duration::from_millis(200));
+                assert!(pulled.load(Ordering::Relaxed) >= 480);
                 drop(device);
                 let after = pulled.load(Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(100));
@@ -294,7 +310,7 @@ mod tests {
             }
             // A machine with no output device (CI) says so; the silent
             // clock takes over, and that is tested next.
-            Err(e) => eprintln!("no CoreAudio output here: {e}"),
+            Err((e, _)) => eprintln!("no CoreAudio output here: {e}"),
         }
     }
 
@@ -306,7 +322,7 @@ mod tests {
             48_000,
             2,
             Box::new(move |out| {
-                count.fetch_add(out.len() / 2, Ordering::Relaxed);
+                count.fetch_add(out.unwrap().len() / 2, Ordering::Relaxed);
             }),
         );
         std::thread::sleep(Duration::from_millis(300));

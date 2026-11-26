@@ -14,8 +14,9 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use victory_gpu::clock;
 use victory_loader::native::{self, seh, teb};
 use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
@@ -380,11 +381,8 @@ pub extern "system" fn DecodePointer(pointer: *mut c_void) -> *mut c_void {
 
 // Time.
 
-fn now_ticks() -> u64 {
-    let since = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    since.as_secs() * TICKS_PER_SECOND + u64::from(since.subsec_nanos()) / 100 + EPOCH_DIFFERENCE
+pub(super) fn now_ticks() -> u64 {
+    EPOCH_DIFFERENCE + (clock::unix_time().as_nanos() / 100) as u64
 }
 
 /// Seconds east of UTC at the current time.
@@ -1049,6 +1047,7 @@ fn until(due: i64) -> Duration {
     let ticks = if due < 0 {
         due.unsigned_abs()
     } else {
+        // shortcut: waits use host time at debug rates, scale wait durations if virtual deadlines must match them.
         (due as u64).saturating_sub(now_ticks())
     };
     Duration::from_nanos(ticks.saturating_mul(100))

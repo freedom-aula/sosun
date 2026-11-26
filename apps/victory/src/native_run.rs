@@ -214,6 +214,7 @@ pub fn run(
     title_args: &[String],
     headless: bool,
 ) -> Result<u32> {
+    victory_gpu::clock::initialize();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let hash = blake3::hash(&bytes).to_hex().to_string();

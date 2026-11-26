@@ -4,7 +4,9 @@
 
 use std::ffi::c_void;
 use std::sync::LazyLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+
+use victory_gpu::clock;
 
 use super::runtime::bad_param;
 use super::{Ch, EINVAL, ERANGE, exports, heap, leak_cstr, set_errno, units};
@@ -130,9 +132,7 @@ fn mktime_local(tm: &mut Tm) -> Option<i64> {
 }
 
 pub extern "system" fn _time64(out: *mut i64) -> i64 {
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+    let t = clock::unix_time().as_secs() as i64;
     if !out.is_null() {
         // SAFETY: the title's pointer.
         unsafe { out.write(t) };
@@ -266,11 +266,9 @@ pub extern "system" fn _mkgmtime64(tm: *mut Tm) -> i64 {
     }
 }
 
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-/// Milliseconds since the first call (`CLOCKS_PER_SEC` is 1000).
+/// Milliseconds since the guest clock started (`CLOCKS_PER_SEC` is 1000).
 pub extern "system" fn clock() -> i32 {
-    START.elapsed().as_millis() as i32
+    clock::ticks(1_000) as i32
 }
 
 /// `struct __timeb64`: `time`, `millitm`, `timezone` (minutes west), `dstflag`.
@@ -278,9 +276,7 @@ pub extern "system" fn _ftime64_s(out: *mut u8) -> i32 {
     if out.is_null() {
         return bad_param(EINVAL);
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = clock::unix_time();
     let secs = now.as_secs() as i64;
     let local = localtime(secs);
     let west = local.and_then(|_| zone_offset(secs)).map_or(0, |o| -o / 60);
@@ -321,9 +317,7 @@ pub extern "system" fn timespec_get(out: *mut i64, base: i32) -> i32 {
     if out.is_null() || base != 1 {
         return 0;
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = clock::unix_time();
     // SAFETY: the title's `timespec` (an `__int64` and a `long`).
     unsafe {
         out.write_unaligned(now.as_secs() as i64);
@@ -342,9 +336,7 @@ static DSTBIAS: super::Shared<i32> = super::Shared::new(0);
 static TZNAMES: super::Shared<[usize; 2]> = super::Shared::new([0; 2]);
 
 pub extern "system" fn _tzset() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
+    let now = clock::unix_time().as_secs() as i64;
     let off = zone_offset(now).unwrap_or(0);
     // SAFETY: the CRT's variables, shared with the title.
     unsafe {

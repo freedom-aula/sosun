@@ -21,9 +21,6 @@ type HRESULT = i32;
 
 const S_OK: HRESULT = 0;
 const MF_E_UNSUPPORTED_BYTESTREAM_TYPE: HRESULT = 0xC00D_36C4_u32 as i32;
-/// 100 ns ticks from 1601 to 1970.
-const EPOCH_DIFFERENCE: i64 = 116_444_736_000_000_000;
-
 static STARTED: AtomicU32 = AtomicU32::new(0);
 
 pub extern "system" fn MFStartup(_version: u32, _flags: u32) -> HRESULT {
@@ -39,10 +36,7 @@ pub extern "system" fn MFShutdown() -> HRESULT {
 /// `MFGetSystemTime`: the clock Media Foundation timestamps with, 100 ns
 /// ticks since 1601.
 pub extern "system" fn MFGetSystemTime() -> i64 {
-    let since_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| (d.as_nanos() / 100) as i64);
-    EPOCH_DIFFERENCE + since_unix
+    super::system::now_ticks() as i64
 }
 
 /// Fails with a null object in `*out`.
