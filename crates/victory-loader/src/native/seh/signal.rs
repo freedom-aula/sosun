@@ -95,6 +95,42 @@ fn gs_is_teb() -> bool {
     teb != 0 && unsafe { ((teb + OFF_SELF) as *const usize).read() } == teb
 }
 
+/// Length of a `clwb` or `clflushopt` (66 [REX] 0F AE /6 or /7) at the start
+/// of `code`. Rosetta does not implement them; they only write a cache line
+/// back, so the title (which flushes memory the GPU reads) loses nothing
+/// when they do nothing.
+fn cache_hint_len(code: &[u8]) -> Option<usize> {
+    let mut i = usize::from(code.first() == Some(&0x66));
+    if i == 0 {
+        return None;
+    }
+    if code.get(i).is_some_and(|b| b & 0xF0 == 0x40) {
+        i += 1;
+    }
+    if code.get(i..i + 2) != Some(&[0x0F, 0xAE]) {
+        return None;
+    }
+    let modrm = *code.get(i + 2)?;
+    let (md, reg, rm) = (modrm >> 6, modrm >> 3 & 7, modrm & 7);
+    if reg != 6 && reg != 7 || md == 3 {
+        return None;
+    }
+    let mut len = i + 3;
+    let sib_base = (md != 3 && rm == 4)
+        .then(|| code.get(len).map(|s| s & 7))
+        .flatten();
+    if rm == 4 {
+        len += 1;
+    }
+    len += match md {
+        0 if rm == 5 || sib_base == Some(5) => 4,
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    };
+    Some(len)
+}
+
 /// # Safety
 /// Called by the kernel with a valid `siginfo_t` and `ucontext_t`.
 unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
@@ -117,6 +153,21 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
     }
     ctx.set_from_thread_state(&thread_state);
     let rip = word(T_RIP);
+    if signal == SIGILL {
+        // SAFETY: rip is in the code that just trapped; 15 bytes is the
+        // longest instruction and the page after is mapped or the read faults
+        // like the instruction would have.
+        let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
+        if let Some(len) = cache_hint_len(code) {
+            // SAFETY: the saved rip, past the hint.
+            unsafe {
+                mc.add(MC_THREAD + T_RIP * 8)
+                    .cast::<u64>()
+                    .write(rip + len as u64)
+            };
+            return;
+        }
+    }
     // The float state's FXSAVE image is `XMM_SAVE_AREA32`.
     // SAFETY: 512 bytes of float state follow the 8-byte header.
     unsafe {
@@ -137,7 +188,11 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
     let mut rec = ExceptionRecord::new(0, 0, rip as usize);
     match signal {
         SIGSEGV | SIGBUS => {
-            let at = if fault_addr != 0 { fault_addr as usize } else { si_addr };
+            let at = if fault_addr != 0 {
+                fault_addr as usize
+            } else {
+                si_addr
+            };
             rec.code = EXCEPTION_ACCESS_VIOLATION;
             rec.number_parameters = 2;
             // 0 read, 1 write (bit 1 of the page-fault error code), 8 execute.
@@ -212,7 +267,12 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
 /// Called from `on_signal` with its arguments.
 unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
     // SAFETY: written once at install, before any signal.
-    let old = unsafe { (&raw const OLD).cast::<SigAction>().add(signal as usize).read() };
+    let old = unsafe {
+        (&raw const OLD)
+            .cast::<SigAction>()
+            .add(signal as usize)
+            .read()
+    };
     match old.handler {
         // Back to the default and return: the fault happens again and ends
         // the process.
@@ -239,5 +299,32 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
             // SAFETY: as above.
             unsafe { f(signal) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_hint_len;
+
+    #[test]
+    fn cache_hints_are_measured() {
+        assert_eq!(
+            cache_hint_len(&[0x66, 0x41, 0x0F, 0xAE, 0x31, 0x49]),
+            Some(5)
+        ); // clwb [r9]
+        assert_eq!(
+            cache_hint_len(&[0x66, 0x0F, 0xAE, 0x74, 0x24, 0x08]),
+            Some(6)
+        ); // clwb [rsp+8]
+        assert_eq!(
+            cache_hint_len(&[0x66, 0x0F, 0xAE, 0xB0, 1, 0, 0, 0]),
+            Some(8)
+        ); // disp32
+        assert_eq!(
+            cache_hint_len(&[0x66, 0x0F, 0xAE, 0x35, 1, 0, 0, 0]),
+            Some(8)
+        ); // rip+disp32
+        assert_eq!(cache_hint_len(&[0x0F, 0xAE, 0x31]), None); // no 66: not ours
+        assert_eq!(cache_hint_len(&[0x66, 0x0F, 0xAE, 0xF0]), None); // register form
     }
 }
