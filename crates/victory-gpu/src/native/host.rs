@@ -612,18 +612,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         let start = START.get_or_init(std::time::Instant::now);
         let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
-        // `<dir>[,<seconds>]`: from that many seconds after the first draw on.
+        // `<dir>[,<seconds>[,<format>]]`: from that many seconds after the first draw on; with a
+        // format, only the draws into render targets of that title format, boot passes included.
         let v = v.to_string_lossy().into_owned();
-        let (dir, after) = v.rsplit_once(',').map_or((v.as_str(), 0), |(d, s)| (d, s.parse().unwrap_or(0)));
-        let dir = std::path::PathBuf::from(dir);
+        let mut parts = v.split(',');
+        let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
+        let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let only: Option<u32> = parts.next().and_then(|s| s.parse().ok());
         if start.elapsed().as_secs() < after {
+            return;
+        }
+        let target = targets.color.first().and_then(|c| {
+            self.resources.borrow().iter().find_map(|(k, r)| matches!(r, Res::Texture(t) if Rc::ptr_eq(t, c)).then_some(*k))
+        });
+        if let Some(f) = only
+            && target.and_then(texture_info_of).map(|i| i.format) != Some(f)
+        {
             return;
         }
         // The boot passes (a 3840-wide texture sampled, nothing else) are skipped.
@@ -645,7 +656,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 _ => false,
             })
         });
-        if boot || plain {
+        if only.is_none() && (boot || plain) {
             return;
         }
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -671,7 +682,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             super::safe_read(a as *const u8, &mut b);
             b
         });
-        tracing::info!(draw = n, ?kinds, ?vertex, ?call, ?head, vs = ?binding.map(|b| (b.dwords, b.user_data.clone(), b.views.clone())), ps = ?binding.and_then(|b| b.ps.as_ref()).map(|p| (p.dwords, p.user_data.clone())), "content: draw");
+        let target = target.map(|k| format!("{k:#x}"));
+        tracing::info!(draw = n, ?target, ?kinds, ?vertex, ?call, ?head, vs = ?binding.map(|b| (b.dwords, b.user_data.clone(), b.views.clone())), ps = ?binding.and_then(|b| b.ps.as_ref()).map(|p| (p.dwords, p.user_data.clone())), "content: draw");
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let base = h.start + *at as u64 * Self::step(h.kind);
@@ -700,6 +712,28 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 let tiled = super::textures::read_memory(info.memory, info.size.min(1 << 26));
                 let nz = tiled.iter().filter(|&&b| b != 0).count();
                 tracing::info!(draw = n, slot, entry = k, key = format!("{key:#x}"), format = info.format, w = info.width, h = info.height, layers = info.depth_or_layers, flags = info.flags, at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, what, "content: texture");
+                // A single-channel 8-bit texture (A8, R8) is written as grey: the title's memory once,
+                // the host texture at every draw (the last one standing).
+                if matches!(info.format, 65 | 61) {
+                    let (w, hh) = (info.width as usize, info.height as usize);
+                    let grey = |px: &[u8]| px.iter().flat_map(|&v| [v, v, v, 255]).collect::<Vec<u8>>();
+                    let mut px = vec![0u8; w * hh];
+                    if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+                        SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+                        if let Some(desc) = info.desc()
+                            && let Ok(tmp) = self.backend.create_texture(&desc)
+                            && super::textures::upload(&self.backend, &tmp, &info, &tiled).is_ok()
+                        {
+                            self.backend.read_texture(&tmp, 0, 0, &mut px, w, w * hh);
+                            ppm(format!("{key:x}_title_{n}.ppm"), w, hh, &grey(&px), false);
+                        }
+                    }
+                    if let Some(Res::Texture(t)) = self.resources.borrow().get(&key) {
+                        self.backend.read_texture(t, 0, 0, &mut px, w, w * hh);
+                        ppm(format!("{key:x}_host.ppm"), w, hh, &grey(&px), false);
+                    }
+                    continue;
+                }
                 if !matches!(info.format, 28 | 87 | 91 | 29) || SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
                     continue;
                 }
@@ -763,13 +797,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 vertex,
                 index,
                 call,
+                targets,
                 ..
             } => {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
                 self.remirror_tables(root);
-                self.trace_content(root, vertex, call, binding.as_deref());
+                self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;

@@ -108,6 +108,26 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
     }
 }
 
+/// A texture uploaded blank and written whole later (a movie's planes) is uploaded again at the
+/// next submission, not a scanner round later (a round is seconds long once the title streams).
+#[test]
+fn a_texture_uploaded_blank_is_probed_at_each_submission() {
+    let Some(pool) = pool(9105, 4) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    with_title(|t| {
+        assert!(t.realize(key));
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 1, "the blank first upload");
+    });
+    pool.write(0, &vec![0xABu8; info.size]);
+    with_title(|t| {
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 2, "uploaded again at the next submission");
+    });
+}
+
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
 #[test]
 fn a_block_compressed_title_texture_is_detiled_as_blocks() {

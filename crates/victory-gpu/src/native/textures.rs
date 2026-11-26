@@ -146,7 +146,7 @@ fn start_scanner() {
                 let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
                 seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for (key, (at, size, target)) in list {
+                for &(key, (at, size, target)) in &list {
                     let mut h = blake3::Hasher::new();
                     for off in (0..size).step_by(buf.len()) {
                         let n = buf.len().min(size - off);
@@ -174,6 +174,35 @@ pub struct Tracked<B: ResourceBackend> {
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
     pub uploads: u64,
+    /// Submissions left in which its memory is probed at submission rather than left to the
+    /// scanner (0: cold), and the hash of the last probe.
+    hot: u32,
+    probe: Option<blake3::Hash>,
+}
+
+/// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
+/// further change.
+const HOT: u32 = 600;
+/// Pages of a hot texture's memory a probe reads, spread over it.
+const PROBE_PAGES: usize = 8;
+
+/// A hash of `PROBE_PAGES` pages spread over `size` bytes at `at`.
+///
+/// shortcut: a write that misses every sampled page goes unseen until the scanner's next round;
+/// a texture the title rewrites whole (a movie's planes) is caught at once.
+fn probe(at: usize, size: usize) -> blake3::Hash {
+    const PAGE: usize = 4096;
+    let mut h = blake3::Hasher::new();
+    let mut page = [0u8; PAGE];
+    let pages = size.div_ceil(PAGE).max(1);
+    for k in 0..PROBE_PAGES.min(pages) {
+        let off = k * pages / PROBE_PAGES.min(pages) * PAGE;
+        let n = PAGE.min(size - off);
+        page[..n].fill(0);
+        let _ = super::safe_read((at + off) as *const u8, &mut page[..n]);
+        h.update(&page[..n]);
+    }
+    h.finalize()
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -239,6 +268,8 @@ impl<B: PresentBackend> Title<B> {
                 info,
                 last: None,
                 uploads: 0,
+                hot: 0,
+                probe: None,
             },
         );
         true
@@ -278,7 +309,18 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner found
     /// changed since.
     pub fn sync_dirty(&mut self) {
-        let dirty = watch(|w| std::mem::take(&mut w.dirty));
+        let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
+        // Hot textures (a movie's planes, a glyph cache) are probed now: the scanner's round over
+        // every texture is seconds long by the menus, and a movie frame sampled before its planes
+        // were seen showed their blank first upload (solid green) or an old frame.
+        for (&key, t) in self.textures.iter_mut().filter(|(_, t)| t.hot > 0) {
+            let now = probe(t.info.memory as usize, t.info.size);
+            if t.probe.replace(now) != Some(now) {
+                dirty.insert(key);
+            } else {
+                t.hot -= 1;
+            }
+        }
         self.sync_where(|key, t| (t.last.is_none() && !t.info.render_target()) || dirty.contains(&key));
     }
 
@@ -295,6 +337,10 @@ impl<B: PresentBackend> Title<B> {
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
                 continue;
+            }
+            // Written again after its first upload, or blank at it (written later): hot.
+            if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
+                t.hot = HOT;
             }
             match upload(&host.backend, &t.texture, &t.info, &tiled) {
                 Ok(()) => {
