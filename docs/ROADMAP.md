@@ -28,10 +28,11 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 ## 3. Shader translation gaps
 
-Seven shader shapes are still refused, on the guessed path:
+Four shader shapes are still refused, on the guessed path:
 - pixel: "a computed buffer descriptor used as a view" ×3, "a hardware SGPR input" ×1;
-  (the first comes only from image instructions: a sampler whose state words are computed, now reported as "a sampler built from computed words", or a 128-bit image descriptor built in code; the address logged is the first use of the result, see docs/native-host.md, "Computed pixel buffers");
-- vertex: "an address in an SGPR that is no root parameter" ×3.
+  (the first comes only from image instructions: a sampler whose state words are computed, now reported as "a sampler built from computed words", or a 128-bit image descriptor built in code; the address logged is the first use of the result, see docs/native-host.md, "Computed pixel buffers").
+
+Fixed: the vertex shaders' "an address in an SGPR that is no root parameter" ×3 — an address in an undeclared SGPR pair now tracks as title memory, and the guessed layout declares the pair as root constants so the load lowers (docs/native-host.md, "Undeclared SGPR addresses").
 
 **Start here:** `crates/victory-shader/src/emit/`. Tests use hand-assembled GFX10 code (`gfx_refusal_tests.rs`).
 

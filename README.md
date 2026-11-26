@@ -39,7 +39,7 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | Sound | 🟡 Plays through CoreAudio (the game's Windows Spatial Audio stream, mixed to stereo); reverb is still silent |
 | Loading: DirectStorage reads about 9,500 requests at about 79 MB/s | ✅ Works |
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
-| Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
+| Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 4 known shapes still refused |
 | Boot movie and menus in the window | 🟡 The boot movie plays and the start screen, FINISH SETUP and LEGAL NOTICES show in the window with correct text and blending ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6) fixed); other screens not checked yet |
 | Start screen ("press A") and input | ✅ Passed; the keyboard drives the gamepad in the window (real controllers not yet) |
 | Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
