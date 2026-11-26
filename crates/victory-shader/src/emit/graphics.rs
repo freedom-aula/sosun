@@ -106,7 +106,7 @@ fn infer(
     }
     let list = crate::gfx10::decode(code)?;
     let wave64 = infer_wave64(&list);
-    let (mut layout, mut used) = metadata_resources(meta, RECORDS, true)?;
+    let (mut layout, mut used) = metadata_resources(meta, RECORDS, |_| Ok(1))?;
     // The registers the program names: its VGPR count, and what it reads on entry.
     let p = crate::ir::build(code, wave64, 256)?;
     if stage == HwStage::Vs

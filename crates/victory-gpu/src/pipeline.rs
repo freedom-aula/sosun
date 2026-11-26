@@ -654,7 +654,8 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
 /// 0x60-byte record, the pieces an `FSPX` part is made of (observed at run time, as the console
 /// runtime takes them): pointer and size of the pipeline registers (kind 0, 0x1c bytes), of the
 /// hash (kind 1, 0x14), of the GFX10 code (kind 6) and of the metadata (kind 7); more fields
-/// follow that are not read.
+/// follow that are not read. The root signature's blob goes into the part too
+/// ([`victory_shader::native::FSPX_ROOT_SIGNATURE`]): it sizes the program's root constants.
 pub(crate) extern "system" fn create_compute_pieces(
     _: This,
     desc: *const u8,
@@ -667,7 +668,9 @@ pub(crate) extern "system" fn create_compute_pieces(
     #[cfg(target_os = "macos")]
     {
         // SAFETY: the title passes a description of this layout.
-        if let Some(container) = unsafe { compute_container(desc.add(8)) } {
+        let root = crate::root::blob_of(unsafe { desc.cast::<This>().read_unaligned() });
+        // SAFETY: as above.
+        if let Some(container) = unsafe { compute_container(root.as_deref(), desc.add(8)) } {
             return hand_out(
                 vec![shader("compute", &container)],
                 #[cfg(windows)]
@@ -681,14 +684,15 @@ pub(crate) extern "system" fn create_compute_pieces(
     create_unread_at(0x218, desc, iid, out)
 }
 
-/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]).
+/// A container with the `ACCC` part of the pieces at `record` (see [`create_compute_pieces`]),
+/// and of the root signature blob `root` if there is one.
 ///
 /// # Safety
 /// `record` points at four (pointer, size) pairs.
 #[cfg(target_os = "macos")]
-unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
+unsafe fn compute_container(root: Option<&[u8]>, record: *const u8) -> Option<Vec<u8>> {
     const KINDS: [u32; 4] = [0, 1, 6, 7];
-    let mut part = vec![0u8; 0x10 + 16 * KINDS.len()];
+    let mut pieces: Vec<(u32, &[u8])> = Vec::with_capacity(KINDS.len() + 1);
     for (i, kind) in KINDS.into_iter().enumerate() {
         // SAFETY: as the caller says.
         let (ptr, size) = unsafe {
@@ -700,14 +704,24 @@ unsafe fn compute_container(record: *const u8) -> Option<Vec<u8>> {
         if ptr == 0 || size == 0 || size > 1 << 22 {
             return None;
         }
+        // SAFETY: the title's piece of `size` bytes.
+        pieces.push((kind, unsafe {
+            std::slice::from_raw_parts(ptr as *const u8, size)
+        }));
+    }
+    pieces.extend(root.map(|r| (victory_shader::native::FSPX_ROOT_SIGNATURE, r)));
+    let mut part = vec![0u8; 0x10 + 16 * pieces.len()];
+    for (i, (kind, bytes)) in pieces.iter().enumerate() {
         let at = part.len().next_multiple_of(16);
         part.resize(at, 0);
-        let entry: Vec<u8> = [kind, at as u32, size as u32, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let entry: Vec<u8> = [*kind, at as u32, bytes.len() as u32, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         part[0x10 + 16 * i..0x20 + 16 * i].copy_from_slice(&entry);
-        // SAFETY: the title's piece of `size` bytes.
-        part.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) });
+        part.extend_from_slice(bytes);
     }
-    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, KINDS.len() as u32, part.len() as u32]
+    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, pieces.len() as u32, part.len() as u32]
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
@@ -1340,22 +1354,32 @@ mod pieces_tests {
             record.extend((p.as_ptr() as u64).to_le_bytes());
             record.extend((p.len() as u64).to_le_bytes());
         }
+        let root = [5u8; 0x24];
         // SAFETY: four pairs over live vectors.
-        let container = unsafe { compute_container(record.as_ptr()) }.expect("a container");
+        let container =
+            unsafe { compute_container(Some(&root), record.as_ptr()) }.expect("a container");
         let parsed = victory_shader::Container::parse(&container).unwrap();
         let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
         let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(&part[..4], b"FSPX");
-        assert_eq!((word(4), word(8), word(12)), (1, 4, part.len()));
-        for (i, (kind, piece)) in [0u32, 1, 6, 7].into_iter().zip(&pieces).enumerate() {
+        assert_eq!((word(4), word(8), word(12)), (1, 5, part.len()));
+        let rts0 = victory_shader::native::FSPX_ROOT_SIGNATURE;
+        let all = pieces.iter().map(Vec::as_slice).chain([&root[..]]);
+        for (i, (kind, piece)) in [0u32, 1, 6, 7, rts0].into_iter().zip(all).enumerate() {
             let at = 0x10 + 16 * i;
             assert_eq!(word(at), kind as usize);
             let (offset, size) = (word(at + 4), word(at + 8));
-            assert_eq!(&part[offset..offset + size], &piece[..]);
+            assert_eq!(&part[offset..offset + size], piece);
         }
+        // Without a root signature, the four pieces alone.
+        // SAFETY: as above.
+        let bare = unsafe { compute_container(None, record.as_ptr()) }.expect("a container");
+        let parsed = victory_shader::Container::parse(&bare).unwrap();
+        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        assert_eq!(u32::from_le_bytes(part[8..12].try_into().unwrap()), 4);
         // A missing piece is no container.
         record[16..24].copy_from_slice(&0u64.to_le_bytes());
         // SAFETY: as above.
-        assert!(unsafe { compute_container(record.as_ptr()) }.is_none());
+        assert!(unsafe { compute_container(Some(&root), record.as_ptr()) }.is_none());
     }
 }

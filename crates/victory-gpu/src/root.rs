@@ -215,6 +215,18 @@ pub(crate) extern "system" fn create(
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
+/// The blob root signature `p` was created from, if `p` is one of ours (its first word, read
+/// without faulting, is our method table).
+#[cfg(target_os = "macos")]
+pub(crate) fn blob_of(p: This) -> Option<Vec<u8>> {
+    let mut word = [0u8; 8];
+    let ours = !p.is_null()
+        && crate::queue::read_bytes(p as usize, &mut word)
+        && object::is_table(usize::from_le_bytes(word), FUNCTIONS.f.as_ptr());
+    // SAFETY: one of our root signatures, which the title holds while it uses it.
+    ours.then(|| unsafe { &*p.cast::<RootSignature>() }.blob.clone())
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
     object::answer(ROOT_SIGNATURE, iid, found, out)
@@ -418,6 +430,19 @@ mod tests {
             query(root, &ROOT_SIGNATURE_IIDS[0], std::ptr::null_mut()),
             E_POINTER
         );
+        assert_eq!(object::release(root), 0);
+    }
+
+    /// A compute pipeline's root signature pointer gives back the blob it was made from; other
+    /// pointers give nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn root_signatures_keep_their_blob() {
+        let root = created(&ROOT_SIGNATURE_IIDS[0]);
+        assert_eq!(blob_of(root).as_deref(), Some(&BLOB[..]));
+        let other = [0u64; 4];
+        assert_eq!(blob_of(other.as_ptr().cast()), None);
+        assert_eq!(blob_of(std::ptr::null()), None);
         assert_eq!(object::release(root), 0);
     }
 
