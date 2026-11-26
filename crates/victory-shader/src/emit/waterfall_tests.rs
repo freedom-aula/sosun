@@ -84,6 +84,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         splits: Vec::new(),
+        table_entries: lowered.table_entries,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

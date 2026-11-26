@@ -45,6 +45,7 @@ fn host_shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
         heap_writes: false,
         view_marks: false,
         splits: vec![],
+        table_entries: vec![],
     }
 }
 

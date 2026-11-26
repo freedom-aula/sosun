@@ -1047,7 +1047,17 @@ fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
     assert_eq!(shader.user_data.len(), 1);
     assert_eq!(shader.user_data[0].slot, 3);
     assert_eq!(shader.user_data[0].root, RootType::Table);
+    assert_eq!(shader.table_entries, [(3, 2)]);
     assert!(parsed_isg1(&shader.dxil).iter().any(|e| e.name == "VBU1"));
+
+    // Reading a descriptor past the 16-entry table window (entry 20 = byte 640 = 0x280,
+    // table_offset_dwords = 160) reports table_entries = [(3, 21)] for host re-mirroring.
+    let mut wide_meta = meta;
+    wide_meta[0x18] = 160;
+    let mut wide_code = code;
+    wide_code[4] = 0xFA00_0280; // s_load_dwordx4 s[12:15], s[4:5], 640
+    let wide_shader = lower(&wide_code, &wide_meta).unwrap();
+    assert_eq!(wide_shader.table_entries, [(3, 21)]);
 
     meta[0x25] = 4; // The original absolute interpretation also supports an explicit s4 record.
     assert_eq!(lower(&code, &meta).unwrap().user_data, shader.user_data);

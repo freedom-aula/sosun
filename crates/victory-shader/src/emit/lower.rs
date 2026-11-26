@@ -37,6 +37,8 @@ pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Pixel inputs split off an input read two ways: (original, new) semantic indices.
     pub splits: Vec<(u32, u32)>,
+    /// Minimum entries needed from each descriptor table root parameter: `(slot, count)`.
+    pub table_entries: Vec<(u8, u32)>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -249,6 +251,8 @@ struct Lower<'a> {
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Minimum entries needed from each `RootType::Table` root slot.
+    table_entries: BTreeMap<u8, u32>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: Map<u32, V>,
@@ -771,6 +775,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            table_entries: BTreeMap::new(),
             root_views: Map::default(),
             samplers: Vec::new(),
             descriptors: x
@@ -1531,8 +1536,29 @@ impl<'a> Lower<'a> {
             .iter()
             .map(|(&(orig, _), &new)| (self.s.inputs[orig].index, self.s.inputs[new].index))
             .collect();
+        for u in &self.x.native.used {
+            if u.root != RootType::Table {
+                continue;
+            }
+            let slot = self
+                .x
+                .native
+                .layout
+                .iter()
+                .find(|rp| rp.root == RootType::Table && rp.user_data == u.user_data)
+                .map_or(u.slot, |rp| rp.slot);
+            let step_dwords = if u.kind == ResourceType::Sampler { 4 } else { 8 };
+            let end_dwords = u.table_offset_dwords.saturating_add(u32::from(u.dwords).max(1));
+            let count = end_dwords.div_ceil(step_dwords);
+            let entry = self.table_entries.entry(slot).or_insert(0);
+            if count > *entry {
+                *entry = count;
+            }
+        }
+        let table_entries = self.table_entries.into_iter().collect();
         Ok(Lowered {
             splits,
+            table_entries,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -7010,15 +7036,34 @@ impl<'a> Lower<'a> {
         (fixed && heap).then_some((a.param, a.offset))
     }
 
+    /// Records that a fixed-offset read from a descriptor table needs at least
+    /// `(byte_offset >> shift) + 1` entries in that table's root slot.
+    fn record_table_entry(&mut self, param: usize, byte_offset: u32, sampler: bool) {
+        let Some(rp) = self.x.native.layout.get(param) else {
+            return;
+        };
+        if rp.root != RootType::Table {
+            return;
+        }
+        let shift = if sampler { 4 } else { 5 };
+        let count = (byte_offset >> shift).saturating_add(1);
+        let entry = self.table_entries.entry(rp.slot).or_insert(0);
+        if count > *entry {
+            *entry = count;
+        }
+    }
+
     /// [`Lower::heap_index`] of a descriptor at a fixed address
     /// ([`Lower::entry_address`]), in the entry block.
     fn entry_heap_index(&mut self, (param, offset): EntryAddress, first: u8, sampler: bool) -> V {
+        let byte_offset = offset.wrapping_add(4 * u32::from(first));
+        self.record_table_entry(param, byte_offset, sampler);
         let entry = self.s.entry;
         let base = match self.x.native.layout[param].root {
             RootType::Table => self.user_dword(param, 0),
             _ => self.s.m.i32(0),
         };
-        let k = self.s.m.i32(offset.wrapping_add(4 * u32::from(first)));
+        let k = self.s.m.i32(byte_offset);
         let addr = self.s.m.bin(entry, Bin::Add, base, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
         self.s.m.bin(entry, Bin::LShr, addr, shift)
@@ -7135,6 +7180,9 @@ impl<'a> Lower<'a> {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
+        if a.dynamic.is_none() {
+            self.record_table_entry(a.param, a.offset.wrapping_add(4 * u32::from(first)), sampler);
+        }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Flat {
             addr: Some(Operand::Vector { reg, .. }),
@@ -7174,6 +7222,9 @@ impl<'a> Lower<'a> {
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
+        }
+        if a.dynamic.is_none() {
+            self.record_table_entry(a.param, a.offset.wrapping_add(4 * u32::from(first)), sampler);
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {
