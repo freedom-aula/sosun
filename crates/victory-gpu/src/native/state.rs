@@ -7,6 +7,34 @@
 use super::descriptors::format;
 use victory_backend::resources::*;
 
+/// A `CB_BLEND<n>_CONTROL` register as the D3D12 description of a target (all channels written);
+/// `None` for a factor D3D12 has no value for (`BOTH_SRC_ALPHA`, `BOTH_INV_SRC_ALPHA`).
+fn cb_blend(r: u32) -> Option<TargetBlend> {
+    if r & 1 << 30 == 0 {
+        return Some(TargetBlend::default());
+    }
+    // The hardware's factors are D3D12's less one; its 11 and 12 (both-alpha factors) have none.
+    let factor = |f: u32| match f {
+        0..=10 => Some(f + 1),
+        13..=20 => Some(f + 1),
+        _ => None,
+    };
+    // Hardware: add, source minus destination, min, max, destination minus source.
+    let op = |o: u32| [1, 2, 4, 5, 3].get(o as usize).copied();
+    let (src, comb, dst) = (r & 0x1f, r >> 5 & 7, r >> 8 & 0x1f);
+    let (src_a, comb_a, dst_a) = if r & 1 << 29 != 0 { (r >> 16 & 0x1f, r >> 21 & 7, r >> 24 & 0x1f) } else { (src, comb, dst) };
+    Some(TargetBlend {
+        enable: true,
+        src: factor(src)?,
+        dst: factor(dst)?,
+        op: op(comb)?,
+        src_alpha: factor(src_a)?,
+        dst_alpha: factor(dst_a)?,
+        op_alpha: op(comb_a)?,
+        mask: 0xf,
+    })
+}
+
 /// One colour target of the blend description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TargetBlend {
@@ -230,6 +258,35 @@ impl Graphics {
     /// less-equal with writes. Variants made by slot 0x1b8 apply their records over it.
     pub fn guess_base() -> Graphics {
         Graphics { cull: 1, depth_func: 4, guess: Some(Guess::default()), ..Graphics::default() }
+    }
+
+    /// [`Graphics::guess_base`] with the blend state of the 0x1c8 register image `image` (pair 0
+    /// of the description's slot), where it is found.
+    ///
+    /// Decoded from 23,000 images of one title: word 1 is 4 or 6 (sections that come before), and
+    /// the eight `CB_BLEND<n>_CONTROL` registers start at byte 0xd0 or 0x124 respectively, with
+    /// DISABLE_ROP3 (bit 31) set in each and 0xffffffff after them (then 3 words and the eight
+    /// `SX_MRT<n>_BLEND_OPT`). shortcut: any other image keeps the guessed "no blend".
+    pub fn guess_from(image: &[u32]) -> Graphics {
+        let mut g = Graphics::guess_base();
+        let at = match image.get(1) {
+            Some(4) => 0xd0 / 4,
+            Some(6) => 0x124 / 4,
+            _ => return g,
+        };
+        let (Some(regs), Some(&0xffff_ffff)) = (image.get(at..at + 8), image.get(at + 8)) else {
+            return g;
+        };
+        if regs.iter().any(|r| r >> 31 == 0) {
+            return g;
+        }
+        g.independent = true;
+        for (t, &r) in g.blend.iter_mut().zip(regs) {
+            if let Some(b) = cb_blend(r) {
+                *t = b;
+            }
+        }
+        g
     }
 
     /// This guessed state for a draw: the targets and vertex strides bound, and the input
@@ -669,6 +726,26 @@ mod tests {
         v.extend(data.iter().flat_map(|w| w.to_le_bytes()));
         v.resize(v.len().next_multiple_of(8), 0);
         v
+    }
+
+    /// The text pipeline's image: straight alpha on target 0 (`e5010504`), the rest disabled.
+    #[test]
+    fn blend_is_read_from_the_register_image() {
+        for (sections, at) in [(4, 0xd0 / 4), (6, 0x124 / 4)] {
+            let mut image = vec![0u32; at + 20];
+            image[1] = sections;
+            image[at..at + 8].copy_from_slice(&[0xe501_0504, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0xe001_0161]);
+            image[at + 8] = 0xffff_ffff;
+            let g = Graphics::guess_from(&image);
+            assert!(g.independent);
+            assert_eq!(g.blend[0], TargetBlend { enable: true, src: 5, dst: 6, op: 1, src_alpha: 2, dst_alpha: 6, op_alpha: 1, mask: 0xf });
+            assert_eq!(g.blend[1], TargetBlend::default());
+            // Max of one and one for colour, alpha added.
+            assert_eq!(g.blend[7], TargetBlend { enable: true, src: 2, dst: 2, op: 5, src_alpha: 2, dst_alpha: 1, op_alpha: 1, mask: 0xf });
+            // Without the marker after the registers, nothing is read.
+            image[at + 8] = 0;
+            assert_eq!(Graphics::guess_from(&image), Graphics::guess_base());
+        }
     }
 
     #[test]

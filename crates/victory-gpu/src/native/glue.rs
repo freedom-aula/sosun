@@ -413,6 +413,17 @@ pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
     with_title(|t| t.host.register_buffer(res as usize, addr, len));
 }
 
+/// A pipeline object's last reference went: the host pipelines made for it are forgotten, as the
+/// title makes thousands of variants (device slot 0x1b8) a minute and a new one often gets a freed
+/// one's address (which drew text with the old variant's blend state: glyphs as boxes).
+pub(crate) fn pipeline_released(pipeline: This) {
+    let key = pipeline as usize;
+    with_title(|t| {
+        t.pipelines.remove(&key);
+        t.console_pipes.retain(|(k, _), _| *k != key);
+    });
+}
+
 pub(crate) fn resource_released(res: This) {
     with_title(|t| {
         t.host.forget_resource(res as usize);
