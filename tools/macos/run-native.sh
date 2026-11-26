@@ -7,7 +7,6 @@
 # Extra VICTORY_* variables in your environment are passed through
 # (see docs/native-host.md, "Bring-up diagnostics").
 set -uo pipefail
-cd "$(dirname "$0")/../.."
 
 headless=()
 seconds=0
@@ -43,6 +42,9 @@ else
   exe="$target"
 fi
 [[ -f "$exe" ]] || { echo "Not a file: $exe"; exit 2; }
+# Absolute before moving to the repo root, so a relative game path still works.
+exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
+cd "$(dirname "$0")/../.."
 
 source tools/macos/native-binary.sh
 bin=$(native_binary) || exit 2
