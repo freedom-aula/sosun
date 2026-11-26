@@ -1110,6 +1110,23 @@ mod tests {
         .unwrap();
     }
 
+    /// The title's G-buffer pixel programs compare a value with its quad neighbour's
+    /// (`v_cmp_gt_f32 vcc, v9, -v9 quad_perm:[2,3,0,1]`): a compare with DPP reads src0 from the
+    /// lane the pattern names, as other DPP operations do.
+    #[test]
+    fn a_pixel_program_compares_with_dpp() {
+        let code = [
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0x7C08_04FA, 0xFF4C_4E02, // v_cmp_gt_f32 vcc, v2, -v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+            0xD501_0003, 0x01A9_E480, // v_cndmask_b32 v3, 0, 1.0, vcc
+            0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+            ENDPGM,
+        ];
+        let c = container(HwStage::Ps, &words(&code), &meta_with(&[])).unwrap();
+        let options = super::super::Options { wave32_host: true, ..Default::default() };
+        super::super::translate_with(&c, options).unwrap();
+    }
+
     /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
     /// an EXEC region (lane < count), a VALU compare of an SGPR, ANDed with EXEC, its SCC kept in
     /// an SGPR and branched on later. The compare holds the same bit in every lane, so SCC (some

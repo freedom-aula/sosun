@@ -7643,10 +7643,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            let r = match v.dpp {
+                None => self.compare(inst, rest),
+                // 16-bit compares read their halves elsewhere (`half_src`).
+                Some(_) if rest.ends_with("16") => Err("a 16-bit compare with DPP"),
+                Some(d) => match self.dpp(inst, d) {
+                    // Lanes DPP leaves out keep their old bit: not modelled.
+                    Ok((_, Some(_))) => Err("a compare with DPP row masks or bounds"),
+                    Ok((x, None)) => {
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    }
+                    Err(why) => Err(why),
+                },
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
