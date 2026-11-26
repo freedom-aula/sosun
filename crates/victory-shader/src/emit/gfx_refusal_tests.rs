@@ -64,6 +64,120 @@ fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     assert!(err.to_string().contains("computed buffer descriptor with swizzling"), "{err}");
 }
 
+#[test]
+fn guessed_pixel_computed_subword_loads_use_title_memory() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2;
+    let code = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8705_FF05, 0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0x8F06_9090, // s_lshl_b32 s6, 16, 16
+        0x8805_0605, // s_or_b32 s5, s5, s6
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF, 0x3001_4FAC, // s_mov_b32 s7, flags
+        0xE020_3000, 0x8001_0200, // buffer_load_ubyte v2, v[0:1], s[4:7], 0 idxen offen
+        0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000,
+    ];
+    let translate = |words: &[u32], wave32_host| {
+        let container = graphics::container(HwStage::Ps, &bytes_of(words), &meta).unwrap();
+        translate_with(&container, Options { wave32_host, zero_copy_memory: true, ..Options::default() })
+    };
+    for wave32_host in [false, true] {
+        for op in 8..=11 {
+            for bounds in 0..4 {
+                for offset in [0, 1, 2, 3, 15, 16, 4095] {
+                    let mut words = code;
+                    words[8] = 0x0001_4FAC | bounds << 28;
+                    words[9] = 0xE000_3000 | op << 18 | offset;
+                    let shader = translate(&words, wave32_host).unwrap();
+                    assert!(shader.memory && !shader.memory_writes && !shader.heap);
+                }
+            }
+        }
+    }
+    // Typed loads, stores and atomics must not gain support accidentally.
+    for op in [0, 24, 26, 28, 50] {
+        let mut words = code;
+        words[9] = 0xE000_3000 | op << 18;
+        assert!(translate(&words, true).is_err(), "opcode {op}");
+    }
+    for flags in [0x3081_4FAC, 0x7001_4FAC] {
+        let mut words = code;
+        words[8] = flags; // ADD_TID or non-buffer type
+        assert!(translate(&words, true).is_err());
+    }
+    let mut swizzled = code.to_vec();
+    swizzled[5] = 0x8805_FF05;
+    swizzled.insert(6, 0x8000_0000);
+    assert!(translate(&swizzled, true).is_err());
+}
+
+/// Exercise the graphics descriptor classification with a compute entry point
+/// so the Windows test host can dispatch it and read back exact integer results.
+/// This does not enable computed descriptors for production compute shaders.
+pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostShader {
+    use crate::native::{ComputeIo, ResourceType, UsedResource};
+    let words = [
+        0xBE88_0300, // s_mov_b32 s8, s0 (base low)
+        0x8709_FF01, 0x3FFF_FFFF, // s_and_b32 s9, s1, 0x3fffffff (base high + stride)
+        0xBE8A_0302, // s_mov_b32 s10, s2 (record count)
+        0xBE8B_03FF, 0x0001_4FAC | bounds << 28,
+        0x7E00_0203, // v_mov_b32 v0, s3 (index)
+        0x7E02_0204, // v_mov_b32 v1, s4 (vector offset)
+        0xE000_3000 | op << 18, 0x0502_0200, // buffer_load_* v2, v[0:1], s[8:11], s5 idxen offen
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0303, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0
+        0xBF8C_0000, // s_waitcnt
+        0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+        0xBF81_0000,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 4,
+        layout: vec![root_const(0, 6), RootParam {
+            root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+            base_register: 0, user_data: 6, slot: 1,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 4, user_data: 6, slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 7 << 1, threads: [1, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track_graphics(&p, &native.layout, HwStage::Ps, Some(&st), true).unwrap();
+    assert!(res.descriptors.iter().any(|d| matches!(d.source, resource::Source::BuiltMemory { .. })));
+    let io = io::raise(&p, &native).unwrap();
+    let l = lower::lower(&Parts {
+        native: &native, p: &p, st: &st, io: &io, res: &res,
+        inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
+        atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
+        wave32_host: false, zero_copy_memory: true, view_marks: false,
+        rect_list: false, copy_params: [0; 32],
+    }).unwrap();
+    super::HostShader {
+        stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
+        user_data: l.user_data, samplers: l.samplers, static_samplers: vec![],
+        root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs,
+        memory: l.memory, memory_writes: l.memory_writes, view_addresses: l.view_addresses,
+        heap: l.heap, heap_writes: l.heap_writes, view_marks: l.view_marks,
+    }
+}
+
+#[test]
+fn computed_subword_execution_fixtures_lower() {
+    for op in 8..=11 {
+        for bounds in 0..4 {
+            assert!(computed_subword_test_shader(op, bounds).memory);
+        }
+    }
+}
+
 fn sig_el(
     name: &str,
     index: u32,
