@@ -38,6 +38,16 @@ fn list_imports_binds_the_probe_and_does_not_run_it() {
         out.contains("STUB           victory-probe-host.dll!ProbeNotImplemented"),
         "{out}"
     );
+    // The probe's host DLL is never built, so its folder has no such file;
+    // the DLL the probe does ship beside it is found.
+    assert!(
+        out.contains("missing dll    victory-probe-host.dll: not in"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("missing dll    victory-probe-dll.dll"),
+        "{out}"
+    );
     assert!(out.contains("not executing"), "{out}");
     // The probe's entry point would have printed a "title exited" line.
     assert!(!out.contains("title exited"), "{out}");

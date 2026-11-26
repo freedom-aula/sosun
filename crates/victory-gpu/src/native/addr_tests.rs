@@ -316,6 +316,59 @@ fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
+/// `s_sext_i32_i8` and `s_sext_i32_i16` of s2 on the GPU: the low byte and the low half
+/// sign-extended to 32 bits (RDNA2 ISA, SOP1), stored to dst and dst + 256.
+#[test]
+fn scalar_sign_extensions_on_the_gpu() {
+    const SEXT: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0xBE84_1902, // s_sext_i32_i8 s4, s2
+        0xBE85_1A02, // s_sext_i32_i16 s5, s2
+        0x7E04_0204, // v_mov_b32_e32 v2, s4
+        0x7E06_0205, // v_mov_b32_e32 v3, s5
+        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xDC70_8100, 0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
+        0xBF81_0000, // s_endpgm
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(SEXT, 3);
+    let [lo, hi] = halves(VA_A);
+    for (x, i8, i16) in [
+        (0x1234_80F0u32, 0xFFFF_FFF0u32, 0xFFFF_80F0u32),
+        (0xFFFF_7F70, 0x70, 0x7F70),
+        (0x0000_0080, 0xFFFF_FF80, 0x80),
+    ] {
+        dispatch(&mut t, &cs, &[lo, hi, x], false);
+        assert_eq!(f.get(0x2_0000, 64), vec![i8; 64], "s_sext_i32_i8 {x:#x}");
+        assert_eq!(f.get(0x2_0100, 64), vec![i16; 64], "s_sext_i32_i16 {x:#x}");
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// A VALU compare with DPP on the GPU: `v_cmp_gt_f32 vcc, v2 quad_perm:[2,3,0,1], v2` of
+/// v2 = the lane index compares the value two lanes over in the quad with the lane's own, so
+/// lanes 0 and 1 of each quad hold 1 and lanes 2 and 3 hold 0.
+#[test]
+fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
+    const DPP_CMP: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7C08_04FA, 0xFF0C_4E02, // v_cmp_gt_f32 vcc, v2, v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+        0xD501_0002, 0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(DPP_CMP, 2);
+    let [lo, hi] = halves(VA_A);
+    dispatch(&mut t, &cs, &[lo, hi], false);
+    let want: Vec<u32> = (0..64).map(|i| u32::from(i % 4 < 2)).collect();
+    assert_eq!(f.get(0x2_0000, 64), want);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
 #[test]
 fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     let vertex = [

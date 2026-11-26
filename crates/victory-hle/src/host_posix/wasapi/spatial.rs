@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use super::{
     DEVICE_CHANNELS, E_INVALIDARG, E_NOINTERFACE, E_POINTER, HRESULT, IID_UNKNOWN,
@@ -214,10 +215,49 @@ struct Stream {
     refs: AtomicU32,
     shared: Arc<Shared>,
     _output: Box<dyn Output>,
+    _clock: Clock,
     objects: Mutex<Vec<Mix>>,
     updating: Arc<AtomicBool>,
     dynamic_used: Arc<AtomicU32>,
     max_dynamic: u32,
+}
+
+/// The clock of the title's event (`Shared::tick`), stopped when dropped.
+struct Clock {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Clock {
+    fn start(shared: Arc<Shared>) -> Clock {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut next = Instant::now();
+            while !flag.load(Ordering::Acquire) {
+                let (event, wait) = shared.tick();
+                if let Some(event) = event {
+                    signal(event);
+                }
+                // A late tick does not bring the next one closer than half a wait.
+                next = (next + wait).max(Instant::now() + wait / 2);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        });
+        Clock {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// `ActivateSpatialAudioStream(PROPVARIANT*, REFIID, void**)`: the variant
@@ -256,18 +296,15 @@ extern "win64" fn activate_stream(
         warn_once("spatial stream with an object format other than mono float".into());
         return super::AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
-    let shared = Shared::new(STEREO, PERIOD * 4, PERIOD);
+    let shared = Shared::new(STEREO, PERIOD * 5, PERIOD);
     lock(&shared.state).event = event;
     let render = shared.clone();
     let output = coreaudio::open_default(
         MIX_RATE,
         DEVICE_CHANNELS as u32,
         Box::new(move |out| match out {
-            Ok(out) => {
-                if let Some(event) = render.render(out) {
-                    signal(event);
-                }
-            }
+            // The event has a clock of its own.
+            Ok(out) => drop(render.render(out)),
             Err(e) => warn_once(format!("the output failed: {e}")),
         }),
     );
@@ -288,6 +325,7 @@ extern "win64" fn activate_stream(
     let stream = leak(Stream {
         vtable: STREAM.as_ptr(),
         refs: AtomicU32::new(1),
+        _clock: Clock::start(shared.clone()),
         shared,
         _output: output,
         objects: Mutex::new(Vec::new()),

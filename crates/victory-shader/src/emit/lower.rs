@@ -338,6 +338,9 @@ struct Lower<'a> {
     /// SCC written by a scalar operation on masks, by value: the dwords of
     /// the mask result it says is not zero.
     mask_scc: Map<Value, (Value, Option<Value>)>,
+    /// Mesh: SCC of a uniform compare ANDed with EXEC ([`Self::uniform_and_exec`]): the
+    /// compare's result value.
+    uniform_scc: Map<Value, Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -835,6 +838,7 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: Map::default(),
             mask_scc: Map::default(),
+            uniform_scc: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -2098,6 +2102,16 @@ impl<'a> Lower<'a> {
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
+        }
+        if let (Some(Val::Missing(_)), Some(&u)) = (found, self.uniform_scc.get(&v)) {
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let any = Val::Bit(self.atom(Atom::Lane(u), at)?);
+            self.vals.insert(v, any);
+            return Ok(any);
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
@@ -4812,7 +4826,7 @@ impl<'a> Lower<'a> {
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
         {
-            if let (Some(scc), true) = (scc, self.mask_data != MaskData::None) {
+            if let Some(scc) = scc {
                 // The result is EXEC when written, else the destination.
                 let pair = |l: u8| {
                     let lo = inst.write(Reg::S(l))?;
@@ -4822,8 +4836,13 @@ impl<'a> Lower<'a> {
                     let hi = inst.write(Reg::S(l + 1)).filter(|_| self.x.native.wave64);
                     Some((lo, hi))
                 };
-                if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
-                    self.mask_scc.insert(scc, r);
+                if self.mask_data != MaskData::None {
+                    if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
+                        self.mask_scc.insert(scc, r);
+                    }
+                } else if let Some(u) = self.uniform_and_exec(inst) {
+                    // Mesh: no ballot, but a uniform mask needs none.
+                    self.uniform_scc.insert(scc, u);
                 }
             }
             return Err(LANE_MASK);
@@ -5281,6 +5300,12 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
                 (r, None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let up = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, up, k), None)
             }
             "s_not_b32" => {
                 let a = src32(self, 0)?;
@@ -7658,10 +7683,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            let r = match v.dpp {
+                None => self.compare(inst, rest),
+                // 16-bit compares read their halves elsewhere (`half_src`).
+                Some(_) if rest.ends_with("16") => Err("a 16-bit compare with DPP"),
+                Some(d) => match self.dpp(inst, d) {
+                    // Lanes DPP leaves out keep their old bit: not modelled.
+                    Ok((_, Some(_))) => Err("a compare with DPP row masks or bounds"),
+                    Ok((x, None)) => {
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    }
+                    Err(why) => Err(why),
+                },
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -10106,6 +10142,27 @@ impl<'a> Lower<'a> {
         } else {
             "a 16-bit read of a 32-bit input: an f16 interpolation of an input not marked 16-bit"
         };
+        // A guessed pipeline's half: its own input element (`graphics::HALF`), an f32.
+        let guessed_half = (self.guessed && packing.is_none() && f16)
+            .then(|| {
+                let index = 2 * u32::from(attribute.row) + u32::from(attribute.high);
+                self.s.inputs.iter().find_map(|e| {
+                    (e.name == super::graphics::HALF
+                        && e.index == index
+                        && (e.col..e.col + e.cols).contains(&attribute.channel))
+                    .then_some(e.row)
+                    .flatten()
+                })
+            })
+            .flatten();
+        if let Some(row) = guessed_half {
+            let row = u8::try_from(row).map_err(|_| "an input row")?;
+            let x = channel(self, row, attribute.channel)?;
+            let f = self.as_float(x);
+            let h = self.narrow16(f);
+            let h = self.half_modifiers(inst, h);
+            return self.write_half(inst, h, None);
+        }
         let x = match packing {
             None if f16 || attribute.high => return Err(unmarked),
             None => channel(self, attribute.row, attribute.channel)?,
@@ -12363,6 +12420,49 @@ impl<'a> Lower<'a> {
                 stores.push((id, col, value, None));
             }
         }
+        // A guessed pipeline's parameter channels, each also as its two halves widened to f32
+        // (`graphics::HALF`).
+        if let (true, Target::Param { usage, row }) = (self.guessed, e.target)
+            && let Some(r) = param_row(usage, row)
+        {
+            for high in [false, true] {
+                let index = 2 * u32::from(r) + u32::from(high);
+                let Some(id) = outputs.iter().position(|o| o.name == super::graphics::HALF && o.index == index) else {
+                    continue;
+                };
+                let (col, cols) = (outputs[id].col, outputs[id].cols);
+                for ch in col..col + cols {
+                    if let Some(value) = e.values[usize::from(ch)] {
+                        stores.push((id, ch - col, value, Some(high)));
+                    }
+                }
+            }
+        }
+        // A guessed pipeline's parameter elements are four channels (`graphics::HALF`): the
+        // channels this export leaves out get a copy of one it has (unread), since the
+        // converter crashes linking a mesh output some channels of which are not written, or
+        // are written a constant.
+        // shortcut: a parameter exported twice with different channels keeps only the last
+        // export's; upgrade if a guessed program is seen doing that.
+        let mut pad = Vec::new();
+        if let (true, false, Target::Param { usage, row }) = (self.guessed, primitive, e.target)
+            && let Some(r) = param_row(usage, row)
+        {
+            let r = u32::from(r);
+            for (id, o) in outputs.iter().enumerate() {
+                let ours = (o.name == "TEXCOORD" && o.kind == 0 && o.row == Some(r) && o.index == r)
+                    || (o.name == super::graphics::HALF && o.index / 2 == r);
+                let half = (o.name == super::graphics::HALF).then_some(o.index % 2 == 1);
+                for col in (0..o.cols).filter(|_| ours) {
+                    if !stores.iter().any(|s| s.0 == id && s.1 == col)
+                        && let Some(value) = e.values.iter().flatten().next()
+                    {
+                        pad.push((id, col, *value, half));
+                    }
+                }
+            }
+        }
+        stores.extend(pad);
         // A parameter a split pixel input copies (`Options::copy_params`) is written with the
         // original's values.
         if self.x.copy_params != [0; 32] && !primitive {
@@ -12887,6 +12987,56 @@ impl<'a> Lower<'a> {
         };
         memo.insert(b, r);
         r
+    }
+
+    /// `s_and` of EXEC and a compare of SGPRs and constants made under the same EXEC (the
+    /// console compiler's form of a wave-uniform boolean, `v_cmp_* vcc, s, k` then
+    /// `s_and_b64 sN, vcc, exec`): the compare's result. The compare holds the same bit in every
+    /// lane, so SCC (some lane set) is that bit, in every lane, those outside EXEC included, as
+    /// the console's wave holds it.
+    // Guess: EXEC is not empty where the title's programs do this (they branch around their
+    // EXEC regions with `s_cbranch_execz`); with an empty EXEC the console's SCC is 0.
+    fn uniform_and_exec(&self, inst: &Inst) -> Option<Value> {
+        let width = if self.x.native.wave64 { "s_and_b64" } else { "s_and_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        if inst.name() != width || src.len() != 2 {
+            return None;
+        }
+        let code = |k: usize| match src[k] {
+            Operand::Scalar { code, .. } => Some(code),
+            _ => None,
+        };
+        let other = match (code(0)?, code(1)?) {
+            (EXEC, c) | (c, EXEC) if c != EXEC => c,
+            _ => return None,
+        };
+        let u = inst.read(Reg::S(other))?;
+        let cmp = self.def_inst(u)?;
+        let same_exec = (EXEC..=EXEC + u8::from(self.x.native.wave64))
+            .all(|r| cmp.read(Reg::S(r)).is_some() && cmp.read(Reg::S(r)) == inst.read(Reg::S(r)));
+        (matches!(cmp.fields, Fields::Valu(_)) && same_exec && self.uniform_atom(Atom::Lane(u)))
+            .then_some(u)
+    }
+
+    /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a
+    /// compare (or carry) of SGPRs and constants, which a wave holds once for all its lanes.
+    fn uniform_atom(&self, a: Atom) -> bool {
+        let st = &self.x.st;
+        match a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => self.def_inst(v).is_some_and(|i| {
+                i.reads.iter().all(|&(r, x)| match r {
+                    Reg::V(_) => false,
+                    Reg::S(c) => {
+                        c == EXEC
+                            || c == EXEC + 1
+                            || !st.masks.contains_key(&x) && !st.highs.contains_key(&x)
+                    }
+                    Reg::Scc => true,
+                })
+            }),
+            _ => false,
+        }
     }
 
     /// The instruction writing `v`.

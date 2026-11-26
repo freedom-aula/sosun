@@ -205,6 +205,9 @@ pub trait ResourceBackend: ComputeBackend {
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);
+    /// Entry `index` names nothing any more: it reads as one never written, and what it kept
+    /// alive and resident is let go.
+    fn clear_entry(&self, heap: &Self::Heap, index: usize);
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(

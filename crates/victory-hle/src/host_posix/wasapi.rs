@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use victory_gpu::clock;
 
@@ -334,6 +334,30 @@ impl Shared {
         state.released += (stereo.len() / DEVICE_CHANNELS) as u64;
         state.peak = stereo.iter().fold(state.peak, |p, s| p.max(s.abs()));
         state.ring.push(stereo);
+    }
+
+    /// One tick of the clock of a title's event: the event to set, if the
+    /// queue has room for a period, and the time to the next tick.
+    ///
+    /// The device cannot be that clock. CoreAudio takes frames in cycles of
+    /// its own (512 on the Mac this was measured on), so it asks for 10 ms
+    /// buffers 10.7 ms apart, with two back to back every 160 ms. An event
+    /// set from the device gave a title one signal for those two periods,
+    /// and one for any stretch it slept through, so the queue ran dry and
+    /// those periods played as silence. Ticks come a period apart, as on
+    /// Windows, and half a period apart while the queue is short: a title
+    /// that fell behind catches up, and is never given two passes back to
+    /// back (the second of two such passes came back silent when a sound
+    /// was starting).
+    pub fn tick(&self) -> (Option<usize>, Duration) {
+        let state = lock(&self.state);
+        let frames = state.ring.frames();
+        let event = (state.running && state.event != 0 && frames < self.buffer_frames)
+            .then_some(state.event);
+        let period =
+            Duration::from_micros(self.period as u64 * 1_000_000 / u64::from(self.format.rate));
+        let short = frames + 2 * self.period < self.buffer_frames;
+        (event, if short { period / 2 } else { period })
     }
 
     /// CoreAudio wants `out` (stereo floats). Returns the title's event
@@ -1146,6 +1170,65 @@ mod tests {
         let mut out = vec![1.0; 2 * 100];
         shared.render(&mut out);
         assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    /// The spatial stream's loop, on a clock of microseconds: the device takes
+    /// frames in cycles of 512 and the title adds a period each time it finds
+    /// its event set. Returns the frames of silence played and the shortest
+    /// time between two passes.
+    fn play(oversleeps: bool) -> (usize, u64) {
+        const PERIOD: usize = 480;
+        let shared = Shared::new(STEREO_F32, 5 * PERIOD, PERIOD);
+        {
+            let mut state = lock(&shared.state);
+            state.running = true;
+            state.event = 7;
+        }
+        let (mut tick, mut cycle) = (0, 0);
+        let (mut set, mut owed, mut silent) = (false, 0, 0);
+        let (mut last, mut closest) = (None, u64::MAX);
+        while tick.min(cycle) < 10_000_000_u64 {
+            let now = tick.min(cycle);
+            if now == tick {
+                let (event, wait) = shared.tick();
+                set |= event.is_some();
+                tick += wait.as_micros() as u64;
+            }
+            // 15 ms asleep in every second.
+            let asleep = oversleeps && now % 1_000_000 < 15_000;
+            if set && !asleep {
+                set = false;
+                shared.push(&[0.25; 2 * PERIOD]);
+                closest = closest.min(last.map_or(u64::MAX, |l| now - l));
+                last = Some(now);
+            }
+            if now == cycle {
+                owed += 512;
+                while owed >= PERIOD {
+                    owed -= PERIOD;
+                    let mut out = vec![0.0; 2 * PERIOD];
+                    shared.render(&mut out);
+                    if now >= 100_000 {
+                        silent += out.iter().filter(|&&s| s == 0.0).count() / 2;
+                    }
+                }
+                cycle += 10_667;
+            }
+            assert!(shared.padding() <= 5 * PERIOD);
+        }
+        (silent, closest)
+    }
+
+    #[test]
+    fn the_event_clock_feeds_a_device_that_takes_frames_in_its_own_cycles() {
+        let (silent, closest) = play(false);
+        assert_eq!(silent, 0, "frames of silence played");
+        assert!(closest >= 5_000, "two passes {closest} microseconds apart");
+    }
+
+    #[test]
+    fn a_title_that_wakes_late_catches_up_instead_of_leaving_silence() {
+        assert_eq!(play(true).0, 0, "frames of silence played");
     }
 
     #[test]

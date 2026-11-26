@@ -352,6 +352,12 @@ impl RtvRecord {
         self.described == 0 || (matches!(self.desc[1], 1 | 3) && self.desc[3] == 0)
     }
 
+    /// The format the view names (0: the resource's own).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn format(&self) -> u32 {
+        if self.described == 0 { 0 } else { self.desc[0] }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

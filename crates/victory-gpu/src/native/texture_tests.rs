@@ -361,6 +361,78 @@ fn a_render_target_is_cleared_through_the_titles_view() {
     assert!(out.chunks(4).all(|p| p == [0, 255, 0, 255]), "{:?}", &out[..8]);
 }
 
+/// A render target view names the format its writes are stored in. Through a plain view of an
+/// sRGB texture a value is stored as it is (a movie's picture, which is display values already);
+/// through an sRGB view of a plain texture it is encoded.
+#[test]
+fn a_render_target_view_stores_in_the_format_it_names() {
+    let Some(pool) = pool(9120, 16) else { return };
+    // The texture's format, the view's (0: none described), and the byte half grey is stored as.
+    for (i, (own, named, stored)) in [(29, 28, 128), (28, 29, 188), (29, 0, 188), (28, 28, 128)]
+        .into_iter()
+        .enumerate()
+    {
+        let at = i * 0x10000;
+        let rt = crate::resource::test_texture_at(
+            pool.va(at),
+            (16, 16),
+            1,
+            own,
+            Swizzle::SW_64KB_R_X.0,
+            1,
+        );
+        let heap = crate::descriptor::test_heap(false, 4);
+        let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+        // A 2D view of mip 0.
+        let desc = [named, 4, 0, 0, 0, 0];
+        let desc = if named == 0 {
+            std::ptr::null()
+        } else {
+            &raw const desc
+        };
+        crate::descriptor::create_rtv(std::ptr::null(), rt, desc, handle);
+        let list = crate::list::test_list(false, std::ptr::null());
+        let (q, f) = (crate::queue::test_queue(false), {
+            let mut f = std::ptr::null();
+            crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+            f
+        });
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+            list,
+            1,
+            &handle,
+            0,
+            std::ptr::null(),
+        );
+        let color = [0.5f32, 0.5, 0.5, 1.0];
+        slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const u8)>(list, 0x1a0)(
+            list,
+            handle,
+            &color,
+            0,
+            std::ptr::null(),
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+        slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+        assert_eq!(
+            slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(
+                f,
+                1,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        let out = read_mip(rt as usize, 0, 16, 16);
+        assert!(
+            out.chunks(4)
+                .all(|p| p[0].abs_diff(stored) <= 1 && p[3] == 255),
+            "texture {own} view {named}: {:?}",
+            &out[..4]
+        );
+    }
+}
+
 /// A layout the host cannot address (`SW_4KB_R_X`, which has no equations) is counted and left empty, not
 /// an error that stops the submission.
 #[test]

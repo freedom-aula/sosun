@@ -437,6 +437,11 @@ impl<B: PresentBackend> Title<B> {
         waiting.retain(|token, _| held.waits_for(*token));
     }
 
+    /// The backend queue of each title queue made so far.
+    pub fn backend_queues(&self) -> impl Iterator<Item = (usize, &B::Queue)> {
+        self.queues.iter().map(|(k, q)| (*k, &**q))
+    }
+
     /// Queues whose head has been held longer than `limit`: a line each, with the waits that do
     /// not hold (address, comparison, reference, mask, current value).
     pub fn stuck(&self, limit: std::time::Duration) -> Vec<String> {

@@ -190,7 +190,8 @@ impl Stream {
         self.drop_readahead();
         self.eof = false;
         match &mut self.io {
-            Io::File(f) => f.seek(to).ok(),
+            // A position before the start is `InvalidInput`, so `EINVAL`.
+            Io::File(f) => f.seek(to).map_err(|e| set_errno(win_errno(&e))).ok(),
             _ => None,
         }
     }
@@ -983,6 +984,10 @@ pub extern "system" fn _read(fd: i32, buf: *mut u8, count: u32) -> i32 {
         return err(EBADF);
     };
     let mut s = lock(&s);
+    if !s.readable {
+        // Not open for reading: -1, not the 0 of an end of file.
+        return err(EBADF);
+    }
     let mut n = 0;
     while n < count as usize {
         match s.get() {
@@ -1005,8 +1010,11 @@ pub extern "system" fn _write(fd: i32, buf: *const u8, count: u32) -> i32 {
 }
 
 pub extern "system" fn _lseeki64(fd: i32, offset: i64, origin: i32) -> i64 {
-    let (Some(s), Some(to)) = (fd_of(fd), seek_from(offset, origin)) else {
+    let Some(s) = fd_of(fd) else {
         return i64::from(err(EBADF));
+    };
+    let Some(to) = seek_from(offset, origin) else {
+        return i64::from(err(EINVAL));
     };
     let mut s = lock(&s);
     s.seek(to).map_or(-1, |p| p as i64)
@@ -1017,7 +1025,10 @@ pub extern "system" fn _lseek(fd: i32, offset: i32, origin: i32) -> i32 {
 }
 
 pub extern "system" fn _telli64(fd: i32) -> i64 {
-    fd_of(fd).map_or(-1, |s| lock(&s).tell().map_or(-1, |p| p as i64))
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
+    lock(&s).tell().map_or(-1, |p| p as i64)
 }
 
 pub extern "system" fn _tell(fd: i32) -> i32 {
@@ -1025,7 +1036,9 @@ pub extern "system" fn _tell(fd: i32) -> i32 {
 }
 
 pub extern "system" fn _filelengthi64(fd: i32) -> i64 {
-    let Some(s) = fd_of(fd) else { return -1 };
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
     match &lock(&s).io {
         Io::File(f) => f.metadata().map_or(-1, |m| m.len() as i64),
         _ => -1,
@@ -1714,6 +1727,87 @@ mod tests {
         assert_eq!(_fileno(f), -1);
         assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_bad_descriptor_sets_ebadf_for_its_length_and_position() {
+        // Microsoft documents -1 with EBADF for an invalid descriptor in `_filelength`,
+        // `_tell` and `_eof` (and their 64-bit forms).
+        let fd = 9999;
+        for name in ["_filelengthi64", "_filelength", "_telli64", "_tell", "_eof"] {
+            set_errno(0);
+            let r = match name {
+                "_filelengthi64" => _filelengthi64(fd),
+                "_filelength" => i64::from(_filelength(fd)),
+                "_telli64" => _telli64(fd),
+                "_tell" => i64::from(_tell(fd)),
+                _ => i64::from(_eof(fd)),
+            };
+            assert_eq!(r, -1, "{name}");
+            assert_eq!(errno(), EBADF, "{name}");
+        }
+    }
+
+    #[test]
+    fn reading_a_write_only_descriptor_fails_with_ebadf() {
+        // Microsoft documents `_read` on a descriptor not open for reading as -1 with EBADF;
+        // 0 would tell the title it is at the end of the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let fd = _open(
+            cstr(path.to_str().unwrap()).as_ptr(),
+            O_WRONLY | O_BINARY,
+            0,
+        );
+        assert!(fd >= 3);
+        let mut b = [0xEEu8; 4];
+        set_errno(0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(b, [0xEE; 4]);
+        // An empty read of a readable descriptor is still 0.
+        assert_eq!(_close(fd), 0);
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 0), 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 3);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 0);
+        assert_eq!(_close(fd), 0);
+    }
+
+    #[test]
+    fn a_bad_seek_sets_einval_and_keeps_the_position() {
+        // Microsoft documents `_lseek`'s errno as EBADF for a bad descriptor and EINVAL for a
+        // bad origin or a position before the start of the file; `fseek` fails the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert!(fd >= 3);
+        assert_eq!(_lseeki64(fd, 2, SEEK_SET), 2);
+        for (offset, origin) in [(-1, SEEK_SET), (-3, SEEK_CUR), (-7, SEEK_END), (0, 3)] {
+            set_errno(0);
+            assert_eq!(_lseeki64(fd, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+            set_errno(0);
+            assert_eq!(_lseek(fd, offset as i32, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(_telli64(fd), 2);
+        set_errno(0);
+        assert_eq!(_lseeki64(9999, 0, SEEK_SET), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(_close(fd), 0);
+
+        let f = open(&path, "rb");
+        assert_eq!(fseek(f, 4, SEEK_SET), 0);
+        for (offset, origin) in [(-5, SEEK_CUR), (-7, SEEK_END)] {
+            set_errno(0);
+            assert_eq!(fseek(f, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(ftell(f), 4);
+        assert_eq!(fclose(f), 0);
     }
 
     #[test]

@@ -66,6 +66,21 @@ fn title_dll(dll: &str) -> bool {
     !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
+/// The title DLLs that stubbed imports come from but that were never
+/// mapped: not in the title's folder. Lower case, sorted, each once.
+fn absent_title_dlls(
+    stubbed_from: &[String],
+    title: &dyn Fn(&str) -> bool,
+    mapped: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let names: std::collections::BTreeSet<String> = stubbed_from
+        .iter()
+        .map(|d| d.to_ascii_lowercase())
+        .filter(|d| title(d) && !mapped(d))
+        .collect();
+    names.into_iter().collect()
+}
+
 /// Binds and finalizes `image`, then prints what was bound (and, with
 /// `list`, every import and who served it).
 fn bind(
@@ -253,8 +268,10 @@ pub fn run(
         note(d);
     }
     let chain = WithTitleDlls { inner: &resolver };
+    let mut stubbed_from = Vec::new();
     for d in &dlls {
-        bind(&d.name, &d.image, &chain, policy, list_imports)?;
+        let report = bind(&d.name, &d.image, &chain, policy, list_imports)?;
+        stubbed_from.extend(report.missing.into_iter().map(|m| m.dll));
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     let report = bind(&exe_name, &image, &chain, policy, list_imports)?;
@@ -266,6 +283,19 @@ pub fn run(
         report.missing.len(),
         dlls.len()
     );
+    stubbed_from.extend(report.missing.iter().map(|m| m.dll.clone()));
+    let absent = absent_title_dlls(&stubbed_from, &title_dll, &|d| dll::find(d).is_some());
+    for name in &absent {
+        println!("missing dll    {name}: not in {}", title_dir.display());
+    }
+    if !absent.is_empty() {
+        tracing::warn!(
+            dlls = absent.len(),
+            dir = %title_dir.display(),
+            "title DLLs are not beside the executable, so their imports are stubbed: \
+             point victory at the whole game folder"
+        );
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
@@ -275,8 +305,17 @@ pub fn run(
     // fixed drives are the package as `G:` and temporary files `T:`.
     let cfg = victory_core::Config::load()?;
     victory_gpu::shader_cache::use_native_cache(cfg.cache_subdir("native-shaders")?);
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = match dll::find_file(title_dir, "MicrosoftGame.config") {
+        Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
+        None => {
+            tracing::warn!(
+                dir = %title_dir.display(),
+                "MicrosoftGame.config is not beside the executable, so the title ID is 00000000: \
+                 point victory at the whole game folder"
+            );
+            String::new()
+        }
+    };
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -406,5 +445,28 @@ impl Observer for PoolFeed {
     }
     fn unmapped(&self, at: usize, len: usize) {
         self.0.unmapped(at, len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absent_title_dlls;
+
+    #[test]
+    fn absent_title_dlls_are_named_once_and_runtime_dlls_never() {
+        let stubbed_from = [
+            "MSVCP140.dll",
+            "msvcp140.dll",
+            "KERNEL32.dll",
+            "Bink2Scarlett.dll",
+            "VCRUNTIME140.dll",
+        ]
+        .map(String::from);
+        let ours = |d: &str| d == "kernel32.dll";
+        let mapped = |d: &str| d == "vcruntime140.dll";
+        assert_eq!(
+            absent_title_dlls(&stubbed_from, &|d| !ours(d), &mapped),
+            ["bink2scarlett.dll", "msvcp140.dll"]
+        );
     }
 }
