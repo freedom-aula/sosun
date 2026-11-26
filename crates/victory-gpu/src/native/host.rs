@@ -687,10 +687,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
         let (_, maps) = self.mapping_list();
-        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
+        addr::sorted_root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
     }
 
-    /// The pool table as the page table builder reads it, and its generation: made again only
+    /// The pool table in title-address order, and its generation: made again only
     /// when the pool table changed.
     fn mapping_list(&self) -> (u64, Rc<[Mapping]>) {
         if let Some((g, maps)) = &*self.maps.borrow()
