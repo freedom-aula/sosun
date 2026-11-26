@@ -188,7 +188,8 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
 /// when we override it: a title that looks a function up by name must not
 /// get past our overrides (the network guard, path rewriting).
 fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
-    if module.is_null() || runtime::image_path(module as usize).is_some() {
+    // Host modules are fake handles without a file on the native host.
+    if !cfg!(windows) || module.is_null() || runtime::image_path(module as usize).is_some() {
         return None;
     }
     let symbol = if (name as usize) < 0x1_0000 {
@@ -594,30 +595,62 @@ mod host {
 mod host {
     use std::ffi::c_void;
 
-    pub(super) fn get_module_handle_w(_: *const u16) -> *mut c_void {
+    /// The system DLLs we serve (kernel32, the API sets, ucrt, ...) have no
+    /// image here: they get a fake module handle, see `host_posix::fake_dll`.
+    fn system_dll(name: &str) -> *mut c_void {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if let Some(handle) = crate::host_posix::fake_dll::handle(name) {
+            return handle;
+        }
+        let _ = name;
+        set_last_error(super::ERROR_MOD_NOT_FOUND);
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_module_handle_a(_: *const u8) -> *mut c_void {
-        std::ptr::null_mut()
+    pub(super) fn get_module_handle_w(name: *const u16) -> *mut c_void {
+        system_dll(&super::wide(name))
     }
 
-    pub(super) fn load_library_ex_a(_: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
-        std::ptr::null_mut()
+    pub(super) fn get_module_handle_a(name: *const u8) -> *mut c_void {
+        system_dll(&super::narrow(name))
     }
 
-    pub(super) fn get_module_file_name_w(_: *mut c_void, _: *mut u16, _: u32) -> u32 {
-        0
+    pub(super) fn load_library_ex_a(name: *const u8, _: *mut c_void, _: u32) -> *mut c_void {
+        system_dll(&super::narrow(name))
     }
 
-    pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
-        0
+    pub(super) fn load_library_ex_w(name: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
+        system_dll(&super::wide(name))
     }
 
-    pub(super) fn set_last_error(_: u32) {}
+    /// `C:\Windows\System32\<name>` for a fake module handle.
+    fn system_path(_module: *mut c_void) -> Option<Vec<u16>> {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return crate::host_posix::fake_dll::path(_module);
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        None
+    }
 
-    pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
-        std::ptr::null_mut()
+    pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
+        match system_path(module) {
+            Some(path) => super::copy_truncated(&path, super::title_buffer(out, size)),
+            None => 0,
+        }
+    }
+
+    pub(super) fn get_module_file_name_a(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
+        match system_path(module) {
+            Some(path) => {
+                let path: Vec<u8> = String::from_utf16_lossy(&path).into_bytes();
+                super::copy_truncated(&path, super::title_buffer(out, size))
+            }
+            None => 0,
+        }
+    }
+
+    pub(super) fn set_last_error(_code: u32) {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        crate::host_posix::SetLastError(_code);
     }
 
     /// Exports of the title's own DLLs (the native host maps them itself).
@@ -637,11 +670,18 @@ mod host {
             {
                 return address as *mut c_void;
             }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(found) = crate::host_posix::fake_dll::proc_address(_module, symbol) {
+                return found;
+            }
         }
         std::ptr::null_mut()
     }
 
-    pub(super) fn free_library(_: *mut c_void) -> i32 {
+    pub(super) fn free_library(_module: *mut c_void) -> i32 {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return i32::from(crate::host_posix::fake_dll::is_fake(_module));
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         0
     }
 

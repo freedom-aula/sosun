@@ -23,6 +23,7 @@ use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
 
+pub(crate) mod fake_dll;
 pub(crate) mod files;
 mod sync;
 mod system;

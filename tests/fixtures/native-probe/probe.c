@@ -944,6 +944,71 @@ u32 probe_dll(ptr unused)
     return ok;
 }
 
+/* ---- module handles of system DLLs -------------------------------------- */
+
+IMPORT ptr GetModuleHandleW(const u16 *);
+IMPORT u32 GetModuleFileNameW(ptr, u16 *, u32);
+IMPORT int FreeLibrary(ptr);
+
+enum {
+    M_KERNEL32 = 1u << 0,
+    M_APISET = 1u << 1,
+    M_STABLE = 1u << 2,
+    M_HEADER = 1u << 3,
+    M_SLEEPCV = 1u << 4,
+    M_WAKEALL = 1u << 5,
+    M_TICK_CALL = 1u << 6,
+    M_MISSING = 1u << 7,
+    M_FILENAME = 1u << 8,
+    M_FREE = 1u << 9,
+    M_ORDINAL_MISSING = 1u << 10,
+    M_ALL = (1u << 11) - 1,
+};
+
+/* What a VC runtime start-up does: GetModuleHandleW for an API set and for
+ * kernel32, then GetProcAddress for the condition-variable functions. */
+u32 probe_modules(ptr unused)
+{
+    (void)unused;
+    u32 ok = 0;
+    ptr k32 = GetModuleHandleW((const u16 *)L"kernel32.dll");
+    ptr set = GetModuleHandleW((const u16 *)L"api-ms-win-core-synch-l1-2-0.dll");
+    if (k32)
+        ok |= M_KERNEL32;
+    if (set && set != k32)
+        ok |= M_APISET;
+    if (k32 && GetModuleHandleW((const u16 *)L"KERNEL32.DLL") == k32)
+        ok |= M_STABLE;
+    if (k32 && (((u64)k32 & 0xFFFF) == 0) && ((const char *)k32)[0] == 'M' && ((const char *)k32)[1] == 'Z') {
+        u32 pe = *(const u32 *)((const char *)k32 + 0x3C);
+        if (*(const u32 *)((const char *)k32 + pe) == 0x00004550u)
+            ok |= M_HEADER;
+    }
+    if (set && GetProcAddress(set, "SleepConditionVariableCS"))
+        ok |= M_SLEEPCV;
+    if (set && GetProcAddress(set, "WakeAllConditionVariable"))
+        ok |= M_WAKEALL;
+    u64 (*tick)(void) = k32 ? (u64(*)(void))GetProcAddress(k32, "GetTickCount64") : 0;
+    if (tick) {
+        u64 t0 = tick();
+        Sleep(20);
+        if (tick() >= t0 + 10 && GetTickCount64() >= t0 + 10)
+            ok |= M_TICK_CALL;
+    }
+    SetLastError(0);
+    if (k32 && !GetProcAddress(k32, "NoSuchVictoryFunction") && GetLastError() == 127)
+        ok |= M_MISSING;
+    u16 name[64];
+    u32 n = k32 ? GetModuleFileNameW(k32, name, 64) : 0;
+    if (n == 32 && name[0] == 'C' && name[3] == 'W' && name[n - 1] == 'l')
+        ok |= M_FILENAME;
+    if (k32 && FreeLibrary(k32))
+        ok |= M_FREE;
+    if (k32 && !GetProcAddress(k32, (const char *)(u64)0x7FFE))
+        ok |= M_ORDINAL_MISSING;
+    return ok;
+}
+
 /* ---- the Universal C runtime ------------------------------------------- */
 
 /* ucrtbase.dll and api-ms-win-crt-math-l1-1-0.dll: victory-hle's host_posix::ucrt. */

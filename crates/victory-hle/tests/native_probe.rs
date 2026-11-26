@@ -309,6 +309,15 @@ mod run {
         assert_all(run_probe("probe_dll", 0), 0xFFF, "probe_dll");
     }
 
+    /// A title's start-up asks for `kernel32.dll` and an API set by name and
+    /// looks functions up in them: both answer with a stable handle, a
+    /// callable entry (called here through the pointer) and NULL with
+    /// `ERROR_PROC_NOT_FOUND` for an unknown name.
+    #[test]
+    fn system_dll_handles_resolve_functions_through_the_binder() {
+        assert_all(run_probe("probe_modules", 0), 0x7FF, "probe_modules");
+    }
+
     #[test]
     fn the_probe_runs_under_rosetta_and_passes_every_check() {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

@@ -374,3 +374,16 @@ impl StubBlock {
         Ok(())
     }
 }
+
+/// A callable Windows x64 entry for the host function at `address`, as the
+/// binder would put in an IAT slot: a fresh bridge stub, or `address` itself
+/// if it needs none. For `GetProcAddress` on modules the host serves.
+pub fn stub_for(address: usize) -> Result<usize> {
+    if is_direct(address) {
+        return Ok(address);
+    }
+    let mut block = StubBlock::new(1)?;
+    let stub = block.emit(address, 0, is_win64(address))?;
+    block.seal()?;
+    Ok(stub)
+}
