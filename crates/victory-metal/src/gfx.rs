@@ -578,12 +578,46 @@ impl GraphicsBackend for Metal {
             match pass {
                 Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches)?,
                 Pass::Render(rp) => self.encode_render(&cb, rp)?,
+                Pass::Blit(ops) => self.encode_blit(&cb, ops)?,
             }
         }
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
         cb.commit();
+        Ok(())
+    }
+}
+
+impl Metal {
+    fn encode_blit(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        ops: &[BlitOp<'_, Metal>],
+    ) -> Result<(), String> {
+        let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+        let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
+        for op in ops {
+            match op {
+                BlitOp::Copy { src, dst, len } => {
+                    // SAFETY: both ranges lie inside live buffers (the caller resolved them).
+                    unsafe {
+                        e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                            &src.0.buf,
+                            off(src.0, src.1),
+                            &dst.0.buf,
+                            off(dst.0, dst.1),
+                            *len,
+                        )
+                    };
+                }
+                BlitOp::Fill { dst, len, value } => {
+                    let o = off(dst.0, dst.1);
+                    e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
+                }
+            }
+        }
+        e.endEncoding();
         Ok(())
     }
 }

@@ -486,3 +486,74 @@ hull/domain/geometry emulation, stream-out, indirect draws, UAV writes from pixe
    and delete copy-back, view marks and the shadow (`shadow.rs`, `watch.rs`) behind a feature once the
    Metal path runs.
 7. Compute detile of the console texture layouts reading title memory; present on `CAMetalLayer`.
+
+## The seam in victory-gpu (branch `native/gpu-seam`)
+
+What landed, and what did not. The D3D12 path is unchanged: the only edits to existing victory-gpu
+files are in `sampler.rs` (the console sampler fields, now platform neutral; `host()`, `console()` and
+the tests stay `cfg(windows)`), `descriptor.rs` (`record` and `increment` are `pub(crate)`) and
+`lib.rs` (`mod sampler` always built, `pub mod native`).
+
+- **`crates/victory-backend`**: the traits (`ComputeBackend`, `ResourceBackend`, `GraphicsBackend`) moved
+  out of `victory-metal`, which re-exports them as `victory_metal::{backend, resources}`. victory-gpu
+  depends on it on every target and on `victory-metal` on macOS only. New: `Pass::Blit(Vec<BlitOp>)`
+  (`CopyBufferRegion` and byte fills on title memory, `MTLBlitCommandEncoder`, ordered with the
+  passes around it).
+- **`victory-gpu/src/native`**, generic over `GraphicsBackend`, so it is built and linted on the
+  Windows target as well; `native::Host` is `NativeHost<Metal>` on macOS. Module selection is by
+  `cfg`: `host.rs` and everything that touches `shadow`/`watch` is Windows only and cannot be
+  reached from `native`.
+  - `memory`: `PoolTable`, the title page to `(pool, offset)` table. `PoolInfo` / `PoolObserver` have
+    exactly the shape of `victory_hle::modules::xmem_physical` (`pool_created`, `pool_released`,
+    `mapped`, `unmapped`; `native/xmem-rest` has them), so the host wires them with a forwarding
+    `impl` (victory-gpu does not depend on victory-hle). Pools are wrapped lazily, one buffer per pool,
+    and dropped on `pool_released`. **Bypass of shadow copies, copy-back and write guards**: there is
+    no code path from `native` to them; a buffer is the pool's own mapping, the title's address is an
+    alias of it, and `PoolTable::resolve` is the only thing between a title address and a GPU
+    address. Nothing is tracked, refreshed or copied. Not wired yet: the call sites in `xmem` that
+    would register the observer (a `Host::memory()` handle is what to pass).
+  - `descriptors`: `descriptor::View` records (what `CreateShaderResourceView` and friends leave in
+    the 32-byte slot as `[tag, index, generation]`) decoded into `Decoded::{Buffer, Image,
+    Sampler}`: raw/typed/structured buffer SRV and UAV ranges (the element size rules of
+    `descriptor/host.rs`), constant buffers, placed buffer views, Texture2D mip ranges, and the
+    console sampler (the same `sampler::Fields` the D3D12 host builds its description from).
+    `NativeHost::mirror(handle)` is the `descriptor::mirror` analogue: decode and `write_buffer` /
+    `write_texture` / `write_sampler`.
+  - `list`: `NativeList`, the recorded calls (pipelines, root constants/views/tables, heaps,
+    dispatch, copy, fill, render targets, clears, vertex/index buffers, draws) with title
+    addresses kept as addresses.
+  - `host`: queues, fences, pipelines, heaps, textures; `execute(queue, lists, waits, signals)`
+    resolves every address, groups commands into compute / blit / render passes and calls
+    `submit_passes`. It never waits; completion is a fence value.
+- **Tests** (`cargo test -p victory-gpu`, macOS arm64, skipped without the Metal Shader Converter): a
+  list recorded as a title would record it, title memory shown at an alias address of the pool, run
+  through `NativeHost`, results read back through the title's alias:
+  `compute_dispatch_writes_title_memory` (GPU copy, GPU fill, root constants and views, a dispatch
+  that writes title memory), `descriptor_table_buffers_decode_into_metal_heap` (descriptors written by
+  the `create_placed_*` device calls, decoded, reached through a root table; a second submission
+  on the same queue waits on the first's fence value), `clear_and_draw_into_render_target` (clear,
+  draw with a texture and sampler through descriptor tables, pixels read back),
+  `unmapped_title_address_is_refused`; plus unit tests of the pool table and the decoders.
+
+### What is left
+
+1. **Title-facing wiring.** `list.rs`, `queue.rs`, `fence.rs`, `device.rs` still end in
+   `cfg(not(windows))` no-ops on macOS: the vtable methods do not yet call `NativeList` / `NativeHost`,
+   and `hold.rs`'s memory-value waits are not connected to `NativeHost::execute` (cut a list at a
+   wait into two `execute` calls, as `list::wait` does into host lists). `resource.rs` must call
+   `register_buffer` / `register_texture` where it makes the objects the views name.
+2. **Textures of the title** (tiled console layouts, placed textures): needs the compute detile
+   reading title memory; `Decoded` returns nothing for `View::Placed` textures and for textures no
+   resource registered. Only host-made textures (render targets, test textures) work.
+3. **Graphics state from the title list**: pipelines come from `render_pipeline(desc)`, not yet
+   from `pipeline.rs`'s translated shaders; blend state, viewport/scissor, stencil, MRT,
+   `ExecuteIndirect`, mesh shaders, queries, 64-bit image atomics, `WriteValue`-style immediate
+   writes (needs a blit or a tiny kernel), present on `CAMetalLayer`.
+4. Plain D3D12 sampler descriptions (13 words, `View::Sampler`) are not decoded.
+5. Buffer views across two adjacent mappings of one pool are refused (`PoolTable::resolve`).
+6. Residency is `useResource` per dispatch / draw for root views; a `MTLResidencySet` over the pool
+   buffers (made at `pool_created`) is the cheaper end state. Pool buffers are dropped at
+   `pool_released` without waiting for in-flight command buffers (Metal retains them for the
+   command buffer, but a title that frees memory the GPU still uses is the title's bug).
+7. The Windows build was only checked with clippy (`--target x86_64-pc-windows-gnullvm`, `-D warnings`)
+   and the existing tests, which this change cannot affect (no Wine run).

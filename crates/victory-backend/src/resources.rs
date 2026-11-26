@@ -109,7 +109,7 @@ pub enum Address {
     Clamp,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerDesc {
     pub min_mag: Filter,
     pub mip: Filter,
@@ -293,9 +293,24 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
     pub draws: Vec<Draw<'a, B>>,
 }
 
+/// A GPU-side buffer operation on title memory (`CopyBufferRegion`, a fill), ordered with the passes around it.
+pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
+    Copy {
+        src: (&'a B::Buffer, *const u8),
+        dst: (&'a B::Buffer, *const u8),
+        len: usize,
+    },
+    Fill {
+        dst: (&'a B::Buffer, *const u8),
+        len: usize,
+        value: u8,
+    },
+}
+
 pub enum Pass<'a, B: GraphicsBackend + ?Sized> {
     Compute(&'a [Dispatch<'a, B>]),
     Render(RenderPass<'a, B>),
+    Blit(Vec<BlitOp<'a, B>>),
 }
 
 /// Like `Submission`, with render passes among the dispatches, run in order.

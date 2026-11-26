@@ -323,7 +323,7 @@ impl Drop for Heap {
 
 /// Bytes per descriptor, by heap type (views, samplers, render targets,
 /// depth).
-fn increment(kind: u32) -> Option<u32> {
+pub(crate) fn increment(kind: u32) -> Option<u32> {
     [32, 16, 128, 128].get(kind as usize).copied()
 }
 
@@ -484,7 +484,7 @@ impl View {
     }
 }
 
-fn record(handle: u64, view: View) {
+pub(crate) fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }

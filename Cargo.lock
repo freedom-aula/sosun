@@ -735,6 +735,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-backend"
+version = "0.1.0"
+
+[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [
@@ -767,7 +771,9 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-backend",
  "victory-formats",
+ "victory-metal",
  "victory-pipeline",
  "victory-shader",
  "windows",
@@ -814,6 +820,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "victory-backend",
 ]
 
 [[package]]

@@ -1,0 +1,11 @@
+[package]
+name = "victory-backend"
+description = "Platform-neutral host GPU traits (queues, fences, title-memory buffers, descriptor heaps, pipelines) that victory-gpu drives."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
