@@ -18,6 +18,9 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// View pairs of the pool-offset contract ([`super::addr`]) written into the heap's reserved
     /// entries so far.
     pub pairs: std::cell::Cell<usize>,
+    /// The page table built for this heap (its view indices are the heap's own) and the pool-table
+    /// generation it is current for.
+    pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):

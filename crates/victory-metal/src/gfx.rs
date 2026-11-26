@@ -45,7 +45,7 @@ pub struct Heap {
     kind: HeapKind,
     count: usize,
     /// What each entry names, kept alive here and made resident with the heap.
-    refs: RefCell<Vec<Option<Res>>>,
+    refs: RefCell<std::collections::HashMap<usize, Res>>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
@@ -242,7 +242,7 @@ impl Metal {
                 set.addAllocation(ProtocolObject::from_ref(&*r));
                 heap.dirty.set(true);
             }
-            heap.refs.borrow_mut()[index] = Some(r);
+            heap.refs.borrow_mut().insert(index, r);
         }
     }
 
@@ -266,7 +266,7 @@ impl Metal {
             return;
         }
         use_res(ProtocolObject::from_ref(&*heap.buf));
-        heap.refs.borrow().iter().flatten().for_each(|r| use_res(r));
+        heap.refs.borrow().values().for_each(|r| use_res(r));
     }
 
     fn stage_function(
@@ -375,7 +375,7 @@ impl ResourceBackend for Metal {
             buf,
             kind,
             count,
-            refs: RefCell::new(vec![None; count]),
+            refs: RefCell::default(),
             set,
             dirty: Cell::new(false),
         })

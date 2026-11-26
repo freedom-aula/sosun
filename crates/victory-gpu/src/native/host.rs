@@ -36,9 +36,6 @@ pub struct NativeHost<B: GraphicsBackend> {
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
     pairs: Pairs,
-    /// The pool-table generation `table` was built for.
-    generation: Option<u64>,
-    table: Option<Rc<Pages<B>>>,
     /// Superseded tables, kept while submissions that read them may still run.
     // shortcut: the GPU is assumed not to be more than `RETIRED` table rebuilds behind.
     retired: VecDeque<Rc<Pages<B>>>,
@@ -52,8 +49,6 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     fn default() -> Self {
         Contract {
             pairs: Pairs::default(),
-            generation: None,
-            table: None,
             retired: VecDeque::new(),
             null: None,
             heap: None,
@@ -182,22 +177,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
         start: u64,
         count: usize,
     ) -> Result<Rc<NativeHeap<B>>, String> {
-        // A resource heap is as long as the translator's clamp of heap indices, whose last entries
-        // hold the pool-offset contract's views.
+        // A resource heap is longer than the title made it by the entries that hold the pool-offset
+        // contract's view pairs.
         let entries = if kind == HeapKind::Resource {
-            count.max(addr::HEAP_ENTRIES)
+            if !addr::fits(count) {
+                tracing::warn!(
+                    count,
+                    "a resource heap too long for title memory views: shaders that find memory by address will not run with it"
+                );
+            }
+            count + addr::RESERVED
         } else {
             count
         };
-        if kind == HeapKind::Resource && count > addr::FIRST_PAIR as usize {
-            tracing::warn!(count, "a resource heap reaches into the entries the host keeps for title memory views");
-        }
         let heap = Rc::new(NativeHeap {
             heap: self.backend.create_heap(kind, entries)?,
             kind,
             start,
             count,
             pairs: Default::default(),
+            table: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -339,12 +338,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
-    /// The page table of the pool-offset contract for the pool table as it is now: rebuilt, into
-    /// a buffer of its own, when a pool or a mapping changed since it was made.
-    fn memory_table(&self) -> Result<Rc<Pages<B>>, String> {
-        let mut c = self.contract.borrow_mut();
+    /// The page table of the pool-offset contract for `heap` and the pool table as it is now:
+    /// rebuilt, into a buffer of its own, when a pool or a mapping changed since it was made.
+    fn memory_table(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
+        if !addr::fits(heap.count) {
+            return Err(format!(
+                "a resource heap of {} entries has no room for title memory views",
+                heap.count
+            ));
+        }
         let (generation, mappings) = self.memory.mappings();
-        if let (Some(t), true) = (&c.table, c.generation == Some(generation)) {
+        if let Some((g, t)) = &*heap.table.borrow()
+            && *g == generation
+        {
             return Ok(t.clone());
         }
         let maps: Vec<Mapping> = mappings
@@ -358,16 +364,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 offset: *offset as u64,
             })
             .collect();
-        let words = addr::build(&maps, &mut c.pairs);
+        let mut c = self.contract.borrow_mut();
+        let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
         table.write(&words);
-        if let Some(old) = c.table.replace(table.clone()) {
+        if let Some((_, old)) = heap.table.borrow_mut().replace((generation, table.clone())) {
             c.retired.push_back(old);
             while c.retired.len() > RETIRED {
                 c.retired.pop_front();
             }
         }
-        c.generation = Some(generation);
         Ok(table)
     }
 
@@ -377,7 +383,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let have = heap.pairs.get();
         let want = c.pairs.keys.len() + 1;
         for n in have..want {
-            let index = addr::pair_index(n as u32) as usize;
+            let index = addr::pair_index(heap.count as u32, n as u32) as usize;
             let (buffer, ptr, size) = if n == 0 {
                 if c.null.is_none() {
                     c.null = Some(Rc::new(Pages::new(&self.backend, 1)?));
@@ -406,11 +412,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         heap: Option<&Rc<NativeHeap<B>>>,
         p: &mut Prep<B>,
     ) -> Result<(), String> {
-        let table = self.memory_table()?;
         let heap = match heap {
             Some(h) => h.clone(),
             None => self.host_heap()?,
         };
+        let table = self.memory_table(&heap)?;
         self.write_pairs(&heap)?;
         let gpu = self.backend.gpu_address(&table.buf, table.ptr());
         p.bufs.push(table.buf.clone());
@@ -425,11 +431,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(h.clone());
         }
         let heap = Rc::new(NativeHeap {
-            heap: self.backend.create_heap(HeapKind::Resource, addr::HEAP_ENTRIES)?,
+            heap: self.backend.create_heap(HeapKind::Resource, addr::RESERVED)?,
             kind: HeapKind::Resource,
             start: 0,
             count: 0,
             pairs: Default::default(),
+            table: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)

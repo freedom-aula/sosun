@@ -141,6 +141,9 @@
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
+//!   With [`Options::zero_copy_memory`] (the native Metal host, whose views are of the title's own
+//!   memory) nothing is marked: no `u0` ([`HostShader::memory_writes`] is false), no atomics, and
+//!   a miss is the null view, unrecorded.
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
 //!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
 //!   and an image descriptor's dwords 1-3 read only for sizes come from the

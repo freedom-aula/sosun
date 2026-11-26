@@ -14,9 +14,9 @@
 //!   pool table gives each of its 64 KiB pages `(pair of views of the pool buffer, start)`. There
 //!   is one SRV/UAV pair of descriptors (two identical entries) per `(pool, 2 GiB chunk)`, a
 //!   [`CHUNK`] plus a page long, because a view's size is 32 bits. The pairs live at fixed
-//!   resource-heap indices at the top of every resource heap ([`FIRST_PAIR`], in the
-//!   range the translator clamps heap indices to), so one table serves every heap, and a heap is
-//!   at least [`HEAP_ENTRIES`] long. Pair 0 is the null view (size 0, bounds-checked by the
+//!   resource-heap indices just past the title's own entries of the heap the shader runs with
+//!   (a heap is [`RESERVED`] entries longer than the title made it, and has a table of its own,
+//!   whose view indices say where). Pair 0 is the null view (size 0, bounds-checked by the
 //!   converter): what a page no pool shows reads as, with its writes dropped.
 //! * `Options::zero_copy_memory`: the shader marks no pages and binds no bitmap, so the table is
 //!   all the host binds besides the heap.
@@ -29,7 +29,6 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::rc::Rc;
 use victory_backend::backend::ComputeBackend;
-use victory_shader::emit::HEAP_VIEWS;
 
 /// Bytes of a title page of the table (the console's allocation granularity).
 pub const PAGE: u64 = 1 << 16;
@@ -37,10 +36,14 @@ pub const PAGE: u64 = 1 << 16;
 pub const CHUNK: u64 = 1 << 31;
 /// Pairs of views the host writes into every resource heap (pair 0 is the null view).
 pub const PAIRS: usize = 256;
-/// Heap index of pair 0, SRV; the UAV is the next entry. Below the translator's own null view.
-pub const FIRST_PAIR: u32 = HEAP_VIEWS - 16 - 2 * PAIRS as u32;
-/// The entries a resource heap needs for the translator's clamp of heap indices.
-pub const HEAP_ENTRIES: usize = HEAP_VIEWS as usize;
+/// Entries the host adds to every resource heap, for the view pairs.
+pub const RESERVED: usize = 2 * PAIRS;
+
+/// Whether a resource heap of `count` entries has its pairs below the translator's clamp of heap
+/// indices (and its own null view).
+pub fn fits(count: usize) -> bool {
+    count + RESERVED < victory_shader::emit::NULL_BUFFER_VIEW as usize
+}
 
 /// Level 1 of the table: 4096 dwords (address bits 28-39), a level-2 block number.
 const LEVEL_1: usize = 4096;
@@ -96,22 +99,22 @@ impl Pairs {
     }
 }
 
-/// Heap index of the SRV of pair `n`.
-pub fn pair_index(n: u32) -> u32 {
-    FIRST_PAIR + 2 * n
+/// Heap index of the SRV of pair `n` in a heap whose pairs start at `first` (its title entries).
+pub fn pair_index(first: u32, n: u32) -> u32 {
+    first + 2 * n
 }
 
 /// The page table, in dwords: level 1, then the null block 0, then the blocks the mappings reach.
-pub fn build(maps: &[Mapping], pairs: &mut Pairs) -> Vec<u32> {
-    let null = pair_index(0);
+pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
+    let null = pair_index(first, 0);
     let mut words = vec![0u32; LEVEL_1];
     for _ in 0..BLOCK / 2 {
         words.extend([null, 0]);
     }
     for m in maps {
-        let first = m.at.next_multiple_of(PAGE);
+        let from = m.at.next_multiple_of(PAGE);
         let end = (m.at + m.len) & !(PAGE - 1);
-        for page in (first..end).step_by(PAGE as usize) {
+        for page in (from..end).step_by(PAGE as usize) {
             // Addresses of 40 bits only; the translator sends the rest to block 0.
             if page >> 40 != 0 {
                 break;
@@ -134,7 +137,7 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs) -> Vec<u32> {
             }
             let at = LEVEL_1 + words[l1] as usize * BLOCK + 2 * ((page >> 16) as usize & 0xFFF);
             let in_view = pool_at - key.chunk * CHUNK;
-            words[at] = pair_index(pair);
+            words[at] = pair_index(first, pair);
             words[at + 1] = (page as u32).wrapping_sub(in_view as u32);
         }
     }
@@ -209,6 +212,9 @@ impl<B: ComputeBackend> Drop for Pages<B> {
 mod tests {
     use super::*;
 
+    /// Where a heap of a thousand title entries has its pairs.
+    const FIRST: u32 = 1000;
+
     fn map(at: u64, len: u64, pool: usize, pool_len: u64, offset: u64) -> Mapping {
         Mapping {
             at,
@@ -223,7 +229,7 @@ mod tests {
     /// What the lookup says an address of the title is: the pair's view and where in the pool.
     fn resolve(words: &[u32], pairs: &Pairs, va: u64) -> Option<(usize, u64)> {
         let (view, offset) = lookup(words, va)?;
-        let key = pairs.keys[((view - FIRST_PAIR) / 2 - 1) as usize];
+        let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
         Some((key.pool, key.chunk * CHUNK + u64::from(offset)))
     }
 
@@ -236,7 +242,7 @@ mod tests {
             map(0x7000_0000, 0x10_0000, 1, 0x40_0000, 0x2_0000),
             map(0x20_0000_0000, 0x2_0000, 2, 0x2_0000, 0),
         ];
-        let words = build(&maps, &mut pairs);
+        let words = build(&maps, &mut pairs, FIRST);
         assert_eq!(resolve(&words, &pairs, 0x12_3450_0000), Some((1, 0)));
         assert_eq!(resolve(&words, &pairs, 0x12_3450_1234), Some((1, 0x1234)));
         assert_eq!(resolve(&words, &pairs, 0x12_347F_FFFC), Some((1, 0x2F_FFFC)));
@@ -256,13 +262,13 @@ mod tests {
         let mut pairs = Pairs::default();
         let len = 3 * CHUNK + 0x3_0000;
         let at = 0x40_0000_0000u64;
-        let words = build(&[map(at, len, 5, len, 0)], &mut pairs);
+        let words = build(&[map(at, len, 5, len, 0)], &mut pairs, FIRST);
         for off in [0, CHUNK - 4, CHUNK, CHUNK + 4, 2 * CHUNK + 0x1234, 3 * CHUNK + 0x2_FFFC] {
             let r = resolve(&words, &pairs, at + off).unwrap();
             assert_eq!(r, (5, off), "{off:#x}");
             // The offset is inside the view of that pair (a chunk and a page long, to the pool's end).
             let (view, o) = lookup(&words, at + off).unwrap();
-            let key = pairs.keys[((view - FIRST_PAIR) / 2 - 1) as usize];
+            let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
             let (_, size) = Pairs::span(&key);
             assert!(u64::from(o) + 4 <= u64::from(size), "{off:#x}");
         }
@@ -274,7 +280,7 @@ mod tests {
         let mut pairs = Pairs::default();
         // From 16 KiB past a 64 KiB boundary, to a 16 KiB-aligned pool offset: the first partial
         // page is null, the four whole ones after it are not, and the last partial one is null.
-        let words = build(&[map(0x1000_4000, 0x4_C000, 1, 0x10_0000, 0x4000)], &mut pairs);
+        let words = build(&[map(0x1000_4000, 0x4_C000, 1, 0x10_0000, 0x4000)], &mut pairs, FIRST);
         assert_eq!(resolve(&words, &pairs, 0x1000_4000), None);
         for va in [0x1001_0000u64, 0x1004_FFFC] {
             assert_eq!(resolve(&words, &pairs, va), Some((1, 0x4000 + va - 0x1000_4000)));
@@ -283,7 +289,7 @@ mod tests {
         assert_eq!(resolve(&words, &pairs, 0x1010_0000), None);
         // A mapping whose last page runs past the pool is null there.
         let mut pairs = Pairs::default();
-        let words = build(&[map(0x2000_0000, 0x2_0000, 1, 0x1_8000, 0)], &mut pairs);
+        let words = build(&[map(0x2000_0000, 0x2_0000, 1, 0x1_8000, 0)], &mut pairs, FIRST);
         assert_eq!(resolve(&words, &pairs, 0x2000_0000), Some((1, 0)));
         assert_eq!(resolve(&words, &pairs, 0x2001_0000), None);
     }
@@ -292,21 +298,21 @@ mod tests {
     fn views_are_stable_and_bounded() {
         let mut pairs = Pairs::default();
         let a = map(0x1000_0000, 0x1_0000, 1, 0x1_0000, 0);
-        build(&[a], &mut pairs);
+        build(&[a], &mut pairs, FIRST);
         let first = pairs.keys.clone();
         // The same pool at another address, and one more pool: earlier pairs keep their numbers.
-        build(&[a, map(0x2000_0000, 0x1_0000, 2, 0x1_0000, 0)], &mut pairs);
+        build(&[a, map(0x2000_0000, 0x1_0000, 2, 0x1_0000, 0)], &mut pairs, FIRST);
         assert_eq!(pairs.keys[..1], first[..]);
         assert_eq!(pairs.keys.len(), 2);
         // Past the heap's reserved entries pages are null, not another pair's.
         let many: Vec<Mapping> = (0..PAIRS as u64 * 2)
             .map(|i| map(0x10_0000_0000 + i * PAGE, PAGE, 100 + i as usize, PAGE, 0))
             .collect();
-        let words = build(&many, &mut pairs);
+        let words = build(&many, &mut pairs, FIRST);
         assert_eq!(pairs.keys.len(), PAIRS - 1);
         assert_eq!(resolve(&words, &pairs, 0x10_0000_0000 + 2 * PAGE).unwrap().0, 102);
         assert_eq!(resolve(&words, &pairs, 0x10_0000_0000 + (PAIRS as u64 * 2 - 1) * PAGE), None);
         // The pairs and the translator's own null views fit below the clamp.
-        assert!(pair_index(PAIRS as u32) < victory_shader::emit::NULL_BUFFER_VIEW);
+        assert!(fits(1_000_000) && !fits(victory_shader::emit::NULL_BUFFER_VIEW as usize));
     }
 }
