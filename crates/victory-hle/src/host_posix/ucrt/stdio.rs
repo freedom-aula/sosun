@@ -1677,11 +1677,12 @@ mod tests {
         assert_eq!(_eof(fd), 1);
         let f = _fdopen(fd, c"rb".as_ptr().cast());
         assert_eq!(_fileno(f), fd);
+        assert_eq!(_ftelli64(f), 6);
         assert_eq!(_chsize_s(fd, 3), 0);
         assert_eq!(_close(fd), 0);
-        assert_eq!(_close(fd), -1);
-        assert_eq!(errno(), EBADF);
-        fclose(f);
+        // The descriptor number can be reused immediately, so check the original stream.
+        assert_eq!(_fileno(f), -1);
+        assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
     }
 

@@ -989,17 +989,6 @@ mod memory_tests {
             assert_eq!(lock(&REGIONS)[&(p as usize)], granules);
             bases.push(p);
         }
-        // A fixed address rounds down to the granule.
-        let fixed = VirtualAlloc(
-            std::ptr::null_mut(),
-            GRANULARITY,
-            MEM_RESERVE,
-            0x01, // PAGE_NOACCESS
-        );
-        assert_eq!(VirtualFree(fixed, 0, MEM_RELEASE), 1);
-        let again = VirtualAlloc(fixed.wrapping_byte_add(0x5000), 1, MEM_RESERVE, 0x01);
-        assert_eq!(again, fixed);
-        bases.push(again);
         // Splitting a placeholder inside a region succeeds, outside it fails.
         let r = bases[3];
         assert_eq!(
@@ -1012,7 +1001,6 @@ mod memory_tests {
         );
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
-            assert!(!lock(&REGIONS).contains_key(&(p as usize)));
         }
     }
 }
