@@ -1166,6 +1166,67 @@ pub fn wanted_early(key: &str) -> bool {
     library::wanted_early(key)
 }
 
+/// A descriptor changed after loading, on the native host's own path.
+#[cfg(all(test, target_os = "macos"))]
+mod changed_descriptor_tests {
+    use super::*;
+
+    /// The container made from a compute description's pieces (wave32, 32 threads, 5 user SGPRs,
+    /// a raw UAV of the table at user data 4), translated with the host's options, is refused
+    /// naming the dword the code changed after loading it and how: the text the refusal log line
+    /// shows.
+    #[test]
+    fn the_host_refuses_a_descriptor_changed_after_loading_naming_the_dword() {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let program = |change: &[u32]| {
+            let mut code = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            ];
+            code.extend_from_slice(change);
+            code.extend([
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ]);
+            let code = words(&code);
+            // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
+            let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
+            let mut uav = [0u8; 32];
+            uav[0] = 0x41;
+            uav[4..6].copy_from_slice(&[3, 3]);
+            uav[16] = 1;
+            uav[20..23].copy_from_slice(&[4, 4, 0]);
+            let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+            metadata.extend([0x40, 4, 1, 0]);
+            metadata.extend(uav);
+            metadata.extend([0x43].into_iter().chain([0; 31]));
+            let size = metadata.len() as u32 - 0x14;
+            metadata[4..8].copy_from_slice(&size.to_le_bytes());
+            let pieces = [registers, vec![0; 0x14], code, metadata];
+            let mut record = Vec::new();
+            for p in &pieces {
+                record.extend((p.as_ptr() as u64).to_le_bytes());
+                record.extend((p.len() as u64).to_le_bytes());
+            }
+            // SAFETY: four pairs over live vectors.
+            unsafe { compute_container(None, record.as_ptr()) }.expect("a container")
+        };
+        let prefix = "a descriptor changed after loading: ";
+        for (change, why) in [
+            (&[0xBE8A_03C0][..], "dword 2 is a constant"), // s_mov_b32 s10, 64
+            // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
+            (&[0x8008_9008, 0x8209_8009], "dword 0 added to (s_add, s_sub...)"),
+        ] {
+            let err = crate::native::shaders::translate(&program(change)).err().expect("refused");
+            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]

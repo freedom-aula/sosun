@@ -311,6 +311,21 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C locale's). A failed invalid-parameter check calls the title's handler if it set one and returns the error; it does not terminate. `_endthread(ex)` is not served (it needs an exit primitive in the loader's thread spawn); `_get_osfhandle`/`_open_osfhandle`, `_ecvt`/`_fcvt`/`_gcvt`, positional `%1$d` formats and the `_mbs*` multibyte-string family are not either. `ucrt::tests::every_ucrt_import_of_a_dry_run_is_served` checks a `--list-imports` output when `VICTORY_UCRT_IMPORTS` names it. The probe (`probe_ucrt` in `tests/fixtures/native-probe/probe.c`) links `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll` and runs 17 checks under Rosetta.
 
+## Descriptors changed after loading
+
+A buffer or image descriptor whose dwords are not one load's consecutive dwords, though one of
+them is loaded, was refused as "a descriptor changed after loading" (34 compute programs in the
+story-load log of issue #123). The forms the translator reads stay as they were (a descriptor made
+raw for byte accesses, `made_raw`). Any other is now refused naming the first dword that is not the
+load's next one and what made it (`Tracer::changed`), after that text and a colon: "dword N is a
+constant", "comes from another load or place in it", "masked or merged (s_and, s_or, s_bfi...)",
+"added to (s_add, s_sub...)", "shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)",
+"chosen by a select or a join", "is a program input" or "computed otherwise". Nothing new is
+lowered: the next tester log tells which forms to lower (a V# base address moved by an offset in
+dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
+`pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
+path: the container made from the title's pieces, the host's options.
+
 ## Known limits of this slice
 
 - Only x86-64 hosts run title code; `native::image` also builds and tests on arm64.
@@ -318,6 +333,7 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - `VirtualAlloc` reserves 64 KiB granules at 64 KiB boundaries; `VirtualFree(MEM_RELEASE)` takes a base from `VirtualAlloc` only.
 - `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory, or of a range `XMemMapPhysicalPages` mapped into, gives its physical-page views back too (`xmem_posix::forget_physical`, as `XMemFreeDefault` does). It used to give back only the address space, so the freed pool stayed in the GPU's pool table and the aliases at an address the next allocation was given: two memories at one title address (issue #15).
 - `VirtualFree(MEM_DECOMMIT)` over physical-page views (`XMemVirtualAlloc`'s pool backing, `XMemMapPhysicalPages`) keeps the views and makes them no access, instead of decommitting them (`xmem_physical::decommit`); the rest of the range is decommitted as before. Decommitting put anonymous pages in place of the pool's while the views and the GPU's pool table still showed the pool, so after a recommit the title wrote one memory and the GPU and aliases read another (issue #15). Windows only promises that a recommitted page reads zeros, so a page is zeroed when it is `XMemVirtualAlloc`'s pool backing and no other address shows it: no one else can read it. Other pages keep their bytes, since a page shown at other addresses (aliases, `map_alias`) is still read there, and pages `XMemAllocatePhysicalPages` made outlive their mappings (the title may map them again). Guess: the console keeps those pages' contents too; what it does is unknown, and `VICTORY_TRACE_OWNERS` names such a decommit. Zeroing touches every page it zeroes, also those never written.
+- File calls (`CreateFileW` and the rest, `host_posix::files::win32_error`) report host errors as Windows does, from one table shared with other callers (`win32_errors::code`, the UCRT's `_dosmaperr` read backwards): `EMFILE` and `ENFILE` are `ERROR_TOO_MANY_OPEN_FILES`, `EBADF` `ERROR_INVALID_HANDLE`, `ENOMEM` `ERROR_NOT_ENOUGH_MEMORY`, `EXDEV` `ERROR_NOT_SAME_DEVICE`, `EINVAL` `ERROR_INVALID_PARAMETER`, `ENOSPC` `ERROR_DISK_FULL`, and as before `ENOENT` (`ERROR_PATH_NOT_FOUND` when the parent folder is missing too), `EACCES`, `EEXIST` and `ENOTEMPTY`. Any other host error is still `ERROR_ACCESS_DENIED`; those above used to be too.
 - TLS images must be registered before the threads that use them; thread notices go to every registered image on every title thread.
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
