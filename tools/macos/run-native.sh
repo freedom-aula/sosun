@@ -1,8 +1,9 @@
 #!/bin/bash
 # Runs the game natively and keeps a log you can attach to a tester report.
-# Usage: tools/macos/run-native.sh [--headless] [--seconds N] <game folder or .exe>
-#   --headless   no window; frames go to an offscreen layer
-#   --seconds N  stop the run after N seconds (default: run until you close it)
+# Usage: tools/macos/run-native.sh [--headless] [--seconds N] [--console series-x|series-s] <game folder or .exe>
+#   --headless            no window; frames go to an offscreen layer
+#   --seconds N           stop the run after N seconds (default: run until you close it)
+#   --console MODEL       console model reported to the game (default: series-s on <=16 GB Macs, else series-x)
 # Extra VICTORY_* variables in your environment are passed through
 # (see docs/native-host.md, "Bring-up diagnostics").
 set -uo pipefail
@@ -10,15 +11,29 @@ cd "$(dirname "$0")/../.."
 
 headless=()
 seconds=0
+console=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --headless) headless=(--headless); shift ;;
     --seconds) seconds="$2"; shift 2 ;;
-    -h|--help) sed -n 2,8p "$0"; exit 0 ;;
+    --console) console="$2"; shift 2 ;;
+    --console=*) console="${1#--console=}"; shift ;;
+    -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) break ;;
   esac
 done
-[[ $# -eq 1 ]] || { sed -n 2,8p "$0"; exit 2; }
+[[ $# -eq 1 ]] || { sed -n 2,9p "$0"; exit 2; }
+
+ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+if [[ -z "$console" ]]; then
+  # Series X reports 13.5 GiB of title memory, which exceeds Metal's working
+  # set on 16 GB Macs (#8). Default <=16 GB Macs to Series S (7.6 GiB).
+  if (( ram_gb <= 16 )); then
+    console="series-s"
+  else
+    console="series-x"
+  fi
+fi
 
 target="$1"
 if [[ -d "$target" ]]; then
@@ -36,19 +51,17 @@ run_dir="runs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run_dir"
 log="$run_dir/victory.log"
 {
-  echo "# $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+  echo "# $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), ${ram_gb} GB, console=${console}"
   echo "# commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
-# There is no live keyboard or gamepad yet: press Enter (the pad's A) every 2 s
-# from 4 s to 80 s so the game gets past its "press A" start screen.
-# shortcut: scripted presses, until real input reaches GameInput.
+# Press Enter (the pad's A) every 2 s from 4 s to 80 s unless VICTORY_KEYS is set.
 export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"
-echo "Running $exe"
+echo "Running $exe (console=$console)"
 echo "Log: $log"
 
-"$bin" run --execute ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
+"$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
 if (( seconds > 0 )); then
   ( sleep "$seconds"; kill "$pid" 2>/dev/null ) &
