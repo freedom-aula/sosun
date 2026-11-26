@@ -293,8 +293,10 @@ fn to_f64(f: &Float) -> f64 {
             mantissa,
             exponent,
         } => {
-            let v = *mantissa as f64 * 2f64.powi((*exponent).clamp(-2200, 2200));
-            let v = if v.is_nan() { f64::INFINITY } else { v };
+            // One exact scaling: a power of two computed apart underflows to 0 below 2^-1022 and
+            // makes 0 * inf for a zero mantissa with a large exponent.
+            // SAFETY: libm's scalbn is a pure function of its arguments.
+            let v = unsafe { super::libc::scalbn(*mantissa as f64, *exponent) };
             if *negative { -v } else { v }
         }
         Float::Inf(n) => {
@@ -994,6 +996,23 @@ mod tests {
         assert_eq!(strtod(b"1e999\0".as_ptr(), &mut end), f64::INFINITY);
         assert_eq!(super::super::errno(), ERANGE);
         assert_eq!(wcstod(w("2.25 ").as_ptr(), std::ptr::null_mut()), 2.25);
+    }
+
+    #[test]
+    fn hex_doubles_scale_exactly_at_both_ends() {
+        let hex = |s: &[u8]| {
+            set_errno(0);
+            let v = strtod(s.as_ptr(), std::ptr::null_mut());
+            (v, super::super::errno())
+        };
+        // What printf's %a writes for 2^-1000, and the smallest subnormal.
+        assert_eq!(hex(b"0x1.0000000000000p-1000\0"), (2f64.powi(-1000), 0));
+        assert_eq!(hex(b"0x1p-1074\0"), (f64::from_bits(1), 0));
+        assert_eq!(hex(b"-0x1.8p-1073\0"), (-f64::from_bits(3), 0));
+        assert_eq!(hex(b"0x1.fffffffffffffp1023\0"), (f64::MAX, 0));
+        // A zero mantissa is zero whatever its exponent.
+        assert_eq!(hex(b"0x0p2000\0"), (0.0, 0));
+        assert_eq!(hex(b"0x1p1024\0"), (f64::INFINITY, ERANGE));
     }
 
     #[test]
