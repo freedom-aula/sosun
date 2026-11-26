@@ -86,6 +86,17 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
+/// Title texels as the host format holds them: DXGI `B4G4R4A4_UNORM` (115) has blue in the low
+/// nibble and alpha in the top one, Metal's `ABGR4Unorm` alpha low and red top. The host's own
+/// writes and reads agree with each other, so only bytes from title memory are converted.
+pub fn to_host(format: u32, texels: &mut [u8]) {
+    if format == 115 {
+        for t in texels.as_chunks_mut::<2>().0 {
+            *t = u16::from_le_bytes(*t).rotate_left(4).to_le_bytes();
+        }
+    }
+}
+
 /// Detiles every mip of every slice of `tiled` (the texture's whole memory) into `tex`.
 pub fn upload<B: ResourceBackend>(
     backend: &B,
@@ -110,6 +121,7 @@ pub fn upload<B: ResourceBackend>(
             layout
                 .detile(tiled, mip, slice, &mut linear, row, slice_pitch)
                 .map_err(|e| format!("detile mip {mip} slice {slice}: {e:?}"))?;
+            to_host(info.format, &mut linear);
             backend.upload_texture(tex, mip as usize, slice as usize, &linear, row, slice_pitch);
         }
     }

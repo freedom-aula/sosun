@@ -122,6 +122,8 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
         Format::Bc1Srgb => MTLPixelFormat::BC1_RGBA_sRGB,
         Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        Format::Bgr5a1Unorm => MTLPixelFormat::BGR5A1Unorm,
+        Format::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
     }
 }
 

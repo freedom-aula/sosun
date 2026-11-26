@@ -430,3 +430,21 @@ fn texture_over_zero_copy_memory() {
     a.write(base, &px(60));
     check(60);
 }
+
+/// The packed 16-bit formats' bit order: `BGR5A1Unorm` is DXGI's `B5G5R5A1_UNORM` (blue in the low
+/// bits, alpha the top one); `ABGR4Unorm` has alpha in the low nibble and red in the top one, where
+/// DXGI's `B4G4R4A4_UNORM` has blue low and alpha top.
+#[test]
+fn packed_16_bit_channel_order() {
+    let Some(m) = backend() else { return };
+    let rgba = [[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    for (f, px, want) in [
+        (Format::Bgr5a1Unorm, [0x001fu16, 0x03e0, 0x7c00, 0x8000], rgba),
+        (Format::Abgr4Unorm, [0x00f0, 0x0f00, 0xf000, 0x000f], rgba),
+    ] {
+        let t = m.create_texture(&d2(f, 2, 2)).unwrap();
+        m.upload_texture(&t, 0, 0, bytes(&px), 4, 0);
+        let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [2, 2], z: 1, filter: Filter::Nearest };
+        assert_eq!(g.run(&t), want, "{f:?}");
+    }
+}

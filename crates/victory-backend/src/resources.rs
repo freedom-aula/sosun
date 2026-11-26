@@ -59,6 +59,10 @@ pub enum Format {
     D16Unorm,
     Bc1Srgb,
     Bc3Srgb,
+    /// Metal's `BGR5A1Unorm`.
+    Bgr5a1Unorm,
+    /// Metal's `ABGR4Unorm`.
+    Abgr4Unorm,
 }
 
 impl Format {
@@ -74,7 +78,7 @@ impl Format {
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
             R8Unorm | A8Unorm | R8Uint => (1, 1),
-            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint => (1, 2),
+            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),
         }
     }
