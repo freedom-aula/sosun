@@ -94,8 +94,55 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
+        .or_insert_with(|| {
+            let s = Arc::new(Shader::new(stage, bytes));
+            // Tests that read containers back would race the translation, which lets them go.
+            #[cfg(target_os = "macos")]
+            if !cfg!(test) || stage == "prewarm-test" {
+                prewarm(&s);
+            }
+            s
+        })
         .clone()
+}
+
+/// Translate `shader` ahead on a host worker, so the title's thread finds it done when it first
+/// binds it: ~1,300 first binds at the first world frame would otherwise translate inline, tens
+/// of seconds in all, past the title's own watchdog. `native()` is a `OnceLock`, so whoever gets
+/// there first does the work. `VICTORY_NO_SHADER_PREWARM=1` turns this off.
+#[cfg(target_os = "macos")]
+fn prewarm(shader: &Arc<Shader>) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    static POOL: OnceLock<Option<std::sync::mpsc::Sender<Arc<Shader>>>> = OnceLock::new();
+    static QUEUED: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    let pool = POOL.get_or_init(|| {
+        if std::env::var_os("VICTORY_NO_SHADER_PREWARM").is_some_and(|v| !v.is_empty() && v != "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<Shader>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..6 {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(move || {
+                loop {
+                    let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                    let Ok(s) = next else { break };
+                    let _ = s.native();
+                    let n = DONE.fetch_add(1, Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::info!("shaders prewarmed n={n} pending={}", QUEUED.load(Relaxed).saturating_sub(n));
+                    }
+                }
+            });
+        }
+        tracing::info!("shader prewarm pool started (6 threads)");
+        Some(tx)
+    });
+    if let Some(tx) = pool {
+        QUEUED.fetch_add(1, Relaxed);
+        let _ = tx.send(shader.clone());
+    }
 }
 
 impl Shader {
@@ -1131,6 +1178,18 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// A registered shader is translated without anyone calling `native()`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registered_shaders_translate_ahead() {
+        let s = shader("prewarm-test", b"not a container, prewarm test");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.native.get().is_none() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(s.native.get().is_some_and(|r| r.is_err()));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
