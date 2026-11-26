@@ -848,6 +848,31 @@ pub extern "system" fn _mbstrlen(s: *const u8) -> usize {
     }
 }
 
+/// The bytes of `s` that make its first `units` UTF-16 units, whole characters only.
+fn bytes_for_units(s: &[u8], units: usize) -> usize {
+    let (mut i, mut made) = (0, 0);
+    while let Ok((cp, len)) = decode(&s[i..]) {
+        let w = if cp >= 0x10000 { 2 } else { 1 };
+        if made + w > units {
+            break;
+        }
+        (made, i) = (made + w, i + len);
+    }
+    i
+}
+
+/// The UTF-16 units of `s` that make its first `bytes` UTF-8 bytes, whole characters only.
+fn units_for_bytes(s: &[u16], bytes: usize) -> usize {
+    let (mut i, mut made) = (0, 0);
+    for c in char::decode_utf16(s.iter().copied()).map_while(Result::ok) {
+        if made + c.len_utf8() > bytes {
+            break;
+        }
+        (made, i) = (made + c.len_utf8(), i + c.len_utf16());
+    }
+    i
+}
+
 /// `mbsrtowcs(dst, &src, n, state)`: advances `*src` past what was converted.
 pub extern "system" fn mbsrtowcs(
     dst: *mut u16,
@@ -859,13 +884,15 @@ pub extern "system" fn mbsrtowcs(
     let s = unsafe { *src };
     let n = mbstowcs(dst, s, count);
     if n != FAILED && !dst.is_null() {
-        // SAFETY: the title's pointer; all of the string was taken or the buffer filled.
+        // SAFETY: the title's pointer: null once the whole string and its NUL are stored, else
+        // just past the last character converted.
         unsafe {
-            let all = super::bytes(s).len();
-            *src = if n < count {
+            let all = super::bytes(s);
+            let used = bytes_for_units(all, n);
+            *src = if used == all.len() && n < count {
                 std::ptr::null()
             } else {
-                s.add(all.min(n))
+                s.add(used)
             };
         }
     }
@@ -882,13 +909,15 @@ pub extern "system" fn wcsrtombs(
     let s = unsafe { *src };
     let n = wcstombs(dst, s, count);
     if n != FAILED && !dst.is_null() {
-        // SAFETY: the title's pointer.
+        // SAFETY: the title's pointer, as in `mbsrtowcs`: whole characters are written, so a
+        // character that does not fit stops the conversion with room left.
         unsafe {
-            let all = super::wide(s).len();
-            *src = if n < count {
+            let all = super::wide(s);
+            let used = units_for_bytes(all, n);
+            *src = if used == all.len() && n < count {
                 std::ptr::null()
             } else {
-                s.add(all)
+                s.add(used)
             };
         }
     }
@@ -1116,5 +1145,32 @@ mod tests {
         assert_eq!(mbrtowc(&mut c, [0xE2u8, 0x82].as_ptr(), 2, 0) as isize, -2);
         assert_eq!(wctomb(back.as_mut_ptr(), 0x20AC), 3);
         assert_eq!(wcrtomb(back.as_mut_ptr(), 0xD800, 0), FAILED);
+    }
+
+    #[test]
+    fn restartable_conversions_resume_after_the_last_character_converted() {
+        // é (2 bytes), € (3 bytes), x: three UTF-16 units.
+        let narrow = "é€x\0".as_bytes();
+        let mut src = narrow.as_ptr();
+        let mut wide = [0u16; 4];
+        assert_eq!(mbsrtowcs(wide.as_mut_ptr(), &mut src, 2, 0), 2);
+        assert_eq!(src as usize - narrow.as_ptr() as usize, 5);
+        assert_eq!(mbsrtowcs(wide[2..].as_mut_ptr(), &mut src, 2, 0), 1);
+        assert!(src.is_null());
+        assert_eq!(String::from_utf16(&wide[..3]).unwrap(), "é€x");
+        // A full buffer that holds every character leaves `*src` on the NUL.
+        src = narrow.as_ptr();
+        assert_eq!(mbsrtowcs(wide.as_mut_ptr(), &mut src, 3, 0), 3);
+        assert_eq!(src as usize - narrow.as_ptr() as usize, 6);
+
+        let units = w("é€x");
+        let mut src = units.as_ptr();
+        let mut bytes = [0u8; 7];
+        // Room for é and part of €: only é is written, and `*src` stops on €.
+        assert_eq!(wcsrtombs(bytes.as_mut_ptr(), &mut src, 3, 0), 2);
+        assert_eq!(src as usize - units.as_ptr() as usize, 2);
+        assert_eq!(wcsrtombs(bytes[2..].as_mut_ptr(), &mut src, 5, 0), 4);
+        assert!(src.is_null());
+        assert_eq!(&bytes[..6], "é€x".as_bytes());
     }
 }
