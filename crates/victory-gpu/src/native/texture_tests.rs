@@ -892,3 +892,113 @@ fn described_rectangle_list_draw_uses_supplied_triangles() {
     .expect("recorded draw");
     assert_eq!(recorded, (Topology::Triangles, 6, 1, 3, 0));
 }
+
+/// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
+/// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
+#[test]
+fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
+    let Some(pool) = pool(9203, (512 << 10) / page_size() + 1) else { return };
+    let tex_a = crate::resource::test_texture_at(
+        pool.va(0),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let tex_b = crate::resource::test_texture_at(
+        pool.va(0x10000),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let tex_c = crate::resource::test_texture_at(
+        pool.va(0x20000),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let up_buf = crate::resource::test_buffer_at(pool.va(0x30000), 0x4000);
+    let down_buf = crate::resource::test_buffer_at(pool.va(0x40000), 0x4000);
+
+    // Stage 8x8 linear texels at row pitch 256 into `up_buf`.
+    let pitch = 256usize;
+    let mut staged = vec![0u8; 7 * pitch + 8 * 4];
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let at = y * pitch + x * 4;
+            staged[at..at + 4].copy_from_slice(&[x as u8 * 11, y as u8 * 23, 77, 255]);
+        }
+    }
+    pool.write(0x30000, &staged);
+
+    let list = crate::list::test_list(false, std::ptr::null());
+    let q = crate::queue::test_queue(false);
+    let mut f = std::ptr::null();
+    crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+
+    // 1. CopyTextureRegion (footprint -> tex_a at (4, 4, 0) from 4x4 box starting at (2, 3))
+    let src_fp = crate::list::CopyLocation::placed(
+        up_buf,
+        crate::resource::PlacedFootprint::new(0, 28, 8, 8, pitch as u32),
+    );
+    let dst_a = crate::list::CopyLocation::whole(tex_a);
+    let box_a = [2u32, 3, 0, 6, 7, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_a, 4, 4, 0, &src_fp, &box_a);
+
+    // 2. CopyResource (tex_a -> tex_b whole texture)
+    slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, tex_b, tex_a);
+
+    // 3. CopyTextureRegion (tex_b subresource (4, 4)..(8, 8) -> tex_c at (1, 2))
+    let src_b = crate::list::CopyLocation::whole(tex_b);
+    let dst_c = crate::list::CopyLocation::whole(tex_c);
+    let box_b = [4u32, 4, 0, 8, 8, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_c, 1, 2, 0, &src_b, &box_b);
+
+    // 4. CopyTextureRegion (tex_c subresource (1, 2)..(5, 6) -> down_buf footprint at (0, 0))
+    let src_c = crate::list::CopyLocation::whole(tex_c);
+    let dst_fp = crate::list::CopyLocation::placed(
+        down_buf,
+        crate::resource::PlacedFootprint::new(0, 28, 4, 4, pitch as u32),
+    );
+    let box_c = [1u32, 2, 0, 5, 6, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_fp, 0, 0, 0, &src_c, &box_c);
+
+    assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+    let before_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+    slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    assert_eq!(
+        slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(
+            f,
+            1,
+            std::ptr::null_mut()
+        ),
+        0
+    );
+    let after_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after_drops, before_drops, "texture copies must not be counted as dropped");
+
+    let mut readback = vec![0u8; 3 * pitch + 16];
+    assert!(crate::native::safe_read(pool.va(0x40000) as *const u8, &mut readback));
+    for row in 0..4usize {
+        for col in 0..4usize {
+            let at = row * pitch + col * 4;
+            assert_eq!(
+                &readback[at..at + 4],
+                &[(col as u8 + 2) * 11, (row as u8 + 3) * 23, 77, 255],
+                "readback texel ({col}, {row})"
+            );
+        }
+    }
+}
