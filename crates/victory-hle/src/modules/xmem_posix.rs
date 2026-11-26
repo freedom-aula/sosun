@@ -394,6 +394,44 @@ mod tests {
         assert!(!reservations().contains_key(&(p as usize)), "the reservation is forgotten");
     }
 
+    /// `VirtualFree(MEM_DECOMMIT)` of pool-backed `XMemVirtualAlloc` memory keeps the pool there:
+    /// recommitted, a page reads zeros through the title address and the GPU's pool alike, and
+    /// later writes reach both. It used to put anonymous memory in place of the pool's pages
+    /// while the views and the GPU's pool table still showed the pool (issue #15).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decommitting_pool_backed_memory_zeroes_the_pool() {
+        use super::super::xmem_physical::{pool_shown_at, pools};
+        const MEM_DECOMMIT: u32 = 0x4000;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULE,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let pool = pool_shown_at(p as usize).expect("pool-backed");
+        // The view starts the pool: its first byte is the pool's.
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        let cpu = p.cast::<u8>();
+        // SAFETY: committed read-write.
+        unsafe { cpu.write(7) };
+        assert_eq!(crate::host_posix::VirtualFree(p, GRANULE, MEM_DECOMMIT), 1);
+        assert_eq!(pool_shown_at(p as usize), Some(pool), "the pool still shows there");
+        assert_eq!(query(p).state, MEM_RESERVE, "decommitted");
+        let again = XMemVirtualAlloc(p, GRANULE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+        assert_eq!(again, p);
+        // SAFETY: recommitted read-write; the pool's own mapping lives as long as the pool.
+        unsafe {
+            assert_eq!(cpu.read(), 0, "a recommitted page reads zeros");
+            assert_eq!(gpu.read(), 0, "the GPU's pool reads zeros too");
+            cpu.write(9);
+            assert_eq!(gpu.read(), 9, "the title's writes reach the GPU's pool");
+        }
+        release_reservation(p as usize);
+    }
+
     #[test]
     fn a_placeholder_reservation_commits_in_parts() {
         let p = XMemVirtualAlloc(

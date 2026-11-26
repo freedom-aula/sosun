@@ -528,6 +528,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let rsrc2 = u32_at(packet, PACKET_RSRC2)?;
     if sized.is_none() {
         expand_constants(&mut layout);
+        constants_to_the_end(&mut layout, (rsrc2 >> 1 & 0x1F) as u8);
     } else {
         // The constants' SGPRs are read as theirs before anything else: a count that runs into
         // another parameter or past the user SGPRs (into the group ids) disagrees with the
@@ -690,6 +691,20 @@ fn root_constant_counts(blob: &[u8]) -> Option<Vec<Option<u32>>> {
             Some((1..=64).contains(&values).then_some(values))
         })
         .collect()
+}
+
+/// Root constants that are the last user data of a compute program fill its user SGPRs up to
+/// `user_sgprs`: one record stands for a block of any length, and the code reads the words after
+/// the first (`s6`, `s7`...) from the SGPRs after it.
+/// Guess: the console compiler places a root constant block's words in consecutive user SGPRs
+/// and puts nothing after the last parameter (observed: no other record claims them).
+fn constants_to_the_end(layout: &mut [RootParam], user_sgprs: u8) {
+    let Some(last) = layout.iter_mut().max_by_key(|p| p.user_data) else {
+        return;
+    };
+    if last.root == RootType::Constants && user_sgprs > last.user_data {
+        last.sgprs = last.sgprs.max(u32::from(user_sgprs - last.user_data));
+    }
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -1577,9 +1592,12 @@ pub(crate) mod tests {
         let layout: Vec<_> = p.layout.iter().map(|r| (r.root, r.user_data, r.sgprs)).collect();
         assert_eq!(layout, [(RootType::Constants, 0, 4), (RootType::Table, 4, 1)]);
         assert_eq!(p.used.len(), 2);
-        // Trailing constants stay one dword (a guess, as in graphics).
+        // Trailing constants fill the user SGPRs the program declares (`s1..s3` of 4): their
+        // words after the first were "a hardware SGPR input".
         let trailing = [fspx_resource(3, 3, 0, 0, 0, 0), fspx_resource(2, 0, 0, 0, 1, 1)];
+        let p = &native_programs(&fspx(&code, 4 << 1, [64, 1, 1], false, &trailing)).unwrap()[0];
+        assert_eq!(p.layout[1].sgprs, 3);
         let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &trailing)).unwrap()[0];
-        assert_eq!(p.layout[1].sgprs, 1);
+        assert_eq!(p.layout[1].sgprs, 1, "none declared");
     }
 }

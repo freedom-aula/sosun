@@ -1967,11 +1967,15 @@ extern "system" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     }
-    // shortcut: a count buffer (D3D12 runs min(count, max) records) needs the records past the
-    // count disabled on the GPU first; none of the title's signatures has one yet, so those drop.
+    // A count buffer (D3D12 runs min(count, max) records) is read on the GPU too: each record
+    // past it is turned into one that does nothing first (`victory_metal` gates them).
     #[cfg(target_os = "macos")]
-    if let (Some(command), Some(address), true) = (crate::signature::command(stride, args), address, count.is_null()) {
-        ran = crate::native::glue::execute_indirect(this, command, stride, max, address);
+    if let (Some(command), Some(address), true) = (
+        crate::signature::command(stride, args),
+        address,
+        count.is_null() || counter.is_some(),
+    ) {
+        ran = crate::native::glue::execute_indirect(this, command, stride, max, address, counter);
     }
     #[cfg(windows)]
     if !ran {

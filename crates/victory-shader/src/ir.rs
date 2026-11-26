@@ -123,6 +123,48 @@ impl Inst {
     }
 }
 
+/// `p` with each `s_cbranch_execz` that leaves for a bare `s_endpgm` block
+/// dropped: the lanes the branch would end run on to the program's end with
+/// EXEC off, as the console's do while their wave has a lane left. Only the
+/// wave whose every lane is off now runs that code too, which changes
+/// nothing but scalar memory writes (none allowed here). `None`: no such
+/// branch, or a scalar memory write.
+pub(crate) fn keep_lanes_to_end(p: &Program) -> Option<Program> {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    if insts().any(|i| {
+        let n = i.name();
+        n.starts_with("s_store") || n.starts_with("s_buffer_store") || n.contains("atomic") && n.starts_with("s_")
+    }) {
+        return None;
+    }
+    let bare_end = |b: &Block| {
+        b.exit == Exit::End
+            && b.phis.is_empty()
+            && b.insts.iter().all(|i| matches!(i.name(), "s_endpgm" | "s_inst_prefetch" | "s_nop"))
+    };
+    let mut q = p.clone();
+    let mut changed = false;
+    for b in 0..q.blocks.len() {
+        let Exit::Branch { taken, not_taken } = q.blocks[b].exit else {
+            continue;
+        };
+        let end = &q.blocks[taken];
+        if taken == not_taken
+            || q.blocks[b].insts.last().map(Inst::name) != Some("s_cbranch_execz")
+            || !bare_end(end)
+            || end.preds.len() < 2
+        {
+            continue;
+        }
+        let k = end.preds.iter().position(|&x| x == b)?;
+        q.blocks[taken].preds.remove(k);
+        q.blocks[b].insts.pop();
+        q.blocks[b].exit = Exit::Jump(not_taken);
+        changed = true;
+    }
+    changed.then_some(q)
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).

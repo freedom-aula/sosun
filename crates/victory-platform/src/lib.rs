@@ -15,3 +15,5 @@ pub mod mem;
 pub mod sync;
 #[cfg(any(windows, target_os = "macos"))]
 pub mod thread;
+#[cfg(target_os = "macos")]
+pub mod watch;

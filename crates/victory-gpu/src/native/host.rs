@@ -86,6 +86,8 @@ struct Prep<B: GraphicsBackend> {
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
     /// The `ExecuteIndirect` argument record.
     indirect: Option<(Rc<B::Buffer>, *const u8)>,
+    /// Its count buffer word and the record's index.
+    count: Option<(Rc<B::Buffer>, *const u8, u32)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
 }
@@ -254,6 +256,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(heap)
     }
 
+    /// Each heap's descriptor records, `[start, end)` in the title's memory (its own view, which
+    /// the device's view calls and the title's stores write).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn heap_ranges(&self) -> Vec<(usize, usize)> {
+        self.heaps
+            .borrow()
+            .iter()
+            .map(|h| {
+                let end = h.start + h.count as u64 * Self::step(h.kind);
+                (h.start as usize, end as usize)
+            })
+            .collect()
+    }
+
     /// The heap `handle` (a descriptor's address, a root table's) lies in, and the entry's index.
     pub fn heap_at(&self, handle: u64) -> Option<(Rc<NativeHeap<B>>, usize)> {
         self.heaps.borrow().iter().find_map(|h| {
@@ -372,12 +388,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            let (mut checked, mut changed) = (0, 0);
             for index in *at..(*at + check).min(h.count) {
                 let handle = h.start + index as u64 * Self::step(h.kind);
                 let record = record_at(handle);
+                checked += 1;
                 if h.mirrored.borrow().get(&index) == Some(&record) {
                     continue;
                 }
+                changed += 1;
                 // shortcut: views of resources the host has not realized yet are not made here
                 // (`glue::mirror` does that for device writes); such an entry stays as it was.
                 if let Err(e) = self.mirror(handle) {
@@ -386,6 +405,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 // Tried once per record, whatever the result.
                 h.mirrored.borrow_mut().insert(index, record);
             }
+            super::descriptor_trace::record(h.start, checked, changed);
         }
     }
 
@@ -623,6 +643,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
             return;
         }
+        self.trace_args(root, binding);
+    }
+
+    /// The root parameters and binding [`Self::trace_draw`] logs, for any one draw.
+    pub(super) fn trace_args(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
         let read = |at: u64, n: usize| {
             let mut b = vec![0u8; n];
             let ok = super::safe_read(at as *const u8, &mut b);
@@ -660,7 +685,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 });
                                 tracing::info!(entry = k, resource = format!("{r:#x}"), counter, desc = ?d, texture = ?info.as_ref().map(|i| (i.format, i.width, i.height, i.memory as usize, i.size)), buffer = ?buffer, "table unordered view");
                             }
-                            Some(crate::descriptor::View::Placed(_, res, d)) => tracing::info!(entry = k, ?res, ?d, "table placed view"),
+                            Some(crate::descriptor::View::Placed(_, res, d)) => {
+                                let at = u64::from(d[10]) | u64::from(d[11]) << 32;
+                                let mem = if res[0] == 1 { read(at, 128) } else { String::new() };
+                                tracing::info!(entry = k, ?res, ?d, mem, "table placed view")
+                            }
                             Some(v) => tracing::info!(entry = k, ?v, "table view"),
                             None => {}
                         }
@@ -832,14 +861,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
             index: None,
             blit: vec![],
             indirect: None,
+            count: None,
             heap: None,
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, groups, indirect, ..
+                root,
+                pso,
+                heaps,
+                groups,
+                indirect,
+                count,
+                ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, 12)?);
+                }
+                if let Some((a, index)) = count {
+                    let (b, at) = self.resolve(*a, 4)?;
+                    p.count = Some((b, at, *index));
                 }
                 tracing::debug!(?groups, "dispatch");
                 if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
@@ -870,10 +910,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 call,
                 targets,
                 indirect,
+                count,
                 ..
             } => {
                 if let Some(a) = indirect {
                     p.indirect = Some(self.resolve(*a, if matches!(call, DrawCall::Indexed { .. }) { 20 } else { 16 })?);
+                }
+                if let Some((a, index)) = count {
+                    let (b, at) = self.resolve(*a, 4)?;
+                    p.count = Some((b, at, *index));
                 }
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
@@ -928,6 +973,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
+        let _counted = super::descriptor_trace::Submission;
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
@@ -1032,6 +1078,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
             buffers.extend(p.indirect.iter().map(|b| &*b.0));
+            buffers.extend(p.count.iter().map(|b| &*b.0));
         }
         if let Err(e) = self.backend.make_resident(queue, &buffers) {
             tracing::warn!(error = %e, "pool buffers were not made resident");
@@ -1065,6 +1112,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             groups: *groups,
                             threads_per_group: pso.threads,
                             indirect: preps[k].indirect.as_ref().map(|(b, p)| (&**b, *p)),
+                            count: preps[k].count.as_ref().map(|(b, p, i)| (&**b, *p, *i)),
                         }
                     })
                     .collect(),
@@ -1175,6 +1223,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     index_buffer: preps[k].index.as_ref().map(|(b, p)| (&**b, *p)),
                                     call: *call,
                                     indirect: preps[k].indirect.as_ref().map(|(b, p)| (&**b, *p)),
+                                    count: preps[k].count.as_ref().map(|(b, p, i)| (&**b, *p, *i)),
                                 }
                             })
                             .collect(),

@@ -127,6 +127,7 @@ impl<'a> Scene<'a> {
             index_buffer: idx.then(|| (&self.arena.buf, self.arena.at(4096) as *const u8)),
             call,
             indirect: None,
+            count: None,
         }
     }
 
@@ -283,6 +284,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
         indirect: None,
+        count: None,
     }];
     s.submit(&[
         s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0]),
@@ -328,6 +330,68 @@ fn depth_test_rejects_a_draw_behind() {
     let (a, b) = (s.draw(0.25, call, 0, false), s.draw(0.75, call, 512, false));
     s.submit(&[s.pass(vec![a, b], [0.0, 0.0, 0.0, 1.0])]);
     assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]));
+}
+
+#[test]
+fn a_count_buffer_limits_the_indirect_draws_that_run() {
+    let Some(m) = backend() else { return };
+    for (count, red) in [(1u32, false), (2, true), (0, false)] {
+        let s = Scene::new(&m, Some((true, Compare::Less)));
+        // The records of `indirect_draws_read_their_records_from_title_memory`: a green quad
+        // (record 0, indexed) and a red triangle (record 1) over the right half, with the count of
+        // records to run in title memory too (D3D12 runs min(count, records)).
+        s.arena.write(
+            0,
+            &[
+                v(-1.0, -1.0, GREEN),
+                v(0.0, -1.0, GREEN),
+                v(0.0, 1.0, GREEN),
+                v(-1.0, 1.0, GREEN),
+            ],
+        );
+        s.arena.write(4096, &[0u16, 1, 2, 0, 2, 3]);
+        s.arena.write(
+            512,
+            &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)],
+        );
+        s.arena.write(6144, &[6u32, 1, 0, 0, 0]);
+        s.arena.write(6164, &[3u32, 1, 0, 0]);
+        s.arena.write(6200, &[count]);
+        let none = DrawCall::Arrays {
+            vertex_count: 0,
+            instance_count: 0,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let record = |at: usize| Some((&s.arena.buf, s.arena.at(at) as *const u8));
+        let counted = |i: u32| Some((&s.arena.buf, s.arena.at(6200) as *const u8, i));
+        let indexed = DrawCall::Indexed {
+            index_count: 0,
+            instance_count: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+            wide: false,
+        };
+        let mut quad = s.draw(0.25, indexed, 0, true);
+        (quad.indirect, quad.count) = (record(6144), counted(0));
+        let mut tri = s.draw(0.75, none, 512, false);
+        (tri.indirect, tri.count) = (record(6164), counted(1));
+        s.submit(&[s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0])]);
+        let p = s.pixels();
+        let green = if count > 0 {
+            [0, 255, 0, 255]
+        } else {
+            [0, 0, 0, 255]
+        };
+        assert_eq!(px(&p, 4, 8), green, "count {count}: the quad");
+        let right = if red {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 0, 255]
+        };
+        assert_eq!(px(&p, 12, 8), right, "count {count}: the triangle");
+    }
 }
 
 #[test]
@@ -438,4 +502,247 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
         "the pass after the refused one drew: {:?}",
         &p[..4]
     );
+}
+
+/// A title's present pass: a target drawn in one pass is sampled through a descriptor table by
+/// the pixel shader of the next pass, in the same submission (both residency modes).
+#[test]
+fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
+    for m in backends() {
+        let s = Scene::new(&m, None);
+        const WHITE: [f32; 4] = [1.0; 4];
+        // Pass 1: green over all of `s.color` (times the white texture).
+        s.arena.write(0, &[v(-1.0, -1.0, GREEN), v(3.0, -1.0, GREEN), v(-1.0, 3.0, GREEN)]);
+        // Pass 2: white over all of `out`, times `s.color` sampled at its centre.
+        s.arena.write(512, &[v(-1.0, -1.0, WHITE), v(3.0, -1.0, WHITE), v(-1.0, 3.0, WHITE)]);
+        let call = DrawCall::Arrays {
+            vertex_count: 3,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+        rt.render_target = true;
+        let out = m.create_texture(&rt).unwrap();
+        m.write_texture(&s.res, 1, &s.color, 0.0);
+        let present = Draw {
+            pipeline: &s.pipe,
+            topology: Topology::Triangles,
+            state: DrawState::default(),
+            root: RootArgs::default()
+                .constants(&[0.5f32.to_bits(), 0, 0, 0])
+                .address(m.heap_address(&s.res, 1))
+                .address(m.heap_address(&s.smp, 0)),
+            fragment_root: None,
+            heaps: Heaps {
+                resource: Some(&s.res),
+                sampler: Some(&s.smp),
+            },
+            resources: vec![],
+            vertex_buffers: vec![(&s.arena.buf, s.arena.at(512))],
+            index_buffer: None,
+            call,
+            indirect: None,
+            count: None,
+        };
+        let second = Pass::Render(RenderPass {
+            color: vec![ColorTarget {
+                texture: &out,
+                clear: Some([0.0, 0.0, 1.0, 1.0]),
+            }],
+            depth: Some(DepthTarget {
+                texture: &s.depth,
+                clear: Some(1.0),
+                clear_stencil: Some(0),
+            }),
+            draws: vec![present],
+        });
+        s.submit(&[s.pass(vec![s.draw(0.5, call, 0, false)], [1.0, 0.0, 0.0, 1.0]), second]);
+        assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]), "pass 1 drew green");
+        let mut px = vec![0u8; W * W * 4];
+        m.read_texture(&out, 0, 0, &mut px, W * 4, 0);
+        assert_eq!(&px[(8 * W + 8) * 4..][..4], &[0, 255, 0, 255], "pass 2 sampled pass 1's green");
+    }
+}
+
+
+/// The present pass as translated shaders bind it: pass 1 draws green into a target, then a pixel
+/// shader takes that target straight from the descriptor heap at `index` (SM 6.6, no table) and
+/// samples it with static sampler `s0` (`sampler`, a `D3D12_STATIC_SAMPLER_DESC`'s ten words).
+fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4] {
+    use victory_metal::backend::{RootLayout, RootParam};
+    let s = Scene::new(m, None);
+    const WHITE: [f32; 4] = [1.0; 4];
+    s.arena.write(
+        0,
+        &[
+            v(-1.0, -1.0, GREEN),
+            v(3.0, -1.0, GREEN),
+            v(-1.0, 3.0, GREEN),
+        ],
+    );
+    s.arena.write(
+        512,
+        &[
+            v(-1.0, -1.0, WHITE),
+            v(3.0, -1.0, WHITE),
+            v(-1.0, 3.0, WHITE),
+        ],
+    );
+    let call = DrawCall::Arrays {
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    let layout = RootLayout {
+        params: vec![RootParam::Constants {
+            register: 0,
+            space: 0,
+            dwords: 4,
+        }],
+        bounds_checked: true,
+        static_samplers: vec![sampler],
+    };
+    let attrs = [
+        VertexAttr {
+            format: VertexFormat::Float2,
+            slot: 0,
+            offset: 0,
+        },
+        VertexAttr {
+            format: VertexFormat::Float2,
+            slot: 0,
+            offset: 8,
+        },
+        VertexAttr {
+            format: VertexFormat::Float4,
+            slot: 0,
+            offset: 16,
+        },
+    ];
+    let pipe = m
+        .create_render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture(ps)),
+            vs_layout: None,
+            ps_layout: Some(&layout),
+            attributes: &attrs,
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: Some(Format::D32Float),
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let out = m.create_texture(&rt).unwrap();
+    let heap = m.create_heap(HeapKind::Resource, index + 8).unwrap();
+    m.write_texture(&heap, index, &s.color, 0.0);
+    let present = Draw {
+        pipeline: &pipe,
+        topology: Topology::Triangles,
+        state: DrawState::default(),
+        root: s.root(0.5),
+        fragment_root: Some(RootArgs::default().constants(&[index as u32, 0, 0, 0])),
+        heaps: Heaps {
+            resource: Some(&heap),
+            sampler: Some(&s.smp),
+        },
+        resources: vec![],
+        vertex_buffers: vec![(&s.arena.buf, s.arena.at(512))],
+        index_buffer: None,
+        call,
+        indirect: None,
+        count: None,
+    };
+    let second = Pass::Render(RenderPass {
+        color: vec![ColorTarget {
+            texture: &out,
+            clear: Some([0.0, 0.0, 1.0, 1.0]),
+        }],
+        depth: Some(DepthTarget {
+            texture: &s.depth,
+            clear: Some(1.0),
+            clear_stencil: Some(0),
+        }),
+        draws: vec![present],
+    });
+    s.submit(&[
+        s.pass(vec![s.draw(0.5, call, 0, false)], [1.0, 0.0, 0.0, 1.0]),
+        second,
+    ]);
+    let mut px = vec![0u8; W * W * 4];
+    m.read_texture(&out, 0, 0, &mut px, W * 4, 0);
+    px[(8 * W + 8) * 4..][..4].try_into().unwrap()
+}
+
+/// Static samplers come from a table the backend fills (the converter does not build them into
+/// the shader): without it the sample read zeros on M1 and M2 GPUs, the title's black window.
+#[test]
+fn a_static_sampler_samples_a_heap_texture() {
+    // Point and clamp; anisotropic 4x with wrap and LOD 0 to 12, as the title's present pass.
+    let point = [0, 3, 3, 3, 0, 1, 1, 0, 0, f32::MAX.to_bits()];
+    let aniso = [0x55, 1, 1, 1, 0, 4, 1, 0, 0, 12.0f32.to_bits()];
+    for m in backends() {
+        for smp in [point, aniso] {
+            for index in [3, 1_010_071] {
+                assert_eq!(
+                    heap_sampled(&m, "heap_ps", index, smp),
+                    [0, 255, 0, 255],
+                    "{smp:?} {index}"
+                );
+            }
+        }
+    }
+}
+
+/// Where the converter puts the static sampler table: one pointer after the root parameters.
+#[test]
+fn the_static_sampler_table_follows_the_root_parameters() {
+    use victory_metal::backend::{RootLayout, RootParam};
+    if backend().is_none() {
+        return;
+    }
+    let msc = victory_metal::msc::Msc::open_default();
+    let point = [0, 3, 3, 3, 0, 1, 1, 0, 0, f32::MAX.to_bits()];
+    let constants = |dwords| RootParam::Constants {
+        register: 0,
+        space: 0,
+        dwords,
+    };
+    for (params, samplers, at) in [
+        (vec![constants(4)], 1, 16),
+        (vec![constants(4)], 2, 16),
+        (
+            vec![
+                constants(12),
+                RootParam::Srv {
+                    register: 0,
+                    space: 9,
+                },
+            ],
+            2,
+            56,
+        ),
+        (vec![], 1, 0),
+    ] {
+        let l = RootLayout {
+            params,
+            bounds_checked: true,
+            static_samplers: vec![point; samplers],
+        };
+        let table = msc
+            .locations(&l)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == 0 && r.1 == u32::MAX);
+        assert_eq!(table.map(|r| (r.3, r.4)), Some((at, 8)), "{:?}", l.params);
+    }
 }

@@ -65,6 +65,9 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     /// `ExecuteIndirect`: the group counts are read on the GPU from this title address (three
     /// words) instead of `groups`.
     pub indirect: Option<(&'a B::Buffer, *const u8)>,
+    /// `ExecuteIndirect` with a count buffer: the count's title address and this record's index.
+    /// The record runs only if the index is below the count, which the GPU reads when it runs.
+    pub count: Option<(&'a B::Buffer, *const u8, u32)>,
 }
 
 /// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.

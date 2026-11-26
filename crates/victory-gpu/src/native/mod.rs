@@ -15,6 +15,7 @@
 
 pub mod addr;
 pub mod console_state;
+pub(crate) mod descriptor_trace;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;

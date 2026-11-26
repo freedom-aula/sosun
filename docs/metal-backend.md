@@ -35,7 +35,7 @@ already assumes ("a resource's GPU address is its CPU address"). On Metal that c
 | `shader_cache.rs` (translated DXIL by content hash) | cache the converted `.metallib` next to it; conversion averages 84 ms (compute), 32 ms (pixel) over the corpus below |
 | `twin.rs` (depth also written by UAV: colour twin) | Metal textures allow `shaderWrite` on depth-format views only through a pixel-format view; likely still needs the twin until checked on real shaders |
 | `query.rs` | `MTLCounterSampleBuffer` / visibility result buffer |
-| `signature.rs` (ExecuteIndirect) | indirect command buffers (`MTLIndirectCommandBuffer`), or compute-generated arguments |
+| `signature.rs` (ExecuteIndirect) | Metal indirect draws and dispatches that read the records in title memory; with a count buffer, a one-thread gate kernel per record first copies the record or zeros (`gfx.rs`, `GATE`) |
 | present | `CAMetalLayer` |
 
 What is not a mapping but a gain: the per-draw "dynamic slots" of the host heap, the per-submission
@@ -664,7 +664,14 @@ group-shared memory, `WaveSize(32)`.
 Group barriers need every thread, so these operations are lowered only where each thread runs the block exactly
 once, or (group of one console wave) behind uniform scalar branches outside loops. In EXEC-divergent code or
 per-lane loops the value is left unknown and the program is refused if anything uses it; LDS shared without a
-barrier in divergent code is refused too. 16-bit wave reductions across the halves are refused. Fixing the
+barrier in divergent code is refused too. The barriers that sync such LDS (`split_wave_barriers`) go in the
+same places: blocks each thread runs once, or (the group being one console wave) reached by uniform scalar
+branches alone outside loops. A program refused for either is translated again with each `s_cbranch_execz`
+to a bare `s_endpgm` dropped (`ir::keep_lanes_to_end`): the usual `if (id < n) { whole shader }` early exit.
+Its lanes then run on to the end with EXEC off, as on the console while their wave has a lane left, and reach
+every barrier. Only a wave with no lane left runs that code too, which changes nothing but scalar memory
+writes (a program with one is not changed). Of 30 dumped story-load shaders refused for these two reasons,
+9 translate with this and the barriers behind uniform branches (27 November). 16-bit wave reductions across the halves are refused. Fixing the
 divergent case needs if-conversion of the region so both halves always arrive (not done).
 
 Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lowered containers pass

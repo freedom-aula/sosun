@@ -2621,6 +2621,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
+    // The same in 64 bits (a sampler's first two words, from the title's compiler).
+    if let ("s_bfm_b64", [Operand::Const(w), Operand::Const(at)]) = (inst.name(), &src[..]) {
+        let (w, at) = (inline(*w)? & 63, inline(*at)? & 63);
+        return Some(Moved::Const((((1u64 << w) - 1) << at >> (32 * k)) as u32));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2956,8 +2961,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Immediate sampler words the upscaler's compiler makes with a bit
-    /// mask and a 64-bit move of a literal.
+    /// Immediate sampler words the compilers make with bit masks (32 and
+    /// 64 bits) and a 64-bit move of a literal.
     #[test]
     fn sampler_words_from_bit_masks_and_wide_literals_are_constants() {
         let code: Vec<u8> = [
@@ -2965,6 +2970,7 @@ pub(crate) mod tests {
             0x9211_8C8C, // s_bfm_b32 s17, 12, 12
             0xBE92_04FF,
             0x1850_0000, // s_mov_b64 s[18:19], 0x18500000
+            0x9294_B682, // s_bfm_b64 s[20:21], 2, 54
             S_ENDPGM,
         ]
         .iter()
@@ -2978,6 +2984,9 @@ pub(crate) mod tests {
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
+        // The title's samplers: bits 54 and 55, "a sampler built from computed words" before.
+        assert_eq!(value(3, 0), Term::Const(0));
+        assert_eq!(value(3, 1), Term::Const(0x00C0_0000));
     }
 
     /// A register kept in a second one across an inner loop that restores

@@ -40,6 +40,7 @@ fn srv_and_uav_through_a_descriptor_table() {
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,
+            count: None,
         }];
         run(&m, &w);
         let out: Vec<u32> = a.read(half, N);
@@ -107,6 +108,7 @@ impl Grid<'_> {
             ],
             threads_per_group: [4, 4, 1],
             indirect: None,
+            count: None,
         }];
         run(m, &w);
         let f: Vec<f32> = a.read(0, cells * 4);
@@ -232,6 +234,7 @@ fn sample_bc1_and_create_every_bc_format() {
         Format::Bc4,
         Format::Bc5,
         Format::Bc6h,
+        Format::Bc6hSigned,
         Format::Bc7,
     ] {
         let t = m
@@ -245,6 +248,45 @@ fn sample_bc1_and_create_every_bc_format() {
             f.row_bytes(16),
             0,
         );
+    }
+}
+
+/// One BC6H block, mode 11 (mode bits `00011`: one region, 10-bit endpoints, not transformed),
+/// endpoint 0 = (0x100, 0x300, 0), every index 0, so every texel is endpoint 0. Decoded as
+/// Microsoft's "BC6H Format" page and the reference decoder (DirectXTex `BC6HBC7.cpp`,
+/// `Unquantize` and `FinishUnquantize`) say:
+/// - unsigned (`BC6H_UF16`): `(x << 16 | 0x8000) >> 10`, then `* 31 >> 6`, as half bits:
+///   0x100 -> 0x1F0F = 1807 / 2^18, 0x300 -> 0x5D0F = 323.75;
+/// - signed (`BC6H_SF16`): endpoints are 10-bit two's complement, so 0x300 is -256;
+///   `(|x| << 15 | 0x4000) >> 9`, then `* 31 >> 5`, sign kept: 0x100 -> 0x3E1F = 1567 / 1024,
+///   0x300 -> 0xBE1F = -1567 / 1024.
+///
+/// Metal's `BC6H_RGBFloat` is the signed format and `BC6H_RGBUfloat` the unsigned one; the host
+/// used the signed one for DXGI 95.
+#[test]
+fn sample_bc6h_unsigned_and_signed() {
+    let Some(m) = backend() else { return };
+    let block = (0b00011u128 | 0x100 << 5 | 0x300 << 15).to_le_bytes();
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1.0);
+    for (format, want) in [
+        (Format::Bc6h, [1807.0 / 262_144.0, 323.75, 0.0]),
+        (Format::Bc6hSigned, [1567.0 / 1024.0, -1567.0 / 1024.0, 0.0]),
+    ] {
+        let t = m.create_texture(&d2(format, 4, 4)).unwrap();
+        m.upload_texture(&t, 0, 0, &block, format.row_bytes(4), 0);
+        let g = Grid {
+            m: &m,
+            dxil: &fixture("sample2d"),
+            g: [4, 4],
+            z: 1,
+            filter: Filter::Nearest,
+        };
+        for (i, c) in g.run(&t).iter().enumerate() {
+            assert!(
+                (0..3).all(|k| close(c[k], want[k])) && near(c[3], 1.0),
+                "{format:?} texel {i}: {c:?} != {want:?}"
+            );
+        }
     }
 }
 
@@ -503,10 +545,52 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
             groups: [0, 0, 0],
             threads_per_group: [64, 1, 1],
             indirect: Some((&a.buf, a.at(record) as *const u8)),
+            count: None,
         }];
         run(&m, &w);
         let out: Vec<u32> = a.read(dst, N);
         assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
         assert!(out[N / 2..].iter().all(|v| *v == 0), "groups past the record's count do not run");
+    }
+}
+
+#[test]
+fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
+    for m in backends() {
+        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+        // Three records of 2, 4 and 8 groups of 64: what ran shows in how much was written.
+        for (count, written) in [(2u32, 256), (0, 0), (5, 512)] {
+            let a = Arena::new(&m, 3);
+            let (dst, records, counter) = (a.region.len / 2, N * 4, N * 4 + 64);
+            a.write(0, &(0..N as u32).collect::<Vec<_>>());
+            a.write(records, &[2u32, 1, 1, 4, 1, 1, 8, 1, 1]);
+            a.write(counter, &[count]);
+            let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+            m.write_buffer(&heap, 5, &a.buf, a.at(0), (N * 4) as u32);
+            m.write_buffer(&heap, 6, &a.buf, a.at(dst), (N * 4) as u32);
+            let w: Vec<_> = (0..3u32)
+                .map(|i| Dispatch {
+                    pipeline: &p,
+                    root: RootArgs::default()
+                        .constants(&[5, 7])
+                        .address(m.heap_address(&heap, 5)),
+                    resources: vec![],
+                    heaps: victory_metal::backend::Heaps {
+                        resource: Some(&heap),
+                        sampler: None,
+                    },
+                    groups: [0, 0, 0],
+                    threads_per_group: [64, 1, 1],
+                    indirect: Some((&a.buf, a.at(records + 12 * i as usize) as *const u8)),
+                    count: Some((&a.buf, a.at(counter) as *const u8, i)),
+                })
+                .collect();
+            run(&m, &w);
+            let out: Vec<u32> = a.read(dst, N);
+            let want: Vec<u32> = (0..N as u32)
+                .map(|i| if (i as usize) < written { i * 5 + 7 } else { 0 })
+                .collect();
+            assert_eq!(out, want, "count {count}");
+        }
     }
 }

@@ -211,6 +211,7 @@ pub unsafe fn run_entry_with(
         .unwrap_or(usize::MAX)
         .max(1 << 20);
     teb::set_image_base(image.base());
+    victory_platform::watch::set_image(image.base(), image.len());
     super::dump::start();
     super::dump::start_mem_watch();
     super::dump::start_hold_byte();

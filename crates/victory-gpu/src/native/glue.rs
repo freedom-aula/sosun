@@ -145,6 +145,11 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
         t.submit(queue as usize, segments);
+        // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
+        // interval, so the title's first store into each is seen.
+        if super::descriptor_trace::sites() {
+            victory_platform::watch::watch(&t.host.heap_ranges());
+        }
     });
 }
 
@@ -370,8 +375,54 @@ fn trace_present(resource: This) {
         );
 }
 
+/// `VICTORY_TRACE_PRESENT=<every>`: the title resources `PresentX` has shown.
+static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn present_every() -> Option<u32> {
+    static EVERY: OnceLock<Option<u32>> = OnceLock::new();
+    *EVERY.get_or_init(|| std::env::var("VICTORY_TRACE_PRESENT").ok().and_then(|v| v.parse().ok()))
+}
+
+/// `VICTORY_TRACE_PRESENT=<every>`: a draw into a texture the title has presented (its present
+/// pass), the first and then every `<every>`th, at most 12: its pipeline's shaders, root
+/// parameters and binding, which textures its tables hold and how much of each is non-zero, and
+/// the first bytes of its constant buffers, all as the draw is recorded.
+fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
+    use std::sync::atomic::AtomicU32;
+    static N: AtomicU32 = AtomicU32::new(0);
+    let Some(every) = present_every().map(|e| e.max(1)) else { return };
+    {
+        let shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !l.target_keys.iter().any(|k| shown.contains(k)) {
+            return;
+        }
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n % every != 0 || n / every >= 12 {
+        return;
+    }
+    let shaders: Vec<String> = crate::pipeline::native_stages(l.pipeline as This)
+        .map(|(stages, _)| stages.iter().map(|(s, sh)| format!("{s} {}", sh.hash)).collect())
+        .unwrap_or_default();
+    let targets: Vec<String> = l.target_keys.iter().map(|k| format!("{k:#x}")).collect();
+    tracing::info!(n, pipeline = format!("{:#x}", l.pipeline), ?shaders, ?targets, "present draw");
+    let (root, binding) = l.list.graphics_args();
+    if let Some(b) = binding {
+        // Filter, address u v w, mip LOD bias, anisotropy, comparison, border, min and max LOD.
+        let ps = b.ps.as_ref().map(|p| &p.static_samplers);
+        tracing::info!(vs = ?b.static_samplers, ?ps, "present draw static samplers");
+    }
+    t.host.trace_args(root, binding);
+}
+
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    if present_every().is_some() {
+        let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !shown.contains(&(resource as usize)) {
+            shown.push(resource as usize);
+        }
+    }
     // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
     // frames from one that follows time.
     static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -679,7 +730,9 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+    let r = with_title(|t| t.host.backend.residency_counts()).unwrap_or_default();
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, "native draws so far");
+    super::descriptor_trace::log(frame);
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
@@ -984,6 +1037,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
             match call {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
@@ -1004,6 +1058,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
                 Ok(()) => {
                     ENCODED.fetch_add(1, Ordering::Relaxed);
+                    trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
@@ -1012,10 +1067,19 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
     });
 }
 
-/// `ExecuteIndirect` of a single-command signature without a count buffer: `max` draws or
-/// dispatches, record `i` at title address `records + i * stride`, each read on the GPU. False
-/// when the host cannot run it (mesh dispatches); the caller logs that. Rectangle lists drop here.
-pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, stride: u32, max: u32, records: u64) -> bool {
+/// `ExecuteIndirect` of a single-command signature: `max` draws or dispatches, record `i` at title
+/// address `records + i * stride`, each read on the GPU; with a count buffer at title address
+/// `count`, record `i` runs only if `i` is below the count, also read on the GPU (D3D12 runs
+/// min(count, max) records). False when the host cannot run it (mesh dispatches); the caller logs
+/// that. Rectangle lists drop here.
+pub(crate) fn execute_indirect(
+    this: This,
+    command: crate::signature::Command,
+    stride: u32,
+    max: u32,
+    records: u64,
+    count: Option<u64>,
+) -> bool {
     use crate::signature::Command;
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
     match command {
@@ -1025,7 +1089,11 @@ pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, s
                 Pipe::Compute(pso) => {
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
-                        if let Err(e) = l.list.dispatch_indirect(at(i)) {
+                        let r = match count {
+                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
+                            None => l.list.dispatch_indirect(at(i)),
+                        };
+                        if let Err(e) = r {
                             tracing::warn!(error = %e, "indirect dispatch");
                         }
                     }
@@ -1045,7 +1113,12 @@ pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, s
                 }
                 Some(false) => {
                     for i in 0..max {
-                        match l.list.draw_indirect(at(i), command == Command::DrawIndexed) {
+                        let indexed = command == Command::DrawIndexed;
+                        let r = match count {
+                            Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
+                            None => l.list.draw_indirect(at(i), indexed),
+                        };
+                        match r {
                             Ok(()) => {
                                 ENCODED.fetch_add(1, Ordering::Relaxed);
                                 l.target_keys.iter().for_each(|&k| trace_bump(k, 0));

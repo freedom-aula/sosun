@@ -49,6 +49,20 @@ const COMPUTED: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// `s_absdiff_i32 s4, s2, s3` and its SCC, stored by every lane to `s[0:1]` and 256 bytes on.
+const ABSDIFF: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x9604_0302, // s_absdiff_i32 s4, s2, s3
+    0x8505_8081, // s_cselect_b32 s5, 1, 0
+    0x7E04_0204, // v_mov_b32_e32 v2, s4
+    0x7E06_0205, // v_mov_b32_e32 v3, s5
+    0xDC70_8000,
+    0x0000_0201, // global_store_dword v1, v2, s[0:1]
+    0xDC70_8100,
+    0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
+    0xBF81_0000, // s_endpgm
+];
+
 /// `dst[tid] = src[tid] + 0x55` stored to `s[2:3]`, and the same value stored to `s[4:5]`, where
 /// the pointers may point at memory no pool shows.
 const MISSES: &[u32] = &[
@@ -65,6 +79,30 @@ const MISSES: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// A wave64 lane mask joined with data at a uniform loop's header: lanes below 40, then on each
+/// back edge that number shifted right by 4 and passed through VGPRs (data). Every lane stores its
+/// bit of the last pass's number to `s[0:1]`: lane < 36, the low dword's for lanes below 32 and
+/// the high dword's above.
+const MASK_DATA_JOIN: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0x7D88_00A8, // v_cmp_gt_u32_e32 vcc, 40, v0
+    0x8786_7E6A, // s_and_b64 s[6:7], vcc, exec
+    0xBE88_0380, // s_mov_b32 s8, 0
+    0xD501_0004,
+    0x0019_0280, // header: v_cndmask_b32_e64 v4, 0, 1, s[6:7]
+    0x9086_8406, // s_lshr_b64 s[6:7], s[6:7], 4
+    0x7E0A_0206, // v_mov_b32_e32 v5, s6
+    0x7E0C_0207, // v_mov_b32_e32 v6, s7
+    0x7E0C_0505, // v_readfirstlane_b32 s6, v5
+    0x7E0E_0506, // v_readfirstlane_b32 s7, v6
+    0x8008_8108, // s_add_u32 s8, s8, 1
+    0xBF0A_8208, // s_cmp_lt_u32 s8, 2
+    0xBF85_FFF6, // s_cbranch_scc1 header
+    0xDC70_8000,
+    0x0000_0401, // global_store_dword v1, v4, s[0:1]
+    0xBF81_0000, // s_endpgm
+];
+
 /// A 64-lane compute shader whose user SGPRs `s0..s<sgprs>` are root constants, translated the way
 /// the host translates, from machine code of our own in a container of no parts.
 fn shader(words: &[u32], sgprs: u32) -> HostShader {
@@ -72,6 +110,18 @@ fn shader(words: &[u32], sgprs: u32) -> HostShader {
 }
 
 fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) -> HostShader {
+    translate_io(words, sgprs, 0, 64, options)
+}
+
+/// [`translate`] with more of `COMPUTE_PGM_RSRC2` set (`rsrc2`: LDS, system SGPRs) and `threads` in
+/// a group.
+pub(super) fn translate_io(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    options: victory_shader::emit::Options,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -86,8 +136,8 @@ fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) 
         }],
         used: vec![],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: sgprs << 1,
-            threads: [64, 1, 1],
+            rsrc2: sgprs << 1 | rsrc2,
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -105,7 +155,7 @@ fn translate(words: &[u32], sgprs: u32, options: victory_shader::emit::Options) 
     emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
 }
 
-fn title() -> Option<Title<Metal>> {
+pub(super) fn title() -> Option<Title<Metal>> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
         && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
     {
@@ -119,20 +169,20 @@ fn title() -> Option<Title<Metal>> {
 }
 
 /// Title addresses nothing in this process is mapped at.
-const VA_A: u64 = 0x12_3450_0000;
+pub(super) const VA_A: u64 = 0x12_3450_0000;
 const VA_B: u64 = 0x7000_0000;
 const POOL: usize = 0x10_0000;
-const CANARY: u32 = 0xEEEE_EEEE;
+pub(super) const CANARY: u32 = 0xEEEE_EEEE;
 
 /// A pool of 1 MiB filled with a canary, shown at `VA_A` (512 KiB from pool offset 0x2_0000) and
 /// `VA_B` (128 KiB from the pool's start).
-struct Fixture {
+pub(super) struct Fixture {
     mem: Alias,
     info: PoolInfo,
 }
 
 impl Fixture {
-    fn new(t: &Title<Metal>) -> Fixture {
+    pub(super) fn new(t: &Title<Metal>) -> Fixture {
         let mem = Alias::new(POOL).unwrap();
         let info = PoolInfo {
             id: 1,
@@ -149,22 +199,22 @@ impl Fixture {
         f
     }
 
-    fn put<T: Copy>(&self, at: usize, v: &[T]) {
+    pub(super) fn put<T: Copy>(&self, at: usize, v: &[T]) {
         // SAFETY: inside the pool's own mapping; the GPU is idle.
         unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.mem.primary.add(at).cast(), v.len()) };
     }
 
-    fn get(&self, at: usize, n: usize) -> Vec<u32> {
+    pub(super) fn get(&self, at: usize, n: usize) -> Vec<u32> {
         // SAFETY: inside the pool's own mapping; read after the fence wait.
         unsafe { std::slice::from_raw_parts(self.mem.primary.add(at).cast::<u32>(), n).to_vec() }
     }
 }
 
-fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool) {
+pub(super) fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool) {
     let Pipe::Compute(pso) = t.compute_pipe(shader, "addr") else {
         panic!("not made: {:?}", t.shaders)
     };
-    assert_eq!(pso.threads, [64, 1, 1]);
+    assert_eq!(pso.threads[1..], [1, 1]);
     let mut l = NativeList::default();
     l.set_compute_pipeline(&pso);
     l.set_compute_root_constants(0, root);
@@ -178,7 +228,7 @@ fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], heap: bool)
     super::run(&t.host, &[&l]);
 }
 
-fn halves(v: u64) -> [u32; 2] {
+pub(super) fn halves(v: u64) -> [u32; 2] {
     [v as u32, (v >> 32) as u32]
 }
 
@@ -219,6 +269,32 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// `s_absdiff_i32` on the GPU: |S0 - S1| of the 32-bit (wrapping) difference read as signed,
+/// SCC whether it is not 0 (RDNA2 ISA, SOP2).
+#[test]
+fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(ABSDIFF, 4);
+    let [lo, hi] = halves(VA_A);
+    for (a, b, want) in [
+        (5i32, 9i32, 4u32),
+        (9, 5, 4),
+        (-3, 4, 7),
+        (7, 7, 0),
+        // The difference wraps: i32::MIN - 1 is i32::MAX; 1 - i32::MIN is 0x8000_0001, negative,
+        // whose magnitude is i32::MAX again.
+        (i32::MIN, 1, i32::MAX as u32),
+        (1, i32::MIN, i32::MAX as u32),
+        (i32::MIN, 0, 0x8000_0000),
+    ] {
+        dispatch(&mut t, &cs, &[lo, hi, a as u32, b as u32], false);
+        assert_eq!(f.get(0x2_0000, 64), vec![want; 64], "|{a} - {b}|");
+        assert_eq!(f.get(0x2_0100, 64), vec![u32::from(want != 0); 64], "SCC of |{a} - {b}|");
+    }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
@@ -368,4 +444,15 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
     let host = shader(COMPUTED, 4);
     assert!(host.memory && !host.memory_writes);
     assert_ne!(d3d12.dxil, host.dxil);
+}
+
+#[test]
+fn a_wave64_mask_joined_with_data_takes_each_lanes_bit_on_the_gpu() {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let cs = shader(MASK_DATA_JOIN, 2);
+    dispatch(&mut t, &cs, &halves(VA_A), false);
+    let want: Vec<u32> = (0..64).map(|lane| u32::from(lane < 36)).collect();
+    assert_eq!(f.get(0x2_0000, 64), want);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }

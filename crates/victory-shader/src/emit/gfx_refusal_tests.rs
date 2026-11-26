@@ -18,6 +18,37 @@ fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// `v_pk_fmac_f16` (VOP2) with a constant first source translates: an inline float constant is
+/// its f16 in the low half and 0 in the high one, an integer one its 32-bit value, a literal its
+/// two halves (llvm-mc's encodings for gfx1030). Values: `valu_tests`.
+#[test]
+fn packed_fmac_takes_constant_operands() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |fmac: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        code.extend_from_slice(fmac);
+        code.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    for fmac in [
+        &[0x7800_00F2][..],          // v_pk_fmac_f16 v0, 1.0, v0
+        &[0x7800_00C1],              // v_pk_fmac_f16 v0, -1, v0
+        &[0x7800_00FF, 0x4000_3C00], // v_pk_fmac_f16 v0, 0x40003c00, v0
+    ] {
+        translate_with(&program(fmac), Options::default()).unwrap();
+    }
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
@@ -732,6 +763,48 @@ fn refusal1_console_layout_dependent_masks_remain_refused() {
 // Refusal #2: "a pixel system input the signature lacks"
 // =========================================================================
 
+/// A buffer descriptor's dword that is no size, read as data, is refused naming it: the host
+/// has no value for the base address, the high address bits and stride, or the format.
+#[test]
+fn descriptor_dwords_read_as_data_say_which() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+            read,        // v_mov_b32 v2, s<12 + n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // A raw UAV at table dword 0, the buffer read at dword 8.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a descriptor's address or format read as data: ";
+    for (read, why) in [
+        (0x7E04_020C, "a buffer's base address (dword 0)"),
+        (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+        (0x7E04_020F, "a buffer's dword 3 (format and type)"),
+    ] {
+        let err = translate_with(&program(read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage
@@ -769,6 +842,25 @@ fn refusal2_pixel_system_inputs_lower_when_declared() {
             "guessed ISG1 missing system value kind {kind}"
         );
     }
+}
+
+/// `s_absdiff_i32` translates (values: `victory-gpu` `addr_tests`).
+#[test]
+fn absdiff_translates() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x9606_0504, // s_absdiff_i32 s6, s4, s5
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
 }
 
 #[test]
@@ -2066,4 +2158,44 @@ fn compute_root_constants_reach_the_user_data() {
     }
     let err = translate_with(&container(None), Options::default()).unwrap_err();
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
+
+/// A value a whole-wave section leaves without a shape is refused naming the
+/// first step the simulation does not model, or, when it models every step,
+/// saying the value is no reduction or prefix.
+#[test]
+fn whole_wave_sections_name_the_step_they_do_not_follow() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |step: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        ];
+        code.extend_from_slice(step);
+        code.extend([
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a whole-wave section step the simulation does not follow: ";
+    for (step, why) in [
+        (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+        // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
+        (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+    ] {
+        let err = translate_with(&program(step), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
+    }
 }

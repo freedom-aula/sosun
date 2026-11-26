@@ -24,7 +24,7 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{BTreeMap, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -110,6 +110,9 @@ struct Pool {
     info: PoolInfo,
     /// Who allocated it (`VICTORY_TRACE_OWNERS`).
     owner: Option<Owner>,
+    /// Committed `XMemVirtualAlloc` memory ([`back_with_pool`]): no page numbers reach it.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    backs: bool,
 }
 
 impl Pool {
@@ -151,6 +154,8 @@ impl Pool {
             pool,
             info,
             owner: tracing_owners().then(Owner::now),
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            backs: false,
         })
     }
 }
@@ -179,6 +184,12 @@ struct Slice {
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    /// Freed page numbers no view shows, given again lowest first: numbers stay as low as the
+    /// pages live at once allow (the title keeps them in 25 bits, [`FRAMES`]).
+    free: BTreeSet<usize>,
+    /// Freed page numbers a view still shows, by the key of their slice in `shown`: free once
+    /// the last view showing it goes (`unmap`).
+    pinned: HashMap<(usize, usize), usize>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each slice (pool, page index) is mapped: the addresses of
@@ -228,6 +239,34 @@ impl Addresses {
             Self::Many(addresses) => {
                 addresses.retain(|&shown| shown != at);
                 addresses.is_empty()
+            }
+        }
+    }
+}
+
+impl Physical {
+    /// Numbers the first `n` pages of `pool`: freed numbers first, then new ones.
+    fn number(&mut self, pool: &Arc<Pool>, n: usize) -> Vec<usize> {
+        (0..n)
+            .map(|index| {
+                let number = self.free.pop_first().unwrap_or_else(|| {
+                    self.next_page += FRAMES;
+                    self.next_page - FRAMES
+                });
+                let pool = pool.clone();
+                self.pages.insert(number, Slice { pool, index });
+                number
+            })
+            .collect()
+    }
+
+    /// Forgets page `number`; the number is free once no view shows the page.
+    fn free_number(&mut self, number: usize) {
+        if let Some(slice) = self.pages.remove(&number) {
+            if self.shown.contains_key(&slice.key(0)) {
+                self.pinned.insert(slice.key(0), number);
+            } else {
+                self.free.insert(number);
             }
         }
     }
@@ -529,20 +568,20 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         "XMemAllocatePhysicalPages"
     );
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
+    let numbers = physical.number(&pool, n);
     if tracing_owners()
-        && let Some((number, kept)) = (0..n)
-            .map(|i| first + i * FRAMES)
-            .find_map(|number| number_kept(number).map(|kept| (number, kept)))
+        && let Some((index, number, kept)) = numbers
+            .iter()
+            .enumerate()
+            .find_map(|(i, &number)| number_kept(number).map(|kept| (i, number, kept)))
     {
         let new = Held {
             what: "page numbers",
             owner: pool.owner,
             base: number,
-            len: n - (number - first) / FRAMES,
+            len: n - index,
             pool: pool.info.id,
-            index: (number - first) / FRAMES,
+            index,
         };
         let old = physical.pages.get(&kept);
         let old = Held {
@@ -555,16 +594,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         };
         conflict("a page number past 25 bits", &new, &old);
     }
-    for index in 0..n {
-        let slice = Slice {
-            pool: pool.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
-    }
+    // SAFETY: the title passes room for `n` page numbers.
+    unsafe { pages.copy_from_nonoverlapping(numbers.as_ptr(), n) };
     1
 }
 
@@ -578,7 +609,8 @@ pub fn unknown_pages(pages: &[usize]) -> usize {
         .count()
 }
 
-/// Pages still mapped stay readable through their views until unmapped.
+/// Pages still mapped stay readable through their views until unmapped, and their numbers
+/// are given again only then.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i32 {
     if pages.is_null() {
         return 0;
@@ -586,7 +618,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free_number(unsafe { *pages.add(i) });
     }
     1
 }
@@ -597,9 +629,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
 /// macOS: the GPU backend resolves title addresses by pool only.
 #[cfg(not(windows))]
 pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
-    let Ok(pool) = Pool::new(len) else {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let Ok(mut pool) = Pool::new(len) else {
         return false;
     };
+    #[cfg(target_arch = "x86_64")]
+    {
+        pool.backs = true;
+    }
     let slice = Slice {
         pool: Arc::new(pool),
         index: 0,
@@ -611,6 +648,56 @@ pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
 #[cfg(not(windows))]
 pub(super) fn release_pool_backing(base: usize, len: usize) {
     unmap(&mut physical(), base, len);
+}
+
+/// `VirtualFree(MEM_DECOMMIT)` of `[base, base + len)`: the physical-page views there stay, so the
+/// GPU's pool table and the aliases keep showing what the title address shows, and are made no
+/// access; the rest of the range is decommitted. Decommitting over the views put anonymous pages
+/// in their place while the pool stayed in the books (issue #15).
+///
+/// Windows only promises that a page committed again reads zeros. A page is zeroed only if it is
+/// `XMemVirtualAlloc`'s pool backing and no other address shows it, so only this address could
+/// read it again. Other pages keep their bytes: a page shown elsewhere (aliases, `map_alias`) is
+/// still read there, and pages `XMemAllocatePhysicalPages` made outlive their mappings, since
+/// the title may map them again. Guess: the console keeps those pages' contents too; what it does
+/// is unknown, and `VICTORY_TRACE_OWNERS` names such a decommit.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(crate) fn decommit(base: usize, len: usize) -> bool {
+    let decommit = |at: usize, len| {
+        // SAFETY: the title decommits inside its own reservation.
+        len == 0 || unsafe { mem::decommit(at as *mut u8, len) }.is_ok()
+    };
+    let physical = physical();
+    let end = base + len;
+    let first = physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base);
+    let (mut done, mut ok) = (base, true);
+    for (&at, (size, slice)) in first.into_iter().chain(physical.views.range(base..end)) {
+        let (from, to) = (at.max(base), (at + size).min(end));
+        ok &= decommit(done, from - done);
+        done = to;
+        // SAFETY: a view in the title's own reservation, which it gives up.
+        if unsafe { mem::protect(from as *mut u8, to - from, Protect::READ_WRITE) }.is_err() {
+            ok = false;
+            continue;
+        }
+        // shortcut: zeroing touches every page it zeroes, also those never written; skip pages
+        // never touched (mincore) if a title decommits large ranges it did not use.
+        for k in (from - at) / PAGE..(to - at).div_ceil(PAGE) {
+            let alone = |a: &Addresses| a.as_slice().len() == 1;
+            if slice.pool.backs && physical.shown.get(&slice.key(k)).is_some_and(alone) {
+                let (a, b) = ((at + k * PAGE).max(from), (at + (k + 1) * PAGE).min(to));
+                // SAFETY: read-write just above.
+                unsafe { std::ptr::write_bytes(a as *mut u8, 0, b - a) };
+            }
+        }
+        // SAFETY: as above.
+        ok &= unsafe { mem::protect(from as *mut u8, to - from, Protect::NO_ACCESS) }.is_ok();
+    }
+    ok && decommit(done, end - done)
 }
 
 /// The pool a physical-page view shows at `at`, if any (its id: a new pool never has an old one's).
@@ -875,9 +962,8 @@ fn map_fresh_scatter(addresses: &[*mut c_void], pages: &[usize]) -> Option<(usiz
     let base = addresses[0] as usize;
     // shortcut: replacements and clears stay page by page, batch them if we can preserve
     // unchanged protection and the scatter call's ordered partial results on failure.
-    if base.checked_add(PAGE) != Some(addresses[1] as usize)
-        || pages[0].checked_add(FRAMES) != Some(pages[1])
-    {
+    // Pages are told apart by their slices: freed numbers come back in any order.
+    if base.checked_add(PAGE) != Some(addresses[1] as usize) {
         return None;
     }
     let mut physical = physical();
@@ -1100,6 +1186,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
+    // Pinned page numbers whose page went from `shown` (Windows may show it again, `remap`).
+    let mut unpinned = Vec::new();
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let mut preceding = physical
@@ -1130,6 +1218,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 && entry.get_mut().remove(at + k * PAGE)
             {
                 entry.remove();
+                if physical.pinned.contains_key(&slice.key(k)) {
+                    unpinned.push(slice.key(k));
+                }
             }
         }
         #[cfg(windows)]
@@ -1153,6 +1244,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             if let Some(owner) = owner.filter(|_| keep) {
                 physical.owners.insert(from, owner);
             }
+        }
+    }
+    for key in unpinned {
+        if !physical.shown.contains_key(&key)
+            && let Some(number) = physical.pinned.remove(&key)
+        {
+            physical.free.insert(number);
         }
     }
 }
@@ -1876,6 +1974,35 @@ mod tests {
         assert_eq!(trips("a view over another"), [(second, first)]);
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn freed_page_numbers_are_given_again_once_unmapped() {
+        // A physical page table of its own: other tests allocate and free at the same time.
+        let mut physical = Physical {
+            next_page: 0x10_0000,
+            ..Default::default()
+        };
+        let pool = |n| Arc::new(Pool::new(n * PAGE).expect("pool"));
+        let a = physical.number(&pool(2), 2);
+        assert_eq!(a, [0x10_0000, 0x10_0010]);
+        physical.free_number(a[1]);
+        physical.free_number(a[0]);
+        let b = physical.number(&pool(3), 3);
+        assert_eq!(b, [a[0], a[1], 0x10_0020], "freed numbers first, lowest first");
+
+        let p = reserve(1) as usize;
+        let slice = physical.pages[&b[0]].clone();
+        assert!(map(&mut physical, p, PAGE, slice));
+        physical.free_number(b[0]);
+        assert!(!physical.pages.contains_key(&b[0]));
+        assert_eq!(
+            physical.number(&pool(1), 1),
+            [0x10_0030],
+            "a number still mapped is not given again"
+        );
+        unmap(&mut physical, p, PAGE);
+        assert_eq!(physical.number(&pool(1), 1), [b[0]], "unmapped, it is");
     }
 
     #[test]

@@ -37,6 +37,7 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     // Our own test shaders, compiled from the .hlsl beside them, so the Metal
     // tests run without a DXC install. Nothing from the game.
     ("crates/victory-metal/tests/affine.dxil", "synthetic Metal test shader"),
+    ("crates/victory-metal/tests/fixtures/heap_ps.dxil", "compiled from heap_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/heap_rw.dxil", "compiled from heap_rw.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample2d.dxil", "compiled from sample2d.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample2darray.dxil", "compiled from sample2darray.hlsl"),

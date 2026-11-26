@@ -398,6 +398,25 @@ fn a_shifted_or_built_mask_needs_the_consoles_lanes() {
     }
 }
 
+/// A mask holding lanes elsewhere read as data is refused saying where it
+/// comes from: here a saveexec of the other width (32 bits in a wave64
+/// program).
+#[test]
+fn masks_holding_lanes_elsewhere_say_where_they_come_from() {
+    const SAVEEXEC32_DATA: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+        0x7E02_0202, // v_mov_b32_e32 v1, s2
+    ];
+    let r = lowered(SAVEEXEC32_DATA, 64, false).err();
+    let why = "a lane mask holding lanes elsewhere read as data: written by a scalar \
+               instruction of the other width";
+    assert!(
+        matches!(r, Some(crate::ShaderError::Unsupported { what, .. }) if what == why),
+        "{r:?}"
+    );
+}
+
 /// What is not translated stays refused, saying what.
 #[test]
 fn what_has_no_form_is_refused_clearly() {
@@ -419,4 +438,31 @@ fn what_has_no_form_is_refused_clearly() {
         matches!(r, Some(crate::ShaderError::Unsupported { .. })),
         "{r:?}"
     );
+}
+
+/// A wave64 lane mask joined with data at a uniform loop's header (the
+/// wave takes one edge): each lane takes its bit of the pair's number, the
+/// low dword for lanes below 32, the high one above, as wave32 does.
+#[test]
+fn a_wave64_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
+    const LOOP: &[u32] = &[
+        0x7D88_0098, // v_cmp_gt_u32_e32 vcc, 24, v0
+        0x8786_7E6A, // s_and_b64 s[6:7], vcc, exec
+        0xBE88_0380, // s_mov_b32 s8, 0
+        0xD501_0001,
+        0x0019_0280, // header: v_cndmask_b32_e64 v1, 0, 1, s[6:7]
+        0x9086_8406, // s_lshr_b64 s[6:7], s[6:7], 4
+        0x7E0A_0206, // v_mov_b32_e32 v5, s6
+        0x7E0C_0207, // v_mov_b32_e32 v6, s7
+        0x7E0C_0505, // v_readfirstlane_b32 s6, v5
+        0x7E0E_0506, // v_readfirstlane_b32 s7, v6
+        0x8008_8108, // s_add_u32 s8, s8, 1
+        0xBF0A_8208, // s_cmp_lt_u32 s8, 2
+        0xBF85_FFF6, // s_cbranch_scc1 header
+    ];
+    for wave32_host in [false, true] {
+        if let Err(e) = lowered(LOOP, 64, wave32_host) {
+            panic!("wave32_host {wave32_host}: {e}");
+        }
+    }
 }

@@ -600,6 +600,19 @@ pub fn emit_with(
     };
     let guessed = graphics::is_guessed(c);
     let l = match lower::lower_graphics(&parts(st, res), guessed) {
+        // A console wave the host splits needs both halves at each group
+        // barrier, and lanes that left early for the end never arrive.
+        // Kept on to the end with EXEC off (`ir::keep_lanes_to_end`), they do.
+        Err(e @ ShaderError::Unsupported { what, .. })
+            if options.wave32_host
+                && native.stage == HwStage::Cs
+                && matches!(what, lower::DIVERGENT_EXCHANGE | lower::SPLIT_LDS) =>
+        {
+            let Some(q) = ir::keep_lanes_to_end(p) else {
+                return Err(e);
+            };
+            return emit_with(c, native, &q, &structure::structure(&q)?, io, res, options);
+        }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
