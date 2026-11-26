@@ -308,8 +308,9 @@ impl Metal {
     fn stage_function(
         &self,
         dxil: &[u8],
+        layout: Option<&victory_backend::backend::RootLayout>,
     ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
-        let (_, lib) = self.msc.convert(dxil, None).map_err(|e| e.to_string())?;
+        let (_, lib) = self.msc.convert_with(dxil, None, layout).map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
         let name = l
             .functionNames()
@@ -642,11 +643,11 @@ impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
-        let vf = self.stage_function(d.vs)?;
+        let vf = self.stage_function(d.vs, d.vs_layout)?;
         let pd = MTLRenderPipelineDescriptor::new();
         pd.setVertexFunction(Some(&vf));
         if let Some(ps) = d.ps {
-            pd.setFragmentFunction(Some(&*self.stage_function(ps)?));
+            pd.setFragmentFunction(Some(&*self.stage_function(ps, d.ps_layout)?));
         }
         // The converter's stage-in function takes its inputs at attribute indices from
         // `kIRStageInAttributeStartIndex`, in input-signature order; buffers from `kIRVertexBufferBindPoint`.

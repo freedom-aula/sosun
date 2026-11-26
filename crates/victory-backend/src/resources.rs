@@ -1,7 +1,7 @@
 //! Descriptor heaps, textures, samplers and render passes: the second slice of the seam (`backend`
 //! has queues, fences and compute). Platform neutral, no Metal types.
 
-use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs};
+use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs, RootLayout};
 
 /// Which descriptor heap type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,6 +408,9 @@ pub enum Topology {
 pub struct RenderPipelineDesc<'a> {
     pub vs: &'a [u8],
     pub ps: Option<&'a [u8]>,
+    /// Explicit root layouts when the converter needs the host's argument contract.
+    pub vs_layout: Option<&'a RootLayout>,
+    pub ps_layout: Option<&'a RootLayout>,
     pub attributes: &'a [VertexAttr],
     pub streams: &'a [VertexStream],
     pub color: &'a [Format],

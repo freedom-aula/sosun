@@ -141,6 +141,9 @@ pub enum Pipe<B: GraphicsBackend> {
     /// A guessed graphics pipeline (`VICTORY_GUESS_GRAPHICS`): made, per target formats and
     /// vertex strides, at its draws.
     Guess(Rc<Guessed<B>>),
+    /// A guessed graphics slot without a vertex producer.
+    #[cfg(target_os = "macos")]
+    Skipped,
     /// The host refused it (the reason is logged and counted once); work using it is dropped.
     Refused,
 }
@@ -151,6 +154,8 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
             Pipe::Compute(p) => Pipe::Compute(p.clone()),
             Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
             Pipe::Guess(g) => Pipe::Guess(g.clone()),
+            #[cfg(target_os = "macos")]
+            Pipe::Skipped => Pipe::Skipped,
             Pipe::Refused => Pipe::Refused,
         }
     }

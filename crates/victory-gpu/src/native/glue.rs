@@ -640,6 +640,9 @@ fn make_host_pipe(
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
     graphics: Option<super::state::Graphics>,
 ) -> Pipe<Metal> {
+    if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
+        return Pipe::Skipped;
+    }
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -817,8 +820,7 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     made
 }
 
-/// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
-/// counted) when there is nothing to draw with.
+/// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
     // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
@@ -826,6 +828,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let targets = l.targets.clone();
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
+        Pipe::Skipped => return None,
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {
