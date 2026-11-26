@@ -2,7 +2,7 @@
 //! and `os_sync` (macOS 14.4 and later) for wait-on-address.
 
 use std::io;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -150,27 +150,41 @@ unsafe extern "C" {
 /// differs; `false` if `timeout` passes first. Spurious wake-ups are
 /// possible: the caller re-checks.
 pub fn wait_on_address(addr: &AtomicU32, expected: u32, timeout: Option<Duration>) -> bool {
+    if let Some(t) = timeout
+        && t.is_zero()
+    {
+        return addr.load(Ordering::Acquire) != expected;
+    }
+    let deadline = timeout.map(|t| Instant::now() + t);
     let p = addr.as_ptr();
     loop {
         // SAFETY: `p` is a live 4-byte aligned atomic.
         let r = unsafe {
-            match timeout {
+            match deadline {
                 None => os_sync_wait_on_address(p, u64::from(expected), 4, 0),
-                Some(t) => os_sync_wait_on_address_with_timeout(
-                    p,
-                    u64::from(expected),
-                    4,
-                    0,
-                    OS_CLOCK_MACH_ABSOLUTE_TIME,
-                    t.as_nanos().min(u128::from(u64::MAX)) as u64,
-                ),
+                Some(d) => {
+                    let Some(left) = d.checked_duration_since(Instant::now()) else {
+                        return addr.load(Ordering::Acquire) != expected;
+                    };
+                    if left.is_zero() {
+                        return addr.load(Ordering::Acquire) != expected;
+                    }
+                    os_sync_wait_on_address_with_timeout(
+                        p,
+                        u64::from(expected),
+                        4,
+                        0,
+                        OS_CLOCK_MACH_ABSOLUTE_TIME,
+                        left.as_nanos().min(u128::from(u64::MAX)) as u64,
+                    )
+                }
             }
         };
         if r >= 0 {
             return true;
         }
         match io::Error::last_os_error().raw_os_error() {
-            Some(4) => {}             // EINTR
+            Some(4) => {}             // EINTR: retry with remaining time
             Some(60) => return false, // ETIMEDOUT
             _ => return true,         // EFAULT and the like: let the caller look
         }

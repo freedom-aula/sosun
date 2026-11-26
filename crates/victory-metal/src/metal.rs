@@ -15,7 +15,8 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
 pub struct Metal {
     pub(crate) dev: Dev,
-    pub(crate) msc: Msc,
+    /// Opened at creation when installed; shader compilation reports the error if absent.
+    pub(crate) msc: Result<Msc, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
     /// The set of the title's pool buffers, made when the first one is.
@@ -95,6 +96,8 @@ impl Buffer {
 
 impl Metal {
     /// The system GPU and the installed converter (`VICTORY_MSC_DYLIB` overrides its path).
+    /// Succeeds even if the converter is not installed so non-shader Metal operations still work;
+    /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
         // Residency is per encoder (`useResource`) unless `VICTORY_METAL_RESIDENCY_SETS=1`. A
@@ -107,12 +110,16 @@ impl Metal {
             && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
         Ok(Metal {
             dev,
-            msc: Msc::open_default(),
+            msc: Msc::try_open_default(),
             residency_sets,
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
         })
+    }
+
+    pub(crate) fn msc(&self) -> Result<&Msc, String> {
+        self.msc.as_ref().map_err(Clone::clone)
     }
 
     fn compute_from(
@@ -245,7 +252,7 @@ impl ComputeBackend for Metal {
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert(dxil, None))
+        self.compute_from(self.msc()?.convert(dxil, None))
     }
 
     fn create_compute_pipeline_with(
@@ -253,7 +260,7 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
-        self.compute_from(self.msc.convert_with(dxil, None, Some(layout)))
+        self.compute_from(self.msc()?.convert_with(dxil, None, Some(layout)))
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
@@ -470,5 +477,19 @@ mod tests {
         );
         // SUBS is even: the last write is array 0.
         assert!((0..N).all(|i| mem.get(0, i) == SUBS as u32));
+    }
+
+    #[test]
+    fn missing_msc_returns_error_instead_of_panicking() {
+        let mut m = Metal::new().expect("Metal device available on macOS");
+        m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib");
+        // Non-shader operations still succeed without MSC.
+        let q = m.create_queue().unwrap();
+        let f = m.create_fence(0).unwrap();
+        m.signal(&f, 1);
+        assert_eq!(m.completed(&f), 1);
+        drop(q);
+        // Shader conversion returns an Err instead of panicking.
+        assert!(m.create_compute_pipeline(AFFINE).is_err());
     }
 }

@@ -320,6 +320,9 @@ fn wait_on_address_wakes_and_times_out() {
     let word = Arc::new(AtomicU32::new(0));
     // The value differs: returns at once.
     assert!(wait_on_address(&word, 1, Some(Duration::from_secs(5))));
+    // Zero timeout: returns false when equal, true when different.
+    assert!(!wait_on_address(&word, 0, Some(Duration::ZERO)));
+    assert!(wait_on_address(&word, 1, Some(Duration::ZERO)));
     let start = Instant::now();
     assert!(!wait_on_address(&word, 0, Some(Duration::from_millis(50))));
     assert!(start.elapsed() >= Duration::from_millis(40));
