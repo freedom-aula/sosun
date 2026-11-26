@@ -46,9 +46,23 @@ pub struct Heap {
     count: usize,
     /// What each entry names, kept alive here and made resident with the heap.
     refs: RefCell<std::collections::HashMap<usize, Res>>,
+    /// Reference counts per raw `MTLResource` pointer currently in `set`, so an allocation is
+    /// added once and removed + committed before its last `refs` entry is dropped.
+    alloc_counts: RefCell<std::collections::HashMap<usize, usize>>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        // MTLResidencySet does not retain allocations: detach everything and commit before
+        // `buf` and `refs` are dropped.
+        if let Some(set) = self.set.take() {
+            set.removeAllAllocations();
+            set.commit();
+        }
+    }
 }
 
 pub struct Texture {
@@ -301,12 +315,44 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
-        if let Some(r) = keep {
-            if let Some(set) = &heap.set {
-                set.addAllocation(ProtocolObject::from_ref(&*r));
-                heap.dirty.set(true);
+        let old = match keep {
+            Some(r) => {
+                let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+                let mut counts = heap.alloc_counts.borrow_mut();
+                let count = counts.entry(ptr).or_insert(0);
+                if *count == 0
+                    && let Some(set) = &heap.set
+                {
+                    set.addAllocation(ProtocolObject::from_ref(&*r));
+                    heap.dirty.set(true);
+                }
+                *count += 1;
+                drop(counts);
+                heap.refs.borrow_mut().insert(index, r)
             }
-            heap.refs.borrow_mut().insert(index, r);
+            None => heap.refs.borrow_mut().remove(&index),
+        };
+        if let Some(old) = old {
+            let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
+            let mut counts = heap.alloc_counts.borrow_mut();
+            let last = match counts.get_mut(&old_ptr) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    counts.remove(&old_ptr);
+                    true
+                }
+                None => false,
+            };
+            drop(counts);
+            if last && let Some(set) = &heap.set {
+                set.removeAllocation(ProtocolObject::from_ref(&*old));
+                set.commit();
+                heap.dirty.set(false);
+            }
+            drop(old);
         }
     }
 
@@ -446,6 +492,7 @@ impl ResourceBackend for Metal {
             kind,
             count,
             refs: RefCell::default(),
+            alloc_counts: RefCell::default(),
             set,
             dirty: Cell::new(false),
         })
