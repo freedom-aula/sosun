@@ -267,6 +267,46 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+/// `s_sext_i32_i8` and `s_sext_i32_i16` sign-extend the low byte (half) of
+/// S0 and leave SCC as it was (RDNA2 ISA, SOP1; neither sets SCC).
+#[test]
+fn scalar_sign_extensions_keep_scc() {
+    // SCC = (s1 == 0), then the extension of s0 into s16, then SCC into s18.
+    let body = |opcode: u32, out: u8| {
+        [
+            0xBF06_8001,               // s_cmp_eq_u32 s1, 0
+            0xBE90_0000 | opcode << 8, // s_sext_i32_i8/i16 s16, s0
+            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
+            vop1(1, 0, sgpr(out)),     // v_mov_b32 v0, s16 or s18
+        ]
+    };
+    // (s0, s1), then (i8 result, i16 result, SCC after). A result of 0 with
+    // SCC 1, and a non-zero one with SCC 0, catch an extension that sets it.
+    let cases = [
+        ([0x0000_007F, 1, 0, 0], [0x7F, 0x7F, 0]),
+        ([0x0000_0080, 0, 0, 0], [0xFFFF_FF80, 0x80, 1]),
+        ([0x1234_80FF, 1, 0, 0], [u32::MAX, 0xFFFF_80FF, 0]),
+        ([0xFFFF_7F00, 0, 0, 0], [0, 0x7F00, 1]),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (wide, opcode) in [0x19, 0x1a].into_iter().enumerate() {
+        let value = build_valu_cs(&body(opcode, 16));
+        run_cases(&value, &inputs, |backend, i, _, got| {
+            assert_eq!(
+                got, cases[i].1[wide],
+                "{backend}, opcode {opcode:#x}, case {i}"
+            );
+        });
+        let scc = build_valu_cs(&body(opcode, 18));
+        run_cases(&scc, &inputs, |backend, i, _, got| {
+            assert_eq!(
+                got, cases[i].1[2],
+                "{backend}, opcode {opcode:#x}, SCC, case {i}"
+            );
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }

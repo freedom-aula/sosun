@@ -941,6 +941,37 @@ fn lds_instructions_addressed_by_m0_translate() {
     );
 }
 
+/// `s_sext_i32_i8` and `s_sext_i32_i16` translate, with SCC from before them
+/// still read after (values: `valu_tests`).
+#[test]
+fn scalar_sign_extensions_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    for sext in [
+        0xBE86_1904, // s_sext_i32_i8 s6, s4
+        0xBE86_1A04, // s_sext_i32_i16 s6, s4
+    ] {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            sext,
+            0x8507_8081, // s_cselect_b32 s7, 1, 0
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0x7E04_0207, // v_mov_b32 v2, s7
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xE070_0004,
+            0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0 offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+            .unwrap();
+    }
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [

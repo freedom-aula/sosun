@@ -5439,6 +5439,13 @@ impl<'a> Lower<'a> {
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
                 (self.s.m.select(c, neg, n, a), None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                // D = the low 8 (16) bits of S0, sign-extended; SCC is kept (RDNA2 ISA, SOP1).
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let up = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, up, k), None)
+            }
             "s_absdiff_i32" => {
                 // D = S0 - S1 (wrapping), negated if negative; SCC = D != 0 (RDNA2 ISA, SOP2).
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);

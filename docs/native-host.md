@@ -414,6 +414,15 @@ marked 16-bit" or "the high half of an input not marked 16-bit". Nothing is lowe
 read returns from a 32-bit attribute is not documented, and in a guessed pipeline the missing mark
 may be the stage data's (guessed) rather than the program's.
 
+## Scalar sign extension
+
+`s_sext_i32_i8` and `s_sext_i32_i16` were decoded but refused ("s_sext_i32_i16 is not supported",
+one compute program in the story-load log of issue #140). They are lowered as the RDNA2 ISA gives
+them (SOP1): the low 8 or 16 bits of `S0`, sign-extended to 32 bits. Neither sets SCC, so a
+compare before them still decides a select after them. `gfx_refusal_tests::scalar_sign_extensions_translate`
+checks they translate; `valu_tests::scalar_sign_extensions_keep_scc` (Windows) runs them on the GPU
+and WARP, values and SCC both.
+
 ## Bring-up diagnostics (native path)
 
 Off by default, environment variables of the host process. The native host's switches that draws and submissions check are read once, at their first check (`env_set!`, and `VICTORY_TRACE_CONTENT`'s options), so setting one after the process started has no effect:
