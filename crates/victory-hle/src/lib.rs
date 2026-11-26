@@ -29,6 +29,10 @@ pub mod posix {
 }
 mod registry;
 pub mod runtime;
+// shortcut: macOS x86_64 only while `host_posix` is its one user; dstorage's own table (#130)
+// can call it once both land, with the gate widened to `not(windows)`.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod win32_errors;
 
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};

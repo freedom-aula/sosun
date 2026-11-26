@@ -1595,6 +1595,39 @@ mod tests {
         }
     }
 
+    /// A 16-bit read of an input no stage data marks 16-bit is refused saying which: an f16
+    /// interpolation of it, or its high half.
+    #[test]
+    fn a_16_bit_read_of_a_32_bit_input_says_which() {
+        let program = |interp: [u32; 4], inputs: Vec<crate::native::PsInput>| {
+            let words = [
+                interp[0],
+                interp[1],
+                interp[2],
+                interp[3],
+                0x7E08_1703, // v_cvt_f32_f16 v4, v3
+                0xF800_180F,
+                0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, inputs, 1 << 1, &isg1, &osg1).unwrap_err().to_string()
+        };
+        // v_interp_p1ll_f16 v2, v0, attr0.x; v_interp_p2_f16 v3, v1, attr0.x, v2
+        let p1ll = [0xD742_0002, 0x0202_0000, 0xD75A_0003, 0x040A_0200];
+        // The same, both with `high`.
+        let high = [0xD742_0002, 0x0202_0100, 0xD75A_0003, 0x040A_0300];
+        let prefix = "a 16-bit read of a 32-bit input: ";
+        for (interp, inputs, why) in [
+            (p1ll, vec![texcoord(false)], "an f16 interpolation of an input not marked 16-bit"),
+            (high, vec![texcoord(false)], "the high half of an input not marked 16-bit"),
+        ] {
+            let err = program(interp, inputs);
+            assert!(err.contains(&format!("{prefix}{why}")), "{err}");
+        }
+    }
+
     /// A 16-bit result written over a first interpolation half keeps that
     /// half's high 16 bits, which have no host form: what reads only the low
     /// half translates, a read of the whole dword does not.

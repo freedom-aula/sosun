@@ -71,24 +71,50 @@ pub struct Mapping {
     pub offset: u64,
 }
 
-/// The view pairs made so far: pair `n` (n >= 1) is `keys[n - 1]`. Only ever grows, so a heap
-/// that has the first k pairs written only needs the ones after them.
+/// The view pairs made so far: pair `n` (n >= 1) is `keys[n - 1]`, `None` once its pool was
+/// released (the slot is free for the next pool). `epoch` changes whenever a slot that existed
+/// changes (released or reused), so a heap whose pairs were written in another epoch writes them
+/// all again; otherwise it only needs the ones after those it has.
 #[derive(Default, Debug)]
 pub struct Pairs {
-    pub keys: Vec<PairKey>,
+    pub keys: Vec<Option<PairKey>>,
+    pub epoch: u64,
 }
 
 impl Pairs {
     fn pair(&mut self, key: PairKey) -> Option<u32> {
-        let n = match self.keys.iter().rposition(|k| *k == key) {
+        let n = match self.keys.iter().rposition(|k| *k == Some(key)) {
             Some(n) => n,
-            None if self.keys.len() + 1 < PAIRS => {
-                self.keys.push(key);
-                self.keys.len() - 1
-            }
-            None => return None,
+            None => match self.keys.iter().position(Option::is_none) {
+                Some(n) => {
+                    self.keys[n] = Some(key);
+                    self.epoch += 1;
+                    n
+                }
+                None if self.keys.len() + 1 < PAIRS => {
+                    self.keys.push(Some(key));
+                    self.keys.len() - 1
+                }
+                None => {
+                    static FULL: std::sync::Once = std::sync::Once::new();
+                    FULL.call_once(|| {
+                        tracing::warn!(pairs = PAIRS - 1, "every title memory view pair is taken: pages of further pools read as zero and drop their writes (first time)");
+                    });
+                    return None;
+                }
+            },
         };
         Some(n as u32 + 1)
+    }
+
+    /// Pool `pool` was released: its pairs are free for other pools.
+    pub fn release(&mut self, pool: usize) {
+        for k in &mut self.keys {
+            if k.is_some_and(|k| k.pool == pool) {
+                *k = None;
+                self.epoch += 1;
+            }
+        }
     }
 
     /// The bytes of the pool a pair shows: from `chunk * CHUNK`, a chunk and a page long, as far
@@ -268,7 +294,7 @@ mod tests {
     /// What the lookup says an address of the title is: the pair's view and where in the pool.
     fn resolve(words: &[u32], pairs: &Pairs, va: u64) -> Option<(usize, u64)> {
         let (view, offset) = lookup(words, va)?;
-        let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
+        let key = pairs.keys[((view - FIRST) / 2 - 1) as usize].unwrap();
         Some((key.pool, key.chunk * CHUNK + u64::from(offset)))
     }
 
@@ -307,7 +333,7 @@ mod tests {
             assert_eq!(r, (5, off), "{off:#x}");
             // The offset is inside the view of that pair (a chunk and a page long, to the pool's end).
             let (view, o) = lookup(&words, at + off).unwrap();
-            let key = pairs.keys[((view - FIRST) / 2 - 1) as usize];
+            let key = pairs.keys[((view - FIRST) / 2 - 1) as usize].unwrap();
             let (_, size) = Pairs::span(&key);
             assert!(u64::from(o) + 4 <= u64::from(size), "{off:#x}");
         }
@@ -353,5 +379,26 @@ mod tests {
         assert_eq!(resolve(&words, &pairs, 0x10_0000_0000 + (PAIRS as u64 * 2 - 1) * PAGE), None);
         // The pairs and the translator's own null views fit below the clamp.
         assert!(fits(1_000_000) && !fits(victory_shader::emit::NULL_BUFFER_VIEW as usize));
+    }
+
+    #[test]
+    fn a_released_pools_pairs_go_to_the_next_pools() {
+        let mut pairs = Pairs::default();
+        // Every pair taken.
+        let many: Vec<Mapping> = (0..PAIRS as u64)
+            .map(|i| map(0x10_0000_0000 + i * PAGE, PAGE, 100 + i as usize, PAGE, 0))
+            .collect();
+        build(&many, &mut pairs, FIRST);
+        assert_eq!(pairs.keys.len(), PAIRS - 1);
+        let fresh = map(0x20_0000_0000, PAGE, 999, PAGE, 0);
+        assert_eq!(resolve(&build(&[fresh], &mut pairs, FIRST), &pairs, 0x20_0000_0000), None);
+        // Pool 105 goes: its pair (6) is the new pool's, and heaps must write their pairs again.
+        let epoch = pairs.epoch;
+        pairs.release(105);
+        assert_ne!(pairs.epoch, epoch);
+        let words = build(&[fresh], &mut pairs, FIRST);
+        assert_eq!(resolve(&words, &pairs, 0x20_0000_0010), Some((999, 0x10)));
+        assert_eq!(lookup(&words, 0x20_0000_0000).unwrap().0, pair_index(FIRST, 6));
+        assert_eq!(pairs.keys.len(), PAIRS - 1);
     }
 }

@@ -5,8 +5,9 @@
 //! Each translator's entries are in a folder of their own, named by the
 //! start of that key: older translators' folders can be deleted whole.
 //! Entries go through `victory-pipeline`'s content-addressed cache, which
-//! writes them atomically; an entry that does not read back is translated
-//! again. A container that does not translate is kept too, with the reason,
+//! writes them atomically. Each entry starts with the blake3 sum of the rest,
+//! as in `victory_metal::disk`: an entry that is damaged, cut short or does
+//! not read back is translated again and rewritten. A container that does not translate is kept too, with the reason,
 //! so it is not tried again on every run.
 //!
 //! `victory translate --cache` fills the same cache ahead of a run, through
@@ -257,7 +258,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        Ok(encode(&(self.translate)(&input[32..])))
+        Ok(seal(encode(&(self.translate)(&input[32..]))))
     }
 }
 
@@ -280,7 +281,7 @@ fn cached(
                 break;
             }
         };
-        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(&b)) {
+        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(unseal(&b)?)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
@@ -424,6 +425,17 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         word(&mut out, n);
     }
     out
+}
+
+/// An entry: the blake3 sum of the encoding, then the encoding.
+fn seal(encoding: Vec<u8>) -> Vec<u8> {
+    [blake3::hash(&encoding).as_bytes().as_slice(), &encoding].concat()
+}
+
+/// The encoding in an entry; `None` if the sum does not match (a damaged or cut-short file).
+fn unseal(entry: &[u8]) -> Option<&[u8]> {
+    let (sum, encoding) = entry.split_at_checked(32)?;
+    (blake3::hash(encoding).as_bytes() == sum).then_some(encoding)
 }
 
 fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
@@ -600,8 +612,19 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0.clone(), true));
         assert_eq!(fails.load(Ordering::Relaxed), 1);
+
+        // A cut-short refusal still decodes (to a shorter reason); the sum
+        // makes it a miss, translated and rewritten.
+        for e in walk(dir.path()) {
+            let bytes = std::fs::read(&e).unwrap();
+            std::fs::write(&e, &bytes[..bytes.len() - 1]).unwrap();
+        }
+        assert_eq!(cached(&cache, &build, b"other", fail), refused);
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
     }
 
     /// The key's parts: a change to any of them (the translator's sources,

@@ -28,6 +28,10 @@ pub struct NativeHost<B: GraphicsBackend> {
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
+    /// The pool table's mappings as [`Self::mapping_list`] last read them, and their generation.
+    maps: RefCell<Option<(u64, Rc<[Mapping]>)>>,
+    /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
+    released: RefCell<Vec<usize>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
@@ -37,6 +41,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Commands dropped because the host could not prepare them for another reason.
+    failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
 }
@@ -126,12 +132,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             backend,
             memory,
             buffers: RefCell::default(),
+            released: RefCell::default(),
+            maps: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
         }
     }
@@ -151,6 +160,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.unmapped.get()
     }
 
+    /// Commands dropped so far because the host could not prepare them (not an unset root
+    /// parameter, not unmapped memory).
+    pub fn failed(&self) -> u64 {
+        self.failed.get()
+    }
+
     /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
     pub fn passes(&self) -> u64 {
         self.passes.get()
@@ -163,16 +178,34 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The buffer and pool-mapping address of `[addr, addr + len)` of title memory.
     pub fn resolve(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
-        let mut buffers = self.buffers.borrow_mut();
-        for gone in self.memory.take_released() {
-            buffers.remove(&gone);
-        }
+        self.forget_released();
         let (pool, ptr) = self
             .memory
             .resolve(addr, len)
             .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}"))?;
-        drop(buffers);
         Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+    }
+
+    /// Drops what the host keeps of pools released since the last call: their buffers, and their
+    /// view pairs (free for other pools from now on). [`Self::released_pools`] lists them.
+    fn forget_released(&self) {
+        let gone = self.memory.take_released();
+        if gone.is_empty() {
+            return;
+        }
+        let mut buffers = self.buffers.borrow_mut();
+        let mut c = self.contract.borrow_mut();
+        for &id in &gone {
+            buffers.remove(&id);
+            c.pairs.release(id);
+        }
+        self.released.borrow_mut().extend(gone);
+    }
+
+    /// Pools released since the last call (for what the title side keeps of them).
+    pub(crate) fn released_pools(&self) -> Vec<usize> {
+        self.forget_released();
+        std::mem::take(&mut self.released.borrow_mut())
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.
@@ -359,7 +392,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             &ViewDesc {
                                 format,
                                 mips: (first as usize, count as usize),
-                                slices: (0, 1),
+                                // Every slice of an array (the backend cuts it to what is there):
+                                // one slice showed an array view's first alone.
+                                slices: (0, usize::MAX),
                             },
                         )?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);
@@ -389,9 +424,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let Some(Root::Table(h, at)) = r else { continue };
             let check = table_check_count(slot, binding, Self::TABLE_CHECK);
             let (mut checked, mut changed) = (0, 0);
-            for index in *at..(*at + check).min(h.count) {
-                let handle = h.start + index as u64 * Self::step(h.kind);
-                let record = record_at(handle);
+            let step = Self::step(h.kind) as usize;
+            let end = (*at + check).min(h.count);
+            // The whole span in one read (a system call each); entry by entry only if part of it
+            // cannot be read.
+            let mut span = vec![0u8; end.saturating_sub(*at) * step];
+            let whole = super::safe_read((h.start + (*at * step) as u64) as *const u8, &mut span);
+            for index in *at..end {
+                let handle = h.start + (index * step) as u64;
+                let record = if whole {
+                    span[(index - *at) * step..][..12].try_into().expect("12 bytes")
+                } else {
+                    record_at(handle)
+                };
                 checked += 1;
                 if h.mirrored.borrow().get(&index) == Some(&record) {
                     continue;
@@ -488,23 +533,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.count
             ));
         }
-        let (generation, mappings) = self.memory.mappings();
         if let Some((g, t)) = &*heap.table.borrow()
-            && *g == generation
+            && *g == self.memory.generation()
         {
             return Ok(t.clone());
         }
-        let maps: Vec<Mapping> = mappings
-            .iter()
-            .map(|(at, len, pool, offset)| Mapping {
-                at: *at as u64,
-                len: *len as u64,
-                pool: pool.id,
-                base: pool.base,
-                pool_len: pool.len as u64,
-                offset: *offset as u64,
-            })
-            .collect();
+        let (generation, maps) = self.mapping_list();
         let mut c = self.contract.borrow_mut();
         let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
@@ -532,38 +566,45 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn write_pairs(&self, heap: &NativeHeap<B>) -> Result<(), String> {
         let null = self.null_view()?;
         let c = self.contract.borrow();
-        let have = heap.pairs.get();
+        let (epoch, have) = heap.pairs.get();
+        let have = if epoch == c.pairs.epoch { have } else { 0 };
         let want = c.pairs.keys.len() + 1;
         for n in have..want {
             let index = addr::pair_index(heap.count as u32, n as u32) as usize;
-            let (buffer, ptr, size) = if n == 0 {
-                (null.buf.clone(), null.ptr().cast_const(), 0)
-            } else {
-                let key = c.pairs.keys[n - 1];
-                let buffer = self.pool_buffer(key.pool, key.base, key.len as usize)?;
-                let (from, size) = Pairs::span(&key);
-                (buffer, (key.base + from as usize) as *const u8, size)
+            // Pair 0, and a pair whose pool was released: the null view.
+            let (buffer, ptr, size) = match n.checked_sub(1).and_then(|k| c.pairs.keys[k]) {
+                None => (null.buf.clone(), null.ptr().cast_const(), 0),
+                Some(key) => {
+                    let buffer = self.pool_buffer(key.pool, key.base, key.len as usize)?;
+                    let (from, size) = Pairs::span(&key);
+                    (buffer, (key.base + from as usize) as *const u8, size)
+                }
             };
             // Both of the pair name the same bytes (the converter's descriptors are the same).
             for i in [index, index + 1] {
                 self.backend.write_buffer(&heap.heap, i, &buffer, ptr, size);
             }
         }
-        heap.pairs.set(want);
+        heap.pairs.set((c.pairs.epoch, want));
         Ok(())
     }
 
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
-        let maps = self.mapping_list();
+        let (_, maps) = self.mapping_list();
         addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
     }
 
-    /// The pool table as the page table builder reads it.
-    fn mapping_list(&self) -> Vec<Mapping> {
-        self.memory
-            .mappings()
-            .1
+    /// The pool table as the page table builder reads it, and its generation: made again only
+    /// when the pool table changed.
+    fn mapping_list(&self) -> (u64, Rc<[Mapping]>) {
+        if let Some((g, maps)) = &*self.maps.borrow()
+            && *g == self.memory.generation()
+        {
+            return (*g, maps.clone());
+        }
+        let (generation, mappings) = self.memory.mappings();
+        let maps: Rc<[Mapping]> = mappings
             .iter()
             .map(|(at, len, pool, offset)| Mapping {
                 at: *at as u64,
@@ -573,7 +614,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 pool_len: pool.len as u64,
                 offset: *offset as u64,
             })
-            .collect()
+            .collect();
+        *self.maps.borrow_mut() = Some((generation, maps.clone()));
+        (generation, maps)
     }
 
     /// What a shader that finds title memory through the page table is given besides its user data:
@@ -640,7 +683,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     fn trace_draw(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, dispatch: bool) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
-        if std::env::var_os("VICTORY_TRACE_TARGETS").is_none() || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
+        if !env_set!("VICTORY_TRACE_TARGETS") || N[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed) >= 6 {
             return;
         }
         self.trace_args(root, binding);
@@ -713,15 +756,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let start = START.get_or_init(std::time::Instant::now);
-        let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
         // `<dir>[,<seconds>[,<format>]]`: from that many seconds after the first draw on; with a
         // format, only the draws into render targets of that title format, boot passes included.
-        let v = v.to_string_lossy().into_owned();
-        let mut parts = v.split(',');
-        let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
-        let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let only: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+        static OPTIONS: std::sync::OnceLock<Option<(std::path::PathBuf, u64, Option<u32>)>> = std::sync::OnceLock::new();
+        let Some((dir, after, only)) = OPTIONS.get_or_init(|| {
+            let v = std::env::var_os("VICTORY_TRACE_CONTENT")?.to_string_lossy().into_owned();
+            let mut parts = v.split(',');
+            let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
+            let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            Some((dir, after, parts.next().and_then(|s| s.parse().ok())))
+        }) else {
+            return;
+        };
+        let (after, only) = (*after, *only);
+        let start = START.get_or_init(std::time::Instant::now);
         if start.elapsed().as_secs() < after {
             return;
         }
@@ -864,6 +912,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count: None,
             heap: None,
         };
+        self.forget_released();
         match cmd {
             Cmd::Dispatch {
                 root,
@@ -882,7 +931,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     p.count = Some((b, at, *index));
                 }
                 tracing::debug!(?groups, "dispatch");
-                if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
+                if env_set!("VICTORY_TRACE_TARGETS") {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                         tracing::info!(?groups, threads = ?pso.threads, "dispatch");
@@ -978,7 +1027,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
         // metadata can name a root slot the title sets nothing in, 255 observed; what the console
-        // gives such a shader there is not known.) Any other error still refuses the piece.
+        // gives such a shader there is not known.) Any other error drops its command alone too.
         // A dropped command still ends the pass it would have ended: the commands either side of it
         // that it kept apart stay in two passes (`cut`), so the backend still orders their
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
@@ -988,7 +1037,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
             _ => false,
         };
-        let trace = std::env::var_os("VICTORY_TRACE_TARGETS").is_some();
+        let trace = env_set!("VICTORY_TRACE_TARGETS");
         let mut cmds: Vec<&Cmd<B>> = Vec::new();
         let mut preps = Vec::new();
         // Whether a pass ends before the kept command of that index, and the commands dropped since
@@ -1047,7 +1096,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
                     dropped.push(c);
                 }
-                Err(e) => return Err(e),
+                // Anything else the host cannot give one command (arguments that are not what the
+                // shader reads, a heap without room for the view pairs, a buffer not made) drops
+                // that command alone too: refusing the piece also dropped its value writes.
+                Err(e) => {
+                    self.failed.set(self.failed.get() + 1);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
+                    });
+                    tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    dropped.push(c);
+                }
             }
         }
 
@@ -1307,5 +1367,22 @@ mod tests {
         assert_eq!(table_check_count(1, Some(&vs), 16), 16);
         assert_eq!(table_check_count(2, Some(&vs), 16), 30);
         assert_eq!(table_check_count(3, Some(&vs), 16), 19);
+    }
+
+    /// The mappings are read from the pool table once per generation, not at every root view.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mapping_list_is_read_again_only_when_the_pool_table_changes() {
+        use super::super::memory::{PoolInfo, PoolObserver};
+        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        let h = NativeHost::new(metal);
+        let pool = PoolInfo { id: 1, base: 0x1000_0000, len: 0x10_0000, memory_entry: None };
+        h.memory().mapped(0x7000_0000, 0x1_0000, &pool, 0);
+        let (g, a) = h.mapping_list();
+        let (_, b) = h.mapping_list();
+        assert!(Rc::ptr_eq(&a, &b));
+        h.memory().mapped(0x7001_0000, 0x1_0000, &pool, 0x1_0000);
+        let (g2, c) = h.mapping_list();
+        assert!(g2 != g && c.len() == 2);
     }
 }

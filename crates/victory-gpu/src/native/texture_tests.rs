@@ -275,6 +275,44 @@ fn a_placed_texture_view_makes_and_fills_its_texture() {
     assert_eq!(out[(5 * 32 + 9) * 4..][..4], texel(0, 9, 5));
 }
 
+/// A placed texture has no object the title releases: it goes when another description is placed
+/// at its address, and when its pool is released.
+#[test]
+fn a_placed_texture_goes_when_replaced_and_with_its_pool() {
+    let Some(pool) = pool(9107, 4) else { return };
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let place = |size: u32| {
+        let res = crate::resource::test_texture_at(pool.va(0), (size.into(), size), 1, 28, Swizzle::SW_64KB_S.0, 0);
+        let words = crate::resource::texture_desc(res).unwrap();
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[5]) = (28, 4, 1);
+        (view[10], view[11]) = (pool.va(0) as u32, (pool.va(0) >> 32) as u32);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, start);
+        crate::native::textures::placed_key(pool.va(0), &words)
+    };
+    let first = place(32);
+    assert!(with_title(|t| t.host.knows(first)).unwrap());
+    let second = place(16);
+    assert_ne!(first, second);
+    with_title(|t| {
+        assert!(t.host.knows(second));
+        assert!(!t.host.knows(first), "replaced at its address");
+    });
+    let info = PoolInfo {
+        id: 9107,
+        base: pool.mem.primary as usize,
+        len: pool.mem.len,
+        memory_entry: None,
+    };
+    glue::pool_observer().pool_released(&info);
+    with_title(|t| {
+        t.sync_dirty();
+        assert!(!t.host.knows(second), "released with its pool");
+        assert!(t.texture_of(second).is_none());
+    });
+}
+
 /// A render target the title clears through its view: the host texture is the target, never
 /// filled from memory.
 #[test]

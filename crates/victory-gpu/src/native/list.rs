@@ -16,8 +16,8 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub start: u64,
     pub count: usize,
     /// View pairs of the pool-offset contract ([`super::addr`]) written into the heap's reserved
-    /// entries so far.
-    pub pairs: std::cell::Cell<usize>,
+    /// entries so far, and the pairs' epoch they were written in.
+    pub pairs: std::cell::Cell<(u64, usize)>,
     /// The page table built for this heap (its view indices are the heap's own) and the pool-table
     /// generation it is current for.
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
