@@ -395,8 +395,7 @@ fn texture_views_and_sampler_filters() {
 #[test]
 fn texture_over_zero_copy_memory() {
     let Some(m) = backend() else { return };
-    // Small texture: 4x4 RGBA8Unorm with aligned pitch.
-    let a = Arena::new(&m, 1);
+    let a = Arena::new(&m, 2);
     let align = m.linear_alignment(Format::Rgba8Unorm);
     let pitch = 16usize.next_multiple_of(align);
     // The texture starts one alignment unit into the arena, like a title resource at an offset.

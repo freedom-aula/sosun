@@ -32,7 +32,8 @@ vertex Out present_vertex(uint i [[vertex_id]]) {
     o.uv = float2(p.x, 1.0 - p.y);
     return o;
 }
-fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[texture(0)]], sampler s [[sampler(0)]]) {
+fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
     return source.sample(s, in.uv);
 }
 "#;
@@ -248,21 +249,6 @@ impl PresentBackend for Metal {
                 .ok_or("no render encoder")?;
             let state = pipeline(self, surface, target.pixelFormat())?;
             e.setRenderPipelineState(&state);
-            // SAFETY: slot 0 of the fragment stage takes the source texture.
-            unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
-            // Bind a sampler at index 0 (matches the shader's `sampler s [[sampler(0)]]`)
-            let sampler_desc = MTLSamplerDescriptor::new();
-            sampler_desc.setMinFilter(MTLSamplerMinMagFilter::Linear);
-            sampler_desc.setMagFilter(MTLSamplerMinMagFilter::Linear);
-            sampler_desc.setMipFilter(MTLSamplerMipFilter::Linear);
-            sampler_desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
-            sampler_desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
-            sampler_desc.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
-            sampler_desc.setMaxAnisotropy(1);
-            let sampler = self.dev.newSamplerStateWithDescriptor(&sampler_desc)
-                .ok_or("failed to create sampler")?;
-            // SAFETY: bind sampler at index 0
-            unsafe { e.setFragmentSamplerState_atIndex(Some(&sampler), 0) };
             // SAFETY: slot 0 of the fragment stage takes the source texture.
             unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
             // SAFETY: three vertices, no buffers.
