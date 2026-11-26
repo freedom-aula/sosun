@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 
-use super::bridge::{StubBlock, is_direct, is_win64, trace_imports, traced_import};
+use super::bridge::{StubBlock, is_direct, is_win64, profile_seconds, trace_imports, traced_import};
 use super::dump::enabled as dump_enabled;
 use super::image::NativeImage;
 use crate::{
@@ -77,7 +77,7 @@ pub fn bind_imports(
                     } else {
                         let win64 = is_win64(address);
                         // win64 functions skip the remapping, and the trace.
-                        let context = if (trace_imports() || dump_enabled()) && !win64 {
+                        let context = if (trace_imports() || dump_enabled() || profile_seconds().is_some()) && !win64 {
                             traced_import(&module.dll, &entry.symbol.to_string())
                         } else {
                             0

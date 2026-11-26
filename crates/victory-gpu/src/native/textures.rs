@@ -8,7 +8,7 @@
 //! start empty and are not read from memory.
 //!
 //! shortcut: the detile runs on the CPU (`Layout::detile`, the code the D3D12 host uses too) and
-//! every submission hashes the memory of every sampled texture; a compute detile that reads the
+//! a thread hashes the memory of every sampled texture round after round (see `Watch`); a compute detile that reads the
 //! pool buffer directly and a per-page change test (what `watch.rs` gives the D3D12 host) are the
 //! next step. A change detiles the whole texture.
 
@@ -113,6 +113,57 @@ pub fn upload<B: ResourceBackend>(
     Ok(())
 }
 
+/// Textures whose memory the scanner thread watches, and those it found changed.
+///
+/// Hashing every sampled texture's memory on every submission (150 ms at 170 MiB, under the
+/// title lock the title's other threads wait on) made a title that streams textures slow to a
+/// crawl as they accumulated. A thread of its own hashes them in rounds, off the lock, and a
+/// submission only looks at the textures it marked.
+/// shortcut: a change is seen one round later (a round is as long as the hashing takes, about
+/// 100 ms for 150 MiB), so a texture written just before it is sampled may show its old content
+/// for a few frames; a per-page write test would make that exact.
+#[derive(Default)]
+struct Watch {
+    /// Title texture key to (address, bytes).
+    entries: HashMap<usize, (usize, usize)>,
+    dirty: std::collections::HashSet<usize>,
+}
+
+static WATCH: std::sync::Mutex<Option<Watch>> = std::sync::Mutex::new(None);
+
+fn watch<R>(f: impl FnOnce(&mut Watch) -> R) -> R {
+    f(WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
+fn start_scanner() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
+            let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let list: Vec<(usize, (usize, usize))> =
+                    watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
+                seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
+                for (key, (at, size)) in list {
+                    let mut h = blake3::Hasher::new();
+                    for off in (0..size).step_by(buf.len()) {
+                        let n = buf.len().min(size - off);
+                        buf[..n].fill(0);
+                        let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+                        h.update(&buf[..n]);
+                    }
+                    let h = h.finalize();
+                    if seen.insert(key, h) != Some(h) {
+                        watch(|w| w.dirty.insert(key));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    });
+}
+
 /// A texture the host keeps for a title texture.
 pub struct Tracked<B: ResourceBackend> {
     pub texture: Rc<B::Texture>,
@@ -165,6 +216,10 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
+        if !info.render_target() {
+            watch(|w| w.entries.insert(key, (info.memory as usize, info.size)));
+            start_scanner();
+        }
         // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
         // was never drawn into, and a black one was drawn black.
         if info.render_target() && std::env::var_os("VICTORY_MAGENTA").is_some() {
@@ -201,18 +256,34 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_released(&mut self, key: usize) {
         self.textures.remove(&key);
         self.pending.remove(&key);
+        watch(|w| {
+            w.entries.remove(&key);
+            w.dirty.remove(&key);
+        });
     }
 
     /// Brings the textures the host samples up to date with title memory: those whose memory
     /// changed since their last upload are detiled again.
     pub fn sync_textures(&mut self) {
+        self.sync_where(|_, _| true);
+    }
+
+    /// What a submission does: the textures not uploaded yet, and those the scanner found
+    /// changed since.
+    pub fn sync_dirty(&mut self) {
+        let dirty = watch(|w| std::mem::take(&mut w.dirty));
+        self.sync_where(|key, t| t.last.is_none() || dirty.contains(&key));
+    }
+
+    fn sync_where(&mut self, wanted: impl Fn(usize, &Tracked<B>) -> bool) {
         let Title {
             host,
             textures,
             stats,
             ..
         } = self;
-        for (key, t) in textures.iter_mut().filter(|(_, t)| !t.info.render_target()) {
+        for (key, t) in textures.iter_mut().filter(|(k, t)| !t.info.render_target() && wanted(**k, t)) {
+            let key = &key;
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {

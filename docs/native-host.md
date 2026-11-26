@@ -289,6 +289,7 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 Off by default, environment variables of the host process:
 
 - `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
+- `VICTORY_PROFILE=<secs>`: times every title-to-host call (imports and the methods of bridged objects: count, total and longest, by `rdtsc` in the bridge) and logs the 40 with the longest total every that many seconds. Time inside a call includes waiting for the host's locks and any title code it calls back, so methods that are long everywhere (all of `0x118`, `0x428`, `0xc0` at about 150 ms) point at a lock someone else holds (here the native host's `TITLE` lock, held by `sync_textures`).
 - `VICTORY_TRACE_IMPORTS=1`: the same for every import bound to a host function (name and DLL), whatever the result. Slow (millions of lines in a title's startup).
 - `VICTORY_PEEK=rva,rva,...`: at the first-chance exception log, prints those qwords of the faulting image (an operand above `0x10000000` is an absolute address), the qwords `rcx` points at, and a call chain by the unwind tables. Use it with `llvm-objdump` on the title (analysis only).
 
