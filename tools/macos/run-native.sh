@@ -64,11 +64,20 @@ echo "Log: $log"
 
 "$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
+timer=""
 if (( seconds > 0 )); then
   ( sleep "$seconds"; kill "$pid" 2>/dev/null ) &
+  timer=$!
 fi
+# A background job ignores Ctrl-C in a script, so pass it on: stop the game, its
+# children (a restarted game) and the timer, or they outlive the script.
+stop_timer() {
+  [[ -z "$timer" ]] || { pkill -P "$timer" 2>/dev/null; kill "$timer" 2>/dev/null; }
+}
+trap 'pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; stop_timer; wait "$pid"; echo; echo "Stopped. Log: $log"; exit 130' INT TERM
 wait "$pid"
 rc=$?
+stop_timer
 
 echo
 echo "Exit code $rc. Last lines of the log:"
