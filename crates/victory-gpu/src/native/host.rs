@@ -49,6 +49,19 @@ pub struct NativeHost<B: GraphicsBackend> {
     passes: std::cell::Cell<u64>,
 }
 
+/// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
+/// list (or this queue's next segment) may wait for with no other way to go on.
+fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
+    // Once per page: a title writes the same unmapped words every frame.
+    static PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if let Cmd::Fill { dst, len, value } = c {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pages.len() < 50 && pages.insert(dst >> 12) {
+            tracing::warn!("native host drops a value write: byte {value:#x} x{len} at {dst:#x}: {why}");
+        }
+    }
+}
+
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
 /// drops that draw or dispatch alone).
 const NEVER_SET: &str = "was never set";
@@ -1130,6 +1143,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
                 // Anything else the host cannot give one command (arguments that are not what the
@@ -1142,6 +1156,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
             }

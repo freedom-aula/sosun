@@ -108,6 +108,27 @@ fn refresh(t: &mut MetalTitle) {
             if !stuck.is_empty() {
                 *last = Some(std::time::Instant::now());
                 tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+                // What a held queue or a fence waits for may be owed by a command buffer the GPU
+                // lost (out of memory): those are paid from the CPU so the title goes on.
+                let lost = victory_metal::gfx::recover_lost();
+                if lost > 0 {
+                    tracing::warn!("recovered {lost} command buffers the GPU never reported on");
+                }
+                // Nothing is submitted while every queue is held, so the per-submission report
+                // of command buffers the GPU has not finished would stay silent.
+                if env_set!("VICTORY_TRACE_GPU_FAILS") {
+                    let flying = victory_metal::gfx::report_in_flight();
+                    let order: Vec<String> = t
+                        .backend_queues()
+                        .map(|(k, q)| (k, q.order_state()))
+                        .filter(|(_, (done, made))| done != made)
+                        .map(|(k, (done, made))| format!("queue {k:#x} at {done} of {made}"))
+                        .collect();
+                    tracing::warn!(
+                        "command buffers in flight while work is held: {flying}; order events behind: {order:?}; commands dropped at unmapped memory so far: {}",
+                        t.host.unmapped()
+                    );
+                }
             }
         }
     }
@@ -135,6 +156,9 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -1374,13 +1398,16 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if env_set!("VICTORY_TRACE_WRITES") {
         let inside = pools().resolve(address, bytes as u64).is_some();
-        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}, list {this:p}");
     }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 
 /// A wait for a memory value, recorded at the current position of the list.
 pub(crate) fn wait_value(this: This, w: Wait) {
+    if env_set!("VICTORY_TRACE_WRITES") {
+        tracing::warn!("list wait at {:#x} cmp {} ref {:#x}, list {this:p}", w.address, w.comparison, w.reference);
+    }
     with_list(this, |_, l| l.wait(w));
 }
 

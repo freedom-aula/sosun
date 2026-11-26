@@ -1100,10 +1100,9 @@ impl GraphicsBackend for Metal {
             queue.0.commandBuffer()
         }
         .ok_or("no command buffer")?;
-        let mut serial = 0;
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut label = String::new();
         if self.trace_fails {
-            serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             label = format!(
                 "q{:x} #{} t={:.3} waits={} signals={} passes={}",
                 Retained::as_ptr(&queue.0) as *const u8 as usize,
@@ -1161,7 +1160,9 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
-        let owed = Owed::new(queue, work, set_on_queue);
+        let owed = std::sync::Arc::new(Owed::new(queue, work, set_on_queue));
+        let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
         let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
@@ -1172,6 +1173,7 @@ impl GraphicsBackend for Metal {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
                 if done.error().is_none()
@@ -1365,6 +1367,97 @@ impl Owed {
     }
 }
 
+// SAFETY: an `Owed` is shared between Metal's completion thread and the thread that looks for
+// lost command buffers. It holds shared events and buffers, which Metal lets any thread use, and
+// `recover` only stores bytes and raises events (never lowers one), so two recoveries of one
+// submission leave what one does.
+unsafe impl Send for Owed {}
+// SAFETY: as for `Send`: `recover` takes `&self` and changes nothing in the `Owed`.
+unsafe impl Sync for Owed {}
+
+/// A command buffer committed and not yet reported on by Metal: its queue, when, what it owes.
+struct Flight {
+    serial: u64,
+    queue: usize,
+    since: std::time::Instant,
+    owed: std::sync::Arc<Owed>,
+}
+
+/// Committed command buffers Metal has not reported on, oldest first, and per queue the newest
+/// serial Metal failed and when.
+static FLIGHTS: std::sync::Mutex<std::collections::VecDeque<Flight>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FAILURES: std::sync::Mutex<Vec<(usize, u64, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+fn flights() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Flight>> {
+    FLIGHTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Metal reported on command buffer `serial` of `queue` (completed, or `failed`).
+fn landed(serial: u64, queue: usize, failed: bool) {
+    flights().retain(|f| f.serial != serial);
+    if failed {
+        let mut failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+        match failures.iter_mut().find(|(q, ..)| *q == queue) {
+            Some(f) if f.1 < serial => *f = (queue, serial, std::time::Instant::now()),
+            Some(_) => {}
+            None => failures.push((queue, serial, std::time::Instant::now())),
+        }
+    }
+}
+
+/// How long after Metal failed a command buffer the ones committed before it on its queue, and
+/// still not reported on, count as lost; and how long any command buffer may go unreported.
+const LOST_BEHIND_A_FAILURE: std::time::Duration = std::time::Duration::from_secs(5);
+const LOST_ANYWAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pays what lost command buffers owe (fence signals, the order event, value writes) from the CPU
+/// and returns how many were lost. The host calls it while work stays held.
+///
+/// Observed with memory running out (two games at once on a 48 GB Mac, 41 GB wired): Metal fails
+/// some command buffers of a queue with `kIOGPUCommandBufferCallbackErrorTimeout` and never
+/// reports on others committed before them, neither completed nor failed. Their value writes
+/// never land, so every title queue stays held on its barrier word and the title spins for good.
+///
+/// Guess: a command buffer older than one Metal failed on the same queue and unreported 5 s
+/// later, or unreported for 30 s, will never run. If one does run after all, its draws land late
+/// and its signals and writes repeat what was paid. The console has no lost command buffers, so
+/// this is our recovery, not console behaviour: the title goes on and the lost frames' draws are
+/// missing.
+pub fn recover_lost() -> usize {
+    recover_lost_after(LOST_BEHIND_A_FAILURE, LOST_ANYWAY)
+}
+
+fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::Duration) -> usize {
+    let failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let lost: Vec<Flight> = {
+        let mut flying = flights();
+        let is_lost = |f: &Flight| {
+            f.since.elapsed() >= anyway
+                || failures.iter().any(|(q, s, at)| *q == f.queue && f.serial < *s && at.elapsed() >= behind_a_failure)
+        };
+        let (lost, kept): (Vec<Flight>, Vec<Flight>) = flying.drain(..).partition(is_lost);
+        *flying = kept.into();
+        lost
+    };
+    for f in &lost {
+        f.owed.recover();
+    }
+    if !lost.is_empty() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::error!(
+                "metal: {} command buffers were never reported on by the GPU (the first unreported for {:.1}s); \
+                 their fence signals and value writes are paid on the CPU and their draws are lost. \
+                 This is what running out of memory looks like: close other apps, or other games. (First time; later ones are counted.)",
+                lost.len(),
+                lost[0].since.elapsed().as_secs_f64()
+            );
+        });
+    }
+    lost.len()
+}
+
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Tracing: command buffers committed and not yet completed, by serial: when, and what they carry.
 static IN_FLIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, (std::time::Instant, String)>> =
@@ -1375,15 +1468,20 @@ static REPORTED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
 static TRACE_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static FLIGHT_LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Logs each command buffer in flight for over 3 s, once (the locks are not held while logging).
-fn report_in_flight() {
-    let old: Vec<(u64, f64, String)> = IN_FLIGHT
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, (t, _))| t.elapsed().as_secs_f64() > 3.0)
-        .map(|(s, (t, d))| (*s, t.elapsed().as_secs_f64(), d.clone()))
-        .collect();
+/// Logs each command buffer in flight for over 3 s, once (the locks are not held while logging),
+/// and returns how many are in flight. Only `VICTORY_TRACE_GPU_FAILS=1` records them. Called at
+/// each submission, and by the host when work stays held: nothing is submitted then, so a
+/// command buffer the GPU never finishes would otherwise go unreported.
+pub fn report_in_flight() -> usize {
+    let (count, old): (usize, Vec<(u64, f64, String)>) = {
+        let flying = IN_FLIGHT.lock().unwrap();
+        let old = flying
+            .iter()
+            .filter(|(_, (t, _))| t.elapsed().as_secs_f64() > 3.0)
+            .map(|(s, (t, d))| (*s, t.elapsed().as_secs_f64(), d.clone()))
+            .collect();
+        (flying.len(), old)
+    };
     for (s, secs, d) in old {
         if REPORTED.lock().unwrap().insert(s)
             && FLIGHT_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
@@ -1391,6 +1489,7 @@ fn report_in_flight() {
             tracing::warn!("metal: command buffer in flight for {secs:.1}s: {d}");
         }
     }
+    count
 }
 
 /// One `tracing::warn!` line for a failed command buffer: its label and each encoder's state.
@@ -2170,6 +2269,35 @@ mod owed_tests {
         // A normal submission after it still completes: the queue is not stuck behind the order value.
         m.submit_passes(&q, &sub(&s9)).unwrap();
         assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
+
+    /// A command buffer Metal never reports on (here one waiting for an event nobody signals) is
+    /// found once it is old enough, and what it owes is paid: the fill and the fence signal the
+    /// title's queues wait for.
+    #[test]
+    fn a_lost_command_buffer_pays_what_it_owes() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let q = m.create_queue().unwrap();
+        let (never, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x5A }])];
+        let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
+        m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &passes, signals: &signals }).unwrap();
+        // Not old enough by either rule: nothing is lost.
+        let (long, zero) = (std::time::Duration::from_secs(3600), std::time::Duration::ZERO);
+        assert_eq!(recover_lost_after(long, long), 0);
+        assert_eq!(m.completed(&fence), 0);
+        // Other tests' command buffers may be in flight too (the list is the process's): at least ours.
+        assert!(recover_lost_after(long, zero) >= 1);
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x5A; 8]);
+        assert_eq!(m.completed(&fence), 3);
+        // Let it finish: a late completion of a recovered command buffer changes nothing.
+        never.0.setSignaledValue(1);
+        let after = [(&fence, 4)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
+        assert!(m.wait(&fence, 4, 5000), "the queue runs on behind the recovered command buffer");
     }
 
     #[test]
