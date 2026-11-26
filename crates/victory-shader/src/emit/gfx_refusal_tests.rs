@@ -1233,8 +1233,22 @@ fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
         0xBF81_0000,
     ];
     meta[0x25] = 0;
-    let err = lower(&unbound, &meta).err().unwrap();
-    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+    // An address in the undeclared s[6:7] pair is title memory: inference
+    // declares the pair as root constants and the load lowers through the
+    // memory space.
+    let unbound_shader = lower(&unbound, &meta).unwrap();
+    assert!(
+        unbound_shader
+            .user_data
+            .iter()
+            .any(|u| u.index == 6 && u.root == RootType::Constants)
+            && unbound_shader
+                .user_data
+                .iter()
+                .any(|u| u.index == 7 && u.root == RootType::Constants),
+        "{:?}",
+        unbound_shader.user_data
+    );
 }
 
 #[test]

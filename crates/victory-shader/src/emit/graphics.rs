@@ -192,6 +192,31 @@ fn infer(
             });
         }
     }
+    // An address in a live-in SGPR pair no parameter fills is title memory
+    // (guessed: the console's user data carries raw addresses). Declare the
+    // pair as root constants so lowering can read it from the user-data
+    // block instead of refusing the SGPR read.
+    // shortcut: the slot is the first free one; the register image does not
+    // yet say which root parameter holds the pair.
+    if let Ok(res) = crate::resource::track(&p, &layout, stage, None) {
+        for n in res.memory_inputs {
+            if occupied(&layout, n) || occupied(&layout, n + 1) {
+                continue;
+            }
+            let Some(slot) = (0..252u16).find(|s| !layout.iter().any(|p| p.slot == *s as u8))
+            else {
+                continue;
+            };
+            layout.push(RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: n,
+                slot: slot as u8,
+            });
+        }
+    }
     let top = p
         .blocks
         .iter()

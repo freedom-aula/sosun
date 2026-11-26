@@ -135,6 +135,10 @@ pub struct Resources {
     /// the root signature's memory, [`USER_DATA`]), layout index, dword
     /// within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Live-in SGPRs an address was taken in that no root parameter fills
+    /// (each pairs with the next); their addresses track as title memory
+    /// ([`MEMORY`]).
+    pub memory_inputs: Vec<u8>,
     pub waterfall: Waterfall,
 }
 
@@ -170,6 +174,12 @@ pub fn track(
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
     track_graphics(p, layout, stage, lanes, false)
+}
+
+fn collect_memory_inputs(t: &Tracer) -> Vec<u8> {
+    let mut v: Vec<u8> = t.memory_inputs.borrow().iter().copied().collect();
+    v.sort_unstable();
+    v
 }
 
 pub(crate) fn track_graphics(
@@ -289,6 +299,7 @@ pub(crate) fn track_graphics(
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
+        out.memory_inputs = collect_memory_inputs(&t);
         return Ok(out);
     }
     for (block, (accesses, mut reads)) in first_lane_at {
@@ -314,6 +325,7 @@ pub(crate) fn track_graphics(
             out.waterfall.loads.extend(loads);
         }
     }
+    out.memory_inputs = collect_memory_inputs(&t);
     Ok(out)
 }
 
@@ -357,6 +369,9 @@ struct Tracer<'a> {
     /// The loads from that memory by code offset, with their user-data byte
     /// offset.
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
+    /// Live-in SGPRs whose pair an address was taken in with no root
+    /// parameter filling them (tracked as title memory).
+    memory_inputs: std::cell::RefCell<std::collections::BTreeSet<u8>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -455,6 +470,7 @@ impl<'a> Tracer<'a> {
             spilled: Default::default(),
             first_spilled: Default::default(),
             spill_at: Default::default(),
+            memory_inputs: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -1085,7 +1101,10 @@ impl<'a> Tracer<'a> {
         if self.param_value(v).is_some() {
             return "an address from a root parameter that is no address";
         }
-        if self.inputs[v.0 as usize].is_some() {
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            if let Reg::S(n) = reg {
+                self.memory_inputs.borrow_mut().insert(n);
+            }
             return "an address in an SGPR that is no root parameter";
         }
         if self
@@ -3106,6 +3125,7 @@ pub(crate) mod tests {
         let p = crate::ir::build(&code, false, 256).unwrap();
         let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0))]);
+        assert_eq!(r.memory_inputs, [2]);
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
