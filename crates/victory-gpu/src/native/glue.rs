@@ -1063,16 +1063,27 @@ pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
     });
 }
 
-/// `IASetVertexBuffers`: the addresses of the streams from `start`.
-pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides: &[u32]) {
+/// Title ABI for `D3D12_VERTEX_BUFFER_VIEW`.
+#[repr(C)]
+pub(crate) struct VertexBufferView {
+    address: u64,
+    size: u32,
+    stride: u32,
+}
+
+pub(crate) fn vertex_buffers(this: This, start: u32, count: u32, views: &[VertexBufferView]) {
     with_list(this, |_, l| {
-        for (i, a) in addresses.iter().enumerate() {
-            l.list.set_vertex_buffer(start as usize + i, *a);
+        for i in 0..count as usize {
             let slot = start as usize + i;
+            let (address, stride) = match views.get(i) {
+                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.stride),
+                _ => (0, 0),
+            };
+            l.list.set_vertex_buffer(slot, address);
             if l.strides.len() <= slot {
                 l.strides.resize(slot + 1, 0);
             }
-            l.strides[slot] = strides.get(i).copied().unwrap_or(0);
+            l.strides[slot] = stride;
         }
     });
 }
