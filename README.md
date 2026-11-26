@@ -8,12 +8,12 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 <p align="center">
 <img alt="Apple Silicon M1 or newer" src="https://img.shields.io/badge/Apple%20Silicon-M1%2B-555555">
 <img alt="macOS 15 or newer" src="https://img.shields.io/badge/macOS-15%2B-blue">
-<img alt="Status: boots, renders its first image" src="https://img.shields.io/badge/status-early%20bring--up-orange">
+<img alt="Status: boot movie and menus on screen" src="https://img.shields.io/badge/status-menus%20on%20screen-orange">
 <img alt="GPL-3.0 licence" src="https://img.shields.io/badge/licence-GPL--3.0-lightgrey">
 </p>
 
 > [!IMPORTANT]
-> **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, gets past its "press A" start screen and runs for about 50 seconds (around 1,400 frames). Its menus now render on Metal: the start screen and the setup menus draw correctly into the game's UI target. The presented window is still black, and some text draws as boxes. We know where to look for both, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
+> **Not playable yet, but you can see it run.** The game boots natively on a Mac, plays its boot movie and shows its menus in the window: the start screen, FINISH SETUP and LEGAL NOTICES, rendered on Metal at about 30 fps. Many lowercase letters still draw as boxes and there is a white band at the top of some screens. Menus can't be navigated yet (no live keyboard or gamepad). We know where to look, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
 📸 **[See the latest screenshots](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/5)** (the game's start screen and setup menus, rendered natively on Metal).
 
@@ -39,7 +39,7 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | Loading: DirectStorage reads about 9,500 requests at about 79 MB/s | ✅ Works |
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
 | Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
-| Menus rendering | 🟡 The start screen and setup menus render into the UI target; the final present to the window is still black, and some glyphs draw as boxes |
+| Boot movie and menus in the window | 🟡 The boot movie plays and the start screen, FINISH SETUP and LEGAL NOTICES show in the window; many glyphs still draw as boxes ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6)), white band at the top |
 | Start screen ("press A") | ✅ Passed with scripted key presses (no live keyboard or gamepad yet) |
 | Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
@@ -74,7 +74,7 @@ The setup script checks Rosetta, the Xcode command line tools, rustup and the Me
 tools/macos/run-native.sh /path/to/your/game/folder
 ```
 
-Point it at the folder that holds `game_scarlett_master.exe`. A window opens, and the full log is saved under `runs/`. The script presses Enter for you every two seconds to get past the start screen, because keyboard input isn't wired up yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
+Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script presses Enter for you every two seconds to get past the start screen, because keyboard input isn't wired up yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
 **3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 

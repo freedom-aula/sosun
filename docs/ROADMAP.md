@@ -6,10 +6,12 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 **Solved on 26 November:** content draws used to be black. There were two bugs. Guessed render pipelines were built without the host root layout, so shaders read their user data from address 0. And descriptor records the game copies into the shader-visible heap with plain stores were never mirrored. Now the start screen ("ACCOUNT PICKER / SCREEN NARRATION / PLAYER") and the "FINISH SETUP?" menu render correctly into the 3840x2160 UI target.
 
+**Solved since:** the present pass now runs (static samplers in the root layout), so the window shows the game's screens. The boot movie's green frames are gone (its video planes were uploaded before the game decoded into them). A stack overflow at the first draw is fixed (title threads now get at least 8 MiB of stack, since the host builds Metal pipelines on them).
+
 **Now:**
-- **The presented image is still black.** The pass that composites the UI target into the swapchain uses a pixel shader with static samplers, and the host `RootLayout` (and `msc.rs`) can't declare static samplers yet, so that stage still gets the old layout. Adding static samplers is the next step to a visible window.
-- **Some glyphs draw as filled boxes,** while the heading font works. It is probably a font-atlas texture format or channel issue.
-- **There is a white band** across the top of the setup menu.
+- **Many lowercase glyphs draw as filled boxes,** while headings are fine ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6)). The A8 glyph atlas reaches the host in time and no pipeline uses stencil, so the suspects are the text pixel shader's translation or how the atlas channel is read.
+- **There is a white band** across the top of the setup menu, and blocky areas around the panel on LEGAL NOTICES.
+- Dropped draw kinds and unknown formats should log loudly, once each.
 - Table re-mirroring (`NativeHost::remirror_tables`) only checks the first 16 entries per table.
 
 **Start here:** `crates/victory-gpu/src/native/shaders.rs`, `crates/victory-metal/src/msc.rs`, and the "First real frame" section of native-host.md.
