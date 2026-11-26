@@ -292,7 +292,17 @@ fn remquo_(x: f64, y: f64) -> (f64, i32) {
     if !r.is_finite() {
         return (check(&[x, y], r), 0);
     }
-    let q = ((x - r) / y).round().abs() as u64 & 7;
+    // The low three bits of the quotient's magnitude. `(x - r) / y` loses them once the
+    // quotient passes 2^53; `|x| mod 8|y|` (exact) keeps them: |x| = 8k|y| + m, so the
+    // quotient is 8k plus that of m, which `remainder` rounds the same way (8k is even).
+    // When 8|y| overflows, |x / y| is below 8 and m is |x| itself.
+    let (ax, ay) = (x.abs(), y.abs());
+    let m = if ay <= f64::MAX / 8.0 {
+        libm::fmod(ax, 8.0 * ay)
+    } else {
+        ax
+    };
+    let q = ((m - libm::remainder(m, ay)) / ay).round() as u64 & 7;
     (
         r,
         if (x < 0.0) != (y < 0.0) {
@@ -660,6 +670,56 @@ mod tests {
         let mut q = 0;
         assert_eq!(remquo(10.0, 3.0, &mut q), 1.0);
         assert_eq!(q, 3);
+    }
+
+    unsafe extern "C" {
+        /// The host's own `remquo`, the reference for the quotient bits.
+        #[link_name = "remquo"]
+        fn host_remquo(x: f64, y: f64, quo: *mut i32) -> f64;
+    }
+
+    #[test]
+    fn remquo_keeps_the_low_bits_of_a_huge_quotient() {
+        // The quotient here is about 5.9e156, far past 2^53; its low three bits are 100.
+        let mut q = 0;
+        remquo(7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!((q, q & 7), (4, 4));
+        remquo(-7.324363029649866e218, 1.232635503059459e62, &mut q);
+        assert_eq!(q, -4);
+        // Every exponent: the sign and the low three bits of the magnitude, as C asks.
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..100_000 {
+            let (x, y) = (f64::from_bits(next() >> 1), f64::from_bits(next() >> 1));
+            if !x.is_finite() || !y.is_finite() || y == 0.0 {
+                continue;
+            }
+            for (x, y) in [(x, y), (-x, y), (x, -y)] {
+                let (mut ours, mut host) = (0, 0);
+                let r = remquo(x, y, &mut ours);
+                // SAFETY: a pure libm function.
+                let host_r = unsafe { host_remquo(x, y, &mut host) };
+                assert_eq!(r.to_bits(), host_r.to_bits(), "remquo({x:e}, {y:e})");
+                let low = host.unsigned_abs() & 7;
+                assert_eq!(
+                    ours.unsigned_abs() & 7,
+                    low,
+                    "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                );
+                if low != 0 {
+                    assert_eq!(
+                        ours < 0,
+                        host < 0,
+                        "remquo({x:e}, {y:e}) gave {ours}, the host {host}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
