@@ -30,7 +30,13 @@
 //! Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 //! EXPRESS OR IMPLIED.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+#[path = "texture_xor.rs"]
+mod xor_tables;
+#[cfg(test)]
+#[path = "texture_xor_tests.rs"]
+mod xor_tests;
 
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,6 +88,54 @@ impl Swizzle {
     /// GPU's pipe configuration.
     pub fn xor(self) -> bool {
         self.0 >= 16
+    }
+}
+
+/// The GPU's pipe configuration (`GB_ADDR_CONFIG`): what the addresses of the XOR modes (`_X`, `_T`)
+/// depend on besides the swizzle mode, because they spread blocks over the GPU's pipes and banks by
+/// XORing higher coordinate bits into the low address bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PipeConfig {
+    pub pipes_log2: u32,
+    /// Pixel packers (RB+ shader array pairs), log2.
+    pub packers_log2: u32,
+}
+
+impl PipeConfig {
+    /// The tables' row for this configuration: 15 are defined, addrlib's RB+ (RDNA2) tables.
+    fn row(self) -> Option<usize> {
+        Some(match (self.packers_log2, self.pipes_log2) {
+            (0 | 1, 0) => 0,
+            (0 | 1, 1) => 1,
+            (0 | 1, 2) => 2,
+            (1, 3) => 3,
+            (2, 2) => 4,
+            (2, 3) => 5,
+            (2, 4) => 6,
+            (3, 3) => 7,
+            (3, 4) => 8,
+            (3, 5) => 9,
+            (4, 4) => 10,
+            (4, 5) => 11,
+            (4, 6) => 12,
+            (5, 5) => 13,
+            (5, 6) => 14,
+            _ => return None,
+        })
+    }
+
+    /// shortcut: assumed, not read from a console: eight pipes on four packers (the Series X: two
+    /// shader engines of two arrays). The Series S has fewer. Set the real value with
+    /// [`Layout::new_for`] when a captured texture says otherwise.
+    pub const DEFAULT: PipeConfig = PipeConfig {
+        pipes_log2: 3,
+        packers_log2: 2,
+    };
+}
+
+impl Default for PipeConfig {
+    fn default() -> Self {
+        PipeConfig::DEFAULT
     }
 }
 
@@ -177,8 +231,97 @@ pub struct Layout {
     pub first_tail_mip: u32,
     pub mips: Vec<Mip>,
     /// Byte offsets inside a block for each coordinate, per axis.
-    /// Empty for linear and unsupported modes.
+    /// Empty for linear, unsupported and XOR modes.
     pattern: &'static SwizzlePattern,
+    /// The XOR modes' equations, by coordinate.
+    xor: Option<Arc<Xor>>,
+}
+
+/// The address equations of an XOR mode: each address bit of a block is the XOR of coordinate bits,
+/// so the block offset is `x[x] ^ y[y] ^ z[z]` (coordinates masked to the bits the equations read),
+/// less the bits the title's pipe-bank XOR flips.
+#[derive(Debug)]
+struct Xor {
+    /// The equation of each address bit inside a block.
+    bits: Vec<xor_tables::Bit>,
+    x: Vec<u32>,
+    y: Vec<u32>,
+    z: Vec<u32>,
+    /// Added to every block offset by XOR: the surface's pipe-bank XOR, in address bits.
+    pipe_bank: u32,
+}
+
+impl PartialEq for Xor {
+    fn eq(&self, o: &Xor) -> bool {
+        self.bits == o.bits && self.pipe_bank == o.pipe_bank
+    }
+}
+
+impl Eq for Xor {}
+
+const XOR_XY: usize = 1 << 12;
+const XOR_Z: usize = 1 << 9;
+
+impl Xor {
+    fn new(bits: Vec<xor_tables::Bit>, pipe_bank: u32) -> Xor {
+        let table = |axis: usize, n: usize| -> Vec<u32> {
+            (0..n as u32)
+                .map(|c| {
+                    bits.iter()
+                        .enumerate()
+                        .map(|(i, b)| ((u32::from(b[axis]) & c).count_ones() & 1) << i)
+                        .sum()
+                })
+                .collect()
+        };
+        Xor {
+            x: table(0, XOR_XY),
+            y: table(1, XOR_XY),
+            z: table(2, XOR_Z),
+            bits,
+            pipe_bank,
+        }
+    }
+
+    /// The byte offset inside the block of element (`x`, `y`, `z`): coordinates of the whole mip, not
+    /// of the block, because the equations also read the bits that number the blocks.
+    fn offset(&self, x: u32, y: u32, z: u32) -> u32 {
+        self.x[x as usize & (XOR_XY - 1)]
+            ^ self.y[y as usize & (XOR_XY - 1)]
+            ^ self.z[z as usize & (XOR_Z - 1)]
+            ^ self.pipe_bank
+    }
+}
+
+/// The tables of an XOR mode, if the mode has them: `thick` for 3D standard and display modes.
+fn xor_patterns(swizzle: Swizzle, thick: bool) -> Option<&'static [[u16; 4]; 75]> {
+    use xor_tables::*;
+    Some(match (swizzle.0, thick) {
+        (17, false) => &SW_64KB_S_T,
+        (17, true) => &SW_64KB_S3_T,
+        (18, _) => &SW_64KB_D_T,
+        (21, false) => &SW_4KB_S_X,
+        (21, true) => &SW_4KB_S3_X,
+        (22, _) => &SW_4KB_D_X,
+        (24, _) => &SW_64KB_Z_X,
+        (25, false) => &SW_64KB_S_X,
+        (25, true) => &SW_64KB_S3_X,
+        (26, false) => &SW_64KB_D_X,
+        (26, true) => &SW_64KB_D3_X,
+        (27, _) => &SW_64KB_R_X,
+        _ => return None,
+    })
+}
+
+/// The address bits (`block_log2` of them) of a pattern row: the nibbles of the tables it names.
+fn xor_bits(row: [u16; 4], block_log2: u32) -> Vec<xor_tables::Bit> {
+    let r = row.map(usize::from);
+    let mut bits: Vec<xor_tables::Bit> = xor_tables::NIBBLE01[r[0]].to_vec();
+    bits.extend(xor_tables::NIBBLE2[r[1]]);
+    bits.extend(xor_tables::NIBBLE3[r[2]]);
+    bits.extend(xor_tables::NIBBLE4[r[3]]);
+    bits.truncate(block_log2 as usize);
+    bits
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -280,6 +423,11 @@ const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4],
 
 impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        Layout::new_for(desc, PipeConfig::DEFAULT)
+    }
+
+    /// [`Layout::new`] for a GPU with the pipe configuration `config` (the XOR modes' addresses).
+    pub fn new_for(desc: &Desc, config: PipeConfig) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
@@ -302,7 +450,7 @@ impl Layout {
         if block_log2 == 0 {
             Ok(Layout::linear(d))
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Ok(Layout::tiled(d, block_log2, config))
         }
     }
 
@@ -341,10 +489,11 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            xor: None,
         }
     }
 
-    fn tiled(d: Desc, block_log2: u32) -> Layout {
+    fn tiled(d: Desc, block_log2: u32, config: PipeConfig) -> Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
@@ -509,6 +658,14 @@ impl Layout {
         let slab = if thick { u64::from(block[2]) } else { 1 };
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
+        // The XOR modes: the equations of the tables, single-sampled, as far as the mode has tables.
+        let xor = (d.swizzle.xor() && d.samples == 1)
+            .then(|| {
+                let row = *xor_patterns(d.swizzle, thick)?
+                    .get(config.row()? * 5 + element_log2 as usize)?;
+                Some(Arc::new(Xor::new(xor_bits(row, block_log2), 0)))
+            })
+            .flatten();
         let addressable = !d.swizzle.xor() && d.samples == 1;
         let pattern = if addressable {
             let kind = if thick {
@@ -531,18 +688,35 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
+            xor,
         }
     }
 
-    /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
+    /// Whether [`Layout::offset`] and the copies work for this layout: linear, the modes without
+    /// pipe or bank XOR, and the XOR modes of the tables (every XOR mode but `SW_4KB_R_X`), all
+    /// single-sampled.
     ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// shortcut: no addressing for MSAA; render targets and depth are what the host renders, add it
+    /// when a title copies into or out of one. The XOR modes depend on the GPU's pipe configuration
+    /// ([`PipeConfig`], assumed) and on the surface's pipe-bank XOR
+    /// ([`Layout::with_pipe_bank_xor`], 0 unless set).
     pub fn addressable(&self) -> bool {
-        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
+        self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty() || self.xor.is_some()
+    }
+
+    /// This layout with the surface's pipe-bank XOR: the value the title's swizzle supplies for the
+    /// surface (in units of 256 bytes, the low bits of the descriptor's address), of which the
+    /// pipe and bank bits count. Does nothing for modes without XOR.
+    pub fn with_pipe_bank_xor(mut self, value: u32, config: PipeConfig) -> Layout {
+        if let Some(x) = &self.xor {
+            let block_log2 = self.alignment.trailing_zeros();
+            let pipes = config.pipes_log2;
+            let bank_bits = block_log2.saturating_sub(8 + pipes + 2).min(3);
+            let mask = ((1u32 << pipes) - 1) | (((1u32 << bank_bits) - 1) << (pipes + 2));
+            let flip = ((value & mask) << 8) & ((1 << block_log2) - 1);
+            self.xor = Some(Arc::new(Xor::new(x.bits.clone(), flip)));
+        }
+        self
     }
 
     /// The slice and the depth inside it for `z` (an array slice or a 3D
@@ -572,13 +746,27 @@ impl Layout {
                 Error::Invalid
             });
         }
-        let (slice, z) = self.split(z);
+        let (slice, inner) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
+        if let Some(xor) = &self.xor {
+            return Ok(base + self.xor_address(xor, m, x, y, z));
+        }
+        let z = inner;
         if self.desc.swizzle == Swizzle::LINEAR {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
         Ok(base + self.row(m, y, z) + self.column(m, x))
+    }
+
+    /// The address of element (`x`, `y`, `z`) of a mip in an XOR mode, from the start of its slice's
+    /// mip: the block, then the equations of the mode over the coordinates (shifted into the tail
+    /// block for a tail mip).
+    fn xor_address(&self, xor: &Xor, m: &Mip, x: u32, y: u32, z: u32) -> u64 {
+        let [bw, bh, _] = self.block;
+        let (x, y) = (x + m.tail.map_or(0, |t| t.x), y + m.tail.map_or(0, |t| t.y));
+        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw) + u64::from(x / bw);
+        (blocks << self.alignment.trailing_zeros()) + u64::from(xor.offset(x, y, z))
     }
 
     /// The part of an address that depends on the row (and depth in a
@@ -703,6 +891,22 @@ impl Layout {
             .ok_or(Error::TooSmall)?;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
+        }
+        if let Some(xor) = &self.xor {
+            // The equations mix every coordinate into the low address bits, so a row is not a few
+            // runs: one element at a time.
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                    for x in 0..m.width {
+                        let tiled = (base + self.xor_address(xor, m, x, y, first + z)) as usize;
+                        copy(tiled, linear_row + x as usize * n, n);
+                    }
+                }
+            }
+            return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
@@ -1274,7 +1478,8 @@ mod tests {
         assert_eq!(t.planes[0].layout.size, 1920 * 1152 * 4);
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
-        assert!(!t.planes[0].layout.addressable());
+        // 64 KiB Z_X blocks are addressed by the XOR equations.
+        assert!(t.planes[0].layout.addressable());
     }
 
     #[test]

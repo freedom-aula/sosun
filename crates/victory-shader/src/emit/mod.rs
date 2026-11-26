@@ -141,6 +141,9 @@
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
+//!   With [`Options::zero_copy_memory`] (the native Metal host, whose views are of the title's own
+//!   memory) nothing is marked: no `u0` ([`HostShader::memory_writes`] is false), no atomics, and
+//!   a miss is the null view, unrecorded.
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
 //!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
 //!   and an image descriptor's dwords 1-3 read only for sizes come from the
@@ -405,6 +408,13 @@ pub struct Options {
     /// memory (module notes, "Wave64 on a 32-lane host"). Implies
     /// [`Self::narrow_waves`]. Off for D3D12.
     pub wave32_host: bool,
+    /// The host's title memory is the memory the GPU reads and writes (the native Metal
+    /// host: one buffer per pool, no copies): accesses at computed addresses still go through
+    /// the page table of "Title memory" to find the host view, but mark nothing, so the
+    /// program binds no bitmap [`HostShader::memory_writes`] and does no atomics for the
+    /// pages it writes. Memory no view holds reads 0 and its writes are dropped, unrecorded,
+    /// if the host's null view is bounds-checked. Off for D3D12.
+    pub zero_copy_memory: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -533,6 +543,7 @@ pub fn emit_with(
         bias_as_gradients: options.bias_as_gradients,
         narrow_waves: options.narrow_waves,
         wave32_host: options.wave32_host,
+        zero_copy_memory: options.zero_copy_memory,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

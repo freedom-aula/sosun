@@ -14,6 +14,8 @@ use victory_backend::resources::*;
 use victory_metal::mem::{Alias, page_size};
 use victory_metal::metal::Metal;
 
+#[path = "addr_tests.rs"]
+mod addr_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
 #[path = "state_tests.rs"]

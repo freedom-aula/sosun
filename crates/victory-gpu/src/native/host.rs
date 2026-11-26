@@ -5,11 +5,12 @@
 //! lists into passes and submits them without waiting. Title memory is wrapped lazily, one buffer
 //! per pool (see [`super::memory`]); nothing is copied to or from it.
 
+use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
@@ -29,7 +30,33 @@ pub struct NativeHost<B: GraphicsBackend> {
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
+    contract: RefCell<Contract<B>>,
 }
+
+/// The host's side of the pool-offset contract ([`super::addr`]).
+struct Contract<B: GraphicsBackend> {
+    pairs: Pairs,
+    /// Superseded tables, kept while submissions that read them may still run.
+    // shortcut: the GPU is assumed not to be more than `RETIRED` table rebuilds behind.
+    retired: VecDeque<Rc<Pages<B>>>,
+    /// The memory the null view (pair 0) has, with size 0.
+    null: Option<Rc<Pages<B>>>,
+    /// A resource heap of the host's own, for shaders that need the pairs and the title bound none.
+    heap: Option<Rc<NativeHeap<B>>>,
+}
+
+impl<B: GraphicsBackend> Default for Contract<B> {
+    fn default() -> Self {
+        Contract {
+            pairs: Pairs::default(),
+            retired: VecDeque::new(),
+            null: None,
+            heap: None,
+        }
+    }
+}
+
+const RETIRED: usize = 8;
 
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
@@ -39,6 +66,8 @@ struct Prep<B: GraphicsBackend> {
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
+    /// The resource heap the work needs in place of the one the title bound (none bound).
+    heap: Option<Rc<NativeHeap<B>>>,
 }
 
 enum Group {
@@ -70,6 +99,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
+            contract: RefCell::default(),
         }
     }
 
@@ -88,16 +118,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
             .memory
             .resolve(addr, len)
             .ok_or_else(|| format!("title address {addr:#x}+{len:#x} is not in a mapped pool"))?;
-        let buffer = match buffers.entry(pool.id) {
+        drop(buffers);
+        Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+    }
+
+    /// The buffer over pool `id`, made the first time the GPU needs it.
+    fn pool_buffer(&self, id: usize, base: usize, len: usize) -> Result<Rc<B::Buffer>, String> {
+        let mut buffers = self.buffers.borrow_mut();
+        Ok(match buffers.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
             std::collections::hash_map::Entry::Vacant(e) => e
-                .insert(Rc::new(
-                    self.backend
-                        .wrap_title_memory(pool.base as *mut u8, pool.len)?,
-                ))
+                .insert(Rc::new(self.backend.wrap_title_memory(base as *mut u8, len)?))
                 .clone(),
-        };
-        Ok((buffer, ptr))
+        })
     }
 
     pub fn compute_pipeline(
@@ -144,11 +177,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
         start: u64,
         count: usize,
     ) -> Result<Rc<NativeHeap<B>>, String> {
+        // A resource heap is longer than the title made it by the entries that hold the pool-offset
+        // contract's view pairs.
+        let entries = if kind == HeapKind::Resource {
+            if !addr::fits(count) {
+                tracing::warn!(
+                    count,
+                    "a resource heap too long for title memory views: shaders that find memory by address will not run with it"
+                );
+            }
+            count + addr::RESERVED
+        } else {
+            count
+        };
         let heap = Rc::new(NativeHeap {
-            heap: self.backend.create_heap(kind, count)?,
+            heap: self.backend.create_heap(kind, entries)?,
             kind,
             start,
             count,
+            pairs: Default::default(),
+            table: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -277,7 +325,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             args = args.constants(&values);
         }
-        for &slot in &b.views {
+        for &(slot, _) in &b.views {
             let Root::View(a) = set(slot)? else {
                 return Err(format!("root parameter {slot} is not a root view"));
             };
@@ -288,6 +336,110 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         p.root = args;
         Ok(())
+    }
+
+    /// The page table of the pool-offset contract for `heap` and the pool table as it is now:
+    /// rebuilt, into a buffer of its own, when a pool or a mapping changed since it was made.
+    fn memory_table(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
+        if !addr::fits(heap.count) {
+            return Err(format!(
+                "a resource heap of {} entries has no room for title memory views",
+                heap.count
+            ));
+        }
+        let (generation, mappings) = self.memory.mappings();
+        if let Some((g, t)) = &*heap.table.borrow()
+            && *g == generation
+        {
+            return Ok(t.clone());
+        }
+        let maps: Vec<Mapping> = mappings
+            .iter()
+            .map(|(at, len, pool, offset)| Mapping {
+                at: *at as u64,
+                len: *len as u64,
+                pool: pool.id,
+                base: pool.base,
+                pool_len: pool.len as u64,
+                offset: *offset as u64,
+            })
+            .collect();
+        let mut c = self.contract.borrow_mut();
+        let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
+        let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
+        table.write(&words);
+        if let Some((_, old)) = heap.table.borrow_mut().replace((generation, table.clone())) {
+            c.retired.push_back(old);
+            while c.retired.len() > RETIRED {
+                c.retired.pop_front();
+            }
+        }
+        Ok(table)
+    }
+
+    /// Writes the view pairs the table names into `heap`'s reserved entries (those it lacks).
+    fn write_pairs(&self, heap: &NativeHeap<B>) -> Result<(), String> {
+        let mut c = self.contract.borrow_mut();
+        let have = heap.pairs.get();
+        let want = c.pairs.keys.len() + 1;
+        for n in have..want {
+            let index = addr::pair_index(heap.count as u32, n as u32) as usize;
+            let (buffer, ptr, size) = if n == 0 {
+                if c.null.is_none() {
+                    c.null = Some(Rc::new(Pages::new(&self.backend, 1)?));
+                }
+                let null = c.null.as_ref().expect("made above");
+                (null.buf.clone(), null.ptr().cast_const(), 0)
+            } else {
+                let key = c.pairs.keys[n - 1];
+                let buffer = self.pool_buffer(key.pool, key.base, key.len as usize)?;
+                let (from, size) = Pairs::span(&key);
+                (buffer, (key.base + from as usize) as *const u8, size)
+            };
+            // Both of the pair name the same bytes (the converter's descriptors are the same).
+            for i in [index, index + 1] {
+                self.backend.write_buffer(&heap.heap, i, &buffer, ptr, size);
+            }
+        }
+        heap.pairs.set(want);
+        Ok(())
+    }
+
+    /// What a shader that finds title memory through the page table is given besides its user data:
+    /// the table (the last root parameter) and, in the heap it reads, the view pairs.
+    fn memory_args(
+        &self,
+        heap: Option<&Rc<NativeHeap<B>>>,
+        p: &mut Prep<B>,
+    ) -> Result<(), String> {
+        let heap = match heap {
+            Some(h) => h.clone(),
+            None => self.host_heap()?,
+        };
+        let table = self.memory_table(&heap)?;
+        self.write_pairs(&heap)?;
+        let gpu = self.backend.gpu_address(&table.buf, table.ptr());
+        p.bufs.push(table.buf.clone());
+        p.root = std::mem::take(&mut p.root).address(gpu);
+        p.heap = Some(heap);
+        Ok(())
+    }
+
+    /// A resource heap of the host's own, for work that needs the view pairs and has no heap.
+    fn host_heap(&self) -> Result<Rc<NativeHeap<B>>, String> {
+        if let Some(h) = &self.contract.borrow().heap {
+            return Ok(h.clone());
+        }
+        let heap = Rc::new(NativeHeap {
+            heap: self.backend.create_heap(HeapKind::Resource, addr::RESERVED)?,
+            kind: HeapKind::Resource,
+            start: 0,
+            count: 0,
+            pairs: Default::default(),
+            table: Default::default(),
+        });
+        self.contract.borrow_mut().heap = Some(heap.clone());
+        Ok(heap)
     }
 
     fn root_args(&self, root: &[Option<Root<B>>], p: &mut Prep<B>) -> Result<(), String> {
@@ -317,10 +469,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             vertex: vec![],
             index: None,
             blit: vec![],
+            heap: None,
         };
         match cmd {
-            Cmd::Dispatch { root, pso, .. } => match &pso.binding {
-                Some(b) => self.translated_args(root, b, &mut p)?,
+            Cmd::Dispatch {
+                root, pso, heaps, ..
+            } => match &pso.binding {
+                Some(b) => {
+                    self.translated_args(root, b, &mut p)?;
+                    if b.memory {
+                        self.memory_args(heaps.0.as_ref(), &mut p)?;
+                    }
+                }
                 None => self.root_args(root, &mut p)?,
             },
             Cmd::Draw {
@@ -421,7 +581,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             pipeline: &pso.pso,
                             root: preps[k].root.clone(),
                             resources: preps[k].bufs.iter().map(|b| &**b).collect(),
-                            heaps: heaps(h),
+                            heaps: match &preps[k].heap {
+                                Some(m) => Heaps {
+                                    resource: Some(&m.heap),
+                                    sampler: h.1.as_ref().map(|s| &s.heap),
+                                },
+                                None => heaps(h),
+                            },
                             groups: *groups,
                             threads_per_group: pso.threads,
                         }

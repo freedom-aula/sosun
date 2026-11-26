@@ -1,7 +1,7 @@
 //! `ComputeBackend` on Metal: `MTLCommandQueue`s, `MTLSharedEvent` fences, DXIL through the Metal
 //! Shader Converter, dispatch with a top-level argument buffer at slot 2 over zero-copy memory.
 
-use crate::backend::{ComputeBackend, Submission};
+use crate::backend::{ComputeBackend, RootLayout, Submission};
 use crate::msc::Msc;
 use crate::resources::GraphicsBackend;
 use objc2::rc::Retained;
@@ -104,6 +104,25 @@ impl Metal {
             pool_set: Default::default(),
             counts: Default::default(),
         })
+    }
+
+    fn compute_from(
+        &self,
+        converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
+    ) -> Result<Pipeline, String> {
+        let (_, lib) = converted.map_err(|e| e.to_string())?;
+        let l = self.load_library(&lib)?;
+        let name = l
+            .functionNames()
+            .iter()
+            .next()
+            .ok_or("converted library is empty")?;
+        let f = l.newFunctionWithName(&name).ok_or("no function")?;
+        let p = self
+            .dev
+            .newComputePipelineStateWithFunction_error(&f)
+            .map_err(|e| e.localizedDescription().to_string())?;
+        Ok(Pipeline(p))
     }
 
     /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
@@ -209,19 +228,15 @@ impl ComputeBackend for Metal {
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        let (_, lib) = self.msc.convert(dxil, None).map_err(|e| e.to_string())?;
-        let l = self.load_library(&lib)?;
-        let name = l
-            .functionNames()
-            .iter()
-            .next()
-            .ok_or("converted library is empty")?;
-        let f = l.newFunctionWithName(&name).ok_or("no function")?;
-        let p = self
-            .dev
-            .newComputePipelineStateWithFunction_error(&f)
-            .map_err(|e| e.localizedDescription().to_string())?;
-        Ok(Pipeline(p))
+        self.compute_from(self.msc.convert(dxil, None))
+    }
+
+    fn create_compute_pipeline_with(
+        &self,
+        dxil: &[u8],
+        layout: &RootLayout,
+    ) -> Result<Pipeline, String> {
+        self.compute_from(self.msc.convert_with(dxil, None, Some(layout)))
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {

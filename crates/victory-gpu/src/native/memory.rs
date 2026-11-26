@@ -44,11 +44,14 @@ struct Inner {
     maps: BTreeMap<usize, Map>,
     /// Pools released since the last [`PoolTable::take_released`]: their GPU buffers must go.
     released: Vec<usize>,
+    /// Counts every change to pools and mappings ([`PoolTable::generation`]).
+    generation: u64,
 }
 
 impl Inner {
     /// Removes `[at, at + len)` from the mappings, keeping what is left of any it cuts.
     fn cut(&mut self, at: usize, len: usize) {
+        self.generation += 1;
         let end = at + len;
         let hit: Vec<usize> = self
             .maps
@@ -107,6 +110,23 @@ impl PoolTable {
         ))
     }
 
+    /// A number that changes whenever a pool or a mapping does: what a table built from
+    /// [`PoolTable::mappings`] is current for.
+    pub fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Every mapping, by title address: `(at, len, pool, offset in the pool)`.
+    pub fn mappings(&self) -> (u64, Vec<(usize, usize, PoolInfo, usize)>) {
+        let g = self.lock();
+        let maps = g
+            .maps
+            .iter()
+            .filter_map(|(&at, m)| Some((at, m.len, g.pools.get(&m.pool)?.clone(), m.offset)))
+            .collect();
+        (g.generation, maps)
+    }
+
     /// Pools released since the last call; the host drops their buffers.
     pub fn take_released(&self) -> Vec<usize> {
         std::mem::take(&mut self.lock().released)
@@ -115,11 +135,14 @@ impl PoolTable {
 
 impl PoolObserver for PoolTable {
     fn pool_created(&self, pool: &PoolInfo) {
-        self.lock().pools.insert(pool.id, pool.clone());
+        let mut g = self.lock();
+        g.generation += 1;
+        g.pools.insert(pool.id, pool.clone());
     }
 
     fn pool_released(&self, pool: &PoolInfo) {
         let mut g = self.lock();
+        g.generation += 1;
         g.pools.remove(&pool.id);
         g.maps.retain(|_, m| m.pool != pool.id);
         g.released.push(pool.id);

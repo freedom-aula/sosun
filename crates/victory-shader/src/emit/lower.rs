@@ -105,6 +105,8 @@ pub(crate) struct Parts<'a> {
     pub narrow_waves: bool,
     /// See [`Options::wave32_host`](super::Options).
     pub wave32_host: bool,
+    /// See [`Options::zero_copy_memory`](super::Options).
+    pub zero_copy_memory: bool,
 }
 
 enum Stop {
@@ -4832,6 +4834,9 @@ impl<'a> Lower<'a> {
         active: Option<V>,
     ) -> (V, V) {
         let e = self.memory_entry(lo, hi, write);
+        if self.x.zero_copy_memory {
+            return (e.handle, e.offset);
+        }
         let c = self.cur;
         // Writes always mark (written or missed pages), reads only misses.
         let marks = match (write, active) {
@@ -11164,6 +11169,7 @@ mod tests {
             bias_as_gradients: false,
             narrow_waves: false,
             wave32_host: false,
+            zero_copy_memory: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -11219,6 +11225,7 @@ mod tests {
             bias_as_gradients: false,
             narrow_waves: false,
             wave32_host: false,
+            zero_copy_memory: false,
             view_marks: false,
         })
     }
@@ -11419,6 +11426,7 @@ mod tests {
             bias_as_gradients: false,
             narrow_waves: false,
             wave32_host: false,
+            zero_copy_memory: false,
             view_marks: false,
         })
         .unwrap();
@@ -12253,6 +12261,7 @@ mod tests {
             bias_as_gradients: false,
             narrow_waves,
             wave32_host,
+            zero_copy_memory: false,
             view_marks: false,
         })
         .expect("lower")

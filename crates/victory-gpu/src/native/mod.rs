@@ -13,6 +13,7 @@
 //! the one instance the title-facing objects call, and its [`pool_observer`] is what the runtime's
 //! physical-memory observer forwards to.
 
+pub mod addr;
 pub mod descriptors;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;

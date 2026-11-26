@@ -6,6 +6,7 @@
 //! which time the pool observer has told us about every mapping the title made.
 
 use std::rc::Rc;
+use victory_backend::backend::{RootLayout, RootParam};
 use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
 
 /// A heap the title wrote views into: `start` is its descriptor memory (title addresses).
@@ -14,6 +15,12 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub kind: HeapKind,
     pub start: u64,
     pub count: usize,
+    /// View pairs of the pool-offset contract ([`super::addr`]) written into the heap's reserved
+    /// entries so far.
+    pub pairs: std::cell::Cell<usize>,
+    /// The page table built for this heap (its view indices are the heap's own) and the pool-table
+    /// generation it is current for.
+    pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
@@ -25,8 +32,20 @@ pub struct Binding {
     /// Dwords of the user-data block (a multiple of 4).
     pub dwords: usize,
     pub user_data: Vec<victory_shader::emit::UserData>,
-    /// Title root parameter indices of the root CBVs, SRVs and UAVs, in this order.
-    pub views: Vec<u8>,
+    /// Title root parameter indices of the root CBVs, SRVs and UAVs, in this order, with their
+    /// kind ([`View`]).
+    pub views: Vec<(u8, View)>,
+    /// The shader finds title memory through the page table (`t0` of the memory space), which
+    /// follows the views in the argument buffer, and the heap's reserved view pairs.
+    pub memory: bool,
+}
+
+/// A root view's kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Cbv,
+    Srv,
+    Uav,
 }
 
 impl Binding {
@@ -37,11 +56,46 @@ impl Binding {
             views: shader
                 .root_cbvs
                 .iter()
-                .chain(&shader.root_srvs)
-                .chain(&shader.root_uavs)
-                .copied()
+                .map(|&r| (r, View::Cbv))
+                .chain(shader.root_srvs.iter().map(|&r| (r, View::Srv)))
+                .chain(shader.root_uavs.iter().map(|&r| (r, View::Uav)))
                 .collect(),
+            memory: shader.memory,
         }
+    }
+
+    /// The root signature the converter lays the argument buffer out by, in the order
+    /// `NativeHost::translated_args` fills it: the user-data block, the views, the page table.
+    /// `None` when the shader has no arguments (it takes its own signature, if it has one).
+    pub fn layout(&self) -> Option<RootLayout> {
+        use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, USER_DATA_SPACE};
+        let mut params = Vec::new();
+        if self.dwords > 0 {
+            params.push(RootParam::Constants {
+                register: 0,
+                space: USER_DATA_SPACE,
+                dwords: self.dwords as u32,
+            });
+        }
+        for &(slot, kind) in &self.views {
+            let (register, space) = (u32::from(slot), ROOT_CBV_SPACE);
+            params.push(match kind {
+                View::Cbv => RootParam::Cbv { register, space },
+                View::Srv => RootParam::Srv { register, space },
+                View::Uav => RootParam::Uav { register, space },
+            });
+        }
+        if self.memory {
+            params.push(RootParam::Srv {
+                register: 0,
+                space: MEMORY_SPACE,
+            });
+        }
+        (!params.is_empty()).then_some(RootLayout {
+            params,
+            // Memory no mapped pool holds is read through a view of size 0.
+            bounds_checked: true,
+        })
     }
 }
 

@@ -61,7 +61,17 @@ fn read_mip(key: usize, mip: usize, w: usize, h: usize) -> Vec<u8> {
 #[test]
 fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
     let Some(pool) = pool(9101, 8) else { return };
-    for swizzle in [Swizzle::LINEAR, Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+    // The XOR modes (`_X`, `_T`) too: their equations come from the pipe configuration, not a
+    // fixed pattern, and a texture of theirs is no longer left empty.
+    for swizzle in [
+        Swizzle::LINEAR,
+        Swizzle::SW_256B_S,
+        Swizzle::SW_4KB_S,
+        Swizzle::SW_64KB_D,
+        Swizzle::SW_4KB_S_X,
+        Swizzle::SW_64KB_D_X,
+        Swizzle::SW_64KB_S_T,
+    ] {
         let at = 0;
         let res = crate::resource::test_texture_at(pool.va(at), (64, 32), 4, 28, swizzle.0, 0);
         let info = crate::resource::texture_info(res).unwrap();
@@ -197,12 +207,12 @@ fn a_render_target_is_cleared_through_the_titles_view() {
     assert!(out.chunks(4).all(|p| p == [0, 255, 0, 255]), "{:?}", &out[..8]);
 }
 
-/// A layout the host cannot address (the console's pipe-XOR modes) is counted and left empty, not
+/// A layout the host cannot address (`SW_4KB_R_X`, which has no equations) is counted and left empty, not
 /// an error that stops the submission.
 #[test]
 fn an_undetilable_layout_is_counted_not_fatal() {
     let Some(pool) = pool(9105, 4) else { return };
-    let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::SW_64KB_D_X.0, 0);
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::SW_4KB_R_X.0, 0);
     let before = with_title(|t| t.stats.undetilable).unwrap();
     with_title(|t| {
         assert!(t.realize(res as usize));

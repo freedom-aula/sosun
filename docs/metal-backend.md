@@ -566,13 +566,41 @@ and raises fence values.
   the vertex shader's `ISG1` order, target formats) into `RenderPipelineDesc` (backend: blend, stencil,
   winding, fill, depth bias, depth clip; per draw: viewport, scissor, stencil reference, blend factor).
   A shader the host cannot run is refused with a reason, counted (`glue::shader_stats()`) and its work
-  dropped; the submission and its fences go on. Refused today: title memory read at computed addresses
-  (the page table of `victory_shader::emit`), heap indexing by the shader, root views as heap views,
-  write marks and view addresses, a pixel stage with arguments of its own (one argument block serves a
-  pipeline), multisampling, vertex inputs missing from the layout.
+  dropped; the submission and its fences go on. Refused today: title memory read at computed addresses in
+  a graphics pipeline (compute shaders have it, below), heap indexing by the shader, root views as heap
+  views, write marks and view addresses, a pixel stage with arguments of its own (one argument block
+  serves a pipeline), multisampling, vertex inputs missing from the layout.
+- **Title memory at computed addresses: the pool-offset contract** (`native/addr.rs`, compute shaders). A
+  shader that reads or writes through a pointer it computes (`global_*`, `s_load` from a loaded address,
+  atomics, BVH nodes) finds the memory through the translator's page table (`emit` "Title memory"): per
+  64 KiB title page, the resource-heap index of a raw buffer view and the title address it starts at
+  (`offset = address low dword - start`). DXIL cannot dereference a 64-bit address, and the converter's raw
+  buffers are `{GPU address, size}` descriptors read from the heap, so this is the construct Metal accepts;
+  the translator is unchanged and only the host's side differs from D3D12's (views of host copies):
+  - the host's views are of the pools themselves, one SRV/UAV pair of descriptors per `(pool, 2 GiB
+    chunk)` (a chunk and a page long: a view's size is 32 bits), at the heap indices just past the title's
+    own entries: a resource heap is made `addr::RESERVED` (512) entries longer than the title asks, and a
+    shader that runs where the title bound no heap gets a heap of the host's own. Pair 0 is the null view:
+    size 0, so with the converter's bounds check (`RootLayout::bounds_checked`) a page no pool shows reads
+    0 and its writes are dropped. Each heap has a table of its own, since the table holds its view indices
+    (heaps must have room below the translator's clamp of heap indices, 2^21 entries);
+  - the table is built from `PoolTable::mappings()` into a buffer of its own whenever the pool table's
+    generation changed (never rewritten in place: the GPU may be reading the old one; the last 8 are kept)
+    and bound as the last root parameter. shortcut: rebuilt whole, not incrementally (8 bytes a page: 2 MiB
+    for 16 GiB of mappings); a 64 KiB title page not wholly inside one mapping of one pool is a null page;
+    at most 255 view pairs;
+  - `Options::zero_copy_memory` (on for the host, off for D3D12): the shader marks no pages, so there is
+    no bitmap, no `u0` and no atomics per store: shadow copies are gone, nothing needs to know what was
+    written. Misses are not recorded;
+  - translated shaders carry no root signature, so `victory_backend::RootLayout` tells the converter
+    (`IRCompilerSetGlobalRootSignature`, heaps directly indexed) the layout `NativeHost::translated_args`
+    fills: the user-data constants, root CBVs, SRVs and UAVs, then the table.
+  A global load and store (SGPR base and VGPR-pair address), a scalar load through a pointer loaded from
+  memory, and an atomic add run on the GPU at title addresses no CPU pointer is at, with remaps, a title
+  heap and the host's own, and misses (`native/addr_tests.rs`).
 - **Textures** (`native/textures.rs`): a title texture object gets a host texture when a view, render target
-  or clear first names it; its tiled memory (`victory_formats::texture`, the addressable modes: linear and
-  the S and D modes without XOR) is detiled on the CPU, mip by mip, when a hash of the memory changed at a
+  or clear first names it; its tiled memory (`victory_formats::texture`, the addressable modes: linear, the S
+  and D modes, and the XOR modes `_X` and `_T`, below) is detiled on the CPU, mip by mip, when a hash of the memory changed at a
   submission; block-compressed formats as blocks; textures named by address and description
   (`CreateShaderResourceViewPlaced`) are made by the view; layouts the host cannot address are counted.
 - **Present**: `native::set_layer(CAMetalLayer*)` (the app's, or `native::create_layer` for one without a
@@ -588,14 +616,23 @@ and raises fence values.
 
 ### What is left
 
-1. **The translated-shader contract on Metal.** Pipelines are made and run only for shaders that need no
-   title memory by computed address: translator output reads it through a page table of shadow copies
-   (`HostShader::memory`), which the zero-copy design replaces by the pool offset (step 6 of the next steps
-   above, a translator change). Binding and the converter's root signature for translator output
-   (`HostShader` carries none; the host root signature of `pipeline/host.rs` is built outside the container)
-   is untested on the GPU: only DXIL with its own root signature (our fixtures) runs end to end. Per-stage
-   argument blocks (the D3D12 host's visibility) have no equivalent in one argument buffer.
-2. Textures: the detile is CPU and hashes the memory of every sampled texture per submission (a compute
+1. **The translated-shader contract on Metal.** Compute shaders now run end to end, with title memory at
+   computed addresses (above), user data in root constants and root views. Not done: graphics pipelines
+   with translator output (the page table, immediate samplers as static samplers of the converter's root
+   signature, per-stage argument blocks: the D3D12 host's visibility has no equivalent in one argument
+   buffer), heap indexing by the shader, view addresses and write marks. The table is rebuilt whole when a
+   mapping changes (incremental update is the next step), and the null view relies on the converter's
+   bounds check, which was verified for loads and stores of a 64-lane compute shader only.
+2. Textures: the XOR modes are addressed by addrlib's RB+ equations (`victory_formats::texture`, tables
+   generated by `tools/swizzle/gen_xor_tables.py`, checked against the modes without XOR and against a
+   reference evaluated from the header's text by `tools/swizzle/xor_reference.py`), so a texture in
+   `_X` or `_T` that the title writes with the CPU or a copy is no longer empty. They depend on the GPU's
+   pipe configuration (`PipeConfig::DEFAULT`, eight pipes on four packers, an assumption) and on the
+   surface's pipe-bank XOR (`Layout::with_pipe_bank_xor`, 0 until the host reads it from the descriptor's
+   address): until both are checked against a captured console texture the pipe and bank bits of a mode
+   (bits 8 and up of the block offset) can be wrong, the micro-tile bits are not. `SW_4KB_R_X` and
+   multisampled layouts have no equations. Render targets are still the host's, not detiled.
+   The detile is CPU and hashes the memory of every sampled texture per submission (a compute
    detile over the pool buffer and a per-page change test are the next step); render targets and depth
    targets are not read back to title memory (`CopyTextureRegion` to a buffer, the title's CPU reads);
    clears ignore their rectangles; array and 3D views are not decoded (`Decoded::Image` has no slices);
