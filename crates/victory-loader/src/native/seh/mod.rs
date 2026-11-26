@@ -36,10 +36,11 @@ pub mod unwind;
 #[cfg(target_arch = "x86_64")]
 mod dispatch;
 #[cfg(target_arch = "x86_64")]
-mod signal;
+pub mod signal;
 
 #[cfg(target_arch = "x86_64")]
 pub use dispatch::{
+    backtrace,
     Handler, add_vectored_handler, remove_vectored_handler, set_unhandled_filter,
 };
 #[cfg(target_arch = "x86_64")]

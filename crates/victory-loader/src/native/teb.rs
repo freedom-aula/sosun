@@ -32,10 +32,25 @@ pub const TLS_SLOT_COUNT: usize = 64;
 /// Ours, in the part of the block Windows leaves unused: the thread's host
 /// GS base, which the bridge swaps back to.
 pub const OFF_HOST_TSD: usize = 0x1F00;
+/// Ours too: what the bridge writes while a thread is in a host call, for
+/// the thread dump (`dump.rs`): the target (0 when in title code), the
+/// title's return address, the stub's context word and the bridge's `rbp`.
+pub const OFF_IN_HOST: usize = 0x1F10;
+pub const OFF_IN_HOST_RET: usize = 0x1F18;
+pub const OFF_IN_HOST_CTX: usize = 0x1F20;
+pub const OFF_IN_HOST_RBP: usize = 0x1F28;
 /// Modules with static TLS one thread can hold (the array's length).
 pub const MAX_TLS_MODULES: usize = 64;
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
+
+/// Every live thread with a TEB: block address, Mach port, thread id.
+static LIVE: Mutex<Vec<(usize, super::threadctl::ThreadPort, u32)>> = Mutex::new(Vec::new());
+
+/// The threads that have a TEB now (for the thread dump).
+pub fn live_threads() -> Vec<(usize, super::threadctl::ThreadPort, u32)> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 static TLS_MODULES: Mutex<Vec<TlsTemplate>> = Mutex::new(Vec::new());
 static PEB: AtomicUsize = AtomicUsize::new(0);
@@ -124,6 +139,11 @@ impl ThreadTeb {
         put(OFF_TLS_ARRAY, tls_array.as_ptr() as usize);
         put(OFF_PEB, peb());
         put(OFF_HOST_TSD, host_tsd_base());
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((
+            teb as usize,
+            super::threadctl::ThreadPort::current(),
+            victory_platform::thread::current_id(),
+        ));
         ThreadTeb {
             teb,
             tls_array,
@@ -135,6 +155,7 @@ impl ThreadTeb {
 impl Drop for ThreadTeb {
     fn drop(&mut self) {
         let _ = &self.tls_array;
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|t| t.0 != self.teb as usize);
         for (block, layout) in self.blocks.drain(..) {
             // SAFETY: allocated in `new` with this layout.
             unsafe { dealloc(block, layout) };

@@ -64,6 +64,12 @@ core::arch::global_asm!(
     "mov r12, gs:[0x30]",
     "mov r13, r10",
     "mov r14, r11",
+    // Where this thread is, for the thread dump.
+    "mov rax, [rbp + 8]",
+    "mov [r12 + {in_host_ret}], rax",
+    "mov [r12 + {in_host_ctx}], r14",
+    "mov [r12 + {in_host_rbp}], rbp",
+    "mov [r12 + {in_host}], r13",
     "mov rbx, [r12 + {host_tsd}]",
     "mov rdi, rbx",
     "mov eax, {set_gs}",
@@ -99,6 +105,7 @@ core::arch::global_asm!(
     "xor eax, eax",
     "call r13",
     "mov r13, rax",
+    "mov qword ptr [r12 + {in_host}], 0",
     "test r14, 1",
     "jz 8f",
     "lea rdi, [r14 - 1]",
@@ -270,6 +277,10 @@ core::arch::global_asm!(
     host_tsd = const OFF_HOST_TSD,
     set_gs = const SET_GS_BASE,
     trace_ret = sym trace_ret,
+    in_host = const super::teb::OFF_IN_HOST,
+    in_host_ret = const super::teb::OFF_IN_HOST_RET,
+    in_host_ctx = const super::teb::OFF_IN_HOST_CTX,
+    in_host_rbp = const super::teb::OFF_IN_HOST_RBP,
 );
 
 /// Which method of which object a traced stub stands for.
@@ -294,11 +305,22 @@ pub(crate) fn traced_import(dll: &str, symbol: &str) -> usize {
 
 /// Whether to log every call of every import (`VICTORY_TRACE_IMPORTS=1`).
 pub(crate) fn trace_imports() -> bool {
-    std::env::var_os("VICTORY_TRACE_IMPORTS").is_some_and(|v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_IMPORTS").is_some_and(|v| v != "0"))
+}
+
+/// `(dll, symbol)` of an import stub's context word, as [`traced_import`] made it.
+pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str)> {
+    if context & 1 == 0 {
+        return None;
+    }
+    // SAFETY: odd context words are leaked `Traced` records plus one.
+    let info = unsafe { &*((context - 1) as *const Traced) };
+    Some((info.area, info.name))
 }
 
 extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
-    if hr < 0 || trace_level() == 2 || !info.name.is_empty() {
+    if hr < 0 || trace_level() == 2 || (!info.name.is_empty() && trace_imports()) {
         tracing::warn!(
             area = info.area,
             name = info.name,
@@ -317,11 +339,12 @@ extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize) {
 /// 0 off, 1 failing results (negative `eax`; a method returning a pointer
 /// or a count shows up as noise), 2 every call.
 fn trace_level() -> u8 {
-    match std::env::var("VICTORY_TRACE_FAILS").as_deref() {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_TRACE_FAILS").as_deref() {
         Ok("0") | Err(_) => 0,
         Ok("2") => 2,
         Ok(_) => 1,
-    }
+    })
 }
 
 unsafe extern "C" {

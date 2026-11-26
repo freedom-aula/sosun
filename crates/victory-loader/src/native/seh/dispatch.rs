@@ -270,6 +270,40 @@ fn stack_bounds() -> Bounds {
     }
 }
 
+/// The return addresses up the stack from `start` by the unwind tables (the
+/// first entry is its `rip`), ending at the first frame they cannot follow.
+pub fn backtrace(start: Context, bounds: Bounds) -> Vec<usize> {
+    let mut u = start;
+    let mut chain = vec![u.rip as usize];
+    for _ in 0..24 {
+        let pc = if chain.len() == 1 { u.rip } else { u.rip.wrapping_sub(1) } as usize;
+        if !stack_ok(&u, bounds) {
+            break;
+        }
+        match unwind::lookup(pc) {
+            Some((b, entry)) => {
+                // SAFETY: an entry of an image we mapped.
+                if unsafe { unwind::virtual_unwind(0, b, pc, entry, &mut u, bounds) }.is_none() {
+                    break;
+                }
+            }
+            None => {
+                if unwind::image_base_of(pc).is_none() {
+                    break;
+                }
+                let rsp = u.gpr[RSP];
+                u.rip = read_stack(rsp, bounds);
+                u.gpr[RSP] = rsp + 8;
+            }
+        }
+        if u.rip == 0 {
+            break;
+        }
+        chain.push(u.rip as usize);
+    }
+    chain
+}
+
 /// Continues at `ctx`: sets the TEB as GS and every register, and leaves
 /// the dispatch (and any nested above it) behind.
 ///
@@ -351,33 +385,10 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                         .collect();
                     tracing::warn!("[rcx] {words:x?}");
                 }
-                // A call chain by the unwind tables (return addresses, as
-                // offsets into the faulting image).
-                let bounds = stack_bounds();
-                let mut u = *c;
-                let mut chain = vec![u.rip as usize - base];
-                for _ in 0..24 {
-                    let pc = if chain.len() == 1 { u.rip } else { u.rip.wrapping_sub(1) } as usize;
-                    if !stack_ok(&u, bounds) {
-                        break;
-                    }
-                    match unwind::lookup(pc) {
-                        Some((b, entry)) => {
-                            if unwind::virtual_unwind(0, b, pc, entry, &mut u, bounds).is_none() {
-                                break;
-                            }
-                        }
-                        None => {
-                            let rsp = u.gpr[RSP];
-                            u.rip = read_stack(rsp, bounds);
-                            u.gpr[RSP] = rsp + 8;
-                        }
-                    }
-                    if u.rip == 0 {
-                        break;
-                    }
-                    chain.push((u.rip as usize).wrapping_sub(base));
-                }
+                let chain: Vec<usize> = backtrace(*c, stack_bounds())
+                    .into_iter()
+                    .map(|pc| pc.wrapping_sub(base))
+                    .collect();
                 tracing::warn!("call chain image+ {chain:x?}");
             }
         }

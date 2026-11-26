@@ -95,6 +95,35 @@ fn gs_is_teb() -> bool {
     teb != 0 && unsafe { ((teb + OFF_SELF) as *const usize).read() } == teb
 }
 
+/// For `clzero; add rax, 0x40; cmp rax, <reg>; jb clzero` (12 bytes), the
+/// register number of the limit.
+fn clzero_loop_limit(code: &[u8]) -> Option<usize> {
+    let [
+        0x0F,
+        0x01,
+        0xFC,
+        0x48,
+        0x83,
+        0xC0,
+        0x40,
+        rex,
+        0x39,
+        modrm,
+        0x72,
+        0xF4,
+        ..,
+    ] = *code
+    else {
+        return None;
+    };
+    // `cmp r/m64, r64` with rm = rax and a 64-bit operand.
+    let reg = usize::from(rex & 4) << 1 | usize::from(modrm >> 3 & 7);
+    (rex & 0xFB == 0x48 && modrm >> 6 == 3 && modrm & 7 == 0 && rex & 1 == 0).then_some(reg)
+}
+
+/// Instructions emulated so far (`clzero`), for the thread dump.
+pub static EMULATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Length of a `clwb` or `clflushopt` (66 [REX] 0F AE /6 or /7) at the start
 /// of `code`. Rosetta does not implement them; they only write a cache line
 /// back, so the title (which flushes memory the GPU reads) loses nothing
@@ -160,11 +189,34 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
         let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
         if code.starts_with(&[0x0F, 0x01, 0xFC]) {
             // clzero (AMD, not in Rosetta): zeroes the cache line at rax.
-            let line = (word(0) & !63) as *mut u8;
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let set = |i: usize, v: u64| {
+                // SAFETY: inside the thread state.
+                unsafe { mc.add(MC_THREAD + i * 8).cast::<u64>().write(v) }
+            };
+            let mut next = rip + 3;
+            let mut rax = word(0);
+            let line = (rax & !63) as *mut u8;
             // SAFETY: the instruction would have written this line.
             unsafe { line.write_bytes(0, 64) };
-            // SAFETY: the saved rip, past the instruction.
-            unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
+            // The title's memory clears are `clzero; add rax, 0x40; cmp rax, r;
+            // jb back` over thousands of lines: one signal per line is too
+            // slow, so the whole loop is done here.
+            if let Some(reg) = clzero_loop_limit(code) {
+                let limit = word(reg);
+                rax += 64;
+                while rax < limit {
+                    // SAFETY: the loop would have written each line.
+                    unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
+                    rax += 64;
+                }
+                set(0, rax);
+                next = rip + 12;
+                // The flags of its last `cmp rax, limit`: not below.
+                let zero = u64::from(rax == limit) << 6;
+                set(17, word(17) & !0x8d5 | zero | 0x2);
+            }
+            set(16, next);
             return;
         }
         if code.starts_with(&[0x0F, 0x01, 0xFA]) || code.starts_with(&[0x0F, 0x01, 0xFB]) {
@@ -324,7 +376,20 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_hint_len;
+    use super::{cache_hint_len, clzero_loop_limit};
+
+    #[test]
+    fn the_clzero_loop_is_recognised() {
+        let code = [
+            0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4,
+        ];
+        assert_eq!(clzero_loop_limit(&code), Some(10)); // r10
+        let rdx = [
+            0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4,
+        ];
+        assert_eq!(clzero_loop_limit(&rdx), Some(2));
+        assert_eq!(clzero_loop_limit(&code[..3]), None);
+    }
 
     #[test]
     fn cache_hints_are_measured() {
