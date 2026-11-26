@@ -283,3 +283,15 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
 - The probe's `.tls` handling is hand-written (`_tls_used`, `_tls_start`, `_tls_end`), since it links no CRT. A real MinGW or MSVC title brings its own.
+
+## Bring-up diagnostics (native path)
+
+Off by default, environment variables of the host process:
+
+- `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
+- `VICTORY_TRACE_IMPORTS=1`: the same for every import bound to a host function (name and DLL), whatever the result. Slow (millions of lines in a title's startup).
+- `VICTORY_PEEK=rva,rva,...`: at the first-chance exception log, prints those qwords of the faulting image (an operand above `0x10000000` is an absolute address), the qwords `rcx` points at, and a call chain by the unwind tables. Use it with `llvm-objdump` on the title (analysis only).
+
+The first-chance log (`seh::dispatch`) shows a breakpoint's `rip` as the `int3` itself, as Windows x64 does.
+
+Instructions Rosetta does not run are skipped or emulated by the SIGILL path in `seh::signal`: `clwb`/`clflushopt` (skipped), `clzero` (zeroes the line), `monitorx`/`mwaitx` (skipped, the latter yields).
