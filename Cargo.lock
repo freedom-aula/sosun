@@ -873,12 +873,14 @@ dependencies = [
 name = "victory-metal"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "block2",
  "libc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
+ "tempfile",
  "victory-backend",
 ]
 

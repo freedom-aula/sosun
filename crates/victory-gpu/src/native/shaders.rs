@@ -31,19 +31,26 @@ pub fn options() -> Options {
 
 /// A console shader container as DXIL for the native host.
 pub fn translate(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
+    translate_cached(container, options())
+}
+
+/// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
+/// `o` is part of the key.
+fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
+    crate::shader_cache::native_shader(container, &format!("{o:?}"), |c| {
+        victory_shader::emit::translate_with(c, o).map_err(|e| e.to_string())
+    })
 }
 
 /// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
 pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: true, ..options() }).map_err(|e| e.to_string())
+    translate_cached(container, Options { rect_list: true, ..options() })
 }
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
 /// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
 pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
-        .map_err(|e| e.to_string())
+    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can

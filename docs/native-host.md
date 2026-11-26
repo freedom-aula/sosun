@@ -325,6 +325,16 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 
 Guess: a 1.1 blob is returned as the 1.0 description, its range and root descriptor flags dropped, which is believed to be what Microsoft's 1.0 deserializer does. The Windows test `we_read_the_hosts_blobs_as_it_does` has Microsoft's serializer write 1.0 and 1.1 blobs, compares Microsoft's reader and ours on them, and settles it. Microsoft's blobs are DXBC containers with an `RTS0` part, which ours reads by the same path; our serializer writes a bare `RTS0`, which only our reader is given.
 
+## Shader and pipeline cache on disk (native path)
+
+On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` leaves it on). Everything lives under the cache folder (`cache_subdir("native-shaders")`, for example `~/.cache/victory/native-shaders/<translator>/`), never in the repo, and is never sent anywhere. Three layers, each written to a temporary name and renamed:
+
+- **Translations** (`translated/`, `victory_gpu::shader_cache::native_shader`): the `HostShader` of a console container, including `table_entries` and `splits`, keyed by the container's bytes, the translation `Options` (rectangle lists, extra and copied parameters), and the build key (`victory_shader::SOURCE_HASH`, the text of `shader_cache.rs` which defines the encoding, the loop limit). The folder is named by the start of the build key, so a changed translator reads nothing old and old folders can be deleted whole. It is the same store and encoding as the Wine path's (`use_shader_cache`), in its own folder; the encoding now carries `table_entries` and `splits` too. A refusal is stored with its reason.
+- **Libraries** (`metal/`, `victory_metal::disk`): the converter's metallib and shader stage, keyed by the DXIL, the root layout, the entry name, the format and the converter itself (its path, size and modification time). Each file has a magic and a checksum; a damaged file is a miss and is converted again.
+- **Pipeline states** (`metal/pipelines-<gpu>.metalarchive`, `victory_metal::archive`): an `MTLBinaryArchive` of the compiled compute and render pipelines. A pipeline is looked up with `FailOnBinaryArchiveMiss`; on a miss it is compiled as before and added. The archive is serialised at most every 5 s while pipelines are added, and when the backend drops. Metal refuses an archive from another GPU or OS version; it is then replaced by an empty one. Limit: a run killed within 5 s of its last new pipeline loses those pipelines.
+
+Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
+
 ## Bring-up diagnostics (native path)
 
 Off by default, environment variables of the host process:
