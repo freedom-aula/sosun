@@ -7992,6 +7992,42 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pknorm_u16_f32" | "v_cvt_pknorm_i16_f32" => {
+                // Two floats as 16-bit normalized integers, src0 in the low
+                // half and src1 in the high one: round(clamp(x, lo, 1) * max)
+                // to nearest even, the product rounded as an f32 first, as
+                // Mesa's ACO uses the pair for packUnorm2x16 and
+                // packSnorm2x16 (VOP3 only on GFX10).
+                // Guess: a NaN gives 0 (D3D's float to normalized integer
+                // rule); no public source states what the hardware gives.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (lo, max) = if signed {
+                    (-1.0f32, 32767.0f32)
+                } else {
+                    (0.0, 65535.0)
+                };
+                let mut halves = Vec::new();
+                for k in 0..2 {
+                    let x = f(self, k)?;
+                    let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                    let zero = self.s.m.f32(0);
+                    let x = self.s.m.select(c, nan, zero, x);
+                    let (lo, one) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(1.0f32.to_bits()));
+                    let x = self.binary(35, x, lo);
+                    let x = self.binary(36, x, one);
+                    let max = self.s.m.f32(max.to_bits());
+                    let x = self.s.m.bin(c, Bin::Mul, x, max);
+                    let x = self.unary(26, x);
+                    let op = if signed { Cast::FpToSi } else { Cast::FpToUi };
+                    let x = self.s.m.cast(c, op, x, self.s.t.i32);
+                    let ffff = self.s.m.i32(0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, ffff));
+                }
+                let sh = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], sh);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded as MODE says (nearest even by default) into the low half.
                 let a = f(self, 0)?;
