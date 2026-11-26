@@ -1250,17 +1250,19 @@ impl<'a> Lower<'a> {
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
-        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
+        // The first step the simulation does not model names the refusal.
+        let sec = &self.sections[&b][&start];
+        let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
+                match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
             } else {
-                Val::Missing(UNKNOWN)
+                Val::Missing(unknown)
             };
             self.vals.insert(w, val);
         }

@@ -1344,6 +1344,69 @@ mod tests {
 mod pieces_tests {
     use super::*;
 
+    /// The container the host makes from a compute description's pieces: wave32 code of 32
+    /// threads with 5 user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
+    fn section_pieces(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
+        let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
+        let code = words(code);
+        let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        metadata.extend([0x40, 4, records.len() as u8, 0]);
+        records.iter().for_each(|r| metadata.extend(r));
+        metadata.extend([0x43].into_iter().chain([0; 31]));
+        let size = metadata.len() as u32 - 0x14;
+        metadata[4..8].copy_from_slice(&size.to_le_bytes());
+        let pieces = [registers, vec![0; 0x14], code, metadata];
+        let mut record = Vec::new();
+        for p in &pieces {
+            record.extend((p.as_ptr() as u64).to_le_bytes());
+            record.extend((p.len() as u64).to_le_bytes());
+        }
+        // SAFETY: four pairs over live vectors.
+        unsafe { compute_container(None, record.as_ptr()) }.expect("a container")
+    }
+
+    /// On the native host's path (the container made from the title's pieces, translated with
+    /// the host's options: two host waves of 32 lanes, title memory zero-copy), a whole-wave
+    /// section value without a shape is refused naming the first step the simulation does not
+    /// model; that text is what the refusal log line shows.
+    #[test]
+    fn the_host_refuses_a_whole_wave_section_naming_its_step() {
+        // A raw UAV of the table at user data 4 (`s4`).
+        let mut uav = [0u8; 32];
+        uav[0] = 0x41;
+        uav[4..6].copy_from_slice(&[3, 3]);
+        uav[16] = 1;
+        uav[20..23].copy_from_slice(&[4, 4, 0]);
+        let program = |step: &[u32]| {
+            let mut code = vec![
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+            ];
+            code.extend_from_slice(step);
+            code.extend([
+                0xBEFE_0302, // s_mov_b32 exec_lo, s2
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ]);
+            section_pieces(&code, &[uav])
+        };
+        let prefix = "a whole-wave section step the simulation does not follow: ";
+        for (step, why) in [
+            (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+            // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
+            (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+        ] {
+            let err = crate::native::shaders::translate(&program(step)).err().expect("refused");
+            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+        }
+    }
+
     /// Four (pointer, size) pairs of a console compute description's record, as the title lays
     /// them out: registers, hash, code, metadata.
     #[test]

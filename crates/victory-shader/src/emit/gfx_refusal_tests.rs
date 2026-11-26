@@ -2067,3 +2067,43 @@ fn compute_root_constants_reach_the_user_data() {
     let err = translate_with(&container(None), Options::default()).unwrap_err();
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
+
+/// A value a whole-wave section leaves without a shape is refused naming the
+/// first step the simulation does not model, or, when it models every step,
+/// saying the value is no reduction or prefix.
+#[test]
+fn whole_wave_sections_name_the_step_they_do_not_follow() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |step: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        ];
+        code.extend_from_slice(step);
+        code.extend([
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a whole-wave section step the simulation does not follow: ";
+    for (step, why) in [
+        (&[0x1002_0100][..], "a VALU operation it does not model"), // v_mul_f32 v1, v0, v0
+        // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
+        (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+    ] {
+        let err = translate_with(&program(step), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
+    }
+}

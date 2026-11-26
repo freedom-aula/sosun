@@ -125,7 +125,29 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// The first step the simulation does not model, if any: why a value
+    /// the section leaves may have no shape.
+    pub why: Option<&'static str>,
 }
+
+/// A refusal of a value a section leaves: the first step not modelled.
+macro_rules! unfollowed {
+    ($what:literal) => {
+        concat!("a whole-wave section step the simulation does not follow: ", $what)
+    };
+}
+const EXEC_WRITE: &str = unfollowed!("an EXEC write that is no constant");
+const SCALAR: &str = unfollowed!("a scalar ALU result");
+const NOT_VALU: &str = unfollowed!("an instruction that is no VALU operation");
+const READLANE: &str = unfollowed!("a v_readlane at a lane it does not know");
+const VALU_SGPR: &str = unfollowed!("a VALU result in an SGPR");
+const DPP_LANES_OFF: &str = unfollowed!("a DPP step with lanes off");
+const DPP: &str = unfollowed!("a DPP control it does not model");
+const MODIFIERS: &str = unfollowed!("an operand or result modifier");
+const PERMLANE: &str = unfollowed!("a v_permlane with computed lane selects");
+const VALU: &str = unfollowed!("a VALU operation it does not model");
+/// Every step modelled, but the value is no single reduction or prefix.
+pub(crate) const NO_SHAPE: &str = unfollowed!("a value that is no reduction or prefix");
 
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
@@ -162,8 +184,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let (shapes, why) = simulate(&insts[i + 1..end], wave, saved);
+        out.insert(i, Section { end, shapes, why });
         i = end + 1;
     }
     out
@@ -312,7 +334,12 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+) -> (HashMap<Value, Shape>, Option<&'static str>) {
+    let mut why = None;
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -333,7 +360,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return shapes(vec, uni, wave);
+                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -348,7 +375,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return shapes(vec, uni, wave);
+                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -359,6 +386,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            } else {
+                why.get_or_insert(SCALAR);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -366,6 +395,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         let Fields::Valu(v) = &inst.fields else {
+            why.get_or_insert(NOT_VALU);
             for &(_, w) in &inst.writes {
                 vec.insert(w, vec![Sym::Unknown; wave as usize]);
             }
@@ -407,14 +437,16 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
-                let s = l
-                    .and_then(|l| x.get(l as usize).copied())
-                    .unwrap_or(Sym::Unknown);
-                uni.insert(w, s);
+                let s = l.and_then(|l| x.get(l as usize).copied());
+                if s.is_none() {
+                    why.get_or_insert(READLANE);
+                }
+                uni.insert(w, s.unwrap_or(Sym::Unknown));
             }
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
+            why.get_or_insert(VALU_SGPR);
             for &(_, w) in &inst.writes {
                 uni.insert(w, Sym::Unknown);
             }
@@ -437,6 +469,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
                 if exec != all {
+                    why.get_or_insert(DPP_LANES_OFF);
                     vec.insert(dst, vec![Sym::Unknown; wave as usize]);
                     continue;
                 }
@@ -453,6 +486,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                         _ => ok = false,
                     }
                 }
+                if !ok {
+                    why.get_or_insert(DPP);
+                }
                 ok.then_some(f)
             }
             (None, Some(s)) => Some(s.clone()),
@@ -460,7 +496,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         };
         let src = |k: usize| v.src.get(k).map(|o| lanes(o, &vec, &uni));
         let result: Vec<Sym> = match (name, fetched) {
-            _ if modifiers => vec![Sym::Unknown; wave as usize],
+            _ if modifiers => {
+                why.get_or_insert(MODIFIERS);
+                vec![Sym::Unknown; wave as usize]
+            }
             ("v_mov_b32", Some(a)) => a,
             ("v_bfrev_b32", Some(a)) => a
                 .into_iter()
@@ -511,7 +550,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                             })
                             .collect()
                     }
-                    _ => vec![Sym::Unknown; wave as usize],
+                    _ => {
+                        why.get_or_insert(PERMLANE);
+                        vec![Sym::Unknown; wave as usize]
+                    }
                 }
             }
             ("v_sub_nc_u32", Some(a)) => {
@@ -562,9 +604,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
                     .collect(),
-                _ => vec![Sym::Unknown; wave as usize],
+                _ => {
+                    why.get_or_insert(VALU);
+                    vec![Sym::Unknown; wave as usize]
+                }
             },
-            _ => vec![Sym::Unknown; wave as usize],
+            _ => {
+                why.get_or_insert(VALU);
+                vec![Sym::Unknown; wave as usize]
+            }
         };
         let merged = (0..wave as usize)
             .map(|l| {
@@ -577,7 +625,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    (shapes(vec, uni, wave), why)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
