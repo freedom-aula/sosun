@@ -781,6 +781,8 @@ survives pressure better.
 
 A sampler heap entry holds only the sampler's resource ID. The host used to drop its `MTLSamplerState` right after writing the entry, and Metal gives a freed sampler's ID to the next sampler made, so an older entry then sampled with a newer descriptor's filter and address modes. `create_sampler` now keeps every sampler it makes, one per distinct `SamplerDesc` (few exist), and hands the same one back for the same descriptor.
 
+Dynamic `CreateSamplerX` descriptors use Metal's border mode for transparent black, opaque black, and opaque white. Other border colors retain edge clamp, since Metal offers three fixed colors.
+
 #### CPU texture transfers are bounds-checked
 
 Texture uploads, the background scanner and submit-time probes first try one Mach read per chunk (up to 1 MiB). If a read spanning multiple pages fails, the host walks the VM regions that overlap the chunk. It leaves unmapped gaps and regions without read permission zero-filled and copies each readable span in one read. If that read also fails, for example because the title changed the mapping after the query, the host retries just that span at page boundaries. A 1 MiB chunk entirely inside a hole or a single no-access region costs one failed read and one region query. A failed probe contained in one page needs only its original read.

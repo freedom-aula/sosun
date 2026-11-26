@@ -165,6 +165,14 @@ pub enum Address {
     Wrap,
     Mirror,
     Clamp,
+    Border,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderColor {
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,6 +180,7 @@ pub struct SamplerDesc {
     pub min_mag: Filter,
     pub mip: Filter,
     pub address: [Address; 3],
+    pub border_color: BorderColor,
     pub max_anisotropy: usize,
 }
 

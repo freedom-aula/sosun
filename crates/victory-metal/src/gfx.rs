@@ -312,6 +312,7 @@ fn address(a: Address) -> MTLSamplerAddressMode {
         Address::Wrap => MTLSamplerAddressMode::Repeat,
         Address::Mirror => MTLSamplerAddressMode::MirrorRepeat,
         Address::Clamp => MTLSamplerAddressMode::ClampToEdge,
+        Address::Border => MTLSamplerAddressMode::ClampToBorderColor,
     }
 }
 
@@ -320,6 +321,28 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
         Filter::Nearest => MTLSamplerMinMagFilter::Nearest,
         Filter::Linear => MTLSamplerMinMagFilter::Linear,
     }
+}
+
+fn dynamic_sampler_descriptor(d: &SamplerDesc) -> Retained<MTLSamplerDescriptor> {
+    let sd = MTLSamplerDescriptor::new();
+    sd.setMinFilter(filter(d.min_mag));
+    sd.setMagFilter(filter(d.min_mag));
+    sd.setMipFilter(match d.mip {
+        Filter::Nearest => MTLSamplerMipFilter::Nearest,
+        Filter::Linear => MTLSamplerMipFilter::Linear,
+    });
+    sd.setSAddressMode(address(d.address[0]));
+    sd.setTAddressMode(address(d.address[1]));
+    sd.setRAddressMode(address(d.address[2]));
+    sd.setBorderColor(match d.border_color {
+        BorderColor::TransparentBlack => MTLSamplerBorderColor::TransparentBlack,
+        BorderColor::OpaqueBlack => MTLSamplerBorderColor::OpaqueBlack,
+        BorderColor::OpaqueWhite => MTLSamplerBorderColor::OpaqueWhite,
+    });
+    sd.setMaxAnisotropy(d.max_anisotropy.max(1));
+    // Heap entries store resource IDs, which exist only for argument-buffer samplers.
+    sd.setSupportArgumentBuffers(true);
+    sd
 }
 
 /// A sampler for a static sampler's `D3D12_STATIC_SAMPLER_DESC` words up to `MaxLOD` (filter,
@@ -1001,19 +1024,7 @@ impl ResourceBackend for Metal {
         if let Some((_, s)) = self.samplers.borrow().iter().find(|(k, _)| k == d) {
             return Ok(Sampler(s.clone()));
         }
-        let sd = MTLSamplerDescriptor::new();
-        sd.setMinFilter(filter(d.min_mag));
-        sd.setMagFilter(filter(d.min_mag));
-        sd.setMipFilter(match d.mip {
-            Filter::Nearest => MTLSamplerMipFilter::Nearest,
-            Filter::Linear => MTLSamplerMipFilter::Linear,
-        });
-        sd.setSAddressMode(address(d.address[0]));
-        sd.setTAddressMode(address(d.address[1]));
-        sd.setRAddressMode(address(d.address[2]));
-        sd.setMaxAnisotropy(d.max_anisotropy.max(1));
-        // The heap entry stores the sampler's resource ID, which exists only for argument-buffer samplers.
-        sd.setSupportArgumentBuffers(true);
+        let sd = dynamic_sampler_descriptor(d);
         let s = self
             .dev
             .newSamplerStateWithDescriptor(&sd)
@@ -2459,12 +2470,146 @@ mod sampler_tests {
     use super::*;
 
     #[test]
+    fn dynamic_samplers_apply_the_metal_border_descriptor() {
+        for (color, expected) in [
+            (BorderColor::TransparentBlack, MTLSamplerBorderColor::TransparentBlack),
+            (BorderColor::OpaqueBlack, MTLSamplerBorderColor::OpaqueBlack),
+            (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
+        ] {
+            let desc = dynamic_sampler_descriptor(&SamplerDesc {
+                min_mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [Address::Border, Address::Clamp, Address::Mirror],
+                border_color: color,
+                max_anisotropy: 1,
+            });
+            assert_eq!(desc.sAddressMode(), MTLSamplerAddressMode::ClampToBorderColor);
+            assert_eq!(desc.tAddressMode(), MTLSamplerAddressMode::ClampToEdge);
+            assert_eq!(desc.rAddressMode(), MTLSamplerAddressMode::MirrorRepeat);
+            assert_eq!(desc.borderColor(), expected);
+        }
+    }
+
+    #[test]
+    fn dynamic_samplers_sample_their_border_color_and_keep_distinct_cache_keys() {
+        use objc2_foundation::NSString;
+
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        let metal = Metal::new().expect("Metal device");
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        metal.upload_texture(&source, 0, 0, &GREEN.repeat(4), 8, 0);
+        let mut output_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 1);
+        output_desc.render_target = true;
+        let output = metal.create_texture(&output_desc).unwrap();
+
+        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            vertex float4 test_vertex(uint i [[vertex_id]]) {
+                return float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
+            }
+            fragment float4 test_fragment(
+                float4 position [[position]],
+                texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]]
+            ) {
+                const float2 uv[] = {
+                    float2(-0.25, 0.25), float2(0.25, 0.25),
+                    float2(1.25, 0.25), float2(0.25, -0.25),
+                };
+                return tex.sample(s, uv[uint(position.x)]);
+            }
+        "#), None).expect("compile generated Metal shader source");
+
+        let desc = MTLRenderPipelineDescriptor::new();
+        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
+        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        desc.setVertexFunction(Some(&vertex));
+        desc.setFragmentFunction(Some(&fragment));
+        // SAFETY: color attachment 0 exists.
+        unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        let pipeline = metal.dev.newRenderPipelineStateWithDescriptor_error(&desc).unwrap();
+        let queue = metal.dev.newCommandQueue().unwrap();
+
+        let sample = |sampler: &ProtocolObject<dyn MTLSamplerState>| {
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: color attachment 0 exists.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&output.tex));
+            a.setLoadAction(MTLLoadAction::Clear);
+            a.setClearColor(MTLClearColor { red: 1.0, green: 0.0, blue: 1.0, alpha: 1.0 });
+            a.setStoreAction(MTLStoreAction::Store);
+            let cb = queue.commandBuffer().unwrap();
+            let e = cb.renderCommandEncoderWithDescriptor(&pass).unwrap();
+            e.setRenderPipelineState(&pipeline);
+            // SAFETY: the generated fragment shader uses texture and sampler slot 0, and
+            // the vertex shader draws a fullscreen triangle using vertex IDs 0 through 2.
+            unsafe {
+                e.setFragmentTexture_atIndex(Some(&source.tex), 0);
+                e.setFragmentSamplerState_atIndex(Some(sampler), 0);
+                e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            e.endEncoding();
+            cb.commit();
+            cb.waitUntilCompleted();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed, "{:?}", cb.error());
+
+            let mut bytes = [0; 16];
+            metal.read_texture(&output, 0, 0, &mut bytes, 16, 0);
+            *bytes.as_chunks::<4>().0.first_chunk::<4>().unwrap()
+        };
+
+        // Independently construct the edge sampler the old dynamic path used.
+        let edge_desc = MTLSamplerDescriptor::new();
+        edge_desc.setMinFilter(MTLSamplerMinMagFilter::Nearest);
+        edge_desc.setMagFilter(MTLSamplerMinMagFilter::Nearest);
+        edge_desc.setMipFilter(MTLSamplerMipFilter::Nearest);
+        edge_desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setSupportArgumentBuffers(true);
+        let legacy_edge = metal.dev.newSamplerStateWithDescriptor(&edge_desc).unwrap();
+        assert_eq!(sample(&legacy_edge), [GREEN; 4]);
+
+        let cases = [
+            (Address::Border, BorderColor::OpaqueWhite, [255; 4]),
+            (Address::Border, BorderColor::OpaqueBlack, [0, 0, 0, 255]),
+            (Address::Border, BorderColor::TransparentBlack, [0; 4]),
+            (Address::Clamp, BorderColor::TransparentBlack, GREEN),
+        ];
+        let cached_before = metal.samplers.borrow().len();
+        let mut ids = std::collections::HashSet::new();
+        for (mode, border_color, outside) in cases {
+            let key = SamplerDesc {
+                min_mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [mode, Address::Clamp, Address::Clamp],
+                border_color,
+                max_anisotropy: 1,
+            };
+            let sampler = metal.create_sampler(&key).unwrap();
+            let id = resource_id(sampler.0.gpuResourceID());
+            assert!(ids.insert(id), "two distinct samplers shared an ID");
+            let repeated = metal.create_sampler(&key).unwrap();
+            assert_eq!(resource_id(repeated.0.gpuResourceID()), id, "repeat lookup changed cache identity");
+
+            let pixels = sample(&sampler.0);
+            assert_eq!(pixels, [outside, GREEN, outside, GREEN], "{mode:?}, {border_color:?}");
+            println!("{mode:?} {border_color:?}: {pixels:?}");
+        }
+        assert_eq!(metal.samplers.borrow().len(), cached_before + cases.len());
+    }
+
+    #[test]
     fn a_sampler_in_a_heap_keeps_its_id() {
         let m = Metal::new().unwrap();
         let desc = |min_mag| SamplerDesc {
             min_mag,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         };
         let id = |s: &Sampler| resource_id(s.0.gpuResourceID());
