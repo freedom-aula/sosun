@@ -284,8 +284,10 @@ pub(super) unsafe fn stat_from_metadata(out: *mut u8, m: &Metadata, wide_size: b
 
 fn put_str(dst: *mut u8, size: usize, s: &str) -> i32 {
     if s.len() + 1 > size {
-        // SAFETY: a buffer of at least one unit.
-        unsafe { dst.write(0) };
+        if size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(0) };
+        }
         return fail(ERANGE);
     }
     // SAFETY: the title's buffer of `size`.
@@ -432,8 +434,10 @@ unsafe fn copy_out<C: Ch>(dst: *mut C, size: usize, src: &[C], secure: bool) -> 
         return 0;
     }
     if secure && src.len() + 1 > size {
-        // SAFETY: a buffer of at least one unit.
-        unsafe { dst.write(C::default()) };
+        if size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(C::default()) };
+        }
         return bad_param(ERANGE);
     }
     // SAFETY: the title's buffer.
@@ -444,17 +448,38 @@ unsafe fn copy_out<C: Ch>(dst: *mut C, size: usize, src: &[C], secure: bool) -> 
     0
 }
 
+unsafe fn clear_outputs<C: Ch>(out: [(*mut C, usize); 4]) {
+    for (dst, size) in out {
+        if !dst.is_null() && size > 0 {
+            // SAFETY: a buffer of at least one unit.
+            unsafe { dst.write(C::default()) };
+        }
+    }
+}
+
 unsafe fn g_splitpath<C: Ch>(path: *const C, out: [(*mut C, usize); 4], secure: bool) -> i32 {
+    if secure && out.iter().any(|&(dst, size)| dst.is_null() != (size == 0)) {
+        // SAFETY: only non-null buffers with positive size are cleared.
+        unsafe { clear_outputs(out) };
+        return bad_param(EINVAL);
+    }
     if path.is_null() {
+        if secure {
+            // SAFETY: only non-null buffers with positive size are cleared.
+            unsafe { clear_outputs(out) };
+        }
         return bad_param(EINVAL);
     }
     // SAFETY: a NUL-terminated path and the title's buffers.
     unsafe {
         let p = units(path);
         let parts = split(p);
-        for ((range, (dst, size)), _) in parts.iter().zip(out).zip(0..) {
+        for (range, (dst, size)) in parts.iter().zip(out) {
             let r = copy_out(dst, size, &p[range.clone()], secure);
             if r != 0 {
+                if secure {
+                    clear_outputs(out);
+                }
                 return r;
             }
         }
@@ -559,7 +584,7 @@ unsafe fn g_makepath<C: Ch>(
     ext: *const C,
     secure: bool,
 ) -> i32 {
-    if out.is_null() {
+    if out.is_null() || (secure && size == 0) {
         return bad_param(EINVAL);
     }
     let mut v: Vec<C> = Vec::new();
@@ -681,6 +706,8 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
     });
     // SAFETY: the title's structure of at least 296 (or 560) bytes.
     unsafe {
+        let name_at = if wide_size { 40 } else { 36 };
+        std::ptr::write_bytes(out, 0, name_at);
         out.cast::<u32>().write_unaligned(attrib);
         if let Some(m) = meta {
             out.add(8)
@@ -693,14 +720,12 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
                 .cast::<i64>()
                 .write_unaligned(secs(m.modified()));
         }
-        let name_at = if wide_size {
+        if wide_size {
             out.add(32).cast::<i64>().write_unaligned(len as i64);
-            40
         } else {
             out.add(32)
                 .cast::<u32>()
                 .write_unaligned(len.min(u64::from(u32::MAX)) as u32);
-            36
         };
         if wide_name {
             let w: Vec<u16> = name.encode_utf16().take(259).collect();
@@ -745,9 +770,14 @@ fn find_first(path: Option<PathBuf>, out: *mut u8, wide_name: bool, wide_size: b
 }
 
 fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i32 {
+    if out.is_null() {
+        bad_param(EINVAL);
+        return -1;
+    }
     let mut table = finds();
-    let Some(Some(l)) = usize::try_from(handle - 1)
-        .ok()
+    let Some(Some(l)) = handle
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
         .and_then(|i| table.get_mut(i))
     else {
         set_errno(super::EBADF);
@@ -797,8 +827,9 @@ pub extern "system" fn _wfindnext64(handle: isize, out: *mut u8) -> i32 {
 
 pub extern "system" fn _findclose(handle: isize) -> i32 {
     let mut table = finds();
-    match usize::try_from(handle - 1)
-        .ok()
+    match handle
+        .checked_sub(1)
+        .and_then(|i| usize::try_from(i).ok())
         .and_then(|i| table.get_mut(i))
     {
         Some(slot @ Some(_)) => {
@@ -1066,5 +1097,109 @@ mod tests {
             }),
             r"C:\x"
         );
+    }
+
+    #[test]
+    fn zero_size_path_buffers_and_find_edge_cases() {
+        // Zero-sized buffers must never be written out of bounds.
+        let mut guard = [0xAAu8; 4];
+        set_errno(0);
+        assert!(_fullpath(guard.as_mut_ptr(), c(r"C:\x").as_ptr(), 0).is_null());
+        assert_eq!(super::super::errno(), ERANGE);
+        assert_eq!(guard, [0xAA; 4]);
+
+        assert_eq!(
+            _makepath_s(
+                guard.as_mut_ptr(),
+                0,
+                c("C:").as_ptr(),
+                c("d").as_ptr(),
+                c("f").as_ptr(),
+                c("e").as_ptr()
+            ),
+            EINVAL
+        );
+        assert_eq!(guard, [0xAA; 4]);
+
+        let mut drive = [b'x'; 4];
+        let mut ext = [b'y'; 2];
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                drive.as_mut_ptr(),
+                drive.len(),
+                guard.as_mut_ptr(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            ),
+            EINVAL
+        );
+        assert_eq!(guard, [0xAA; 4]);
+        assert_eq!(drive[0], 0);
+
+        // Non-zero size with a null pointer is `EINVAL`.
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                std::ptr::null_mut(),
+                4,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+            ),
+            EINVAL
+        );
+
+        // Overflow on a later component clears earlier outputs too.
+        drive = [b'x'; 4];
+        assert_eq!(
+            _splitpath_s(
+                c(r"C:\a\b.txt").as_ptr(),
+                drive.as_mut_ptr(),
+                drive.len(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                ext.as_mut_ptr(),
+                ext.len(),
+            ),
+            ERANGE
+        );
+        assert_eq!(drive[0], 0);
+        assert_eq!(ext[0], 0);
+
+        // `_findnext*` rejects null output, and `isize::MIN` handles do not underflow.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"1").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"2").unwrap();
+        let pattern = c(&format!("{}/*.txt", dir.path().to_str().unwrap()));
+        let mut data = [0u8; 304];
+        let h = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(h > 0);
+        set_errno(0);
+        assert_eq!(_findnext64i32(h, std::ptr::null_mut()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        assert_eq!(_findclose(h), 0);
+
+        set_errno(0);
+        assert_eq!(_findnext64i32(isize::MIN, data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), super::super::EBADF);
+        set_errno(0);
+        assert_eq!(_findclose(isize::MIN), -1);
+        assert_eq!(super::super::errno(), super::super::EBADF);
+
+        // Missing metadata zeroes timestamp fields instead of keeping stale bytes.
+        let mut stale = [0xFFu8; 304];
+        // SAFETY: `stale` is large enough for `_finddata64i32_t`.
+        unsafe { fill_find(stale.as_mut_ptr(), &("ghost".into(), None), false, false) };
+        assert_eq!(&stale[..36], &[0u8; 36]);
+        assert_eq!(&stale[36..42], b"ghost\0");
     }
 }
