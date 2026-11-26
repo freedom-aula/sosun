@@ -12707,7 +12707,9 @@ impl<'a> Lower<'a> {
             let mut copies = Vec::new();
             for &(id, col, value, half) in &stores {
                 let src = &self.s.outputs[id];
-                if src.kind != 0 || src.index >= 32 {
+                // `TEXCOORD`s only: a `HALF` of the copied index is another parameter's half,
+                // and copying it would overwrite the `HALF` of the copy's index.
+                if src.kind != 0 || src.name != "TEXCOORD" || src.index >= 32 {
                     continue;
                 }
                 for (m, &from) in self.x.copy_params.iter().enumerate() {
