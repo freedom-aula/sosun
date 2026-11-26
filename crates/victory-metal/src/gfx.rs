@@ -96,6 +96,10 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Bc5 => MTLPixelFormat::BC5_RGUnorm,
         Format::Bc6h => MTLPixelFormat::BC6H_RGBFloat,
         Format::Bc7 => MTLPixelFormat::BC7_RGBAUnorm,
+        Format::R8Unorm => MTLPixelFormat::R8Unorm,
+        Format::A8Unorm => MTLPixelFormat::A8Unorm,
+        Format::R16Unorm => MTLPixelFormat::R16Unorm,
+        Format::Rgba32Float => MTLPixelFormat::RGBA32Float,
     }
 }
 

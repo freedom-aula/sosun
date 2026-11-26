@@ -31,6 +31,11 @@ pub enum Format {
     Bc5,
     Bc6h,
     Bc7,
+    R8Unorm,
+    /// Alpha only: samples as (0, 0, 0, a), as D3D's `A8_UNORM` (UI font atlases).
+    A8Unorm,
+    R16Unorm,
+    Rgba32Float,
 }
 
 impl Format {
@@ -43,6 +48,9 @@ impl Format {
             Rgba16Float => (1, 8),
             Bc1 | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc5 | Bc6h | Bc7 => (4, 16),
+            R8Unorm | A8Unorm => (1, 1),
+            R16Unorm => (1, 2),
+            Rgba32Float => (1, 16),
         }
     }
 

@@ -150,6 +150,22 @@ impl Msc {
             let params: Vec<Parameter> = layout
                 .map(|l| l.params.iter().map(Parameter::of).collect())
                 .unwrap_or_default();
+            // `IRStaticSamplerDescriptor` (`D3D12_STATIC_SAMPLER_DESC`): the layout's ten words,
+            // then register n, space 0, visibility all.
+            let samplers: Vec<[u32; 13]> = layout
+                .map(|l| {
+                    l.static_samplers
+                        .iter()
+                        .enumerate()
+                        .map(|(n, w)| {
+                            let mut d = [0u32; 13];
+                            d[..10].copy_from_slice(w);
+                            d[10] = n as u32;
+                            d
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut signature = std::ptr::null_mut();
             if let Some(l) = layout {
                 let d = Descriptor {
@@ -157,8 +173,8 @@ impl Msc {
                     _pad: 0,
                     count: params.len() as u32,
                     parameters: params.as_ptr(),
-                    samplers: 0,
-                    static_samplers: std::ptr::null(),
+                    samplers: samplers.len() as u32,
+                    static_samplers: samplers.as_ptr().cast(),
                     flags: HEAPS_DIRECTLY_INDEXED,
                 };
                 let mut err = std::ptr::null_mut();

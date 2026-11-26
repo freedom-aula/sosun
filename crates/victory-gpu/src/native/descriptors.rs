@@ -76,6 +76,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         83 => Format::Bc5,
         95 => Format::Bc6h,
         98 => Format::Bc7,
+        61 => Format::R8Unorm,
+        65 => Format::A8Unorm,
+        56 => Format::R16Unorm,
+        2 => Format::Rgba32Float,
         _ => return None,
     })
 }

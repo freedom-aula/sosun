@@ -45,6 +45,10 @@ pub struct RootLayout {
     /// The shader reads the memory of a raw buffer view out of range as 0 and drops its writes
     /// (`D3D12` hardware does; Metal needs the converter told).
     pub bounds_checked: bool,
+    /// Static samplers, `s<n>` at position n in space 0: the words of a
+    /// `D3D12_STATIC_SAMPLER_DESC` up to `MaxLOD` (filter, address U, V, W, LOD bias as f32 bits,
+    /// anisotropy, comparison, border, minimum and maximum LOD as f32 bits).
+    pub static_samplers: Vec<[u32; 10]>,
 }
 
 /// One `Dispatch` call: the pipeline, its root arguments, the memory it touches (for residency),
