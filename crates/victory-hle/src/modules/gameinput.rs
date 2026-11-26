@@ -619,6 +619,100 @@ pub fn release_live_keys() {
     lock(&LIVE).clear();
 }
 
+/// Whether virtual key `vk` is currently held in the live macOS key set.
+#[cfg(not(windows))]
+pub fn is_live_key_down(vk: u8) -> bool {
+    lock(&LIVE).contains(&vk)
+}
+
+/// PS/2 Set-1 scan code (with `0xE000` extended prefix, matching Windows
+/// `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`) for standard virtual keys.
+#[cfg(not(windows))]
+fn vk_to_scan_code(vk: u8) -> u32 {
+    match vk {
+        0x1B => 0x01, // Esc
+        b'1' => 0x02,
+        b'2' => 0x03,
+        b'3' => 0x04,
+        b'4' => 0x05,
+        b'5' => 0x06,
+        b'6' => 0x07,
+        b'7' => 0x08,
+        b'8' => 0x09,
+        b'9' => 0x0A,
+        b'0' => 0x0B,
+        0xBD => 0x0C, // -
+        0xBB => 0x0D, // =
+        0x08 => 0x0E, // Backspace
+        0x09 => 0x0F, // Tab
+        b'Q' => 0x10,
+        b'W' => 0x11,
+        b'E' => 0x12,
+        b'R' => 0x13,
+        b'T' => 0x14,
+        b'Y' => 0x15,
+        b'U' => 0x16,
+        b'I' => 0x17,
+        b'O' => 0x18,
+        b'P' => 0x19,
+        0xDB => 0x1A, // [
+        0xDD => 0x1B, // ]
+        0x0D => 0x1C, // Enter
+        0xA2 => 0x1D, // Left Ctrl
+        b'A' => 0x1E,
+        b'S' => 0x1F,
+        b'D' => 0x20,
+        b'F' => 0x21,
+        b'G' => 0x22,
+        b'H' => 0x23,
+        b'J' => 0x24,
+        b'K' => 0x25,
+        b'L' => 0x26,
+        0xBA => 0x27, // ;
+        0xDE => 0x28, // '
+        0xC0 => 0x29, // `
+        0xA0 => 0x2A, // Left Shift
+        0xDC => 0x2B, // \
+        b'Z' => 0x2C,
+        b'X' => 0x2D,
+        b'C' => 0x2E,
+        b'V' => 0x2F,
+        b'B' => 0x30,
+        b'N' => 0x31,
+        b'M' => 0x32,
+        0xBC => 0x33, // ,
+        0xBE => 0x34, // .
+        0xBF => 0x35, // /
+        0xA1 => 0x36, // Right Shift
+        0xA4 => 0x38, // Left Alt
+        0x20 => 0x39, // Space
+        0x70 => 0x3B, // F1
+        0x71 => 0x3C, // F2
+        0x72 => 0x3D, // F3
+        0x73 => 0x3E, // F4
+        0x74 => 0x3F, // F5
+        0x75 => 0x40, // F6
+        0x76 => 0x41, // F7
+        0x77 => 0x42, // F8
+        0x78 => 0x43, // F9
+        0x79 => 0x44, // F10
+        0x7A => 0x57, // F11
+        0x7B => 0x58, // F12
+        0xA3 => 0xE01D, // Right Ctrl
+        0xA5 => 0xE038, // Right Alt
+        0x24 => 0xE047, // Home
+        0x26 => 0xE048, // Up
+        0x21 => 0xE049, // Page Up
+        0x25 => 0xE04B, // Left
+        0x27 => 0xE04D, // Right
+        0x23 => 0xE04F, // End
+        0x28 => 0xE050, // Down
+        0x22 => 0xE051, // Page Down
+        0x2E => 0xE053, // Delete
+        _ => 0,
+    }
+}
+
 /// `scripted` (`VICTORY_KEYS`) and the live keys, OR-ed: each key once.
 #[cfg(not(windows))]
 fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
@@ -627,6 +721,7 @@ fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
     vks.dedup();
     vks.into_iter()
         .map(|vk| KeyState {
+            scan_code: vk_to_scan_code(vk),
             virtual_key: vk,
             ..Default::default()
         })
@@ -1638,8 +1733,13 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    static LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(not(windows))]
     #[test]
     fn live_keys_drive_the_pad_while_held_and_merge_with_scripted() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
         let pad_of = |scripted: Vec<u8>| fallback(&held(scripted));
         set_live_key(b'W', true);
         set_live_key(0x20, true); // Space
@@ -1658,6 +1758,43 @@ mod tests {
         assert_eq!(pad_of(vec![]).buttons, B | MENU | RIGHT);
         release_live_keys();
         assert_eq!(pad_of(vec![b'X']), PadState { buttons: X, ..Default::default() });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_keys_report_ps2_scan_codes_through_hub_readings() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        let hub = Hub::new(host());
+        hub.poll();
+
+        set_live_key(0x0D, true); // Enter
+        set_live_key(b'W', true); // Left stick up
+        set_live_key(0x26, true); // Up arrow (extended)
+        set_live_key(0xA0, true); // Left Shift
+        hub.poll();
+
+        let kr = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let Value::Keys(ref ks) = reading(kr).value else {
+            panic!("expected keyboard reading");
+        };
+        assert!(ks.iter().any(|k| k.virtual_key == 0x0D && k.scan_code == 0x1C));
+        assert!(ks.iter().any(|k| k.virtual_key == b'W' && k.scan_code == 0x11));
+        assert!(ks.iter().any(|k| k.virtual_key == 0x26 && k.scan_code == 0xE048));
+        assert!(ks.iter().any(|k| k.virtual_key == 0xA0 && k.scan_code == 0x2A));
+        release(kr);
+
+        let pr = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let ps = pad(pr);
+        assert_eq!(ps.buttons, A | UP);
+        assert_eq!(ps.left_y, 1.0);
+        release(pr);
+
+        release_live_keys();
+        hub.poll();
+        let pr2 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(pr2), PadState::default());
+        release(pr2);
     }
 
     #[test]
