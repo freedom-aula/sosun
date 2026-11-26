@@ -903,6 +903,11 @@ A render target view's format says how its writes are stored, so a view that nam
 
 ## Whole-wave sections the simulation does not follow
 
+The section emitter can reproduce register results. If it encounters a store, atomic, export,
+barrier or another instruction it cannot safely treat as a register operation, translation stops
+at that instruction's byte offset and names the opcode. This also covers atomics whose result
+goes unused.
+
 A whole-wave section (`emit::wave`, decision 0003) is simulated on the console's lanes, and a
 value it leaves is lowered by the reduction or prefix it turns out to be. A value without such a
 shape was refused as "a whole-wave section step the simulation does not follow". That text is
