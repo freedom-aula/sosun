@@ -175,34 +175,39 @@ pub struct Tracked<B: ResourceBackend> {
     /// Uploads of its memory so far.
     pub uploads: u64,
     /// Submissions left in which its memory is probed at submission rather than left to the
-    /// scanner (0: cold), and the hash of the last probe.
+    /// scanner (0: cold), and what the last probe read.
     hot: u32,
-    probe: Option<blake3::Hash>,
+    probe: Vec<u8>,
 }
 
 /// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
 /// further change.
 const HOT: u32 = 600;
-/// Pages of a hot texture's memory a probe reads, spread over it.
+/// Pages of a large hot texture's memory a probe reads, spread over it.
 const PROBE_PAGES: usize = 8;
+/// Hot textures up to this size that changed more than once are probed whole (a glyph cache gets
+/// a few glyphs at a time). Textures written once after a blank upload (streaming) are sampled:
+/// probing all of them whole looked about 15% slower in one run.
+const PROBE_WHOLE: usize = 4 << 20;
 
-/// A hash of `PROBE_PAGES` pages spread over `size` bytes at `at`.
+/// The bytes a probe of `size` bytes at `at` compares: all of them if `whole`, else `PROBE_PAGES`
+/// pages spread over them.
 ///
-/// shortcut: a write that misses every sampled page goes unseen until the scanner's next round;
-/// a texture the title rewrites whole (a movie's planes) is caught at once.
-fn probe(at: usize, size: usize) -> blake3::Hash {
-    const PAGE: usize = 4096;
-    let mut h = blake3::Hasher::new();
-    let mut page = [0u8; PAGE];
-    let pages = size.div_ceil(PAGE).max(1);
-    for k in 0..PROBE_PAGES.min(pages) {
-        let off = k * pages / PROBE_PAGES.min(pages) * PAGE;
-        let n = PAGE.min(size - off);
-        page[..n].fill(0);
-        let _ = super::safe_read((at + off) as *const u8, &mut page[..n]);
-        h.update(&page[..n]);
+/// shortcut: when sampled, a write that misses every sampled page goes unseen until the scanner's
+/// next round; a texture the title rewrites whole (a movie's planes) is caught at once.
+fn probe(at: usize, size: usize, whole: bool) -> Vec<u8> {
+    if whole || size <= PROBE_PAGES * 4096 {
+        return read_memory(at as *const u8, size);
     }
-    h.finalize()
+    const PAGE: usize = 4096;
+    let pages = size.div_ceil(PAGE);
+    let mut out = vec![0u8; PROBE_PAGES * PAGE];
+    for (k, page) in out.chunks_mut(PAGE).enumerate() {
+        let off = k * pages / PROBE_PAGES * PAGE;
+        let n = PAGE.min(size - off);
+        let _ = super::safe_read((at + off) as *const u8, &mut page[..n]);
+    }
+    out
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -236,7 +241,13 @@ impl<B: PresentBackend> Title<B> {
             return false;
         };
         let Some(desc) = info.desc() else {
-            tracing::debug!(format = info.format, "title texture the host does not represent");
+            // Loud once per format: views of it get no texture and their draws sample nothing.
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&info.format) {
+                seen.push(info.format);
+                tracing::warn!(format = info.format, w = info.width, h = info.height, flags = info.flags, "a title texture format the host does not represent (first of this format)");
+            }
             return false;
         };
         let tex = match self.host.texture(&desc) {
@@ -269,7 +280,7 @@ impl<B: PresentBackend> Title<B> {
                 last: None,
                 uploads: 0,
                 hot: 0,
-                probe: None,
+                probe: Vec::new(),
             },
         );
         true
@@ -314,8 +325,9 @@ impl<B: PresentBackend> Title<B> {
         // every texture is seconds long by the menus, and a movie frame sampled before its planes
         // were seen showed their blank first upload (solid green) or an old frame.
         for (&key, t) in self.textures.iter_mut().filter(|(_, t)| t.hot > 0) {
-            let now = probe(t.info.memory as usize, t.info.size);
-            if t.probe.replace(now) != Some(now) {
+            let now = probe(t.info.memory as usize, t.info.size, t.uploads >= 2 && t.info.size <= PROBE_WHOLE);
+            let before = std::mem::replace(&mut t.probe, now);
+            if before != t.probe {
                 dirty.insert(key);
             } else {
                 t.hot -= 1;

@@ -63,10 +63,12 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
+const FALLBACK_BUTTONS: [(u8, u32); 16] = [
+    (0x09, MENU), // Tab
+    (b'V', VIEW),
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
+    (0x1B, B),    // Esc
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -596,6 +598,41 @@ fn scripted() -> Vec<u8> {
         .collect()
 }
 
+/// Keys held down in the host window (macOS), kept by its event loop.
+#[cfg(not(windows))]
+static LIVE: Mutex<std::collections::BTreeSet<u8>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// A key went down or up in the host window; `vk` is a Windows virtual key.
+#[cfg(not(windows))]
+pub fn set_live_key(vk: u8, down: bool) {
+    let mut live = lock(&LIVE);
+    if down {
+        live.insert(vk);
+    } else {
+        live.remove(&vk);
+    }
+}
+
+/// The window lost focus: no key is held any more.
+#[cfg(not(windows))]
+pub fn release_live_keys() {
+    lock(&LIVE).clear();
+}
+
+/// `scripted` (`VICTORY_KEYS`) and the live keys, OR-ed: each key once.
+#[cfg(not(windows))]
+fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
+    vks.extend(lock(&LIVE).iter());
+    vks.sort_unstable();
+    vks.dedup();
+    vks.into_iter()
+        .map(|vk| KeyState {
+            virtual_key: vk,
+            ..Default::default()
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
@@ -608,15 +645,9 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        /// Only the scripted keys: this host has no input of its own yet.
+        /// The window's live keys and the scripted ones, together.
         fn keys(&mut self) -> Vec<KeyState> {
-            scripted()
-                .into_iter()
-                .map(|vk| KeyState {
-                    virtual_key: vk,
-                    ..Default::default()
-                })
-                .collect()
+            held(scripted())
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
@@ -1604,6 +1635,29 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_keys_drive_the_pad_while_held_and_merge_with_scripted() {
+        let pad_of = |scripted: Vec<u8>| fallback(&held(scripted));
+        set_live_key(b'W', true);
+        set_live_key(0x20, true); // Space
+        set_live_key(0x1B, true); // Esc
+        set_live_key(0x09, true); // Tab
+        set_live_key(0x27, true); // Right
+        set_live_key(b'C', true);
+        // Enter from the script is A too, together with the live Space.
+        let pad = pad_of(vec![0x0D]);
+        assert_eq!(pad.buttons, A | B | MENU | RIGHT);
+        assert_eq!((pad.left_y, pad.right_trigger, pad.left_trigger), (1.0, 1.0, 0.0));
+        set_live_key(b'S', true); // W and S cancel
+        assert_eq!(pad_of(vec![]).left_y, 0.0);
+        set_live_key(0x20, false);
+        set_live_key(b'S', false);
+        assert_eq!(pad_of(vec![]).buttons, B | MENU | RIGHT);
+        release_live_keys();
+        assert_eq!(pad_of(vec![b'X']), PadState { buttons: X, ..Default::default() });
     }
 
     #[test]

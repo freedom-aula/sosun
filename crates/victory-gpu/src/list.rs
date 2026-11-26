@@ -1910,6 +1910,7 @@ pub(crate) fn indirect_dropped() -> u64 {
 #[cfg(target_os = "macos")]
 fn drop_kind(kind: usize) {
     DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::native::glue::warn_once(["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)]);
 }
 
 #[cfg(target_os = "macos")]
@@ -1979,7 +1980,7 @@ extern "system" fn execute_indirect(
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
         seen.push(signature as usize);
-        tracing::info!(
+        tracing::warn!(
             stride,
             ?args,
             max,

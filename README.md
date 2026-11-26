@@ -13,7 +13,7 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 </p>
 
 > [!IMPORTANT]
-> **Not playable yet, but you can see it run.** The game boots natively on a Mac, plays its boot movie and shows its menus in the window: the start screen, FINISH SETUP and LEGAL NOTICES, rendered on Metal at about 30 fps. Text and blending are now correct on the screens we have checked. Menus can't be navigated yet (no live keyboard or gamepad). We know where to look, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
+> **Not playable yet, but you can see it run.** The game boots natively on a Mac, plays its boot movie and shows its menus in the window: the start screen, FINISH SETUP and LEGAL NOTICES, rendered on Metal at about 30 fps. Text and blending are now correct on the screens we have checked. You can move through the menus with the keyboard. We know where to look, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
 📸 **[See the latest screenshots](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/5)** (the game's start screen and setup menus, rendered natively on Metal).
 
@@ -40,7 +40,7 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
 | Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
 | Boot movie and menus in the window | 🟡 The boot movie plays and the start screen, FINISH SETUP and LEGAL NOTICES show in the window with correct text and blending ([#6](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/6) fixed); other screens not checked yet |
-| Start screen ("press A") | ✅ Passed with scripted key presses (no live keyboard or gamepad yet) |
+| Start screen ("press A") and input | ✅ Passed; the keyboard drives the gamepad in the window (real controllers not yet) |
 | Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
 | Gameplay | 🔴 Not yet |
@@ -74,7 +74,20 @@ The setup script checks Rosetta, the Xcode command line tools, rustup and the Me
 tools/macos/run-native.sh /path/to/your/game/folder
 ```
 
-Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script presses Enter for you every two seconds to get past the start screen, because keyboard input isn't wired up yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
+Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script also presses Enter for you every two seconds until 80 s to get past the start screen. Click the window and the keyboard drives the game's gamepad:
+
+| Keys | Pad |
+| --- | --- |
+| Enter, Space | A |
+| Escape, Backspace | B |
+| X, Y | X, Y |
+| Arrow keys | D-pad |
+| W A S D | left stick |
+| Tab | Menu (Start) |
+| Q, E | left, right shoulder |
+| Z, C | left, right trigger |
+
+Real controllers aren't supported yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
 **3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 
@@ -84,7 +97,7 @@ Whatever your background, there is something to do:
 
 - **Testers:** run the game on your Mac and file a tester report. No coding needed.
 - **Graphics and Metal:** the still-guessed pipeline state (culling, depth, stencil, write mask), shader refusals, the GPU timeout at about 53 s.
-- **Debugging:** the Metal GPU timeout at about 50 s, and live keyboard and gamepad input.
+- **Debugging:** the Metal GPU timeout at about 50 s, and real controllers through the Game Controller framework.
 - **Compilers:** the arm64 recompiler (jump tables, SSE, exceptions).
 - **Rust and systems:** missing Windows and Xbox system calls, speed, tests.
 

@@ -22,7 +22,7 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 **Now:**
 - At about 53 s (about 1,400 frames) a Metal command buffer fails with `kIOGPUCommandBufferCallbackErrorTimeout`. A fence is left one step behind (signal 2836, GPU at 2832) and presents stop. Not investigated yet.
-- There is no live keyboard or gamepad on macOS. Wiring the window's key events and Game Controller framework pads into `GameInput` is a self-contained task.
+- The keyboard now drives the stand-in pad in the window (Enter/Space = A, Esc = B, arrows = D-pad, WASD = left stick). Real controllers through the Game Controller framework are still a self-contained task.
 
 **Start here:** `crates/victory-gpu/src/native/` and `queue.rs` for the timeout; `crates/victory-hle/src/modules/gameinput.rs` and `apps/victory/src/window.rs` for input.
 
