@@ -816,6 +816,9 @@ offsets back from them (the field layouts below match the values seen):
 
 **Polygon offset ([#18](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/18)), a guess.** Which of the three floats is which was not checked against the images. They are taken in register order (`PA_SU_POLY_OFFSET_CLAMP` at 0x28b7c, then `_FRONT_SCALE`, `_FRONT_OFFSET`), and read the way AMD's PAL writes them (`CmdSetDepthBiasState`): the clamp as it is, the slope scale times 16 (the hardware takes Z gradients in 1/16ths), D3D12's integer bias as a float with no scaling for the depth format, and the back face the same as the front. So `guess_from` sets `DepthBias` to the offset, `SlopeScaledDepthBias` to the scale / 16 and `DepthBiasClamp` to the clamp, when `POLY_OFFSET_FRONT_ENABLE` (bit 11 of `PA_SU_SC_MODE_CNTL`) is set. Every value seen sets it, with the back face's (bit 12). A variant's rasterizer record replaces them. To check the guess in images dumped with `VICTORY_DUMP_DESC_DIR`: the word at 0x1c back should hold only whole numbers, and 16.0 (a slope scale of 1) should sit at 0x20 back.
 
+Metal binds the pipeline's depth-stencil state on every draw. When both tests are disabled,
+passing `nil` clears the previous draw's comparison and depth writes within the same render pass.
+
 #### The first world frame is black (27 November, Series S, headless)
 
 In each of five runs the prologue presented exactly one world frame (about 80 targets drawn or cleared; the game renders at 1280x720 there) before the crash, or none when the first-frame stall tripped the watchdog. With `VICTORY_TRACE_TARGETS=1` and `VICTORY_DUMP_TARGETS` at that frame:

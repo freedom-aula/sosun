@@ -2134,9 +2134,8 @@ impl Metal {
                 MTLDepthClipMode::Clamp
             });
             e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            if let Some(ds) = &d.pipeline.depth {
-                e.setDepthStencilState(Some(ds));
-            }
+            // Passing nil restores Metal's default depth and stencil state for this draw.
+            e.setDepthStencilState(d.pipeline.depth.as_deref());
             if d.pipeline.stencil {
                 e.setStencilReferenceValue(d.state.stencil_ref);
             }

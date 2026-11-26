@@ -34,7 +34,10 @@ const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 
 impl<'a> Scene<'a> {
-    fn new(m: &'a Metal, depth_test: Option<(bool, Compare)>) -> Scene<'a> {
+    fn pipeline(
+        m: &Metal,
+        depth_test: Option<(bool, Compare)>,
+    ) -> <Metal as GraphicsBackend>::RenderPipeline {
         let attrs = [
             VertexAttr {
                 format: VertexFormat::Float2,
@@ -52,25 +55,28 @@ impl<'a> Scene<'a> {
                 offset: 16,
             },
         ];
-        let pipe = m
-            .create_render_pipeline(&RenderPipelineDesc {
-                vs: &fixture("tri_vs"),
-                ps: Some(&fixture("tri_ps")),
-                vs_layout: None,
-                ps_layout: None,
-                attributes: &attrs,
-                streams: &[VertexStream {
-                    slot: 0,
-                    stride: 32,
-                    per_instance: false,
-                }],
-                color: &[Format::Rgba8Unorm],
-                depth: Some(Format::D32Float),
-                depth_test,
-                cull: Cull::None,
-                ..Default::default()
-            })
-            .unwrap();
+        m.create_render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: Some(Format::D32Float),
+            depth_test,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn new(m: &'a Metal, depth_test: Option<(bool, Compare)>) -> Scene<'a> {
+        let pipe = Self::pipeline(m, depth_test);
         let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
         rt.render_target = true;
         let color = m.create_texture(&rt).unwrap();
@@ -332,6 +338,50 @@ fn depth_test_rejects_a_draw_behind() {
     let (a, b) = (s.draw(0.25, call, 0, false), s.draw(0.75, call, 512, false));
     s.submit(&[s.pass(vec![a, b], [0.0, 0.0, 0.0, 1.0])]);
     assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]));
+}
+
+#[test]
+fn switching_to_disabled_depth_clears_the_previous_test() {
+    let Some(m) = backend() else { return };
+    let s = Scene::new(&m, Some((true, Compare::Never)));
+    let disabled = Scene::pipeline(&m, None);
+    s.arena.write(
+        0,
+        &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)],
+    );
+    let call = DrawCall::Arrays {
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    let first = s.draw(0.5, call, 0, false);
+    let mut second = s.draw(0.5, call, 0, false);
+    second.pipeline = &disabled;
+    second.state.scissor = Some([0, 0, 8, 16]);
+    s.submit(&[s.pass(vec![first, second], [0.0, 0.0, 0.0, 1.0])]);
+
+    let p = s.pixels();
+    assert_eq!(
+        px(&p, 12, 8),
+        [0, 0, 0, 255],
+        "Compare::Never rejects the first draw"
+    );
+    assert_eq!(
+        px(&p, 4, 8),
+        [255, 0, 0, 255],
+        "the depth-disabled draw reaches the target"
+    );
+    let mut depth = [0u8; W * W * 4];
+    m.read_texture(&s.depth, 0, 0, &mut depth, W * 4, 0);
+    assert!(
+        depth
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|d| f32::from_ne_bytes(*d) == 1.0),
+        "the depth-disabled draw preserves the clear depth"
+    );
 }
 
 #[test]
