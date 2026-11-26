@@ -662,7 +662,7 @@ mod tests {
     fn a_rectangle_list_reads_three_corners_per_instance() {
         // One float3 at slot 0 offset 0 of a 24-byte vertex, read at corners 0 to 2.
         let reads: Vec<(String, u32)> = (0..3).map(|c| ("VBF3".to_owned(), c << 28)).collect();
-        let g = Graphics::guessed(vec![Format::Rgba8Unorm], None, vec![24], &reads, true);
+        let g = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![24], &reads, true);
         let (attrs, streams) = g.vertex_layout(&reads).unwrap();
         assert_eq!(attrs.iter().map(|a| a.offset).collect::<Vec<_>>(), [0, 24, 48]);
         assert_eq!((streams[0].stride, streams[0].per_instance), (72, true));
