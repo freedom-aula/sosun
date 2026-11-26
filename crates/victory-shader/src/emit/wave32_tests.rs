@@ -282,3 +282,21 @@ fn a_whole_wave_sum_combines_the_two_halves() {
     // Whatever the section leaves is one reduction: write, barrier, read, barrier.
     assert_eq!(l.barriers, 2);
 }
+
+#[test]
+fn permlane16_and_permlanex16_lower_within_host32_half() {
+    // v_permlane16_b32 v2, v0, 0, 0 fi:1 (op 0x377, opsel=1 -> 0xD777_0802)
+    // v_permlanex16_b32 v3, v2, -1, -1 fi:1 (op 0x378, opsel=1 -> 0xD778_0803)
+    const PROG: &[u32] = &[
+        0xD777_0802,
+        0x0201_0100, // v_permlane16_b32 v2, v0, 0, 0 fi:1
+        0xD778_0803,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x7E0A_0303, // v_mov_b32_e32 v5, v3
+        S_ENDPGM,
+    ];
+    let l = host32(PROG, 64);
+    assert_eq!(l.wave_size, Some(32));
+    // Both stay within the 32-lane half, so no cross-half LDS exchange barriers are needed.
+    assert_eq!(l.barriers, 0);
+}
