@@ -190,7 +190,8 @@ impl Stream {
         self.drop_readahead();
         self.eof = false;
         match &mut self.io {
-            Io::File(f) => f.seek(to).ok(),
+            // A position before the start is `InvalidInput`, so `EINVAL`.
+            Io::File(f) => f.seek(to).map_err(|e| set_errno(win_errno(&e))).ok(),
             _ => None,
         }
     }
@@ -1005,8 +1006,11 @@ pub extern "system" fn _write(fd: i32, buf: *const u8, count: u32) -> i32 {
 }
 
 pub extern "system" fn _lseeki64(fd: i32, offset: i64, origin: i32) -> i64 {
-    let (Some(s), Some(to)) = (fd_of(fd), seek_from(offset, origin)) else {
+    let Some(s) = fd_of(fd) else {
         return i64::from(err(EBADF));
+    };
+    let Some(to) = seek_from(offset, origin) else {
+        return i64::from(err(EINVAL));
     };
     let mut s = lock(&s);
     s.seek(to).map_or(-1, |p| p as i64)
@@ -1714,6 +1718,41 @@ mod tests {
         assert_eq!(_fileno(f), -1);
         assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_bad_seek_sets_einval_and_keeps_the_position() {
+        // Microsoft documents `_lseek`'s errno as EBADF for a bad descriptor and EINVAL for a
+        // bad origin or a position before the start of the file; `fseek` fails the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert!(fd >= 3);
+        assert_eq!(_lseeki64(fd, 2, SEEK_SET), 2);
+        for (offset, origin) in [(-1, SEEK_SET), (-3, SEEK_CUR), (-7, SEEK_END), (0, 3)] {
+            set_errno(0);
+            assert_eq!(_lseeki64(fd, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+            set_errno(0);
+            assert_eq!(_lseek(fd, offset as i32, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(_telli64(fd), 2);
+        set_errno(0);
+        assert_eq!(_lseeki64(9999, 0, SEEK_SET), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(_close(fd), 0);
+
+        let f = open(&path, "rb");
+        assert_eq!(fseek(f, 4, SEEK_SET), 0);
+        for (offset, origin) in [(-5, SEEK_CUR), (-7, SEEK_END)] {
+            set_errno(0);
+            assert_eq!(fseek(f, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(ftell(f), 4);
+        assert_eq!(fclose(f), 0);
     }
 
     #[test]
