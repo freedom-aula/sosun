@@ -40,4 +40,7 @@ pub enum ShaderError {
     /// Valid code the translator cannot handle yet: an opcode name or a construct.
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
+    /// An FSPX/FSPG metadata resource record whose root type the reader does not take.
+    #[error("FSPX metadata resource of root type {root}: {what}")]
+    FspxRoot { root: u8, what: &'static str },
 }
