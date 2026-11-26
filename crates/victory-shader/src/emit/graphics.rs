@@ -168,6 +168,23 @@ fn infer(
             });
         }
     }
+    // Guess: the heaps' SGPRs follow the last root parameter's, so root constants the metadata
+    // leaves at one SGPR, with no parameter after them but a heap, reach up to the heap (the
+    // title's mesh programs read b500 as two dwords, the heap SGPR after them).
+    for i in 0..layout.len() {
+        let (start, end) = (layout[i].user_data, u32::from(layout[i].user_data) + layout[i].sgprs);
+        let next = layout.iter().map(|p| p.user_data).filter(|&u| u > start).min();
+        let heap = |u: u8| {
+            layout.iter().any(|p| {
+                p.user_data == u && matches!(p.root, RootType::ResourceHeap | RootType::SamplerHeap)
+            })
+        };
+        if layout[i].root == RootType::Constants
+            && let Some(next) = next.filter(|&u| u32::from(u) > end && heap(u))
+        {
+            layout[i].sgprs = u32::from(next - start);
+        }
+    }
     // A vertex shader's own vertex fetch: usually s0/s1 address the table of vertex buffer
     // descriptors it loads from (observed: `s_load_dwordx4 sN, s[0:1]` before its `buffer_load`),
     // unless metadata already occupies s0..s1 or an inferred vertex table sits at another pair.
@@ -1040,5 +1057,117 @@ mod tests {
         let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
         let h = super::super::translate_with(&c, options).unwrap();
         assert_eq!(h.stage, HwStage::Ms);
+    }
+
+    /// Translates `code` as a guessed vertex program with root constants in user data 0 (s8 of a
+    /// mesh program).
+    fn mesh(code: &[u32]) -> Result<super::super::HostShader, ShaderError> {
+        let c = container(HwStage::Vs, &words(code), &meta_with(&[rec(2, 0, 0, 0)])).unwrap();
+        let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
+        super::super::translate_with(&c, options)
+    }
+
+    /// The title's mesh programs read root constants of two dwords (b500, user data 13 and 14 in
+    /// their metadata, which gives one) just below the descriptor heap's SGPR (15, inferred).
+    /// The constants reach up to the heap, so the second dword is user data, not a hardware SGPR.
+    #[test]
+    fn root_constants_reach_up_to_an_inferred_heap() {
+        let code = [
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0x8010_0908, // s_add_u32 s16, s8, s9
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_0000, 0x1003_0100, // buffer_load_dword v1, off, s[12:15], s16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ];
+        let meta = meta_with(&[rec(2, 0, 0, 0)]);
+        let (p, _) = infer(HwStage::Vs, &words(&code), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::ResourceHeap && r.user_data == 2), "{:?}", p.layout);
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 0 && r.sgprs == 2), "{:?}", p.layout);
+        mesh(&code).unwrap();
+    }
+
+    /// `s_sext_i32_i16` and `s_sext_i32_i8` (some of the title's mesh programs) translate.
+    #[test]
+    fn scalar_sign_extensions_translate() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE89_1A08, // s_sext_i32_i16 s9, s8
+            0xBE8A_1909, // s_sext_i32_i8 s10, s9
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
+    }
+
+    /// The title's G-buffer pixel programs compare a value with its quad neighbour's
+    /// (`v_cmp_gt_f32 vcc, v9, -v9 quad_perm:[2,3,0,1]`): a compare with DPP reads src0 from the
+    /// lane the pattern names, as other DPP operations do.
+    #[test]
+    fn a_pixel_program_compares_with_dpp() {
+        let code = [
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0x7C08_04FA, 0xFF4C_4E02, // v_cmp_gt_f32 vcc, v2, -v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+            0xD501_0003, 0x01A9_E480, // v_cndmask_b32 v3, 0, 1.0, vcc
+            0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+            ENDPGM,
+        ];
+        let c = container(HwStage::Ps, &words(&code), &meta_with(&[])).unwrap();
+        let options = super::super::Options { wave32_host: true, ..Default::default() };
+        super::super::translate_with(&c, options).unwrap();
+    }
+
+    /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
+    /// an EXEC region (lane < count), a VALU compare of an SGPR, ANDed with EXEC, its SCC kept in
+    /// an SGPR and branched on later. The compare holds the same bit in every lane, so SCC (some
+    /// lane set) is that bit, in every lane.
+    #[test]
+    fn a_mesh_program_keeps_the_scc_of_a_uniform_lane_mask() {
+        // EXEC as a v_cmpx sets it, or as the join of two lane conditions.
+        let cmpx: &[u32] = &[0x7DA8_0008]; // v_cmpx_gt_u32 s8, v0
+        let join: &[u32] = &[
+            0xD4C4_001E, 0x0002_0008, // v_cmp_gt_u32 s[30:31], s8, v0
+            0xD4C1_0020, 0x0002_0208, // v_cmp_lt_u32 s[32:33], s8, v1
+            0x88FE_201E, // s_or_b64 exec, s[30:31], s[32:33]
+        ];
+        let program = |exec: &[u32], cmp: [u32; 2]| {
+            let mut code = vec![
+                0xBEFE_0481, // s_mov_b64 exec, 1
+                0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+            ];
+            code.extend(exec);
+            code.extend([
+                0xBF88_0007, // s_cbranch_execz 7
+                cmp[0], cmp[1], // v_cmp_ge_f32 vcc, <src0>, 0
+                0x8796_7E6A, // s_and_b64 s[22:23], vcc, exec
+                0xBE94_03FD, // s_mov_b32 s20, src_scc
+                0xBF01_8014, // s_cmp_lg_i32 s20, 0
+                0xBF84_0001, // s_cbranch_scc0 1
+                0x7E00_02F2, // v_mov_b32 v0, 1.0
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+                0xF800_0941, 0x0000_0001, // exp prim v1 done
+                ENDPGM,
+            ]);
+            code
+        };
+        for exec in [cmpx, join] {
+            mesh(&program(exec, [0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
+            // A compare of a VGPR differs between lanes: SCC is a ballot the mesh stage cannot
+            // take.
+            let e = mesh(&program(exec, [0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
+            assert!(e.to_string().contains("lane mask"), "{e}");
+        }
     }
 }

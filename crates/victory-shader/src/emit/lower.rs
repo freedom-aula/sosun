@@ -338,6 +338,9 @@ struct Lower<'a> {
     /// SCC written by a scalar operation on masks, by value: the dwords of
     /// the mask result it says is not zero.
     mask_scc: Map<Value, (Value, Option<Value>)>,
+    /// Mesh: SCC of a uniform compare ANDed with EXEC ([`Self::uniform_and_exec`]): the
+    /// compare's result value.
+    uniform_scc: Map<Value, Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -835,6 +838,7 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: Map::default(),
             mask_scc: Map::default(),
+            uniform_scc: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -2098,6 +2102,16 @@ impl<'a> Lower<'a> {
         }
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
+        }
+        if let (Some(Val::Missing(_)), Some(&u)) = (found, self.uniform_scc.get(&v)) {
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let any = Val::Bit(self.atom(Atom::Lane(u), at)?);
+            self.vals.insert(v, any);
+            return Ok(any);
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
@@ -4812,7 +4826,7 @@ impl<'a> Lower<'a> {
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
         {
-            if let (Some(scc), true) = (scc, self.mask_data != MaskData::None) {
+            if let Some(scc) = scc {
                 // The result is EXEC when written, else the destination.
                 let pair = |l: u8| {
                     let lo = inst.write(Reg::S(l))?;
@@ -4822,8 +4836,13 @@ impl<'a> Lower<'a> {
                     let hi = inst.write(Reg::S(l + 1)).filter(|_| self.x.native.wave64);
                     Some((lo, hi))
                 };
-                if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
-                    self.mask_scc.insert(scc, r);
+                if self.mask_data != MaskData::None {
+                    if let Some(r) = pair(EXEC).or_else(|| dst_code.and_then(pair)) {
+                        self.mask_scc.insert(scc, r);
+                    }
+                } else if let Some(u) = self.uniform_and_exec(inst) {
+                    // Mesh: no ballot, but a uniform mask needs none.
+                    self.uniform_scc.insert(scc, u);
                 }
             }
             return Err(LANE_MASK);
@@ -5281,6 +5300,12 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
                 (r, None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let up = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, up, k), None)
             }
             "s_not_b32" => {
                 let a = src32(self, 0)?;
@@ -7658,10 +7683,21 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            let r = match v.dpp {
+                None => self.compare(inst, rest),
+                // 16-bit compares read their halves elsewhere (`half_src`).
+                Some(_) if rest.ends_with("16") => Err("a 16-bit compare with DPP"),
+                Some(d) => match self.dpp(inst, d) {
+                    // Lanes DPP leaves out keep their old bit: not modelled.
+                    Ok((_, Some(_))) => Err("a compare with DPP row masks or bounds"),
+                    Ok((x, None)) => {
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    }
+                    Err(why) => Err(why),
+                },
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -12887,6 +12923,56 @@ impl<'a> Lower<'a> {
         };
         memo.insert(b, r);
         r
+    }
+
+    /// `s_and` of EXEC and a compare of SGPRs and constants made under the same EXEC (the
+    /// console compiler's form of a wave-uniform boolean, `v_cmp_* vcc, s, k` then
+    /// `s_and_b64 sN, vcc, exec`): the compare's result. The compare holds the same bit in every
+    /// lane, so SCC (some lane set) is that bit, in every lane, those outside EXEC included, as
+    /// the console's wave holds it.
+    // Guess: EXEC is not empty where the title's programs do this (they branch around their
+    // EXEC regions with `s_cbranch_execz`); with an empty EXEC the console's SCC is 0.
+    fn uniform_and_exec(&self, inst: &Inst) -> Option<Value> {
+        let width = if self.x.native.wave64 { "s_and_b64" } else { "s_and_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        if inst.name() != width || src.len() != 2 {
+            return None;
+        }
+        let code = |k: usize| match src[k] {
+            Operand::Scalar { code, .. } => Some(code),
+            _ => None,
+        };
+        let other = match (code(0)?, code(1)?) {
+            (EXEC, c) | (c, EXEC) if c != EXEC => c,
+            _ => return None,
+        };
+        let u = inst.read(Reg::S(other))?;
+        let cmp = self.def_inst(u)?;
+        let same_exec = (EXEC..=EXEC + u8::from(self.x.native.wave64))
+            .all(|r| cmp.read(Reg::S(r)).is_some() && cmp.read(Reg::S(r)) == inst.read(Reg::S(r)));
+        (matches!(cmp.fields, Fields::Valu(_)) && same_exec && self.uniform_atom(Atom::Lane(u)))
+            .then_some(u)
+    }
+
+    /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a
+    /// compare (or carry) of SGPRs and constants, which a wave holds once for all its lanes.
+    fn uniform_atom(&self, a: Atom) -> bool {
+        let st = &self.x.st;
+        match a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => self.def_inst(v).is_some_and(|i| {
+                i.reads.iter().all(|&(r, x)| match r {
+                    Reg::V(_) => false,
+                    Reg::S(c) => {
+                        c == EXEC
+                            || c == EXEC + 1
+                            || !st.masks.contains_key(&x) && !st.highs.contains_key(&x)
+                    }
+                    Reg::Scc => true,
+                })
+            }),
+            _ => false,
+        }
     }
 
     /// The instruction writing `v`.
