@@ -641,6 +641,7 @@ impl<'a> Lower<'a> {
                     let n = i.name();
                     n.starts_with("ds_swizzle")
                         || n.contains("permute")
+                        || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -8207,6 +8208,77 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads from its own 16-lane row (`v_permlane16`) or
+                // the other row in the same 32-lane half (`v_permlanex16`),
+                // using nibble `lane & 15` of `{src2, src1}` as the lane within
+                // that row.
+                self.cross_lane(false)?;
+                self.s.flags |= flags::WAVE_OPS;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k0, k2, k7, k8, k15, not15) = (
+                    k(self, 0),
+                    k(self, 2),
+                    k(self, 7),
+                    k(self, 8),
+                    k(self, 15),
+                    k(self, !15),
+                );
+                let hi_bit = self.s.m.bin(c, Bin::And, lane, k8);
+                let is_hi = self.s.m.cmp(c, pred::NE, hi_bit, k0);
+                let word = self.s.m.select(c, is_hi, s2, s1);
+                let nibble = self.s.m.bin(c, Bin::And, lane, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let row = self.s.m.bin(c, Bin::And, lane, not15);
+                let row = if name == "v_permlanex16_b32" {
+                    let k16 = k(self, 16);
+                    self.s.m.bin(c, Bin::Xor, row, k16)
+                } else {
+                    row
+                };
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let mut r = self.read_in_half(x, src);
+                // Without `fi:1` (opsel bit 0), reading an inactive lane yields 0
+                // (`bound_ctrl:1`, opsel bit 1) or keeps the destination's old value.
+                if v.opsel & 1 == 0
+                    && let Some(on) = guard
+                {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    let (lo, hi) = (
+                        self.s.m.extract(c, ballot, 0),
+                        self.s.m.extract(c, ballot, 1),
+                    );
+                    let active = if self.host32 {
+                        let k31 = k(self, 31);
+                        let in_half = self.s.m.bin(c, Bin::And, src, k31);
+                        let bit = self.s.m.bin(c, Bin::LShr, lo, in_half);
+                        let one = k(self, 1);
+                        let bit = self.s.m.bin(c, Bin::And, bit, one);
+                        self.s.m.cmp(c, pred::NE, bit, k0)
+                    } else {
+                        self.lane_bit_of(c, src, lo, hi)
+                    };
+                    let fallback = if v.opsel & 2 != 0 {
+                        k0
+                    } else if let Some(Operand::Vector { reg, .. }) = v.dst
+                        && let Some(old) = inst.read(Reg::V(reg))
+                    {
+                        self.i32_of(old)?
+                    } else {
+                        k0
+                    };
+                    r = self.s.m.select(c, active, r, fallback);
+                }
                 int(self, r)
             }
             _ => {

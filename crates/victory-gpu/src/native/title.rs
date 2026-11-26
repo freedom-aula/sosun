@@ -186,6 +186,14 @@ pub struct Title<B: PresentBackend> {
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
+    /// Sampled textures realized but not yet uploaded once.
+    pub(super) unloaded: std::collections::HashSet<usize>,
+    /// Keys of textures currently in the fast per-submission probe set (`hot > 0`).
+    pub(super) hot_keys: Vec<usize>,
+    /// Round-robin cursor into `hot_keys` when more than `MAX_SYNC_HOT` textures are hot.
+    pub(super) hot_cursor: usize,
+    /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
+    pub(super) probe_buf: Vec<u8>,
     /// Where `Present` shows frames, if the app gave a layer.
     pub(super) surface: Option<B::Surface>,
     /// Title textures no view has named yet.
@@ -210,6 +218,10 @@ impl<B: PresentBackend> Title<B> {
             shaders: Default::default(),
             libraries: Default::default(),
             textures: Default::default(),
+            unloaded: std::collections::HashSet::new(),
+            hot_keys: Vec::new(),
+            hot_cursor: 0,
+            probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
             queues: HashMap::new(),
