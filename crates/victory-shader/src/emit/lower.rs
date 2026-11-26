@@ -4740,7 +4740,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -4908,6 +4911,59 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
                     self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_bfm_b64" => {
+                    // ((1 << S0[5:0]) - 1) << S1[5:0] (RDNA2 ISA, SOP2 opcode
+                    // 37; the summary table's [4:0] is the 32-bit form's).
+                    let (w, o) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let w = self.s.m.bin(c, Bin::And, w, k63);
+                    let w = self.s.m.cast(c, Cast::ZExt, w, i64t);
+                    let o = self.s.m.bin(c, Bin::And, o, k63);
+                    let o = self.s.m.cast(c, Cast::ZExt, o, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let m = self.s.m.bin(c, Bin::Shl, one, w);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, o);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    // Bit i of S0 to bits 2i and 2i+1 (RDNA2 ISA, SOP1 opcode
+                    // 59): each half of S0 spread to the even bits of a dword,
+                    // then doubled.
+                    let a = src32(self, 0)?;
+                    let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                    let halves = [
+                        (self.s.m.bin(c, Bin::And, a, low), lo),
+                        (self.s.m.bin(c, Bin::LShr, a, k16), hi),
+                    ];
+                    for (mut x, v) in halves {
+                        for (d, keep) in [
+                            (8, 0x00FF_00FF),
+                            (4, 0x0F0F_0F0F),
+                            (2, 0x3333_3333),
+                            (1, 0x5555_5555),
+                        ] {
+                            let d = self.s.m.i32(d);
+                            let t = self.s.m.bin(c, Bin::Shl, x, d);
+                            let t = self.s.m.bin(c, Bin::Or, x, t);
+                            let keep = self.s.m.i32(keep);
+                            x = self.s.m.bin(c, Bin::And, t, keep);
+                        }
+                        let one = self.s.m.i32(1);
+                        let t = self.s.m.bin(c, Bin::Shl, x, one);
+                        let x = self.s.m.bin(c, Bin::Or, x, t);
+                        self.set(v, Val::I32(x));
+                    }
                     Ok(())
                 }
                 "s_mov_b64" => {
@@ -5185,6 +5241,25 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, one, a);
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 (self.s.m.bin(c, Bin::Shl, m, b), None)
+            }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // D = {S1 half, S0 half}, `ll`/`lh`/`hh` naming the S0 and S1
+                // halves (RDNA2 ISA, SOP2 opcodes 50-52); no SCC.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let k16 = self.s.m.i32(16);
+                let a = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    let low = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let b = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let high = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, a, b), None)
             }
             _ => return Err(name),
         };
@@ -9175,6 +9250,23 @@ impl<'a> Lower<'a> {
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
+            "v_mad_u32_u16" => {
+                // S0.u16 * S1.u16 + S2.u32, wrapping (RDNA2 ISA, VOP3 opcode
+                // 883); op_sel bits 0 and 1 pick the high halves of S0 and S1
+                // (table 21). Bits 2 and 3 would name the 32-bit S2 and D,
+                // which the manual leaves undefined: refused, as are
+                // integer source modifiers.
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.opsel & 0b1100 != 0 || (v.abs | v.neg) & 0b11 != 0 {
+                    return Err("op_sel or modifiers on a 32-bit operand");
+                }
+                let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let d = s(self, 2)?;
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }

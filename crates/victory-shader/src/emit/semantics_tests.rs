@@ -1810,7 +1810,7 @@ fn integer_probes() -> Vec<Probe> {
             move |i| vec![f(i[1], i[0])],
         )
     };
-    vec![
+    let mut p = vec![
         vop3_int(
             0x143,
             |a, b, c| (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF).wrapping_add(c),
@@ -1911,7 +1911,25 @@ fn integer_probes() -> Vec<Probe> {
         vop2_int(0x25, |a, b| a.wrapping_add(b)),
         vop2_int(0x26, |a, b| a.wrapping_sub(b)),
         vop2_int(0x27, |a, b| b.wrapping_sub(a)),
-    ]
+    ];
+    // v_mad_u32_u16: op_sel bits 0 and 1 pick the high halves of src0 and
+    // src1; the addend is 32 bits and the sum wraps.
+    for opsel in 0..4u8 {
+        let half = move |x: u32, k: u8| {
+            if opsel >> k & 1 != 0 {
+                x >> 16
+            } else {
+                x & 0xFFFF
+            }
+        };
+        p.push(probe(
+            vop3(0x373, 5, [v(1), v(2), v(3)], M { opsel, ..NONE }),
+            abc.clone(),
+            INT,
+            move |i| vec![(half(i[0], 0) * half(i[1], 1)).wrapping_add(i[2])],
+        ));
+    }
+    p
 }
 
 #[test]
@@ -2643,6 +2661,12 @@ fn scalar_probes() -> Vec<Probe> {
         sop1_probe(0x15, unary(U32_EDGES), |a| (ffbh(a), None)),
         sop1_probe(0x0F, unary(U32_EDGES), |a| (a.count_ones(), Some(a != 0))),
         sop1_probe(0x0B, unary(U32_EDGES), |a| (a.reverse_bits(), None)),
+        // s_pack_{ll,lh,hh}_b32_b16: {S1 half, S0 half}; no SCC.
+        sop2_probe(0x32, ab.clone(), |a, b| (b << 16 | a & 0xFFFF, None)),
+        sop2_probe(0x33, ab.clone(), |a, b| {
+            (b & 0xFFFF_0000 | a & 0xFFFF, None)
+        }),
+        sop2_probe(0x34, ab.clone(), |a, b| (b & 0xFFFF_0000 | a >> 16, None)),
         sop1_probe(0x34, unary(U32_EDGES), |a| {
             let r = (a as i32).wrapping_abs() as u32;
             (r, Some(r != 0))
@@ -2666,6 +2690,28 @@ fn scalar_probes() -> Vec<Probe> {
         fields,
         move |i| vec![sbfe(i[0], i[1], true)],
     ));
+    // 64-bit results out as v5 = s20, v6 = s21.
+    let wide = |word: u32, inputs: Vec<[u32; 4]>, f: fn(u32, u32) -> u64| {
+        scalar(
+            [word, vop1(0x01, 5, s(20)), vop1(0x01, 6, s(21))],
+            inputs,
+            move |i| {
+                let r = f(i[0], i[1]);
+                vec![r as u32, (r >> 32) as u32]
+            },
+        )
+    };
+    // s_bfm_b64: both counts read six bits.
+    let counts = [0u32, 1, 16, 31, 32, 33, 63, 64, 65, 0xFFFF_FFFF];
+    p.push(wide(
+        sop2(0x25, 20, s(16), s(17)),
+        pairs(&counts, &counts),
+        |w, o| ((1u64 << (w & 63)) - 1) << (o & 63),
+    ));
+    // s_bitreplicate_b64_b32: bit k of S0 to bits 2k and 2k + 1.
+    p.push(wide(sop1(0x3B, 20, s(16)), unary(U32_EDGES), |a, _| {
+        (0..32).fold(0, |r, k| r | (u64::from(a >> k & 1) * (3 << (2 * k))))
+    }));
     // Compares into SCC, read by s_cselect.
     for (op, f) in [
         (0x06u16, (|a: u32, b: u32| a == b) as fn(u32, u32) -> bool),
