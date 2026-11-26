@@ -6,11 +6,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Names the file format: part of every key, and the start of every file.
 const MAGIC: &[u8; 4] = b"VML1";
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+static HITS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps converted libraries in `dir` from now on.
 pub fn use_dir(dir: PathBuf) {
@@ -38,12 +41,22 @@ pub fn key(parts: &[&[u8]]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The payload stored under `key` in `dir`; `None` if there is none or it is damaged.
+/// The payload stored under `key` in `dir`; `None` if there is none or it is damaged. Counted
+/// in [`counts`].
 pub fn read(dir: &Path, key: &str) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(dir.join(key)).ok()?;
-    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
-    let (sum, payload) = rest.split_at_checked(32)?;
-    (blake3::hash(payload).as_bytes() == sum).then(|| payload.to_vec())
+    let found = std::fs::read(dir.join(key)).ok().and_then(|bytes| {
+        let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+        let (sum, payload) = rest.split_at_checked(32)?;
+        (blake3::hash(payload).as_bytes() == sum).then(|| payload.to_vec())
+    });
+    (if found.is_some() { &HITS } else { &MISSES }).fetch_add(1, Ordering::Relaxed);
+    found
+}
+
+/// Lookups since the start that found their entry, and those that did not: the slow-conversion
+/// log line shows only conversions of 20 ms or more, which a hit never is.
+pub fn counts() -> (u64, u64) {
+    (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
 /// Stores `payload` under `key` in `dir`, atomically. Failures are not fatal: the next run converts again.
@@ -68,6 +81,19 @@ mod tests {
         assert_eq!(read(d.path(), &k).as_deref(), Some(&b"metallib bytes"[..]));
         // No temporary file is left behind.
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn lookups_are_counted() {
+        let d = tempfile::tempdir().unwrap();
+        let k = key(&[b"counted"]);
+        let (hits, misses) = counts();
+        assert_eq!(read(d.path(), &k), None);
+        write(d.path(), &k, b"payload");
+        assert!(read(d.path(), &k).is_some());
+        // Other tests read too, at the same time: at least these two.
+        let (h, m) = counts();
+        assert!(h > hits && m > misses);
     }
 
     #[test]
