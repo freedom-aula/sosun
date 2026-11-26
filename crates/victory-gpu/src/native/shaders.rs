@@ -240,6 +240,9 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let color_state = g.color_state();
+        if std::env::var_os("VICTORY_TRACE_PIPES").is_some() {
+            tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
+        }
         let vs_binding = Binding::of(vs);
         let ps_binding = ps
             .map(Binding::of)
