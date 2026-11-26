@@ -173,6 +173,13 @@ test_setup() {
   cmp "$RECORD" "$root/expected" || fail "build arguments changed"
   launch "$shared"
 }
+test_setup_sysroot_failure() {
+  prepare_setup
+  printf '#!/bin/bash\nif [[ "$1" == run ]]; then exit 47; fi\n' > "$bin_dir/rustup"
+  cp "$TEST_SYSROOT/bin/cargo" "$bin_dir/cargo"
+  run_script native-setup.sh
+  [[ "$rc" == 47 && ! -e "$RECORD" ]] || fail "setup continued after sysroot lookup failed (status $rc)"
+}
 test_setup_metadata_failure() {
   prepare_setup
   printf '[build\n' > "$CARGO_HOME/config.toml"
@@ -235,7 +242,7 @@ test_launch_without_cargo() {
 if [[ $# == 0 ]]; then
   set -- default same_second_logs global home_global global_without_default environment \
     build_environment relative_environment project missing not_executable invalid_config \
-    bad_metadata setup setup_metadata_failure setup_build_failure \
+    bad_metadata setup setup_sysroot_failure setup_metadata_failure setup_build_failure \
     setup_rustup_in_cargo_home setup_rustup_in_homebrew setup_without_rustup \
     launch_rustup_in_cargo_home launch_without_cargo
 fi
