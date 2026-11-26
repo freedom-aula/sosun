@@ -231,6 +231,8 @@ mod mask_tests;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
+#[cfg(test)]
+mod sample_tests;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
