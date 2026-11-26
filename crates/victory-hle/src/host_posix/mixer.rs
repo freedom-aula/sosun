@@ -386,7 +386,9 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
             return true;
         }
         if b.loops > 0 && b.loop_end > b.loop_begin {
-            s.position -= (b.loop_end - b.loop_begin) as f64;
+            let span = b.loop_end - b.loop_begin;
+            s.position -= span as f64;
+            s.played += span as u64;
             if b.loops != LOOP_INFINITE {
                 b.loops -= 1;
             }
@@ -617,5 +619,28 @@ mod tests {
         assert_eq!(decode(f(32, false), &[0, 0, 0, 0x80]).unwrap(), [-1.0]);
         assert_eq!(decode(f(32, true), &0.25f32.to_le_bytes()).unwrap(), [0.25]);
         assert!(decode(f(12, false), &[0, 0]).is_none());
+    }
+
+    #[test]
+    fn played_samples_stay_monotonic_and_accurate_across_loops() {
+        let mut m = Mixer::new(RATE, 1);
+        let v = m.add_source(1, RATE, Some(MASTER));
+        let mut b = buffer(vec![0.5; 100], 1, 42);
+        b.loop_begin = 20;
+        b.loop_end = 70;
+        b.loops = 2;
+        m.source(v).unwrap().submit(b);
+        m.source(v).unwrap().running = true;
+
+        let mut prev = 0u64;
+        let mut out = [0.0; 25];
+        for _ in 0..10 {
+            m.render(&mut out);
+            let played = m.source(v).unwrap().state().2;
+            assert!(played >= prev, "samples played regressed: {prev} -> {played}");
+            prev = played;
+        }
+        // 100 base frames + 2 loops of 50 frames = 200 frames total.
+        assert_eq!(m.source(v).unwrap().state(), (0, 0, 200));
     }
 }
