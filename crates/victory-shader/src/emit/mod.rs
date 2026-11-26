@@ -222,6 +222,8 @@ pub mod host;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
+#[cfg(test)]
+mod mask_tests;
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
