@@ -8,7 +8,7 @@
 //! `file` (package paths), `thread` (TLS callbacks for title threads),
 //! `xaudio2`, `xstore` stubs.
 
-#[cfg(windows)]
+#[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
@@ -61,7 +61,7 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
-    #[cfg(windows)]
+    #[cfg(any(windows, all(target_os = "macos", target_arch = "x86_64")))]
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());

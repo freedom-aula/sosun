@@ -26,7 +26,9 @@ use victory_platform::thread;
 pub(crate) mod files;
 mod sync;
 mod system;
+mod coreaudio;
 mod mf;
+mod mixer;
 mod winhttp;
 mod winsock;
 
