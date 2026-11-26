@@ -691,6 +691,12 @@ slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend 
 the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
 count are not read; a view of part of an array shows all of it.
 
+A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
+`MostDetailedMip` onward. The native decoder preserves that count for ordinary and placed
+views so Metal clamps it to the remaining levels. Previously the decoder returned zero and
+the host bound the whole texture, so a shader reading level 0 saw the base mip even when
+the view started farther down the chain.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers
