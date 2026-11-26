@@ -530,7 +530,10 @@ pub(crate) fn mirror(handle: u64) {
             _ => {}
         }
         if let Err(e) = t.host.mirror(handle) {
-            tracing::debug!(error = %e, "a descriptor was not mirrored");
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 12 {
+                tracing::info!(error = %e, handle = format!("{handle:#x}"), "a descriptor was not mirrored");
+            }
         }
     });
 }
@@ -831,9 +834,12 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     RECORDED.fetch_add(1, Ordering::Relaxed);
     if tracing_targets() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let late = START.get_or_init(std::time::Instant::now).elapsed().as_secs() >= 26;
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || (late && n % 7 == 0 && n < 4000) {
             with_list(this, |_, l| {
-                let mut head = [0u8; 48];
+                let mut head = [0u8; 72];
                 let at = l.list.vertex_buffer_address(0);
                 let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
                 tracing::info!(vertices, instances, first, topology = l.topology, vb0 = ?at, ok, head = ?head, strides = ?l.strides, formats = ?l.targets, "draw");

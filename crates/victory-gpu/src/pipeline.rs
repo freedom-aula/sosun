@@ -122,7 +122,7 @@ impl Shader {
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
-                if made.is_err()
+                if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
                 {
                     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);

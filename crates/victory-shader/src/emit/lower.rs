@@ -10804,14 +10804,17 @@ impl<'a> Lower<'a> {
                     d
                 } else {
                     let (fa, fb, fd) = (self.as_float(a), self.as_float(b), self.as_float(d));
-                    let sum = self.s.m.bin(c, Bin::Add, fb, fd);
-                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fa);
+                    // Observed: the corners come as top-left, bottom-left, bottom-right, so the
+                    // missing one is opposite the middle vertex: v0 + v2 - v1.
+                    let sum = self.s.m.bin(c, Bin::Add, fa, fd);
+                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fb);
                     self.as_int(fourth)
                 };
+                // Strip order v0, v1, the missing corner, v2: both triangles wind alike.
                 let (c1, c2, c3) = (is(self, 1), is(self, 2), is(self, 3));
                 v = self.s.m.select(c, c1, b, a);
-                v = self.s.m.select(c, c2, d, v);
-                v = self.s.m.select(c, c3, ex, v);
+                v = self.s.m.select(c, c2, ex, v);
+                v = self.s.m.select(c, c3, d, v);
             }
             self.write(inst, Reg::V(reg + k as u8), v, guard);
         }
@@ -11593,6 +11596,14 @@ impl<'a> Lower<'a> {
             } else {
                 x
             };
+            // Debug: VICTORY_DEBUG_VS_PARAM=<n,...> writes 1.0 to every channel of those vertex
+            // parameters (the guessed signature's row n).
+            let forced = !self.s.pixel
+                && !mesh
+                && std::env::var("VICTORY_DEBUG_VS_PARAM").is_ok_and(|v| {
+                    v.split(',').filter_map(|p| p.parse::<u32>().ok()).any(|p| elements(self, primitive)[id].row == Some(p) && el_kind == 0)
+                });
+            let x = if forced && suffix == ".f32" { self.s.m.f32(1.0f32.to_bits()) } else { x };
             let x = if self.s.pixel && std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() && suffix == ".f32" {
                 self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
             } else {
