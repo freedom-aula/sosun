@@ -71,8 +71,7 @@ pub enum Notice {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
-    /// The title's `IXAudio2VoiceCallback`, or 0.
-    pub callback: usize,
+    pub voice: VoiceId,
     pub notice: Notice,
     /// The buffer's `pContext`.
     pub context: usize,
@@ -93,6 +92,7 @@ pub struct Buffer {
 }
 
 pub struct Source {
+    id: VoiceId,
     pub channels: usize,
     pub rate: u32,
     queue: VecDeque<Buffer>,
@@ -107,7 +107,6 @@ pub struct Source {
     pub ratio: f32,
     pub played: u64,
     pub output: Option<VoiceId>,
-    pub callback: usize,
 }
 
 impl Source {
@@ -124,15 +123,47 @@ impl Source {
     /// voice is stopped), as `FlushSourceBuffers`: they end as played.
     pub fn flush(&mut self) -> Vec<Event> {
         let keep = usize::from(self.running && !self.queue.is_empty());
-        let callback = self.callback;
         self.queue
             .drain(keep..)
             .map(|b| Event {
-                callback,
+                voice: self.id,
                 notice: Notice::BufferEnd,
                 context: b.context,
             })
             .collect()
+    }
+
+    fn step(&self, out_rate: u32) -> f64 {
+        f64::from(self.ratio) * f64::from(self.rate) / f64::from(out_rate)
+    }
+
+    /// Source frames still needed to play this many output frames.
+    pub fn frames_required(&self, mut frames: usize, out_rate: u32) -> usize {
+        if !self.running {
+            return 0;
+        }
+        let step = self.step(out_rate);
+        for (i, b) in self.queue.iter().enumerate() {
+            let position = if i == 0 {
+                self.position
+            } else {
+                b.begin as f64
+            };
+            if b.loops == LOOP_INFINITE {
+                return 0;
+            }
+            let end = if b.loops == 0 {
+                b.end as f64
+            } else {
+                b.end.max(b.loop_begin) as f64
+                    + (b.loop_end - b.loop_begin) as f64 * f64::from(b.loops)
+            };
+            frames = frames.saturating_sub(((end - position) / step).ceil() as usize);
+            if frames == 0 {
+                return 0;
+            }
+        }
+        (frames as f64 * step).ceil() as usize
     }
 
     /// `ExitLoop`: the front buffer plays on to its end.
@@ -187,7 +218,6 @@ impl Mixer {
         &mut self,
         channels: usize,
         rate: u32,
-        callback: usize,
         output: Option<VoiceId>,
     ) -> VoiceId {
         let id = self.next;
@@ -195,6 +225,7 @@ impl Mixer {
         self.sources.insert(
             id,
             Source {
+                id,
                 channels,
                 rate,
                 queue: VecDeque::new(),
@@ -207,7 +238,6 @@ impl Mixer {
                 ratio: 1.0,
                 played: 0,
                 output,
-                callback,
             },
         );
         id
@@ -308,7 +338,7 @@ fn mix(
         .clone()
         .filter(|m| m.len() == s.channels * out_channels)
         .unwrap_or_else(|| default_matrix(s.channels, out_channels));
-    let step = f64::from(s.ratio) * f64::from(s.rate) / f64::from(out_rate);
+    let step = s.step(out_rate);
     let mut frame = 0;
     while frame < frames && settle(s, events) {
         let c = s.channels;
@@ -346,7 +376,7 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
         if !s.announced {
             s.announced = true;
             events.push(Event {
-                callback: s.callback,
+                voice: s.id,
                 notice: Notice::BufferStart,
                 context: b.context,
             });
@@ -361,7 +391,7 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
                 b.loops -= 1;
             }
             events.push(Event {
-                callback: s.callback,
+                voice: s.id,
                 notice: Notice::LoopEnd,
                 context: b.context,
             });
@@ -370,7 +400,7 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
         let done = s.queue.pop_front().unwrap();
         s.played += (done.end - done.begin) as u64;
         events.push(Event {
-            callback: s.callback,
+            voice: s.id,
             notice: Notice::BufferEnd,
             context: done.context,
         });
@@ -382,7 +412,7 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
             None => {
                 if done.end_of_stream {
                     events.push(Event {
-                        callback: s.callback,
+                        voice: s.id,
                         notice: Notice::StreamEnd,
                         context: 0,
                     });
@@ -427,9 +457,33 @@ mod tests {
     }
 
     #[test]
+    fn pass_shortfall_counts_play_regions_loops_and_the_front_cursor() {
+        let mut mixer = Mixer::new(RATE, 1);
+        let voice = mixer.add_source(1, RATE, Some(MASTER));
+        let source = mixer.source(voice).unwrap();
+        let mut front = buffer(vec![1.0; 10], 1, 0);
+        front.begin = 2;
+        front.loop_begin = 3;
+        front.loop_end = 5;
+        front.loops = 2;
+        source.submit(front);
+        let mut next = buffer(vec![1.0; 6], 1, 1);
+        next.begin = 4;
+        source.submit(next);
+        assert_eq!(source.frames_required(16, RATE), 0); // Stopped.
+        source.running = true;
+        assert_eq!(source.frames_required(16, RATE), 2);
+        mixer.render(&mut [0.0; 4]);
+        let source = mixer.source(voice).unwrap();
+        assert_eq!(source.frames_required(16, RATE), 6);
+        source.queue.front_mut().unwrap().loops = LOOP_INFINITE;
+        assert_eq!(source.frames_required(16, RATE), 0);
+    }
+
+    #[test]
     fn a_synthetic_tone_comes_out_of_the_mixer() {
         let mut m = Mixer::new(RATE, 2);
-        let v = m.add_source(1, RATE, 0, Some(MASTER));
+        let v = m.add_source(1, RATE, Some(MASTER));
         // 100 ms of 440 Hz mono 16-bit, through the title's own byte layout.
         let pcm: Vec<u8> = tone(440.0, RATE, 4800)
             .iter()
@@ -468,7 +522,7 @@ mod tests {
     fn rate_volume_loops_and_submixes_shape_the_sound() {
         let mut m = Mixer::new(RATE, 2);
         // A 24 kHz voice is played at twice its length in frames.
-        let slow = m.add_source(1, 24_000, 0, Some(MASTER));
+        let slow = m.add_source(1, 24_000, Some(MASTER));
         m.source(slow).unwrap().submit(buffer(tone(440.0, 24_000, 2400), 1, 1));
         m.source(slow).unwrap().running = true;
         let mut out = vec![0.0; 2 * 4800];
@@ -484,7 +538,7 @@ mod tests {
         let sub = m.add_submix(Some(MASTER));
         m.submix(sub).unwrap().volume = 0.5;
         m.volume = 0.5;
-        let v = m.add_source(1, RATE, 99, Some(sub));
+        let v = m.add_source(1, RATE, Some(sub));
         let mut b = buffer(vec![1.0; 100], 1, 3);
         b.loop_end = 100;
         b.loops = 2;
@@ -507,11 +561,11 @@ mod tests {
                 Notice::StreamEnd
             ]
         );
-        assert!(events.iter().all(|e| e.callback == 99));
+        assert!(events.iter().all(|e| e.voice == v));
 
         // An output matrix and channel volumes: left only, quietly.
         let mut m = Mixer::new(RATE, 2);
-        let v = m.add_source(2, RATE, 0, Some(MASTER));
+        let v = m.add_source(2, RATE, Some(MASTER));
         let s = m.source(v).unwrap();
         s.matrix = Some(vec![1.0, 0.0, 0.0, 0.0]); // out 0 takes source 0
         s.channel_volumes = vec![0.5, 1.0];
@@ -525,7 +579,7 @@ mod tests {
     #[test]
     fn flushing_and_ending_a_loop() {
         let mut m = Mixer::new(RATE, 1);
-        let v = m.add_source(1, RATE, 5, Some(MASTER));
+        let v = m.add_source(1, RATE, Some(MASTER));
         let s = m.source(v).unwrap();
         for ctx in 1..=3 {
             s.submit(buffer(vec![0.1; 10], 1, ctx));

@@ -4,21 +4,19 @@
 //!
 //! `IXAudio2` and its voices are objects whose vtables hold bridge stubs, so
 //! title code calls them directly: every method is `extern "win64"` (floats
-//! arrive in their Windows registers) behind a stub that swaps GS. The title's
-//! `IXAudio2VoiceCallback` is called from a thread of ours, off the audio
-//! thread, with the buffer notices the mixer reports.
+//! arrive in their Windows registers) behind a stub that swaps GS. Pass
+//! callbacks run on the audio thread. Buffer notices go to a separate worker.
 //!
-//! shortcut: PCM and float sources only (ADPCM, XMA, xWMA fail
-//! `CreateSourceVoice`; XMA goes through `AcpHal`), no effects, no
-//! `OnVoiceProcessingPass*` or engine callbacks, and the operation sets of
-//! `CommitChanges` are applied at once.
+//! shortcut: PCM and float sources only, add other formats when a title needs them through XAudio2.
+//! shortcut: operation sets apply at once, defer them when a title needs atomic CommitChanges.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use victory_loader::native;
 
@@ -34,6 +32,7 @@ const S_OK: HRESULT = 0;
 const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 const XAUDIO2_E_INVALID_CALL: HRESULT = 0x8896_0001_u32 as i32;
+const XAUDIO2_E_DEVICE_INVALIDATED: HRESULT = 0x8896_0004_u32 as i32;
 const XAUDIO2_END_OF_STREAM: u32 = 0x40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,10 +45,25 @@ enum Kind {
 /// What every voice and the engine's output share.
 struct Inner {
     mixer: Mutex<Mixer>,
-    running: std::sync::atomic::AtomicBool,
+    callbacks: Mutex<Callbacks>,
+    pass_done: Condvar,
     events: Sender<Event>,
-    output: Mutex<Option<Box<dyn Output>>>,
+    output: Mutex<OutputState>,
     opener: Opener,
+}
+
+enum OutputState {
+    Closed,
+    Busy,
+    Open(Box<dyn Output>),
+}
+
+struct Callbacks {
+    engines: Vec<Arc<Callback>>,
+    voices: BTreeMap<VoiceId, (Arc<Callback>, usize)>,
+    running: bool,
+    in_pass: bool,
+    device_invalidated: bool,
 }
 
 #[repr(C)]
@@ -71,8 +85,71 @@ struct Voice {
 
 // Callbacks into the title.
 
-#[cfg(not(test))]
-fn deliver(e: Event) {
+/// A snapshot keeps this gate alive. Cancellation prevents new calls and
+/// waits for any caller already using the title's callback object.
+struct Callback {
+    ptr: usize,
+    state: Mutex<CallbackState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct CallbackState {
+    cancelled: bool,
+    in_flight: usize,
+}
+
+impl Callback {
+    fn new(ptr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            ptr,
+            state: Mutex::default(),
+            idle: Condvar::new(),
+        })
+    }
+
+    fn cancel(&self) {
+        let mut state = lock(&self.state);
+        state.cancelled = true;
+        drop(self.idle.wait_while(state, |state| state.in_flight != 0));
+    }
+
+    fn call(&self, slot: usize, arg: Option<usize>) {
+        {
+            let mut state = lock(&self.state);
+            if state.cancelled {
+                return;
+            }
+            state.in_flight += 1;
+        }
+        // SAFETY: the title's callback object is valid until it is unregistered
+        // or its voice is destroyed. Both wait for active calls before returning.
+        unsafe {
+            let table = (self.ptr as *const *const usize).read();
+            let method = table.add(slot).read();
+            #[cfg(not(test))]
+            match arg {
+                Some(arg) => native::call_win64(method, &[self.ptr as u64, arg as u64]),
+                None => native::call_win64(method, &[self.ptr as u64]),
+            };
+            #[cfg(test)]
+            match arg {
+                Some(arg) => std::mem::transmute::<usize, extern "win64" fn(usize, usize)>(method)(
+                    self.ptr, arg,
+                ),
+                None => std::mem::transmute::<usize, extern "win64" fn(usize)>(method)(self.ptr),
+            }
+        }
+        let mut state = lock(&self.state);
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.idle.notify_all();
+        }
+    }
+}
+
+fn deliver(callback: &Callback, e: Event) {
+    // shortcut: PCM and float decoding errors return from SubmitSourceBuffer, dispatch OnVoiceError when a decoder can fail during mixing.
     // The callback object's vtable: OnVoiceProcessingPassStart, PassEnd,
     // OnStreamEnd, OnBufferStart, OnBufferEnd, OnLoopEnd, OnVoiceError.
     let slot = match e.notice {
@@ -81,25 +158,83 @@ fn deliver(e: Event) {
         Notice::BufferEnd => 4,
         Notice::LoopEnd => 5,
     };
-    // SAFETY: a title's `IXAudio2VoiceCallback`, as it passed it to
-    // `CreateSourceVoice`.
-    unsafe {
-        let table = (e.callback as *const *const usize).read();
-        let method = table.add(slot).read();
-        if e.notice == Notice::StreamEnd {
-            native::call_win64(method, &[e.callback as u64]);
-        } else {
-            native::call_win64(method, &[e.callback as u64, e.context as u64]);
-        }
-    }
+    callback.call(slot, (e.notice != Notice::StreamEnd).then_some(e.context));
 }
 
-#[cfg(test)]
-static DELIVERED: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+impl Inner {
+    fn close_output(&self) {
+        let output = {
+            let mut output = lock(&self.output);
+            if !matches!(*output, OutputState::Open(_)) {
+                return;
+            }
+            std::mem::replace(&mut *output, OutputState::Busy)
+        };
+        if let OutputState::Open(output) = output {
+            drop(output);
+        }
+        *lock(&self.output) = OutputState::Closed;
+    }
 
-#[cfg(test)]
-fn deliver(e: Event) {
-    lock(&DELIVERED).push(e);
+    fn render(&self, out: &mut [f32]) {
+        let engines = {
+            let mut callbacks = lock(&self.callbacks);
+            if !callbacks.running {
+                out.fill(0.0);
+                return;
+            }
+            callbacks.in_pass = true;
+            callbacks.engines.clone()
+        };
+        for callback in &engines {
+            callback.call(0, None); // OnProcessingPassStart
+        }
+
+        let voices = lock(&self.callbacks).voices.clone();
+        for (&id, (callback, frame_bytes)) in &voices {
+            let bytes = {
+                let mut mixer = lock(&self.mixer);
+                let (frames, rate) = (out.len() / mixer.channels, mixer.rate);
+                mixer.source(id).map_or(0, |source| {
+                    source
+                        .frames_required(frames, rate)
+                        .saturating_mul(*frame_bytes)
+                        .min(u32::MAX as usize)
+                })
+            };
+            callback.call(0, Some(bytes)); // OnVoiceProcessingPassStart
+        }
+
+        let events = lock(&self.mixer).render(out);
+        for e in events {
+            let _ = self.events.send(e);
+        }
+        for (callback, _) in voices.values() {
+            callback.call(1, None); // OnVoiceProcessingPassEnd
+        }
+        for callback in &engines {
+            callback.call(1, None); // OnProcessingPassEnd
+        }
+        lock(&self.callbacks).in_pass = false;
+        self.pass_done.notify_all();
+    }
+
+    fn output_failed(&self, error: std::io::Error) {
+        tracing::warn!(%error, "XAudio2: audio output failed");
+        let engines = {
+            let mut callbacks = lock(&self.callbacks);
+            if callbacks.device_invalidated {
+                return;
+            }
+            callbacks.running = false;
+            callbacks.device_invalidated = true;
+            callbacks.engines.clone()
+        };
+        // shortcut: only StartEngine reports device invalidation after OnCriticalError, gate other HRESULT methods if a title uses the failed engine.
+        for callback in &engines {
+            callback.call(2, Some(XAUDIO2_E_DEVICE_INVALIDATED as u32 as usize)); // OnCriticalError
+        }
+    }
 }
 
 // Objects.
@@ -186,22 +321,37 @@ static MASTER_TABLE: LazyLock<Vec<usize>> =
 
 fn new_engine(opener: Opener) -> *mut Engine {
     let (events, received) = channel::<Event>();
+    let inner = Arc::new(Inner {
+        mixer: Mutex::new(Mixer::new(48_000, 2)),
+        callbacks: Mutex::new(Callbacks {
+            engines: Vec::new(),
+            voices: BTreeMap::new(),
+            running: true,
+            in_pass: false,
+            device_invalidated: false,
+        }),
+        pass_done: Condvar::new(),
+        events,
+        output: Mutex::new(OutputState::Closed),
+        opener,
+    });
+    let weak = Arc::downgrade(&inner);
     // Ends with the last `Inner`, which holds the only sender.
     std::thread::Builder::new()
         .name("xaudio2-callbacks".into())
         .spawn(move || {
             for e in received {
-                deliver(e);
+                let Some(inner) = weak.upgrade() else { break };
+                let callback = lock(&inner.callbacks)
+                    .voices
+                    .get(&e.voice)
+                    .map(|(c, _)| c.clone());
+                if let Some(callback) = callback {
+                    deliver(&callback, e);
+                }
             }
         })
         .expect("starting the XAudio2 callback thread");
-    let inner = Arc::new(Inner {
-        mixer: Mutex::new(Mixer::new(48_000, 2)),
-        running: std::sync::atomic::AtomicBool::new(true),
-        events,
-        output: Mutex::new(None),
-        opener,
-    });
     Box::into_raw(Box::new(Engine {
         vtable: ENGINE_TABLE.as_ptr(),
         refs: AtomicU32::new(1),
@@ -266,28 +416,61 @@ extern "win64" fn engine_release(this: *mut Engine) -> u32 {
         // SAFETY: made by `new_engine`, released for the last time. The
         // output stops with it, before the mixer goes.
         unsafe {
-            lock(&(&*this).inner.output).take();
+            (&*this).inner.close_output();
             drop(Box::from_raw(this));
         }
     }
     left
 }
 
-extern "win64" fn engine_register(_this: *mut Engine, _callback: *mut c_void) -> HRESULT {
+extern "win64" fn engine_register(this: *mut Engine, callback: *mut c_void) -> HRESULT {
+    if callback.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's engine.
+    let mut callbacks = lock(&unsafe { &*this }.inner.callbacks);
+    let ptr = callback as usize;
+    if !callbacks.engines.iter().any(|c| c.ptr == ptr) {
+        callbacks.engines.push(Callback::new(ptr));
+    }
     S_OK
 }
 
-extern "win64" fn engine_unregister(_this: *mut Engine, _callback: *mut c_void) {}
+extern "win64" fn engine_unregister(this: *mut Engine, callback: *mut c_void) {
+    let removed = {
+        // SAFETY: the title's engine.
+        let mut callbacks = lock(&unsafe { &*this }.inner.callbacks);
+        callbacks
+            .engines
+            .iter()
+            .position(|c| c.ptr == callback as usize)
+            .map(|i| callbacks.engines.remove(i))
+    };
+    if let Some(removed) = removed {
+        removed.cancel();
+    }
+}
 
 extern "win64" fn start_engine(this: *mut Engine) -> HRESULT {
     // SAFETY: the title's object.
-    unsafe { (&*this).inner.running.store(true, Ordering::Release) };
+    let mut callbacks = lock(&unsafe { &*this }.inner.callbacks);
+    if callbacks.device_invalidated {
+        return XAUDIO2_E_DEVICE_INVALIDATED;
+    }
+    callbacks.running = true;
     S_OK
 }
 
 extern "win64" fn stop_engine(this: *mut Engine) {
     // SAFETY: the title's object.
-    unsafe { (&*this).inner.running.store(false, Ordering::Release) };
+    let inner = &unsafe { &*this }.inner;
+    let mut callbacks = lock(&inner.callbacks);
+    callbacks.running = false;
+    drop(
+        inner
+            .pass_done
+            .wait_while(callbacks, |callbacks| callbacks.in_pass),
+    );
 }
 
 extern "win64" fn commit_changes(_this: *mut Engine, _operation_set: u32) -> HRESULT {
@@ -385,9 +568,14 @@ extern "win64" fn create_source_voice(
     // SAFETY: the title's object.
     let inner = unsafe { &(*this).inner };
     let output = first_send(inner, sends);
-    let id = lock(&inner.mixer).add_source(format.channels, format.rate, callback as usize, output);
+    let id = lock(&inner.mixer).add_source(format.channels, format.rate, output);
     // SAFETY: the title's out parameter.
     unsafe { out.write(voice_object(inner, &SOURCE_TABLE, id, Kind::Source, format)) };
+    if !callback.is_null() {
+        lock(&inner.callbacks)
+            .voices
+            .insert(id, (Callback::new(callback as usize), format.frame_bytes()));
+    }
     S_OK
 }
 
@@ -434,9 +622,12 @@ extern "win64" fn create_mastering_voice(
     }
     // SAFETY: the title's object.
     let inner = unsafe { &(*this).inner };
-    let mut output = lock(&inner.output);
-    if output.is_some() {
-        return XAUDIO2_E_INVALID_CALL;
+    {
+        let mut output = lock(&inner.output);
+        if !matches!(*output, OutputState::Closed) {
+            return XAUDIO2_E_INVALID_CALL;
+        }
+        *output = OutputState::Busy;
     }
     // 0 asks for the device's own; stereo at 48 kHz is every Mac's.
     let (channels, rate) = (if channels == 0 { 2 } else { channels }, if rate == 0 { 48_000 } else { rate });
@@ -445,29 +636,21 @@ extern "win64" fn create_mastering_voice(
         mixer.channels = channels as usize;
         mixer.rate = rate;
     }
-    let weak: Weak<Inner> = Arc::downgrade(inner);
-    let render: coreaudio::Render = Box::new(move |out| {
-        let Some(inner) = weak.upgrade() else {
-            out.fill(0.0);
-            return;
-        };
-        if !inner.running.load(Ordering::Acquire) {
-            out.fill(0.0);
-            return;
-        }
-        let events = lock(&inner.mixer).render(out);
-        for e in events.into_iter().filter(|e| e.callback != 0) {
-            let _ = inner.events.send(e);
-        }
+    let weak = Arc::downgrade(inner);
+    let render: coreaudio::Render = Box::new(move |pull| match (weak.upgrade(), pull) {
+        (Some(inner), Ok(out)) => inner.render(out),
+        (Some(inner), Err(error)) => inner.output_failed(error),
+        (None, Ok(out)) => out.fill(0.0),
+        (None, Err(_)) => (),
     });
     match (inner.opener)(rate, channels, render) {
-        Ok(device) => *output = Some(device),
+        Ok(device) => *lock(&inner.output) = OutputState::Open(device),
         Err(e) => {
+            *lock(&inner.output) = OutputState::Closed;
             tracing::warn!(error = %e, "XAudio2: no audio output");
             return E_OUTOFMEMORY;
         }
     }
-    drop(output);
     let format = Format {
         channels: channels as usize,
         rate,
@@ -678,14 +861,22 @@ extern "win64" fn get_output_matrix(
 
 extern "win64" fn destroy_voice(this: *mut Voice) {
     // SAFETY: made by a `create_*_voice`, destroyed once.
-    let v = unsafe { Box::from_raw(this) };
+    let v = unsafe { &*this };
     match v.kind {
         Kind::Master => {
             // The output stops before anything else can pull from it.
-            lock(&v.inner.output).take();
+            v.inner.close_output();
         }
-        _ => lock(&v.inner.mixer).remove(v.id),
+        _ => {
+            let removed = lock(&v.inner.callbacks).voices.remove(&v.id);
+            if let Some((callback, _)) = removed {
+                callback.cancel();
+            }
+            lock(&v.inner.mixer).remove(v.id);
+        }
     }
+    // SAFETY: no callback can use the voice after cancellation.
+    unsafe { drop(Box::from_raw(this)) };
 }
 
 // IXAudio2SourceVoice and IXAudio2MasteringVoice.
@@ -768,7 +959,7 @@ extern "win64" fn source_flush(this: *mut Voice) -> HRESULT {
     // SAFETY: the title's voice.
     let v = unsafe { &*this };
     let events = with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.flush()).unwrap_or_default();
-    for e in events.into_iter().filter(|e| e.callback != 0) {
+    for e in events {
         let _ = v.inner.events.send(e);
     }
     S_OK
@@ -848,6 +1039,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use std::io;
+    use std::sync::atomic::AtomicPtr;
+    use std::sync::mpsc::Receiver;
+    use std::time::Duration;
 
     /// An output that is the test: it keeps the render function to pull
     /// frames from, as the device would.
@@ -868,7 +1062,9 @@ mod tests {
 
     fn pull(frames: usize, channels: usize) -> Vec<f32> {
         let mut out = vec![0.0; frames * channels];
-        (lock(&PULL).as_mut().expect("an open output"))(&mut out);
+        let mut render = lock(&PULL).take().expect("an open output");
+        render(Ok(&mut out));
+        *lock(&PULL) = Some(render);
         out
     }
 
@@ -895,10 +1091,100 @@ mod tests {
         w
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum Observed {
+        EngineStart(usize),
+        EngineEnd(usize),
+        CriticalError(usize, usize),
+        VoiceStart(usize, usize),
+        VoiceEnd(usize),
+        Notice(Notice, usize),
+    }
+
+    #[repr(C)]
+    struct TestCallback<'a> {
+        table: *const usize,
+        log: &'a Mutex<Vec<Observed>>,
+        id: usize,
+        voice: AtomicPtr<Voice>,
+    }
+
+    impl<'a> TestCallback<'a> {
+        fn new(table: &'a [usize], log: &'a Mutex<Vec<Observed>>, id: usize) -> Self {
+            Self {
+                table: table.as_ptr(),
+                log,
+                id,
+                voice: AtomicPtr::new(std::ptr::null_mut()),
+            }
+        }
+
+        fn ptr(&self) -> *mut c_void {
+            (self as *const Self).cast_mut().cast()
+        }
+
+        fn from_ptr(this: usize) -> &'a Self {
+            // SAFETY: the test keeps the object alive while registered.
+            unsafe { &*(this as *const Self) }
+        }
+    }
+
+    extern "win64" fn engine_pass_start(this: usize) {
+        let cb = TestCallback::from_ptr(this);
+        lock(cb.log).push(Observed::EngineStart(cb.id));
+    }
+
+    extern "win64" fn engine_pass_end(this: usize) {
+        let cb = TestCallback::from_ptr(this);
+        lock(cb.log).push(Observed::EngineEnd(cb.id));
+    }
+
+    extern "win64" fn critical_error(this: usize, error: usize) {
+        let cb = TestCallback::from_ptr(this);
+        lock(cb.log).push(Observed::CriticalError(cb.id, error));
+    }
+
+    extern "win64" fn voice_pass_start(this: usize, bytes: usize) {
+        let cb = TestCallback::from_ptr(this);
+        lock(cb.log).push(Observed::VoiceStart(cb.id, bytes));
+        let voice = cb.voice.load(Ordering::Relaxed);
+        if !voice.is_null() {
+            assert_eq!(call!(voice, 12, fn(f32, u32) -> HRESULT, 0.25, 0), S_OK);
+        }
+    }
+
+    extern "win64" fn voice_pass_end(this: usize) {
+        let cb = TestCallback::from_ptr(this);
+        lock(cb.log).push(Observed::VoiceEnd(cb.id));
+    }
+
+    extern "win64" fn stream_end(this: usize) {
+        lock(TestCallback::from_ptr(this).log).push(Observed::Notice(Notice::StreamEnd, 0));
+    }
+
+    extern "win64" fn buffer_start(this: usize, context: usize) {
+        lock(TestCallback::from_ptr(this).log).push(Observed::Notice(Notice::BufferStart, context));
+    }
+
+    extern "win64" fn buffer_end(this: usize, context: usize) {
+        lock(TestCallback::from_ptr(this).log).push(Observed::Notice(Notice::BufferEnd, context));
+    }
+
+    fn voice_callback_table() -> [usize; 7] {
+        let mut table = [0; 7];
+        table[..5].copy_from_slice(&methods![
+            voice_pass_start,
+            voice_pass_end,
+            stream_end,
+            buffer_start,
+            buffer_end
+        ]);
+        table
+    }
+
     #[test]
     fn a_title_plays_a_tone_through_the_engine() {
         let _turn = lock(&TURN);
-        lock(&DELIVERED).clear();
         let mut engine: *mut Engine = std::ptr::null_mut();
         assert_eq!(create_with(&mut engine, open_held), S_OK);
         let engine = engine.cast::<c_void>();
@@ -923,11 +1209,13 @@ mod tests {
 
         // CreateSourceVoice: mono, 16-bit, 24 kHz, with a callback object.
         let w = wave(1, 24_000, 16, 1);
-        let callback = 0x5000usize as *mut c_void;
+        let log = Mutex::new(Vec::new());
+        let table = voice_callback_table();
+        let callback = TestCallback::new(&table, &log, 0);
         let mut voice: *mut Voice = std::ptr::null_mut();
         assert_eq!(
             call!(engine, 5, fn(*mut *mut Voice, *const u8, u32, f32, *mut c_void, *const u8, *const c_void) -> HRESULT,
-                &mut voice, w.as_ptr(), 0, 2.0, callback, std::ptr::null(), std::ptr::null()),
+                &mut voice, w.as_ptr(), 0, 2.0, callback.ptr(), std::ptr::null(), std::ptr::null()),
             S_OK
         );
         // ADPCM is not ours.
@@ -935,7 +1223,7 @@ mod tests {
         let mut none: *mut Voice = std::ptr::null_mut();
         assert_eq!(
             call!(engine, 5, fn(*mut *mut Voice, *const u8, u32, f32, *mut c_void, *const u8, *const c_void) -> HRESULT,
-                &mut none, adpcm.as_ptr(), 0, 2.0, callback, std::ptr::null(), std::ptr::null()),
+                &mut none, adpcm.as_ptr(), 0, 2.0, callback.ptr(), std::ptr::null(), std::ptr::null()),
             XAUDIO2_E_INVALID_CALL
         );
 
@@ -978,18 +1266,20 @@ mod tests {
         assert!(left[2400..].iter().all(|&x| x == 0.0));
         // The notices go out through the channel to the callback thread.
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let got: Vec<_> = lock(&DELIVERED)
+        let notices = lock(&log);
+        let got: Vec<_> = notices
             .iter()
-            .map(|e| (e.notice, e.context, e.callback))
+            .filter(|e| matches!(e, Observed::Notice(..)))
             .collect();
         assert_eq!(
             got,
             [
-                (Notice::BufferStart, 0xC0DE, 0x5000),
-                (Notice::BufferEnd, 0xC0DE, 0x5000),
-                (Notice::StreamEnd, 0, 0x5000)
+                &Observed::Notice(Notice::BufferStart, 0xC0DE),
+                &Observed::Notice(Notice::BufferEnd, 0xC0DE),
+                &Observed::Notice(Notice::StreamEnd, 0)
             ]
         );
+        drop(notices);
         call!(voice_ptr, 25, fn(*mut u8, u32) -> (), state.as_mut_ptr(), 0);
         assert_eq!(u32::from_le_bytes(state[8..12].try_into().unwrap()), 0);
         assert_eq!(u64::from_le_bytes(state[16..24].try_into().unwrap()), 1200);
@@ -1001,7 +1291,181 @@ mod tests {
         assert_eq!(call!(engine, 2, fn() -> u32,), 0);
     }
 
-    /// The engine tests share the delivered-notice log and the held output.
+    #[test]
+    fn processing_passes_bracket_mixing_and_respect_engine_state() {
+        let _turn = lock(&TURN);
+        let engine = new_engine(open_held);
+        let log = Mutex::new(Vec::new());
+        let engine_table = methods![engine_pass_start, engine_pass_end, critical_error];
+        let a = TestCallback::new(&engine_table, &log, 1);
+        let b = TestCallback::new(&engine_table, &log, 2);
+        let unknown = TestCallback::new(&engine_table, &log, 3);
+        for cb in [&a, &b, &a] {
+            assert_eq!(call!(engine, 3, fn(*mut c_void) -> HRESULT, cb.ptr()), S_OK);
+        }
+        call!(engine, 4, fn(*mut c_void) -> (), unknown.ptr());
+
+        let mut master = std::ptr::null_mut();
+        assert_eq!(
+            create_mastering_voice(
+                engine,
+                &mut master,
+                2,
+                48_000,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0
+            ),
+            S_OK
+        );
+        let voice_table = voice_callback_table();
+        let empty = TestCallback::new(&voice_table, &log, 3);
+        let fed = TestCallback::new(&voice_table, &log, 4);
+        let wave = wave(1, 24_000, 16, 1);
+        let source = |cb: &TestCallback<'_>| {
+            let mut voice = std::ptr::null_mut();
+            assert_eq!(
+                create_source_voice(
+                    engine,
+                    &mut voice,
+                    wave.as_ptr(),
+                    0,
+                    2.0,
+                    cb.ptr(),
+                    std::ptr::null(),
+                    std::ptr::null()
+                ),
+                S_OK
+            );
+            assert_eq!(source_start(voice, 0, 0), S_OK);
+            voice
+        };
+        let starved = source(&empty);
+        let fed_voice = source(&fed);
+        fed.voice.store(fed_voice, Ordering::Relaxed);
+        let pcm = [16_384i16; 480]; // Two output passes at a 2:1 resampling ratio.
+        let mut buffer = [0; 48];
+        buffer[4..8].copy_from_slice(&(size_of_val(&pcm) as u32).to_le_bytes());
+        buffer[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
+        assert_eq!(
+            source_submit(fed_voice, buffer.as_ptr(), std::ptr::null()),
+            S_OK
+        );
+        let take_log = || {
+            let mut events = std::mem::take(&mut *lock(&log));
+            events.retain(|e| !matches!(e, Observed::Notice(..)));
+            events
+        };
+
+        assert!(pull(480, 2).iter().all(|&sample| sample == 0.125));
+        use Observed::*;
+        assert_eq!(
+            take_log(),
+            [
+                EngineStart(1),
+                EngineStart(2),
+                VoiceStart(3, 480),
+                VoiceStart(4, 0),
+                VoiceEnd(3),
+                VoiceEnd(4),
+                EngineEnd(1),
+                EngineEnd(2)
+            ]
+        );
+
+        call!(engine, 9, fn() -> (),);
+        assert!(pull(480, 2).iter().all(|&sample| sample == 0.0));
+        assert!(take_log().is_empty());
+        call!(engine, 4, fn(*mut c_void) -> (), a.ptr());
+        call!(engine, 4, fn(*mut c_void) -> (), a.ptr());
+        assert_eq!(call!(engine, 8, fn() -> HRESULT,), S_OK);
+        assert!(pull(480, 2).iter().all(|&sample| sample == 0.125));
+        assert_eq!(
+            take_log(),
+            [
+                EngineStart(2),
+                VoiceStart(3, 480),
+                VoiceStart(4, 0),
+                VoiceEnd(3),
+                VoiceEnd(4),
+                EngineEnd(2)
+            ]
+        );
+
+        let mut render = lock(&PULL).take().unwrap();
+        render(Err(io::Error::other("simulated output failure")));
+        *lock(&PULL) = Some(render);
+        assert_eq!(
+            take_log(),
+            [CriticalError(
+                2,
+                XAUDIO2_E_DEVICE_INVALIDATED as u32 as usize
+            )]
+        );
+        assert_eq!(start_engine(engine), XAUDIO2_E_DEVICE_INVALIDATED);
+        assert!(pull(480, 2).iter().all(|&sample| sample == 0.0));
+        assert!(take_log().is_empty());
+
+        destroy_voice(starved);
+        destroy_voice(fed_voice);
+        destroy_voice(master);
+        engine_unregister(engine, b.ptr());
+        assert_eq!(engine_release(engine), 0);
+    }
+
+    #[test]
+    fn destroying_a_voice_waits_for_its_buffer_callback() {
+        static BLOCK: Mutex<Option<(Sender<()>, Receiver<()>)>> = Mutex::new(None);
+
+        extern "win64" fn blocked_buffer_end(_this: usize, _context: usize) {
+            let (entered, resume) = lock(&BLOCK).take().unwrap();
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        let engine = new_engine(open_held);
+        let table = [0, 0, 0, 0, blocked_buffer_end as *const () as usize, 0, 0];
+        let callback = table.as_ptr();
+        let wave = wave(1, 48_000, 16, 1);
+        let mut voice = std::ptr::null_mut();
+        assert_eq!(
+            create_source_voice(
+                engine,
+                &mut voice,
+                wave.as_ptr(),
+                0,
+                2.0,
+                (&raw const callback).cast_mut().cast(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
+            S_OK
+        );
+        let (entered, began) = channel();
+        let (resume, wait) = channel();
+        *lock(&BLOCK) = Some((entered, wait));
+        assert_eq!(
+            source_submit(voice, [0; 48].as_ptr(), std::ptr::null()),
+            S_OK
+        );
+        assert_eq!(source_flush(voice), S_OK);
+        began.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (destroyed, done) = channel();
+        let ptr = voice as usize;
+        let destroyer = std::thread::spawn(move || {
+            destroy_voice(ptr as *mut Voice);
+            destroyed.send(()).unwrap();
+        });
+        let early = done.recv_timeout(Duration::from_millis(50));
+        resume.send(()).unwrap();
+        destroyer.join().unwrap();
+        assert_eq!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert_eq!(engine_release(engine), 0);
+    }
+
+    /// The engine tests share the held output.
     static TURN: Mutex<()> = Mutex::new(());
 
     #[test]
