@@ -29,18 +29,31 @@ static EPOCH: AtomicU32 = AtomicU32::new(0);
 /// not take the rest gives them back, and two doing it would starve.
 static WAIT_ALL: Mutex<()> = Mutex::new(());
 
+/// Threads in [`wait_multiple`]: with none, a signal makes no wake system call.
+static MULTI_WAITERS: AtomicU32 = AtomicU32::new(0);
+
 /// Something a wait could be waiting for was signalled.
 pub(super) fn signalled() {
-    EPOCH.fetch_add(1, Ordering::AcqRel);
-    wake_all(&EPOCH);
+    // SeqCst on both sides: a waiter that registers after this load reads the new epoch.
+    EPOCH.fetch_add(1, Ordering::SeqCst);
+    if MULTI_WAITERS.load(Ordering::SeqCst) != 0 {
+        wake_all(&EPOCH);
+    }
 }
 
 /// `WaitForMultipleObjects` over `objects`: the index of the first one
 /// signalled (any), or `WAIT_OBJECT_0` once all are taken (all).
 pub(super) fn wait_multiple(objects: &[Waitable], all: bool, timeout: Option<Duration>) -> u32 {
+    MULTI_WAITERS.fetch_add(1, Ordering::SeqCst);
+    let result = wait_registered(objects, all, timeout);
+    MULTI_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+fn wait_registered(objects: &[Waitable], all: bool, timeout: Option<Duration>) -> u32 {
     let deadline = timeout.map(|t| Instant::now() + t);
     loop {
-        let seen = EPOCH.load(Ordering::Acquire);
+        let seen = EPOCH.load(Ordering::SeqCst);
         if all {
             let _one_at_a_time = WAIT_ALL.lock().unwrap_or_else(|e| e.into_inner());
             let taken = objects.iter().take_while(|o| o.try_take()).count();
