@@ -164,7 +164,8 @@ pub struct Guessed<B: GraphicsBackend> {
     /// The pipeline's state with the targets of its draw ([`Graphics::for_draw`] completes it).
     pub state: super::state::Graphics,
     /// The vertex shader's container, translated again for rectangle lists at the first such draw.
-    pub vs_source: Arc<crate::pipeline::Shader>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) vs_source: Arc<crate::pipeline::Shader>,
     /// By the formats and strides they were made for.
     pub made: std::cell::RefCell<HashMap<String, Pipe<B>>>,
 }

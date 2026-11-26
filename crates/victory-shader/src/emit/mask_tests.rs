@@ -68,6 +68,7 @@ fn lowered(body: &[u32], lanes: u32, wave32_host: bool) -> Result<Lowered, crate
         narrow_waves: false,
         wave32_host,
         zero_copy_memory: false,
+        rect_list: false,
         view_marks: false,
     })
 }

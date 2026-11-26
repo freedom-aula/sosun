@@ -172,6 +172,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         wave32_host: false,
         // The D3D12 host copies title memory: it needs the pages marked.
         zero_copy_memory: false,
+        rect_list: false,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());

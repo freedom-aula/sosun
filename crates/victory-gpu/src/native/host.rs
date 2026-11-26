@@ -536,7 +536,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         match crate::descriptor::view(handle) {
                             Some(crate::descriptor::View::Constant(a, n)) => tracing::info!(entry = k, addr = format!("{a:#x}"), size = n, mem = read(a, 64), "table constant buffer"),
                             Some(crate::descriptor::View::Shader(r, d)) => {
-                                let info = crate::resource::texture_info(r as crate::object::This);
+                                let info = texture_info_of(r);
                                 let (nz, total) = info.as_ref().map_or((0, 0), |i| {
                                     let m = super::textures::read_memory(i.memory, i.size.min(1 << 22));
                                     (m.iter().filter(|&&b| b != 0).count(), m.len())
@@ -825,4 +825,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             },
         )
     }
+}
+
+/// The title texture a view names (macOS only; the target trace's).
+#[cfg(target_os = "macos")]
+fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
+    crate::resource::texture_info(r as crate::object::This)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
+    None
 }
