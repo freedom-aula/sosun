@@ -666,7 +666,12 @@ once, or (group of one console wave) behind uniform scalar branches outside loop
 per-lane loops the value is left unknown and the program is refused if anything uses it; LDS shared without a
 barrier in divergent code is refused too. The barriers that sync such LDS (`split_wave_barriers`) go in the
 same places: blocks each thread runs once, or (the group being one console wave) reached by uniform scalar
-branches alone outside loops. 16-bit wave reductions across the halves are refused. Fixing the
+branches alone outside loops. A program refused for either is translated again with each `s_cbranch_execz`
+to a bare `s_endpgm` dropped (`ir::keep_lanes_to_end`): the usual `if (id < n) { whole shader }` early exit.
+Its lanes then run on to the end with EXEC off, as on the console while their wave has a lane left, and reach
+every barrier. Only a wave with no lane left runs that code too, which changes nothing but scalar memory
+writes (a program with one is not changed). Of 30 dumped story-load shaders refused for these two reasons,
+9 translate with this and the barriers behind uniform branches (27 November). 16-bit wave reductions across the halves are refused. Fixing the
 divergent case needs if-conversion of the region so both halves always arrive (not done).
 
 Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lowered containers pass
