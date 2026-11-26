@@ -26,6 +26,8 @@ use victory_platform::thread;
 pub(crate) mod files;
 mod sync;
 mod system;
+mod winhttp;
+mod winsock;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
@@ -722,7 +724,9 @@ pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) ->
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
-    if let Some(address) = system::lookup(&dll, name) {
+    if let Some(address) = system::lookup(&dll, name)
+        .or_else(|| winsock::lookup(&dll, name))
+        .or_else(|| winhttp::lookup(&dll, name)) {
         return Some(address);
     }
     // The API sets and kernelbase forward to kernel32's functions; the

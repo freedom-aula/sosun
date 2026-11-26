@@ -320,6 +320,21 @@ pub(crate) fn is_win64(address: usize) -> bool {
 
 const STUB_SIZE: usize = 32;
 
+/// Bridge stubs for host functions the title calls through pointers it was
+/// handed (the methods of a COM object), not through its import table, one
+/// per `(target, win64)` in the same order; `win64` says the function is
+/// `extern "win64"` (floats in their Windows registers). The stubs live for
+/// the life of the process.
+pub fn host_callbacks(targets: &[(usize, bool)]) -> Result<Vec<usize>> {
+    let mut block = StubBlock::new(targets.len())?;
+    let stubs = targets
+        .iter()
+        .map(|&(target, win64)| block.emit(target, 0, win64))
+        .collect::<Result<Vec<_>>>()?;
+    block.seal()?;
+    Ok(stubs)
+}
+
 /// Executable memory holding one stub per host function bound to the title.
 pub struct StubBlock {
     base: *mut u8,
