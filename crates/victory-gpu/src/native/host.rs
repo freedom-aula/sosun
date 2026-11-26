@@ -842,6 +842,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// The textures the first 32 entries from each of `root`'s tables name as unordered-access
+    /// views (for traces of work whose program is not known: a table may be shorter).
+    #[cfg(target_os = "macos")]
+    pub(super) fn table_uav_textures(&self, root: &[Option<Root<B>>]) -> Vec<usize> {
+        let handles = root.iter().flatten().filter_map(|r| match r {
+            Root::Table(h, at) if h.kind == HeapKind::Resource => Some((h.start, *at as u64)),
+            _ => None,
+        });
+        let mut out: Vec<usize> = handles
+            .flat_map(|(start, at)| (0..32).map(move |k| start + (at + k) * Self::step(HeapKind::Resource)))
+            .filter_map(|handle| match crate::descriptor::view(handle) {
+                Some(crate::descriptor::View::Unordered(r, _, _)) if texture_info_of(r).is_some() => Some(r),
+                _ => None,
+            })
+            .collect();
+        out.dedup();
+        out
+    }
+
     /// `VICTORY_TRACE_CONTENT=<dir>`: for the first draws into a depth target, every texture and
     /// constant buffer their descriptor tables hold: its view, the fraction of its title memory
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host

@@ -10343,6 +10343,60 @@ impl<'a> Lower<'a> {
     /// the console compiler's if/else always skips into its join that way.
     /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
     /// edge into its header; the others take the wave's.
+    /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
+    /// it and EXEC (or `s_orn2` of it by EXEC) in `b`, with no lane of edge `n` in that EXEC as the
+    /// edge brings it: those lanes' bits of the result are 0 (1) whatever the mask holds for them.
+    fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
+        let (p, st) = (self.x.p, self.x.st);
+        let block = &p.blocks[b];
+        let mut reads = 0;
+        for (bb, blk) in p.blocks.iter().enumerate() {
+            if blk.phis.iter().any(|phi| phi.args.contains(&value)) {
+                return false;
+            }
+            for inst in blk.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == value)) {
+                // `s_orn2 d, x, exec` sets the bits of lanes outside EXEC as `s_and` clears them.
+                let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
+                    && matches!(&inst.fields, Fields::Sop { src, .. }
+                        if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                if bb != b || !(matches!(inst.name(), "s_and_b32" | "s_and_b64") || orn2_of_exec) {
+                    return false;
+                }
+                let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
+                let exec = block.phis.iter().find(|phi| phi.value == exec).map_or(exec, |phi| phi.args[n]);
+                let Some(&m) = st.masks.get(&exec) else { return false };
+                let mut lanes = self.lane_edge(block.preds[n], b);
+                lanes.push((m, true));
+                if st.bools.meet(&lanes) {
+                    return false;
+                }
+                reads += 1;
+            }
+        }
+        reads > 0
+    }
+
+    /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
+    /// only successor, is a move in `q` of an inline 0 (`false`: no lane) or -1 (`true`: every
+    /// lane), both dwords at once in a wave64 program. The wave holds that constant on the edge
+    /// whichever lanes run `q`, as nothing after the move runs before the join.
+    fn constant_mask(&self, low: Value, q: usize) -> Option<bool> {
+        let block = &self.x.p.blocks[q];
+        if block.exit.successors().len() != 1 {
+            return None;
+        }
+        let op = if self.x.native.wave64 { "s_mov_b64" } else { "s_mov_b32" };
+        let (_, [src]) = scalar_def::<1>(block, low, op)?;
+        match src {
+            Operand::Const(code) => match crate::resource::inline(code)? {
+                0 => Some(false),
+                u32::MAX => Some(true),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn uniform_join(&self, b: usize) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
@@ -13520,6 +13574,15 @@ impl<'a> Lower<'a> {
                         if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) =>
                     {
                         self.s.m.bool(false)
+                    }
+                    // Read only ANDed with an EXEC those lanes are not in: any bit will do.
+                    (None, Some(Val::I32(_))) if self.anded_off_on_edge(b, phi.value, n) => {
+                        self.s.m.bool(false)
+                    }
+                    // No lanes or every lane, moved just before the edge: each lane's bit,
+                    // whatever the lane layout and whichever lanes take the edge.
+                    (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
+                        self.s.m.bool(all)
                     }
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));

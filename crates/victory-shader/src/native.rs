@@ -454,6 +454,31 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// Adds the descriptor heaps a compute program indexes itself to its layout: a user SGPR below
+/// `user_sgprs` no parameter holds that the program loads descriptors through as a 32-bit address
+/// (high half 0) is the resource or sampler heap. Guess, as for guessed graphics programs
+/// (`emit::graphics`): the metadata declares no heap record, and the root signature blob is not
+/// decoded for it (`docs/native-host.md`, "Compute programs that index the heap themselves").
+fn infer_heaps(layout: &mut Vec<RootParam>, code: &[u8], wave64: bool, user_sgprs: u8) {
+    let Ok(p) = crate::ir::build(code, wave64, 256) else { return };
+    // A program the tracer cannot follow is refused later, with its own reason.
+    let Ok(inferred) = crate::resource::infer_roots(&p, layout, HwStage::Cs) else { return };
+    for (user_data, root) in inferred.heaps {
+        let r = u32::from(user_data);
+        let held = layout.iter().any(|q| r >= u32::from(q.user_data) && r < u32::from(q.user_data) + q.sgprs);
+        if user_data < user_sgprs && !held {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data,
+                slot: if root == RootType::SamplerHeap { 254 } else { 252 },
+            });
+        }
+    }
+}
+
 /// The compute program of an `ACCC` part, which a container carries in place
 /// of `DXIL` when another compiler made the native code (the AMD
 /// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
@@ -552,6 +577,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             return Err(ShaderError::FspxRoot { root: 0, what });
         }
     }
+    infer_heaps(&mut layout, code, wave64, (rsrc2 >> 1 & 0x1F) as u8);
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
