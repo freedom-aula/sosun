@@ -1382,4 +1382,72 @@ mod pieces_tests {
         // SAFETY: as above.
         assert!(unsafe { compute_container(Some(&root), record.as_ptr()) }.is_none());
     }
+
+    /// The container the host makes from a compute description's pieces: wave32 code of 32
+    /// threads with 5 user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
+    fn descriptor_pieces(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
+        let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
+        let code = words(code);
+        let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        metadata.extend([0x40, 4, records.len() as u8, 0]);
+        records.iter().for_each(|r| metadata.extend(r));
+        metadata.extend([0x43].into_iter().chain([0; 31]));
+        let size = metadata.len() as u32 - 0x14;
+        metadata[4..8].copy_from_slice(&size.to_le_bytes());
+        let pieces = [registers, vec![0; 0x14], code, metadata];
+        let mut record = Vec::new();
+        for p in &pieces {
+            record.extend((p.as_ptr() as u64).to_le_bytes());
+            record.extend((p.len() as u64).to_le_bytes());
+        }
+        // SAFETY: four pairs over live vectors.
+        unsafe { compute_container(None, record.as_ptr()) }.expect("a container")
+    }
+
+    /// On the native host's path (the container made from the title's pieces, translated with
+    /// the host's options), a buffer descriptor's dword that is no size, read as data, is refused
+    /// naming the dword; that text is what the refusal log line shows.
+    #[test]
+    fn the_host_refuses_a_descriptor_dword_read_as_data_naming_it() {
+        // A table at user data 4 (`s4`): a raw UAV at dword 0, the buffer read at dword 8.
+        let table = |kind: u8, offset: u8| {
+            let mut r = [0u8; 32];
+            r[0] = 0x41;
+            r[4..6].copy_from_slice(&[kind, 3]);
+            r[8] = offset;
+            r[16] = 1;
+            r[20..23].copy_from_slice(&[4, 4, 0]);
+            r
+        };
+        let program = |read: u32| {
+            let code = [
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xF408_0302,
+                0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xE030_1000,
+                0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+                read,        // v_mov_b32 v2, s<12 + n>
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ];
+            descriptor_pieces(&code, &[table(3, 0), table(0, 8)])
+        };
+        let prefix = "a descriptor's address or format read as data: ";
+        for (read, why) in [
+            (0x7E04_020C, "a buffer's base address (dword 0)"),
+            (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+            (0x7E04_020F, "a buffer's dword 3 (format and type)"),
+        ] {
+            let err = crate::native::shaders::translate(&program(read)).err().expect("refused");
+            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+        }
+    }
 }

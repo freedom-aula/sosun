@@ -732,6 +732,48 @@ fn refusal1_console_layout_dependent_masks_remain_refused() {
 // Refusal #2: "a pixel system input the signature lacks"
 // =========================================================================
 
+/// A buffer descriptor's dword that is no size, read as data, is refused naming it: the host
+/// has no value for the base address, the high address bits and stride, or the format.
+#[test]
+fn descriptor_dwords_read_as_data_say_which() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+            read,        // v_mov_b32 v2, s<12 + n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // A raw UAV at table dword 0, the buffer read at dword 8.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let prefix = "a descriptor's address or format read as data: ";
+    for (read, why) in [
+        (0x7E04_020C, "a buffer's base address (dword 0)"),
+        (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+        (0x7E04_020F, "a buffer's dword 3 (format and type)"),
+    ] {
+        let err = translate_with(&program(read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage

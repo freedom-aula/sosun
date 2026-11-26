@@ -5569,7 +5569,19 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        // What the host has no value for, by dword, so a refusal log says which is read.
+        const BUFFER_ADDRESS: Why =
+            "a descriptor's address or format read as data: a buffer's base address (dword 0)";
+        const BUFFER_DWORD1: Why = "a descriptor's address or format read as data: a buffer's \
+                                    dword 1 (address high bits, stride, swizzle)";
+        const BUFFER_FORMAT: Why =
+            "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
+        const IMAGE_ADDRESS: Why =
+            "a descriptor's address or format read as data: an image's base address (dword 0)";
+        const IMAGE_REST: Why =
+            "a descriptor's address or format read as data: an image's dwords 5 to 7";
+        const OUTSIDE: Why =
+            "a descriptor's address or format read as data: a dword outside the descriptor";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -5742,8 +5754,16 @@ impl<'a> Lower<'a> {
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
+                    let why = match (image.is_some(), rel) {
+                        (false, 0) => BUFFER_ADDRESS,
+                        (false, 1) => BUFFER_DWORD1,
+                        (false, 3) => BUFFER_FORMAT,
+                        (true, 0) => IMAGE_ADDRESS,
+                        (true, 5..=7) => IMAGE_REST,
+                        _ => OUTSIDE,
+                    };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(why));
                     }
                 }
             }
