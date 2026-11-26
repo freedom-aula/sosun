@@ -22,6 +22,35 @@ pub fn enabled() -> bool {
     seconds().is_some()
 }
 
+/// `VICTORY_WATCH_MEM=<hex address>`: every second, the qwords of the 4 KiB around the address
+/// that changed since the last look are logged (data only; for finding what writes a flag).
+pub fn start_mem_watch() {
+    let Some(at) = std::env::var("VICTORY_WATCH_MEM")
+        .ok()
+        .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let base = (at & !0xfff) as usize;
+        let mut last: Vec<Option<usize>> = vec![None; 512];
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut lines = Vec::new();
+            for (i, old) in last.iter_mut().enumerate() {
+                let now = read_checked(base + i * 8);
+                if *old != now && old.is_some() {
+                    lines.push(format!("{:#x}: {:x?} -> {:x?}", base + i * 8, old, now));
+                }
+                *old = now;
+            }
+            if !lines.is_empty() {
+                tracing::warn!("mem watch: {} changed: {}", lines.len(), lines[..lines.len().min(24)].join("; "));
+            }
+        }
+    });
+}
+
 /// Starts the dumping thread if `VICTORY_DUMP_THREADS` is set.
 pub fn start() {
     let Some(secs) = seconds() else { return };
@@ -104,6 +133,23 @@ fn collect() -> Vec<String> {
                 let arg = |off: usize| read_checked(rbp - off).unwrap_or(0);
                 line += &format!(" args {:#x} {:#x} regs {}", arg(0x100), arg(0xF8), regs.join(" "));
             }
+            // VICTORY_DUMP_STACK=1: the title's stack words above the call, and 4 qwords behind
+            // each that points at data (not at the image's code).
+            if std::env::var_os("VICTORY_DUMP_STACK").is_some() && chain.len() > 2 && !read_all_bases(&chain) {
+                let mut out = Vec::new();
+                for i in 0..96 {
+                    let at = rbp + 16 + 8 * i;
+                    let Some(v) = read_checked(at) else { break };
+                    let data = (0x1_4600_0000..0x7fff_ffff_0000).contains(&v) && v & 7 == 0;
+                    let words: Vec<String> = if data {
+                        (0..4).map(|w| read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}"))).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    out.push(format!("+{:#x}: {v:x} [{}]", 8 * i, words.join(" ")));
+                }
+                line += &format!(" stack {}", out.join(" | "));
+            }
         } else if port.context(&mut ctx) {
             if unwind::image_base_of(ctx.rip as usize).is_some() {
                 line += "in title code";
@@ -137,4 +183,10 @@ pub fn caller_chain() -> Vec<usize> {
     let chain = super::seh::backtrace(ctx, bounds);
     let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
     chain.iter().map(|&pc| pc.wrapping_sub(base)).collect()
+}
+
+/// Whether the chain is not the main wait loop's (the stack dump is for one thread).
+fn read_all_bases(chain: &[usize]) -> bool {
+    let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
+    !chain.iter().any(|&pc| pc.wrapping_sub(base) == 0x1d83996)
 }
