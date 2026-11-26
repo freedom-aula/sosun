@@ -42,6 +42,7 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     ("crates/victory-metal/tests/fixtures/sample2d.dxil", "compiled from sample2d.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample2darray.dxil", "compiled from sample2darray.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample3d.dxil", "compiled from sample3d.hlsl"),
+    ("crates/victory-metal/tests/fixtures/tex_fill.dxil", "compiled from tex_fill.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_ps.dxil", "compiled from tri_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_vs.dxil", "compiled from tri_vs.hlsl"),
     // shortcut: one source file over the size limit, until it is split into modules.
