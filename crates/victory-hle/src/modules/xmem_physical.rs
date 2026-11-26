@@ -110,6 +110,9 @@ struct Pool {
     info: PoolInfo,
     /// Who allocated it (`VICTORY_TRACE_OWNERS`).
     owner: Option<Owner>,
+    /// Committed `XMemVirtualAlloc` memory ([`back_with_pool`]): no page numbers reach it.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    backs: bool,
 }
 
 impl Pool {
@@ -151,6 +154,8 @@ impl Pool {
             pool,
             info,
             owner: tracing_owners().then(Owner::now),
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            backs: false,
         })
     }
 }
@@ -597,9 +602,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> i
 /// macOS: the GPU backend resolves title addresses by pool only.
 #[cfg(not(windows))]
 pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
-    let Ok(pool) = Pool::new(len) else {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let Ok(mut pool) = Pool::new(len) else {
         return false;
     };
+    #[cfg(target_arch = "x86_64")]
+    {
+        pool.backs = true;
+    }
     let slice = Slice {
         pool: Arc::new(pool),
         index: 0,
@@ -611,6 +621,56 @@ pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
 #[cfg(not(windows))]
 pub(super) fn release_pool_backing(base: usize, len: usize) {
     unmap(&mut physical(), base, len);
+}
+
+/// `VirtualFree(MEM_DECOMMIT)` of `[base, base + len)`: the physical-page views there stay, so the
+/// GPU's pool table and the aliases keep showing what the title address shows, and are made no
+/// access; the rest of the range is decommitted. Decommitting over the views put anonymous pages
+/// in their place while the pool stayed in the books (issue #15).
+///
+/// Windows only promises that a page committed again reads zeros. A page is zeroed only if it is
+/// `XMemVirtualAlloc`'s pool backing and no other address shows it, so only this address could
+/// read it again. Other pages keep their bytes: a page shown elsewhere (aliases, `map_alias`) is
+/// still read there, and pages `XMemAllocatePhysicalPages` made outlive their mappings, since
+/// the title may map them again. Guess: the console keeps those pages' contents too; what it does
+/// is unknown, and `VICTORY_TRACE_OWNERS` names such a decommit.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(crate) fn decommit(base: usize, len: usize) -> bool {
+    let decommit = |at: usize, len| {
+        // SAFETY: the title decommits inside its own reservation.
+        len == 0 || unsafe { mem::decommit(at as *mut u8, len) }.is_ok()
+    };
+    let physical = physical();
+    let end = base + len;
+    let first = physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base);
+    let (mut done, mut ok) = (base, true);
+    for (&at, (size, slice)) in first.into_iter().chain(physical.views.range(base..end)) {
+        let (from, to) = (at.max(base), (at + size).min(end));
+        ok &= decommit(done, from - done);
+        done = to;
+        // SAFETY: a view in the title's own reservation, which it gives up.
+        if unsafe { mem::protect(from as *mut u8, to - from, Protect::READ_WRITE) }.is_err() {
+            ok = false;
+            continue;
+        }
+        // shortcut: zeroing touches every page it zeroes, also those never written; skip pages
+        // never touched (mincore) if a title decommits large ranges it did not use.
+        for k in (from - at) / PAGE..(to - at).div_ceil(PAGE) {
+            let alone = |a: &Addresses| a.as_slice().len() == 1;
+            if slice.pool.backs && physical.shown.get(&slice.key(k)).is_some_and(alone) {
+                let (a, b) = ((at + k * PAGE).max(from), (at + (k + 1) * PAGE).min(to));
+                // SAFETY: read-write just above.
+                unsafe { std::ptr::write_bytes(a as *mut u8, 0, b - a) };
+            }
+        }
+        // SAFETY: as above.
+        ok &= unsafe { mem::protect(from as *mut u8, to - from, Protect::NO_ACCESS) }.is_ok();
+    }
+    ok && decommit(done, end - done)
 }
 
 /// The pool a physical-page view shows at `at`, if any (its id: a new pool never has an old one's).

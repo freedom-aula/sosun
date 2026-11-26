@@ -312,8 +312,8 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
             let range = region_held("decommitted range", (at, size), owner_at);
             xmem_physical::freeing("VirtualFree(MEM_DECOMMIT) over views", &range);
         }
-        // SAFETY: the title decommits inside its own reservation.
-        unsafe { mem::decommit(address.cast(), size.next_multiple_of(mem::page_size())) }.is_ok()
+        // Physical-page views there stay, zeroed.
+        xmem_physical::decommit(address as usize, size.next_multiple_of(mem::page_size()))
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -1136,6 +1136,54 @@ mod memory_tests {
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
         }
+    }
+
+    /// `VirtualFree(MEM_DECOMMIT)` keeps the bytes of a physical page another address still
+    /// shows: `XMemMapPhysicalPages` pages mapped twice, and `XMemVirtualAlloc` memory the GPU's
+    /// page mapping (`map_alias`) shows elsewhere too (issue #15).
+    #[test]
+    fn decommitting_keeps_pages_shown_at_other_addresses() {
+        use crate::modules::xmem::{
+            XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages,
+            XMemVirtualAlloc, map_alias,
+        };
+        let region = || {
+            let r = VirtualAlloc(std::ptr::null_mut(), GRANULARITY, MEM_RESERVE, 0x01);
+            assert!(!r.is_null());
+            r
+        };
+        let (mut n, mut page) = (1usize, [0usize]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, page.as_mut_ptr()), 1);
+        let (a, b) = (region(), region());
+        for r in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(r, 1, page.as_ptr()), r);
+        }
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write(7) };
+        assert_eq!(VirtualFree(a, GRANULARITY, MEM_DECOMMIT), 1);
+        // SAFETY: still mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().read() }, 7, "physical pages keep their bytes");
+
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULARITY,
+            MEM_RESERVE | MEM_COMMIT,
+            0,
+            0x04,
+        );
+        assert!(!p.is_null());
+        let c = region();
+        assert!(map_alias(c as u64, p as u64, GRANULARITY as u64));
+        // SAFETY: committed read-write.
+        unsafe { p.cast::<u8>().write(5) };
+        assert_eq!(VirtualFree(p, GRANULARITY, MEM_DECOMMIT), 1);
+        // SAFETY: the alias is still mapped read-write.
+        assert_eq!(unsafe { c.cast::<u8>().read() }, 5, "an aliased page keeps its bytes");
+
+        for r in [a, b, c, p] {
+            assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
+        }
+        assert_eq!(XMemFreePhysicalPages(1, page.as_ptr()), 1);
     }
 
     /// `VICTORY_TRACE_OWNERS`: views left in a range `VirtualFree(MEM_DECOMMIT)` gives back, and
