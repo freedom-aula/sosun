@@ -525,8 +525,13 @@ impl Metal {
         }
     }
 
-    /// Residency for one command buffer: the heap's set, committed if entries changed.
-    fn use_heap_cb(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>, heap: &Heap) {
+    /// A set covers all passes in the command buffer. Later uses can still commit new entries.
+    fn use_heap_cb(
+        &self,
+        heap: &Heap,
+        attached_heaps: &mut Vec<*const Heap>,
+        attach: impl FnOnce(&ProtocolObject<dyn MTLResidencySet>),
+    ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
                 set.commit();
@@ -536,7 +541,10 @@ impl Metal {
                     c.heap_set_bytes = c.heap_set_bytes.max(set.allocatedSize());
                 });
             }
-            cb.useResidencySet(set);
+            if !attached_heaps.contains(&std::ptr::from_ref(heap)) {
+                attached_heaps.push(heap);
+                attach(set);
+            }
         }
     }
 
@@ -1139,10 +1147,15 @@ impl GraphicsBackend for Metal {
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
         // is dropped, the command buffer still commits, and the caller is told.
         let mut refused: Option<String> = None;
+        let mut attached_heaps = Vec::new();
         for pass in work.passes {
             let encoded = match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order),
-                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order),
+                Pass::Compute(dispatches) => {
+                    self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
+                }
+                Pass::Render(rp) => {
+                    self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
+                }
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
             };
             if let Err(e) = encoded {
@@ -1696,6 +1709,7 @@ impl Metal {
         dispatches: &[crate::backend::Dispatch<'_, Metal>],
         set_on_queue: bool,
         order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
     ) -> Result<(), String> {
         let runs = |d: &crate::backend::Dispatch<'_, Metal>| {
             d.indirect.is_some() || !d.groups.contains(&0)
@@ -1720,7 +1734,7 @@ impl Metal {
             };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
-                self.use_heap_cb(cb, h);
+                self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
             self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
@@ -1778,6 +1792,7 @@ impl Metal {
         rp: &RenderPass<'_, Metal>,
         set_on_queue: bool,
         order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
     ) -> Result<(), String> {
         // Attachments must agree in sample count. Their sizes may differ (a 1920x1080 colour
         // target over a 3840x2160 depth target in GTA VI's story load): the console draws into
@@ -1925,7 +1940,7 @@ impl Metal {
                 continue;
             }
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
-                self.use_heap_cb(cb, h);
+                self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
             e.setRenderPipelineState(&d.pipeline.pso);
             e.setCullMode(d.pipeline.cull);
@@ -2479,6 +2494,38 @@ mod sampler_tests {
 #[cfg(test)]
 mod heap_set_tests {
     use super::*;
+
+    #[test]
+    fn each_command_buffer_attaches_each_heap_once_and_commits_later_changes() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let a = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let b = m.create_heap(HeapKind::Sampler, 1).unwrap();
+        let Some(set_a) = &a.set else {
+            eprintln!("skipped: no residency sets on this system");
+            return;
+        };
+        let attaches = |heap: &Heap, attached_heaps: &mut Vec<*const Heap>| {
+            let mut called = false;
+            m.use_heap_cb(heap, attached_heaps, |_| called = true);
+            called
+        };
+        let mut first = Vec::new();
+        assert!(attaches(&a, &mut first));
+        assert!(attaches(&b, &mut first));
+
+        // Metal reports allocatedSize at the last commit.
+        let before = set_a.allocatedSize();
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 128, 128)).unwrap();
+        m.write_texture(&a, 0, &texture, 0.0);
+        assert!(a.dirty.get());
+        assert!(!attaches(&a, &mut first));
+        assert!(!a.dirty.get());
+        assert!(set_a.allocatedSize() > before);
+
+        let mut second = Vec::new();
+        assert!(attaches(&a, &mut second));
+        assert!(!attaches(&a, &mut second));
+    }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,
     /// and lets an allocation go when the last entry naming it is overwritten: the set is what a
