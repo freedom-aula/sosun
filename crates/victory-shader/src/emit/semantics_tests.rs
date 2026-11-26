@@ -296,6 +296,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         bias_as_gradients: false,
         narrow_waves: false,
         wave32_host: false,
+        zero_copy_memory: false,
         view_marks: false,
     })
     .map_err(e)?;

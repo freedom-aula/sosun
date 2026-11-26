@@ -5,11 +5,12 @@
 //! keeps libraries by URL), pipelines cached by the content of their DXIL, and what the host
 //! cannot run refused, logged and counted instead of failing the submission.
 //!
-//! What a translated shader needs from the host that this one does not give yet, and is refused
-//! for: title memory read at addresses the shader computes (the page table of `victory_shader`'s
-//! "Title memory", whose replacement by the pool offset of the zero-copy contract is a change to
-//! the translator), buffer views read from the heap by index, and the write marks and view
-//! addresses of the shadow-copy design. See docs/metal-backend.md.
+//! Title memory at addresses the shader computes is found through the page table of
+//! `victory_shader`'s "Title memory", which `super::addr` fills with views of the pools
+//! themselves (the pool-offset contract; compute shaders so far). What a translated shader needs
+//! from the host that this one does not give yet, and is refused for: buffer views read from the
+//! heap by index, the write marks and view addresses of the shadow-copy design, and, in a graphics
+//! pipeline, the page table. See docs/metal-backend.md.
 
 use super::list::{Binding, ComputePso};
 use super::state::{self, Graphics};
@@ -23,6 +24,7 @@ use victory_shader::emit::{HostShader, Options};
 pub fn options() -> Options {
     Options {
         wave32_host: true,
+        zero_copy_memory: true,
         ..Options::default()
     }
 }
@@ -32,10 +34,14 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::translate_with(container, options()).map_err(|e| e.to_string())
 }
 
-/// What the host cannot give a translated shader (the reason is the refusal's).
-pub fn unsupported(shader: &HostShader) -> Option<&'static str> {
-    if shader.memory || shader.memory_writes {
-        return Some("reads title memory through the page table");
+/// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
+/// give the page table (compute shaders).
+pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
+    if shader.memory_writes {
+        return Some("marks the pages it writes (translated without zero_copy_memory)");
+    }
+    if shader.memory && !memory {
+        return Some("reads title memory through the page table in a graphics pipeline");
     }
     if shader.view_addresses || shader.view_marks {
         return Some("needs view addresses or write marks");
@@ -46,7 +52,7 @@ pub fn unsupported(shader: &HostShader) -> Option<&'static str> {
     if shader
         .user_data
         .iter()
-        .any(|u| u.dword >= victory_shader::emit::ROOT_SRV_VIEW)
+        .any(|u| u.root == victory_shader::RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW)
     {
         return Some("reads root views as heap views");
     }
@@ -56,7 +62,7 @@ pub fn unsupported(shader: &HostShader) -> Option<&'static str> {
 /// Why a vertex shader and pixel shader cannot be a pipeline of the host, if they cannot.
 fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
     for s in [Some(vs), ps].into_iter().flatten() {
-        if let Some(why) = unsupported(s) {
+        if let Some(why) = unsupported(s, false) {
             return Some(why);
         }
     }
@@ -130,7 +136,7 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
-        if let Some(why) = unsupported(shader) {
+        if let Some(why) = unsupported(shader, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -149,13 +155,20 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.refuse(name, "no thread group size".into());
             return Pipe::Refused;
         };
-        match self.host.backend.create_compute_pipeline(&shader.dxil) {
+        // Translator output carries no root signature: the argument buffer is laid out by the
+        // binding the host fills it by.
+        let binding = Binding::of(shader);
+        let made = match binding.layout() {
+            Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
+            None => self.host.backend.create_compute_pipeline(&shader.dxil),
+        };
+        match made {
             Ok(pso) => {
                 self.shaders.pipelines += 1;
                 Pipe::Compute(Rc::new(ComputePso {
                     pso,
                     threads,
-                    binding: Some(Binding::of(shader)),
+                    binding: Some(binding),
                 }))
             }
             Err(e) => {

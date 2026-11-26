@@ -596,6 +596,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         bias_as_gradients: false,
         narrow_waves: false,
         wave32_host: false,
+        zero_copy_memory: false,
         view_marks: false,
     })
     .expect("lower");

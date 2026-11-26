@@ -25,6 +25,28 @@ impl RootArgs {
     }
 }
 
+/// One root parameter of a [`RootLayout`]: what a translated shader declares at a register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RootParam {
+    /// `dwords` root constants at `b<register>` of `space`: inline in the argument buffer.
+    Constants { register: u32, space: u32, dwords: u32 },
+    /// A root CBV (`b`), SRV (`t`) or UAV (`u`): a 64-bit GPU address in the argument buffer.
+    Cbv { register: u32, space: u32 },
+    Srv { register: u32, space: u32 },
+    Uav { register: u32, space: u32 },
+}
+
+/// The root signature of translated shaders, which carry none: parameters in the order
+/// [`RootArgs`] is filled in, descriptor heaps indexed directly. Without one a backend takes the
+/// signature the shader itself embeds (DXIL compiled by dxc), or its own default layout.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RootLayout {
+    pub params: Vec<RootParam>,
+    /// The shader reads the memory of a raw buffer view out of range as 0 and drops its writes
+    /// (`D3D12` hardware does; Metal needs the converter told).
+    pub bounds_checked: bool,
+}
+
 /// One `Dispatch` call: the pipeline, its root arguments, the memory it touches (for residency),
 /// and the group counts and sizes.
 pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
@@ -88,6 +110,12 @@ pub trait ComputeBackend {
     fn gpu_address(&self, buffer: &Self::Buffer, title: *const u8) -> u64;
     /// DXIL container (`victory_shader::emit` output) to a compute pipeline.
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Self::Pipeline, String>;
+    /// The same for DXIL without a root signature, laid out as `layout` says.
+    fn create_compute_pipeline_with(
+        &self,
+        dxil: &[u8],
+        layout: &RootLayout,
+    ) -> Result<Self::Pipeline, String>;
     /// Queue the work and return; never waits for the GPU.
     fn submit(&self, queue: &Self::Queue, work: &Submission<'_, Self>) -> Result<(), String>;
     /// `ID3D12Fence::Signal` from the CPU: queues waiting for `value` go on.

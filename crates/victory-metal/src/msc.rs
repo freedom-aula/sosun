@@ -4,6 +4,7 @@
 //! supplies (`VICTORY_MSC_DYLIB`). The C API is declared by hand from `metal_irconverter.h`.
 
 use std::ffi::{CStr, CString, c_char, c_void};
+use victory_backend::backend::{RootLayout, RootParam};
 
 type Create = unsafe extern "C" fn() -> *mut c_void;
 type Destroy = unsafe extern "C" fn(*mut c_void);
@@ -17,6 +18,58 @@ type LibBytes = unsafe extern "C" fn(*const c_void, *mut u8) -> usize;
 type ErrCode = unsafe extern "C" fn(*mut c_void) -> u32;
 type SetEntry = unsafe extern "C" fn(*mut c_void, *const c_char);
 type Payload = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -> *mut c_void;
+type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
+type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
+
+/// `IRRootParameter1`: type, a 16-byte union (constants `{register, space, count}`, descriptor
+/// `{register, space, flags}`), shader visibility (all).
+#[repr(C)]
+struct Parameter {
+    kind: u32,
+    union: [u64; 2],
+    visibility: u32,
+}
+
+/// `IRVersionedRootSignatureDescriptor` with version 1.1 (`IRRootSignatureDescriptor1`, no static
+/// samplers).
+#[repr(C)]
+struct Descriptor {
+    version: u32,
+    /// The union that follows is 8-aligned.
+    _pad: u32,
+    count: u32,
+    parameters: *const Parameter,
+    samplers: u32,
+    static_samplers: *const c_void,
+    flags: u32,
+}
+
+/// `IRRootSignatureFlagCBVSRVUAVHeapDirectlyIndexed | IRRootSignatureFlagSamplerHeapDirectlyIndexed`.
+const HEAPS_DIRECTLY_INDEXED: u32 = 0x400 | 0x800;
+/// `IRCompatibilityFlagBoundsCheck`.
+const BOUNDS_CHECK: u32 = 1;
+
+impl Parameter {
+    fn of(p: &RootParam) -> Parameter {
+        // IRRootParameterType: table 0, 32-bit constants 1, CBV 2, SRV 3, UAV 4.
+        let (kind, register, space, extra) = match *p {
+            RootParam::Constants {
+                register,
+                space,
+                dwords,
+            } => (1, register, space, dwords),
+            RootParam::Cbv { register, space } => (2, register, space, 0),
+            RootParam::Srv { register, space } => (3, register, space, 0),
+            RootParam::Uav { register, space } => (4, register, space, 0),
+        };
+        Parameter {
+            kind,
+            union: [u64::from(register) | u64::from(space) << 32, u64::from(extra)],
+            visibility: 0,
+        }
+    }
+}
 
 pub struct Msc {
     h: *mut c_void,
@@ -79,10 +132,50 @@ impl Msc {
 
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
     pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), ConvError> {
+        self.convert_with(dxil, entry, None)
+    }
+
+    /// [`Self::convert`] with the top-level argument buffer laid out as `layout` says (for DXIL
+    /// that carries no root signature), and out-of-range raw buffer accesses made safe if it asks.
+    pub fn convert_with(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+    ) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
             let comp = sym::<Create>(h, "IRCompilerCreate")();
+            let params: Vec<Parameter> = layout
+                .map(|l| l.params.iter().map(Parameter::of).collect())
+                .unwrap_or_default();
+            let mut signature = std::ptr::null_mut();
+            if let Some(l) = layout {
+                let d = Descriptor {
+                    version: 2,
+                    _pad: 0,
+                    count: params.len() as u32,
+                    parameters: params.as_ptr(),
+                    samplers: 0,
+                    static_samplers: std::ptr::null(),
+                    flags: HEAPS_DIRECTLY_INDEXED,
+                };
+                let mut err = std::ptr::null_mut();
+                signature = sym::<MakeSignature>(h, "IRRootSignatureCreateFromDescriptor")(&d, &mut err);
+                if signature.is_null() {
+                    let code = if err.is_null() { 0 } else { sym::<ErrCode>(h, "IRErrorGetCode")(err) };
+                    sym::<Destroy>(h, "IRCompilerDestroy")(comp);
+                    return Err(ConvError {
+                        code,
+                        msg: "the root signature was refused".into(),
+                    });
+                }
+                sym::<SetSignature>(h, "IRCompilerSetGlobalRootSignature")(comp, signature);
+                if l.bounds_checked {
+                    sym::<SetFlags>(h, "IRCompilerSetCompatibilityFlags")(comp, BOUNDS_CHECK);
+                }
+            }
             if let Some(e) = entry {
                 let e = CString::new(e).unwrap();
                 sym::<SetEntry>(h, "IRCompilerSetEntryPointName")(comp, e.as_ptr());
@@ -133,6 +226,9 @@ impl Msc {
             }
             sym::<Destroy>(h, "IRObjectDestroy")(input);
             sym::<Destroy>(h, "IRCompilerDestroy")(comp);
+            if !signature.is_null() {
+                sym::<Destroy>(h, "IRRootSignatureDestroy")(signature);
+            }
             res
         }
     }

@@ -144,6 +144,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         bias_as_gradients: false,
         narrow_waves: false,
         wave32_host: false,
+        zero_copy_memory: false,
         view_marks: false,
     })?;
 
@@ -1307,6 +1308,7 @@ fn lower_cs32_with(
         bias_as_gradients: super::host::under_wine(),
         narrow_waves: false,
         wave32_host: false,
+        zero_copy_memory: false,
         view_marks: false,
     })
     .expect("lower");
