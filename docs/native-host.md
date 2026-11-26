@@ -316,6 +316,12 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
 - The probe's `.tls` handling is hand-written (`_tls_used`, `_tls_start`, `_tls_end`), since it links no CRT. A real MinGW or MSVC title brings its own.
 
+## Root signatures without a host `d3d12.dll`
+
+`D3D12SerializeRootSignature`, its versioned form and `D3D12CreateRootSignatureDeserializer` call the host's `d3d12.dll` when there is one (Windows). On macOS `victory-gpu/src/rootser.rs` does both in Rust: it writes `RTS0` blobs (versions 1.0 and 1.1) and reads them back, bare or as the `RTS0` part of a DXBC container, into an `ID3D12RootSignatureDeserializer` whose description lives as long as the object. A malformed blob (truncated, an offset or count outside the blob, more than 4096 parameters or 2048 static samplers, a version other than 1 or 2, a parameter type above 4) gives `E_INVALIDARG` and no object. The AMD FidelityFX upscaler deserializes its root signatures at the first world frame (29 calls in testers' logs, which used to fail with `E_NOTIMPL`).
+
+Guess: a 1.1 blob is returned as the 1.0 description, its range and root descriptor flags dropped, which is believed to be what Microsoft's 1.0 deserializer does. The Windows test `we_read_the_hosts_blobs_as_it_does` has Microsoft's serializer write 1.0 and 1.1 blobs, compares Microsoft's reader and ours on them, and settles it. Microsoft's blobs are DXBC containers with an `RTS0` part, which ours reads by the same path; our serializer writes a bare `RTS0`, which only our reader is given.
+
 ## Bring-up diagnostics (native path)
 
 Off by default, environment variables of the host process:
