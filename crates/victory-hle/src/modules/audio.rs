@@ -1213,7 +1213,10 @@ mod tests {
         // Blocks 2, 3 and 0 written (silence), 1 left for the title, and
         // nothing past the ring.
         assert_eq!((write, writable), (1, 0));
-        assert!(ring[0x400..].iter().all(|&b| b == 0x55), "written past the ring");
+        assert!(
+            ring[0x400..].iter().all(|&b| b == 0x55),
+            "written past the ring"
+        );
         let block = |n: usize| &ring[n * 0x100..(n + 1) * 0x100];
         assert!([0, 2, 3].iter().all(|&n| block(n).iter().all(|&b| b == 0)));
         assert!(block(1).iter().all(|&b| b == 0x55));

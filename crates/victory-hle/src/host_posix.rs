@@ -44,6 +44,9 @@ const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
 const DEFAULT_STACK: usize = 1 << 20;
 const STILL_ACTIVE: u32 = 259;
+/// `VirtualAlloc`'s allocation granularity: where a reservation starts, and
+/// the least it takes of the address space.
+const GRANULARITY: usize = 64 << 10;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -108,6 +111,16 @@ pub extern "system" fn Sleep(ms: u32) {
 /// the whole region.
 static REGIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
+/// Lets `VirtualFree(MEM_RELEASE)` release a region another module reserved
+/// (`xmem`'s `XMemVirtualAlloc`), and takes it back when that module frees it.
+pub(crate) fn adopt_region(base: usize, len: usize) {
+    lock(&REGIONS).insert(base, len);
+}
+
+pub(crate) fn forget_region(base: usize) {
+    lock(&REGIONS).remove(&base);
+}
+
 /// Win32 `PAGE_*` to a protection.
 fn protection(flags: u32) -> Option<Protect> {
     Some(match flags & 0xFF {
@@ -131,6 +144,31 @@ fn page_flags(p: Protect) -> u32 {
     }
 }
 
+/// Reserves `len` bytes (a multiple of [`GRANULARITY`]) at `at`, or at an
+/// address that is a multiple of it: more than that is reserved and the ends
+/// given back, since macOS reserves on its page size (16 KiB; 4 KiB under
+/// Rosetta).
+fn reserve_granular(at: Option<usize>, len: usize) -> std::io::Result<*mut u8> {
+    if at.is_some() {
+        // SAFETY: fresh address space; a fixed address fails if taken.
+        return unsafe { mem::reserve(at, len) };
+    }
+    // SAFETY: fresh address space.
+    let p = unsafe { mem::reserve(None, len + GRANULARITY) }? as usize;
+    let start = p.next_multiple_of(GRANULARITY);
+    // SAFETY: the ends of the reservation just made.
+    unsafe {
+        if start > p {
+            mem::release(p as *mut u8, start - p)?;
+        }
+        let end = start + len;
+        if p + len + GRANULARITY > end {
+            mem::release(end as *mut u8, p + len + GRANULARITY - end)?;
+        }
+    }
+    Ok(start as *mut u8)
+}
+
 pub extern "system" fn VirtualAlloc(
     address: *mut c_void,
     size: usize,
@@ -145,15 +183,19 @@ pub extern "system" fn VirtualAlloc(
     let len = size.next_multiple_of(page);
     let at = address as usize;
     let result = if kind & MEM_RESERVE != 0 {
-        let at = (at != 0).then_some(at & !(page - 1));
-        let prot = if kind & MEM_COMMIT != 0 {
-            prot
-        } else {
-            Protect::NO_ACCESS
-        };
-        // SAFETY: fresh address space; a fixed address fails if taken.
-        unsafe { mem::alloc(at, len, prot) }.inspect(|p| {
-            lock(&REGIONS).insert(*p as usize, len);
+        let len = size.next_multiple_of(GRANULARITY);
+        let at = (at != 0).then_some(at & !(GRANULARITY - 1));
+        reserve_granular(at, len).and_then(|p| {
+            if kind & MEM_COMMIT != 0 {
+                // SAFETY: the reservation just made.
+                if let Err(e) = unsafe { mem::commit(p, len, prot) } {
+                    // SAFETY: as above.
+                    unsafe { mem::release(p, len) }?;
+                    return Err(e);
+                }
+            }
+            lock(&REGIONS).insert(p as usize, len);
+            Ok(p)
         })
     } else if kind & MEM_COMMIT != 0 && at != 0 {
         let start = at & !(page - 1);
@@ -754,5 +796,49 @@ fn exceptions(name: &str) -> Option<usize> {
         "RemoveVectoredExceptionHandler" => Some(api::remove_vectored as *const () as usize),
         "SetUnhandledExceptionFilter" => Some(api::set_unhandled as *const () as usize),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn reservations_start_on_64_kib_and_take_whole_granules() {
+        let mut bases = Vec::new();
+        for size in [1, 4096, 16384, 65536, 65537, 3 << 20] {
+            let p = VirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                0x04, // PAGE_READWRITE
+            );
+            assert!(!p.is_null());
+            assert_eq!(p as usize % GRANULARITY, 0, "size {size}");
+            // The whole granule is there to use, and is what was taken.
+            let granules = size.div_ceil(GRANULARITY) * GRANULARITY;
+            // SAFETY: committed read-write by the call above.
+            unsafe {
+                p.cast::<u8>().add(granules - 1).write(1);
+                p.cast::<u8>().write(2);
+            }
+            assert_eq!(lock(&REGIONS)[&(p as usize)], granules);
+            bases.push(p);
+        }
+        // A fixed address rounds down to the granule.
+        let fixed = VirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULARITY,
+            MEM_RESERVE,
+            0x01, // PAGE_NOACCESS
+        );
+        assert_eq!(VirtualFree(fixed, 0, MEM_RELEASE), 1);
+        let again = VirtualAlloc(fixed.wrapping_byte_add(0x5000), 1, MEM_RESERVE, 0x01);
+        assert_eq!(again, fixed);
+        bases.push(again);
+        for p in bases {
+            assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+            assert!(!lock(&REGIONS).contains_key(&(p as usize)));
+        }
     }
 }

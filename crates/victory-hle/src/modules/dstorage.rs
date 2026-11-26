@@ -20,7 +20,9 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -103,10 +105,36 @@ fn iid_text(iid: *const Guid) -> String {
 }
 
 /// `HRESULT_FROM_WIN32` of a host error.
+#[cfg(windows)]
 fn from_win32(error: &std::io::Error) -> HRESULT {
     error
         .raw_os_error()
         .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
+}
+
+/// The Win32 error a POSIX one stands for (`ERROR_FILE_NOT_FOUND`,
+/// `ERROR_ACCESS_DENIED`, `ERROR_READ_FAULT` for the rest), as an `HRESULT`.
+#[cfg(not(windows))]
+fn from_win32(error: &std::io::Error) -> HRESULT {
+    let code: u32 = match error.kind() {
+        std::io::ErrorKind::NotFound => 2,
+        std::io::ErrorKind::PermissionDenied => 5,
+        _ => 30,
+    };
+    (0x8007_0000 | code) as i32
+}
+
+/// Reads at `offset` without moving a file position (`ReadFile` with an
+/// offset on Windows, `pread` elsewhere).
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(windows)]
+    {
+        file.seek_read(buf, offset)
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, offset)
+    }
 }
 
 // The factory.
@@ -115,13 +143,35 @@ type Factory = *const Object;
 
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
-    const GENERIC_READ: u32 = 0x8000_0000;
-    const FILE_SHARE_READ: u32 = 1;
-    const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
+    // SAFETY: the title passes a NUL-terminated path.
+    let name = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+    };
+    let file = match open_for_reading(path, &name) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+            return from_win32(&error);
+        }
+    };
+    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, path: name },
+    );
+    put(out, file)
+}
+
+/// Goes through `files` on Windows, so paths on our virtual drives work too.
+#[cfg(windows)]
+fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::File> {
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
@@ -131,21 +181,18 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
-    // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
-    };
     if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
+        return Err(std::io::Error::last_os_error());
     }
-    tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
-    put(out, file)
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+// shortcut: no virtual drives yet (they come with `files.rs` on POSIX); the
+// path is used as the title wrote it with `\` read as `/`.
+#[cfg(not(windows))]
+fn open_for_reading(_path: *const u16, name: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(name.replace('\\', "/"))
 }
 
 /// `(capacity, name, iid, out)`.
@@ -498,7 +545,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
@@ -587,7 +635,11 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        let mut commands = if explicit {
+            std::mem::take(&mut lane.held)
+        } else {
+            Vec::new()
+        };
         commands.append(&mut lane.unsubmitted);
         for command in commands {
             let hold = !explicit
@@ -800,7 +852,9 @@ fn queue(this: QueueRef, command: Command) {
         if !lane.held.is_empty() {
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+                tracing::warn!(
+                    "dstorage: a full queue's reads into physical pages start before the title's Submit"
+                );
             }
             lanes.submit(id);
             scheduler.work.notify_all();
@@ -838,7 +892,10 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes
+        .lanes
+        .get(&id)
+        .map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1004,7 +1061,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match read_at(file, &mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1027,6 +1084,7 @@ fn into_destination(
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
+        #[cfg(windows)]
         let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
@@ -1101,7 +1159,9 @@ fn source_name(request: &Request) -> &str {
         return "memory";
     }
     // SAFETY: a file object we created; the title keeps it open.
-    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
+    &unsafe { &*request.source.cast::<Instance<File>>() }
+        .state
+        .path
 }
 
 /// Queues that submitted themselves, half full (diagnostics).
@@ -1139,7 +1199,6 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
-    use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1157,7 +1216,7 @@ mod tests {
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain([0]).collect();
         let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let mut file = std::ptr::null_mut();
@@ -1621,6 +1680,123 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    /// File reads (`pread` on the workers) into plain memory and into
+    /// physical pages (a page boundary crossed, in place through the pool's
+    /// view), several at once on two queues, each signalling its own status.
+    #[test]
+    fn file_reads_land_in_memory_and_in_physical_pages() {
+        use crate::modules::xmem;
+        let plain = pattern(3 * PAGE + 1234);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain[..100_000], 6);
+        let mut contents = plain.clone();
+        contents.extend_from_slice(&packed);
+        let (_dir, file) = file_with(&contents);
+
+        let (mut pages, mut n) = ([0usize; 3], 3);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
+            mapped
+        );
+
+        let (q_pages, q_memory) = (new_queue(1), new_queue(1));
+        let (a_pages, a_memory) = (status_array(1), status_array(2));
+
+        // Raw bytes from the middle of the file, across the first page edge.
+        let mut r = request(
+            PAGE_DESTINATION,
+            pages.as_mut_ptr().cast(),
+            120_000,
+            file,
+            1000,
+            120_000,
+        );
+        r.page_offset = (PAGE - 500) as u64;
+        enqueue(q_pages, &r);
+        enqueue_status(q_pages, a_pages, 0);
+        // The compressed tail into plain memory, and a raw read of the end.
+        let mut inflated = vec![0u8; 100_000];
+        let mut tail = vec![0u8; 1234];
+        enqueue(
+            q_memory,
+            &request(
+                ZLIB,
+                inflated.as_mut_ptr().cast(),
+                inflated.len(),
+                file,
+                plain.len() as u64,
+                packed.len(),
+            ),
+        );
+        enqueue_status(q_memory, a_memory, 0);
+        enqueue(
+            q_memory,
+            &request(
+                0,
+                tail.as_mut_ptr().cast(),
+                1234,
+                file,
+                3 * PAGE as u64,
+                1234,
+            ),
+        );
+        // Past the end of the file: fails with end-of-file.
+        let mut beyond = vec![0u8; 64];
+        enqueue(
+            q_memory,
+            &request(
+                0,
+                beyond.as_mut_ptr().cast(),
+                64,
+                file,
+                contents.len() as u64,
+                64,
+            ),
+        );
+        enqueue_status(q_memory, a_memory, 1);
+        void(q_pages, 0x30);
+        void(q_memory, 0x30);
+
+        assert_eq!(wait(a_pages, 0), S_OK);
+        assert_eq!(wait(a_memory, 0), S_OK);
+        assert_eq!(wait(a_memory, 1), END_OF_FILE);
+        // SAFETY: all three pages are mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
+        assert_eq!(
+            &seen[PAGE - 500..PAGE - 500 + 120_000],
+            &plain[1000..121_000]
+        );
+        assert_eq!(seen[PAGE - 501], 0, "nothing before the offset is written");
+        assert_eq!(inflated, plain[..100_000]);
+        assert_eq!(tail, plain[3 * PAGE..]);
+    }
+
+    #[test]
+    fn opening_a_missing_file_reports_not_found() {
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nothing.bin");
+        let wide: Vec<u16> = path.to_str().unwrap().encode_utf16().chain([0]).collect();
+        let mut file = std::ptr::null_mut();
+        assert_eq!(
+            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
+            0x8007_0002_u32 as i32
+        );
+        assert!(file.is_null());
+    }
+
     #[test]
     fn a_page_list_filled_after_its_request_starts() {
         use crate::modules::xmem;
@@ -1694,7 +1870,11 @@ mod tests {
         read(&mut l, 0, PAGE_DESTINATION, 16);
         read(&mut l, 0, 0, 16);
         add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
@@ -1727,7 +1907,10 @@ mod tests {
             0x04,
         );
         assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
+            mapped
+        );
         // The title's page table: still the page's previous owner when the
         // request is enqueued, the right page by its Submit.
         let mut list = [pages[0]];
@@ -1754,7 +1937,17 @@ mod tests {
         );
         enqueue(queue, &r);
         let mut out = [0u8; 16];
-        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        enqueue(
+            queue,
+            &request(
+                MEMORY_SOURCE,
+                out.as_mut_ptr().cast(),
+                16,
+                plain.as_ptr().cast(),
+                0,
+                16,
+            ),
+        );
         // Half of four: the queue submitted itself. Time for a read started
         // then to land in the old page.
         std::thread::sleep(std::time::Duration::from_millis(50));

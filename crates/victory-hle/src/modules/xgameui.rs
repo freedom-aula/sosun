@@ -60,7 +60,8 @@ extern "system" fn text_entry_async(
     scope: u32,
     max_length: u32,
 ) -> HRESULT {
-    let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let [title, description, default] =
+        [title, description, default].map(|t| text(t).unwrap_or_default());
     let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {

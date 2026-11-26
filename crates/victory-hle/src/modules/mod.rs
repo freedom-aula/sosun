@@ -14,7 +14,7 @@ pub mod audio;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod dstorage;
 #[cfg(windows)]
 pub mod fidelityfx;
@@ -37,8 +37,12 @@ pub mod xgame;
 pub mod xgameruntime;
 pub mod xgamesave;
 pub mod xgameui;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod xmem;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod xmem_physical;
+#[cfg(target_os = "macos")]
+mod xmem_posix;
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
@@ -61,7 +65,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     all.push(dstorage::module());
     #[cfg(windows)]
     all.push(files::module());
@@ -70,7 +74,7 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(net::module());
     all.push(rpcrt4::module());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());

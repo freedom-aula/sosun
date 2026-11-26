@@ -52,9 +52,18 @@ fn reserve_at_an_address_fails_when_taken() {
         let p = mem::reserve(None, g).unwrap();
         assert!(mem::reserve(Some(p as usize), g).is_err());
         mem::release(p, g).unwrap();
-        // Free again, so exactly there works.
-        let q = mem::reserve(Some(p as usize), g).unwrap();
-        assert_eq!(q, p);
+        // Free again, so exactly there works. Other tests reserve at the same
+        // time and may take the address between the release and here, so
+        // try new addresses until one is not taken.
+        let mut at = p;
+        let q = loop {
+            if let Ok(q) = mem::reserve(Some(at as usize), g) {
+                break q;
+            }
+            at = mem::reserve(None, g).unwrap();
+            mem::release(at, g).unwrap();
+        };
+        assert_eq!(q, at);
         mem::release(q, g).unwrap();
     }
 }
@@ -84,6 +93,9 @@ fn a_page_pool_maps_at_several_addresses() {
 
         // At a chosen address.
         let free = mem::reserve(None, 4 * g).unwrap();
+        // Windows maps over free space only; macOS over the reservation
+        // (letting go first would race the other tests for the address).
+        #[cfg(windows)]
         mem::release(free, 4 * g).unwrap();
         let d = pool
             .map(0, 4 * g, Some(free as usize), Protect::READ_WRITE)
@@ -133,6 +145,117 @@ fn one_protect_call_covers_many_mappings_of_a_pool() {
         mem::unmap(alias, n * g).unwrap();
         mem::release(base, n * g).unwrap();
     }
+}
+
+/// The pool's own mapping of all of it, which stays where it is whatever
+/// else is mapped and unmapped, and the windows cut from it.
+#[test]
+fn a_page_pool_has_one_permanent_base() {
+    let g = mem::granularity();
+    let pool = PagePool::new(4 * g).unwrap();
+    let base = pool.base().expect("the host maps the pool");
+    assert_eq!(base as usize % 0x4000, 0);
+    // SAFETY: the test owns every view it maps.
+    unsafe {
+        write(base, 2 * g + 1, 0x5a);
+        let a = pool.map(0, 4 * g, None, Protect::READ_WRITE).unwrap();
+        assert_eq!(read(a, 2 * g + 1), 0x5a, "a view shows what base wrote");
+        write(a, 3 * g, 0x77);
+        mem::unmap(a, 4 * g).unwrap();
+        assert_eq!(pool.base(), Some(base), "the base does not move");
+        assert_eq!(read(base, 3 * g), 0x77, "and what a view wrote stays");
+    }
+    // A window is the same bytes at their place in the base.
+    let w = pool.window(g, 2 * g).unwrap();
+    assert_eq!(w.as_mut_ptr(), base.wrapping_add(g));
+    assert_eq!(read(w.as_mut_ptr(), g + 1), 0x5a);
+    assert!(pool.window(3 * g, 2 * g).is_err(), "past the end");
+}
+
+/// A mapping goes over part of a reservation and comes off it again, at
+/// title addresses: one VM call each, the pool's base undisturbed. macOS
+/// only: a Windows mapping goes over a placeholder (see the `xmem` tests).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pool_maps_over_a_reservation_and_unmaps_again() {
+    let g = mem::granularity();
+    let pool = PagePool::new(8 * g).unwrap();
+    assert!(pool.memory_entry() != 0);
+    // SAFETY: the test owns the reservation and its views.
+    unsafe {
+        let base = pool.base().unwrap();
+        let at = mem::reserve(None, 8 * g).unwrap();
+        // Remap the pool in halves, swapped: one call per run.
+        pool.map_over(4 * g, 4 * g, at as usize, Protect::READ_WRITE)
+            .unwrap();
+        pool.map_over(0, 4 * g, at as usize + 4 * g, Protect::READ_WRITE)
+            .unwrap();
+        write(base, 0, 1);
+        assert_eq!(read(at, 4 * g), 1);
+        write(at, 0, 2);
+        assert_eq!(read(base, 4 * g), 2);
+        // The Mach memory entry maps the same pages once more.
+        let mut other: u64 = 0;
+        let kr = mach_vm_map(
+            mach_task_self_,
+            &mut other,
+            (8 * g) as u64,
+            0,
+            1, // anywhere
+            pool.memory_entry(),
+            0,
+            0,
+            3,
+            3,
+            2,
+        );
+        assert_eq!(kr, 0);
+        assert_eq!(read(other as *mut u8, 4 * g), 2);
+        mem::unmap(other as *mut u8, 8 * g).unwrap();
+        // Unmapping a part cuts the mapping there and leaves no access.
+        mem::unmap_over(at.wrapping_add(g), g).unwrap();
+        assert_eq!(
+            mem::query(at as usize).unwrap().protect,
+            Protect::READ_WRITE
+        );
+        assert_eq!(
+            mem::query(at as usize + g).unwrap().protect,
+            Protect::NO_ACCESS
+        );
+        assert_eq!(
+            read(at, 2 * g),
+            0,
+            "the pages after the cut are still there"
+        );
+        // The pool kept everything.
+        assert_eq!(read(base, 4 * g), 2);
+        assert_eq!(pool.base(), Some(base));
+        // Mapped again over the cut, the same pages show.
+        pool.map_over(5 * g, g, at as usize + g, Protect::READ_WRITE)
+            .unwrap();
+        write(base, 5 * g + 7, 9);
+        assert_eq!(read(at, g + 7), 9);
+        mem::release(at, 8 * g).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    #[allow(clippy::too_many_arguments)]
+    fn mach_vm_map(
+        task: u32,
+        addr: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        object: u32,
+        offset: u64,
+        copy: u32,
+        cur: i32,
+        max: i32,
+        inherit: u32,
+    ) -> i32;
 }
 
 #[test]
@@ -210,4 +333,36 @@ fn wait_on_address_wakes_and_times_out() {
     wake_one(&word);
     wake_all(&word);
     assert_eq!(t.join(), 5);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reserve_in_keeps_to_the_range_and_alignment() {
+    const MIB: usize = 1 << 20;
+    let (lowest, highest) = (1usize << 32, (1usize << 40) - 1);
+    // SAFETY: the test owns everything it reserves.
+    unsafe {
+        let p = mem::reserve_in(lowest, highest, 4 * MIB, 2 * MIB).unwrap();
+        let at = p as usize;
+        assert_eq!(at % (2 * MIB), 0);
+        assert!(at >= lowest && at + 4 * MIB - 1 <= highest);
+        assert_eq!(mem::query(at).unwrap().protect, Protect::NO_ACCESS);
+        // A range that cannot hold the request fails and leaves nothing behind.
+        assert!(mem::reserve_in(lowest, lowest + MIB, 4 * MIB, 0).is_err());
+        mem::release(p, 4 * MIB).unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn next_region_finds_the_following_mapping() {
+    let g = mem::granularity();
+    // SAFETY: the test owns everything it reserves.
+    unsafe {
+        let p = mem::reserve(None, 2 * g).unwrap();
+        let inside = mem::next_region(p as usize + 1).unwrap();
+        assert!(inside.base <= p as usize && inside.base + inside.len >= p as usize + 2 * g);
+        mem::release(p, 2 * g).unwrap();
+    }
+    assert!(mem::footprint() > 0);
 }
