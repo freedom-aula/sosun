@@ -334,7 +334,9 @@ fn infer(
         let rows = params.iter().map(|p| u32::from(p.0) + 1).max().unwrap_or(0);
         let mut outs: Vec<SigElement> = params
             .iter()
-            .map(|&(n, m)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
+            // Four channels whatever the code exports: Metal links a fragment input only to an
+            // output of the same type, and the pixel side reads channels the code does not show.
+            .map(|&(n, _)| element("TEXCOORD", u32::from(n), 0, u32::from(n), 0xf))
             .collect();
         outs.push(element("SV_Position", 0, 3, rows, 0xf));
         let outputs = params
@@ -361,26 +363,30 @@ fn infer(
         };
         let packed = packed_params(&p);
         let mut next = rows + 1;
-        for &(n, m) in params.iter().filter(|p| packed.contains(&p.0)) {
+        for &(n, _) in params.iter().filter(|p| packed.contains(&p.0)) {
             if outs.len() + 2 > max_rows as usize {
                 break;
             }
-            outs.push(element(HALF, 2 * u32::from(n), 0, next, m));
-            outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, m));
+            // Four channels whatever the parameter has, so the pixel side's type is known.
+            outs.push(element(HALF, 2 * u32::from(n), 0, next, 0xf));
+            outs.push(element(HALF, 2 * u32::from(n) + 1, 0, next + 1, 0xf));
             next += 2;
         }
         (io, (Vec::new(), outs))
     } else {
         let mut ins: Vec<SigElement> = attrs
             .iter()
-            .map(|&(n, m, _)| element("TEXCOORD", u32::from(n), 0, u32::from(n), m))
+            // Four channels, as the vertex side declares them.
+            .map(|&(n, _, _)| element("TEXCOORD", u32::from(n), 0, u32::from(n), 0xf))
             .collect();
         let mut next_row = attrs.iter().map(|a| u32::from(a.0) + 1).max().unwrap_or(0);
         halves.sort_unstable();
         for &(n, lo, hi) in &halves {
             for (index, m) in [(2 * u32::from(n), lo), (2 * u32::from(n) + 1, hi)] {
                 if m != 0 {
-                    ins.push(element(HALF, index, 0, next_row, m));
+                    // Four channels, as the vertex side declares them: Metal links an input
+                    // only to an output of the same type.
+                    ins.push(element(HALF, index, 0, next_row, 0xf));
                     next_row += 1;
                 }
             }
@@ -1043,7 +1049,7 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                (0, Some(0), 1),
+                (0, Some(0), 4), // TEXCOORD: four channels, as the vertex side declares them
                 (3, Some(1), 4),
                 (13, Some(2), 1),
                 (12, None, 1),

@@ -250,6 +250,38 @@ fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
     }
 }
 
+/// A pixel program reading the halves of fewer channels than the vertex side exports still links
+/// (parameter elements are four channels on both sides, those the export leaves out written a
+/// copy of one it has): only x's low half, of a parameter of x and y. Before, the converter
+/// refused such pairs as mismatching types, and crashed when the channels were left unwritten.
+#[test]
+fn halves_of_some_channels_link() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x7E10_02FF, 0x3C00_3800, // v_mov_b32 v8, 0x3c003800 (1.0, 0.5)
+        0x7E12_02FF, 0x3400_3A00, // v_mov_b32 v9, 0x34003a00 (0.25, 0.75)
+        0xF800_0203, 0x0000_0908, // exp param0 v8, v9
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128; 4]), "{:?}", pixels(&t, &color));
+}
+
 /// The halves fit the converter's mesh size (32 KiB of outputs): ten parameters a literal fills
 /// (so each may hold halves) still make a mesh pipeline, those past the room left without them.
 #[test]

@@ -12438,6 +12438,31 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // A guessed pipeline's parameter elements are four channels (`graphics::HALF`): the
+        // channels this export leaves out get a copy of one it has (unread), since the
+        // converter crashes linking a mesh output some channels of which are not written, or
+        // are written a constant.
+        // shortcut: a parameter exported twice with different channels keeps only the last
+        // export's; upgrade if a guessed program is seen doing that.
+        let mut pad = Vec::new();
+        if let (true, false, Target::Param { usage, row }) = (self.guessed, primitive, e.target)
+            && let Some(r) = param_row(usage, row)
+        {
+            let r = u32::from(r);
+            for (id, o) in outputs.iter().enumerate() {
+                let ours = (o.name == "TEXCOORD" && o.kind == 0 && o.row == Some(r) && o.index == r)
+                    || (o.name == super::graphics::HALF && o.index / 2 == r);
+                let half = (o.name == super::graphics::HALF).then_some(o.index % 2 == 1);
+                for col in (0..o.cols).filter(|_| ours) {
+                    if !stores.iter().any(|s| s.0 == id && s.1 == col)
+                        && let Some(value) = e.values.iter().flatten().next()
+                    {
+                        pad.push((id, col, *value, half));
+                    }
+                }
+            }
+        }
+        stores.extend(pad);
         // A parameter a split pixel input copies (`Options::copy_params`) is written with the
         // original's values.
         if self.x.copy_params != [0; 32] && !primitive {
