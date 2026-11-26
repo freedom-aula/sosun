@@ -394,6 +394,14 @@ pub(super) fn release_pool_backing(base: usize, len: usize) {
     unmap(&mut physical(), base, len);
 }
 
+/// The pool a physical-page view shows at `at`, if any (its id: a new pool never has an old one's).
+#[cfg(all(test, not(windows)))]
+pub(super) fn pool_shown_at(at: usize) -> Option<usize> {
+    let physical = physical();
+    let (&base, (len, slice)) = physical.views.range(..=at).next_back()?;
+    (at < base + len).then_some(slice.pool.info.id)
+}
+
 /// Consecutive slices of one pool, committed and writable: through the
 /// pool's own mapping of all of it, or a view of their own if the host would
 /// not map all of it.

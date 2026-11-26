@@ -91,15 +91,19 @@ fn a_page_pool_maps_at_several_addresses() {
         let c = pool.map(3 * g, g, None, Protect::READ).unwrap();
         assert_eq!(read(c, 0), 0xCD);
 
-        // At a chosen address.
-        let free = mem::reserve(None, 4 * g).unwrap();
-        // Windows maps over free space only; macOS over the reservation
-        // (letting go first would race the other tests for the address).
-        #[cfg(windows)]
-        mem::release(free, 4 * g).unwrap();
-        let d = pool
-            .map(0, 4 * g, Some(free as usize), Protect::READ_WRITE)
-            .unwrap();
+        // At a chosen address. Windows maps over free space only, so the
+        // reservation is let go first, and another test may take the address
+        // in between (error 487): then try again elsewhere. macOS maps over the
+        // reservation itself.
+        let (free, d) = (0..8)
+            .find_map(|_| {
+                let free = mem::reserve(None, 4 * g).unwrap();
+                #[cfg(windows)]
+                mem::release(free, 4 * g).unwrap();
+                let d = pool.map(0, 4 * g, Some(free as usize), Protect::READ_WRITE);
+                d.ok().map(|d| (free, d))
+            })
+            .expect("a free address to map at");
         assert_eq!(d, free);
         assert_eq!(read(d, 5), 0xAB);
 
