@@ -371,7 +371,9 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
-            if r.code == 0x8000_0003 {
+            // A breakpoint (the title's asserts) or an access violation (its fatal-error path
+            // writes to address 0).
+            if r.code == 0x8000_0003 || r.code == 0xC000_0005 {
                 super::super::dump::report_at_break();
             }
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of

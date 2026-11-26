@@ -65,7 +65,7 @@ pub fn start() {
 }
 
 /// With `VICTORY_DUMP_THREADS=0`, the dump is taken when the title first hits a breakpoint
-/// (its asserts), from the thread that hit it.
+/// (its asserts) or an access violation (its fatal-error path), from the thread that hit it.
 pub fn report_at_break() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     if seconds() == Some(0) {
