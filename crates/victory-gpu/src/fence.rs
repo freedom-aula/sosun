@@ -38,6 +38,9 @@ struct Fence {
     /// Events to set once the value reaches theirs (handles as integers),
     /// and since when.
     waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+    /// The value it was made with: the native host's fence starts there.
+    #[cfg(target_os = "macos")]
+    initial: u64,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -58,6 +61,8 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        #[cfg(target_os = "macos")]
+        initial,
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -68,7 +73,9 @@ fn set_event(event: usize) {
     unsafe {
         windows_sys::Win32::System::Threading::SetEvent(event as *mut c_void)
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    crate::native::glue::signal_event(event);
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = event;
 }
 
@@ -81,14 +88,37 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(target_os = "macos")]
+    if !this.is_null() && object::refs(this) == 1 {
+        crate::native::glue::fence_released(this);
+    }
     object::release_boxed::<Fence>(this)
 }
+
+/// The value the fence was made with.
+#[cfg(target_os = "macos")]
+pub(crate) fn initial(this: This) -> u64 {
+    fence(this).initial
+}
+
+/// Raises the value to what the GPU has reached (never lowers it) and wakes the events waiting.
+#[cfg(target_os = "macos")]
+pub(crate) fn raise(this: This, value: u64) {
+    if fence(this).value.load(Ordering::Acquire) < value {
+        set(this, value);
+    }
+}
+
 extern "system" fn completed(this: This) -> u64 {
+    #[cfg(target_os = "macos")]
+    raise(this, crate::native::glue::fence_poll(this));
     // A title polling for a value: held work that may run now does first.
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    raise(this, crate::native::glue::fence_poll(this));
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -97,6 +127,16 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             set_event(event as usize);
         }
         return S_OK;
+    }
+    #[cfg(target_os = "macos")]
+    if event.is_null() {
+        // Block until reached; held work keeps moving meanwhile. shortcut: gives up after a
+        // minute (the title's own watchdog is 30 s).
+        drop(waiters);
+        let reached =
+            crate::native::glue::fence_wait(this, value, std::time::Duration::from_secs(60));
+        raise(this, crate::native::glue::fence_poll(this));
+        return if reached { S_OK } else { E_NOTIMPL };
     }
     if event.is_null() {
         // shortcut: a null event means "block until reached"; nothing can
@@ -110,6 +150,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// The title's Signal from the CPU: what queues hold behind a Wait for it
 /// may run now (`crate::hold`).
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    #[cfg(target_os = "macos")]
+    crate::native::glue::fence_signal(this, value);
     let hr = set(this, value);
     crate::queue::pump_held(crate::queue::Why::Fence);
     hr

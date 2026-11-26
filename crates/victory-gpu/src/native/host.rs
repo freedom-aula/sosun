@@ -59,9 +59,14 @@ fn heaps<B: GraphicsBackend>(h: &HeapPair<B>) -> Heaps<'_, B> {
 
 impl<B: GraphicsBackend> NativeHost<B> {
     pub fn new(backend: B) -> Self {
+        Self::with_memory(backend, Arc::new(PoolTable::default()))
+    }
+
+    /// A host over a pool table the pool observer already feeds.
+    pub fn with_memory(backend: B, memory: Arc<PoolTable>) -> Self {
         NativeHost {
             backend,
-            memory: Arc::new(PoolTable::default()),
+            memory,
             buffers: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
@@ -146,6 +151,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
+    }
+
+    /// The heap `handle` (a descriptor's address, a root table's) lies in, and the entry's index.
+    pub fn heap_at(&self, handle: u64) -> Option<(Rc<NativeHeap<B>>, usize)> {
+        self.heaps.borrow().iter().find_map(|h| {
+            let index = (handle.checked_sub(h.start)? / Self::step(h.kind)) as usize;
+            (index < h.count).then(|| (h.clone(), index))
+        })
+    }
+
+    /// The title released the heap whose descriptors start at `start`.
+    pub fn drop_heap(&self, start: u64) {
+        self.heaps.borrow_mut().retain(|h| h.start != start);
+    }
+
+    /// The title released resource object `key`: later views naming it decode to nothing.
+    pub fn forget_resource(&self, key: usize) {
+        self.resources.borrow_mut().remove(&key);
+    }
+
+    /// Whether resource object `key` is registered (as a buffer or a texture).
+    pub fn knows(&self, key: usize) -> bool {
+        self.resources.borrow().contains_key(&key)
     }
 
     fn step(kind: HeapKind) -> u64 {

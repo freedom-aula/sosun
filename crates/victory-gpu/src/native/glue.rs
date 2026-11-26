@@ -1,0 +1,425 @@
+//! The one native host the title-facing objects call on macOS: `queue.rs`, `fence.rs`, `list.rs`,
+//! `descriptor.rs` and `resource.rs` forward to the functions here (the same call sites that go to
+//! `crate::host` on Windows).
+//!
+//! Threads. The title calls from many threads; the backend's objects and the `Rc`s inside
+//! [`Title`] are not thread safe, so everything that touches them runs under one lock (`TITLE`),
+//! always taken before a list's own lock, and objects holding such `Rc`s (lists) are dropped under
+//! it. The GPU never waits on the lock: submissions are asynchronous, and a timer thread moves held
+//! work and fence values along.
+
+use super::memory::{PoolObserver, PoolTable};
+use super::title::{Pipe, Title, TitleList, Wait};
+use crate::object::This;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use victory_backend::resources::HeapKind;
+use victory_metal::metal::Metal;
+
+pub type MetalTitle = Title<Metal>;
+pub type MetalList = TitleList<Metal>;
+
+struct Shared(MetalTitle);
+// SAFETY: every access to the title's `Rc`s and Objective-C objects is under `TITLE`.
+unsafe impl Send for Shared {}
+
+static TITLE: Mutex<Option<Shared>> = Mutex::new(None);
+static FAILED: AtomicBool = AtomicBool::new(false);
+static POOLS: OnceLock<Arc<PoolTable>> = OnceLock::new();
+
+/// The table of the title's memory pools. Feed it through [`pool_observer`].
+pub fn pools() -> &'static Arc<PoolTable> {
+    POOLS.get_or_init(Default::default)
+}
+
+/// What `victory_hle`'s physical-memory observer forwards its four calls to
+/// (`pool_created`, `pool_released`, `mapped`, `unmapped`): a plain handle on the pool table the
+/// native host reads, safe to call from any title thread, before or after the GPU exists.
+pub fn pool_observer() -> Arc<dyn PoolObserver> {
+    pools().clone()
+}
+
+/// Called with the event handle (as the title gave it) when a fence a title waits on with
+/// `SetEventOnCompletion` is reached. The runtime sets it; without one, events are not signalled.
+static EVENT_HOOK: OnceLock<fn(usize)> = OnceLock::new();
+
+pub fn set_event_hook(hook: fn(usize)) {
+    let _ = EVENT_HOOK.set(hook);
+}
+
+pub(crate) fn signal_event(event: usize) {
+    if let Some(hook) = EVENT_HOOK.get() {
+        hook(event);
+    }
+}
+
+fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
+    TITLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
+/// is then ignored, as when there is no host GPU on Windows).
+pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
+    let mut guard = lock();
+    if guard.is_none() {
+        if FAILED.load(Ordering::Relaxed) {
+            return None;
+        }
+        match Metal::new() {
+            Ok(metal) => {
+                tracing::info!("native host: Metal");
+                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                start_timer();
+            }
+            Err(e) => {
+                FAILED.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "no native host GPU");
+                return None;
+            }
+        }
+    }
+    guard.as_mut().map(|t| f(&mut t.0))
+}
+
+/// Moves held work along and raises the title's copies of fence values as the GPU signals them
+/// (titles read a fence's value from memory), without a call of the title's to drive it.
+fn start_timer() {
+    let _ = std::thread::Builder::new()
+        .name("victory native host".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if let Ok(mut g) = TITLE.try_lock()
+                    && let Some(t) = g.as_mut()
+                {
+                    refresh(&mut t.0);
+                }
+            }
+        });
+}
+
+fn refresh(t: &mut MetalTitle) {
+    t.pump();
+    for (fence, value) in t.completed() {
+        crate::fence::raise(fence as This, value);
+    }
+}
+
+/// Runs `f` on the native host and a title list's recording.
+pub(crate) fn with_list<R>(
+    this: This,
+    f: impl FnOnce(&mut MetalTitle, &mut MetalList) -> R,
+) -> Option<R> {
+    if this.is_null() {
+        return None;
+    }
+    with_title(|t| {
+        let list = crate::list::native(this);
+        let mut list = list.lock().unwrap_or_else(|e| e.into_inner());
+        f(t, &mut list)
+    })
+}
+
+// --- queues and fences ---
+
+/// `ExecuteCommandLists`.
+pub(crate) fn submit(queue: This, lists: &[This]) {
+    with_title(|t| {
+        if t.ensure_queue(queue as usize).is_err() {
+            return;
+        }
+        let mut segments = Vec::new();
+        for &l in lists.iter().filter(|l| !l.is_null()) {
+            let list = crate::list::native(l);
+            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
+        }
+        t.submit(queue as usize, segments);
+    });
+}
+
+pub(crate) fn queue_signal(queue: This, fence: This, value: u64) {
+    let initial = crate::fence::initial(fence);
+    with_title(|t| {
+        let _ = t.ensure_queue(queue as usize);
+        t.signal_queue(queue as usize, fence as usize, initial, value);
+    });
+}
+
+pub(crate) fn queue_wait(queue: This, fence: This, value: u64) {
+    let initial = crate::fence::initial(fence);
+    with_title(|t| {
+        let _ = t.ensure_queue(queue as usize);
+        t.wait_queue(queue as usize, fence as usize, initial, value);
+    });
+}
+
+pub(crate) fn queue_released(queue: This) {
+    with_title(|t| t.forget_queue(queue as usize));
+}
+
+/// `ID3D12Fence::Signal`.
+pub(crate) fn fence_signal(fence: This, value: u64) {
+    let initial = crate::fence::initial(fence);
+    with_title(|t| t.signal_cpu(fence as usize, initial, value));
+}
+
+/// The value fence `fence` has completed, queues pumped first.
+pub(crate) fn fence_poll(fence: This) -> u64 {
+    let initial = crate::fence::initial(fence);
+    with_title(|t| {
+        t.pump();
+        t.fence_value(fence as usize, initial)
+    })
+    .unwrap_or(initial)
+}
+
+/// `GetCompletedValue` of a fence that has no GPU behind it yet: nothing to ask.
+pub(crate) fn fence_released(fence: This) {
+    with_title(|t| t.forget_fence(fence as usize));
+}
+
+/// Blocks until fence `fence` reaches `value` (the title's `SetEventOnCompletion` with no event):
+/// held work keeps moving while it waits. False after `timeout`.
+pub(crate) fn fence_wait(fence: This, value: u64, timeout: std::time::Duration) -> bool {
+    let initial = crate::fence::initial(fence);
+    let start = std::time::Instant::now();
+    loop {
+        match with_title(|t| t.try_wait(fence as usize, initial, value)) {
+            Some(true) => return true,
+            None => return false,
+            Some(false) => {}
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+// --- resources and descriptors ---
+
+/// A buffer resource object `res` of `len` bytes at title address `addr`.
+pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
+    with_title(|t| t.host.register_buffer(res as usize, addr, len));
+}
+
+pub(crate) fn resource_released(res: This) {
+    with_title(|t| t.host.forget_resource(res as usize));
+}
+
+/// Shader-visible descriptor heaps by address range: start, end, sampler heap, count. The host
+/// heap is made when a list first names the heap, from what the title wrote by then.
+static HEAPS: Mutex<Vec<(u64, u64, bool, usize)>> = Mutex::new(Vec::new());
+
+pub(crate) fn heap_created(start: u64, samplers: bool, count: usize) {
+    let step = if samplers { 16 } else { 32 };
+    HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((start, start + step * count as u64, samplers, count));
+}
+
+pub(crate) fn heap_released(start: u64) {
+    HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|h| h.0 != start);
+    with_title(|t| t.host.drop_heap(start));
+}
+
+/// The host heap the descriptor at `handle` is in (made now if it was not) and its index.
+fn heap_of(t: &mut MetalTitle, handle: u64) -> Option<(Rc<super::list::NativeHeap<Metal>>, usize)> {
+    if let Some(found) = t.host.heap_at(handle) {
+        return Some(found);
+    }
+    let (start, _, samplers, count) = HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|h| (h.0..h.1).contains(&handle))?;
+    let kind = if samplers {
+        HeapKind::Sampler
+    } else {
+        HeapKind::Resource
+    };
+    let step = if samplers { 16 } else { 32 };
+    match t.host.heap(kind, start, count) {
+        Ok(heap) => {
+            // What the title wrote before the heap was made.
+            for i in 0..count as u64 {
+                let _ = t.host.mirror(start + i * step);
+            }
+            t.host.heap_at(handle).or(Some((heap, 0)))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no host descriptor heap");
+            None
+        }
+    }
+}
+
+/// The title wrote a view at `handle` (the call `descriptor::mirror` is on Windows).
+pub(crate) fn mirror(handle: u64) {
+    with_title(|t| {
+        if let Err(e) = t.host.mirror(handle) {
+            tracing::debug!(error = %e, "a descriptor was not mirrored");
+        }
+    });
+}
+
+// --- list recording ---
+
+pub(crate) fn set_pipeline(this: This, pipeline: This) {
+    with_list(this, |_, l| l.pipeline = pipeline as usize);
+}
+
+/// The host pipeline of title pipeline `key`, made at first use.
+fn pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    if let Some(p) = t.pipelines.get(&key) {
+        return p.clone();
+    }
+    let made = make_pipe(t, key);
+    t.pipelines.insert(key, made.clone());
+    made
+}
+
+/// Work dropped because its pipeline has no host pipeline.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+fn make_pipe(_t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    tracing::warn!(pipeline = key, "title pipeline without a host pipeline; its work is dropped");
+    Pipe::Refused
+}
+
+/// Makes title pipeline `key` the compute pipeline of a pre-translated DXIL container with the
+/// given group size (what a translated shader's pipeline is made of); for diagnostics and tests.
+pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) -> Result<(), String> {
+    with_title(|t| {
+        let pso = t.host.compute_pipeline(dxil, threads)?;
+        t.pipelines.insert(key, Pipe::Compute(pso));
+        Ok(())
+    })
+    .unwrap_or_else(|| Err("no native host GPU".into()))
+}
+
+pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
+    with_list(this, |t, l| match pipe(t, l.pipeline) {
+        Pipe::Compute(pso) => {
+            l.list.set_compute_pipeline(&pso);
+            if let Err(e) = l.list.dispatch(x, y, z) {
+                tracing::warn!(error = %e, "dispatch");
+            }
+        }
+        _ => dropped(),
+    });
+}
+
+pub(crate) fn root_constants(this: This, compute: bool, slot: u32, offset: u32, words: &[u32]) {
+    with_list(this, |_, l| {
+        l.list
+            .set_root_constants_at(compute, slot as usize, offset as usize, words)
+    });
+}
+
+pub(crate) fn root_view(this: This, compute: bool, slot: u32, address: u64) {
+    with_list(this, |_, l| {
+        if compute {
+            l.list.set_compute_root_view(slot as usize, address)
+        } else {
+            l.list.set_graphics_root_view(slot as usize, address)
+        }
+    });
+}
+
+pub(crate) fn root_table(this: This, compute: bool, slot: u32, handle: u64) {
+    with_list(this, |t, l| {
+        let Some((heap, index)) = heap_of(t, handle) else {
+            return;
+        };
+        if compute {
+            l.list.set_compute_root_table(slot as usize, &heap, index)
+        } else {
+            l.list.set_graphics_root_table(slot as usize, &heap, index)
+        }
+    });
+}
+
+/// `SetDescriptorHeaps`: the title's heap objects.
+pub(crate) fn set_heaps(this: This, heaps: &[This]) {
+    with_list(this, |t, l| {
+        let (mut views, mut samplers) = (None, None);
+        for &h in heaps {
+            let Some((start, sampler, _)) = crate::descriptor::span(h) else {
+                continue;
+            };
+            let Some((heap, _)) = heap_of(t, start) else {
+                continue;
+            };
+            if sampler {
+                samplers = Some(heap);
+            } else {
+                views = Some(heap);
+            }
+        }
+        l.list.set_heaps(views.as_ref(), samplers.as_ref());
+    });
+}
+
+/// `CopyBufferRegion` between title buffers.
+pub(crate) fn copy_buffer(this: This, dst: (This, u64), src: (This, u64), len: u64) {
+    let (Some((to, to_size)), Some((from, from_size))) = (
+        crate::resource::buffer_bytes(dst.0),
+        crate::resource::buffer_bytes(src.0),
+    ) else {
+        return;
+    };
+    if dst.1.saturating_add(len) > to_size || src.1.saturating_add(len) > from_size {
+        tracing::warn!(len, "copy outside its buffer");
+        return;
+    }
+    // SAFETY: inside the buffers, checked above.
+    let (to, from) = unsafe { (to.add(dst.1 as usize), from.add(src.1 as usize)) };
+    copy_memory(this, to as u64, from as u64, len);
+}
+
+/// `CopyMemoryToMemoryX` and buffer copies: title addresses.
+pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
+    with_list(this, |_, l| {
+        l.list.copy_buffer_region(dst, src, len as usize);
+    });
+}
+
+/// A bottom-of-pipe value write of `value`, `bytes` long.
+pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
+    with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
+}
+
+/// A wait for a memory value, recorded at the current position of the list.
+pub(crate) fn wait_value(this: This, w: Wait) {
+    with_list(this, |_, l| l.wait(w));
+}
+
+/// `Reset`: forgets what was recorded (the host objects it named go with it, under the lock).
+pub(crate) fn reset_list(this: This) {
+    with_list(this, |_, l| l.reset());
+}
+
+/// Drops a list object, whose `Rc`s must be dropped under the lock.
+pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
+    let mut f = Some(f);
+    match with_title(|_| (f.take().expect("once"))()) {
+        Some(r) => r,
+        None => (f.take().expect("not run"))(),
+    }
+}
+
+/// Counters of the host for tests and the frame line.
+pub fn stats() -> Option<super::title::Stats> {
+    with_title(|t| t.stats.clone())
+}

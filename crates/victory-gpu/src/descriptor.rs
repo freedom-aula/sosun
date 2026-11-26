@@ -515,6 +515,16 @@ pub(crate) fn record(handle: u64, view: View) {
     drop(views);
     #[cfg(windows)]
     mirror(handle);
+    #[cfg(target_os = "macos")]
+    crate::native::glue::mirror(handle);
+}
+
+/// A shader-visible heap's descriptor memory: its start, whether it holds samplers, and its
+/// descriptor count (`None` for other heap types).
+#[cfg(target_os = "macos")]
+pub(crate) fn span(this: This) -> Option<(u64, bool, usize)> {
+    let h = heap(this);
+    matches!(h.desc.kind, VIEWS_KIND | SAMPLERS).then(|| (h.start, h.samplers(), h.desc.count as usize))
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -658,6 +668,10 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
+        #[cfg(target_os = "macos")]
+        for i in 0..u64::from(count) {
+            crate::native::glue::mirror(dst + i * step);
+        }
     }
 }
 
@@ -787,9 +801,39 @@ pub(crate) extern "system" fn create_heap(
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    if visible {
+        crate::native::glue::heap_created(start, desc.kind == SAMPLERS, desc.count as usize);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = visible;
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
+}
+
+/// A shader-visible view (or sampler) heap of `count` descriptors the heap allocates.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_heap(samplers: bool, count: u32) -> This {
+    /// What newer titles pass: the description, then (no) memory of their own.
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let extended = Extended(
+        HeapDesc {
+            kind: u32::from(samplers),
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -797,6 +841,13 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(target_os = "macos")]
+    if !this.is_null()
+        && object::refs(this) == 1
+        && let Some((start, ..)) = span(this)
+    {
+        crate::native::glue::heap_released(start);
+    }
     object::release_boxed::<Heap>(this)
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {

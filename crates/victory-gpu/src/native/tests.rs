@@ -14,6 +14,9 @@ use victory_backend::resources::*;
 use victory_metal::mem::{Alias, page_size};
 use victory_metal::metal::Metal;
 
+#[path = "title_tests.rs"]
+mod title_tests;
+
 fn host() -> Option<Host> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
         && std::env::var_os("VICTORY_MSC_DYLIB").is_none()

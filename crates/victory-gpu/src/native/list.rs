@@ -73,7 +73,7 @@ impl<B: GraphicsBackend> Targets<B> {
     }
 }
 
-pub(super) enum Cmd<B: GraphicsBackend> {
+pub enum Cmd<B: GraphicsBackend> {
     Dispatch {
         pso: Rc<ComputePso<B>>,
         root: Vec<Option<Root<B>>>,
@@ -104,6 +104,57 @@ pub(super) enum Cmd<B: GraphicsBackend> {
         index: Option<(u64, bool)>,
         call: DrawCall,
     },
+}
+
+impl<B: GraphicsBackend> Clone for Cmd<B> {
+    fn clone(&self) -> Self {
+        match self {
+            Cmd::Dispatch {
+                pso,
+                root,
+                heaps,
+                groups,
+            } => Cmd::Dispatch {
+                pso: pso.clone(),
+                root: root.clone(),
+                heaps: heaps.clone(),
+                groups: *groups,
+            },
+            Cmd::Copy { dst, src, len } => Cmd::Copy {
+                dst: *dst,
+                src: *src,
+                len: *len,
+            },
+            Cmd::Fill { dst, len, value } => Cmd::Fill {
+                dst: *dst,
+                len: *len,
+                value: *value,
+            },
+            Cmd::Clear { color, depth } => Cmd::Clear {
+                color: color.clone(),
+                depth: depth.clone(),
+            },
+            Cmd::Draw {
+                pso,
+                topology,
+                root,
+                heaps,
+                targets,
+                vertex,
+                index,
+                call,
+            } => Cmd::Draw {
+                pso: pso.clone(),
+                topology: *topology,
+                root: root.clone(),
+                heaps: heaps.clone(),
+                targets: targets.clone(),
+                vertex: vertex.clone(),
+                index: *index,
+                call: *call,
+            },
+        }
+    }
 }
 
 /// The state a title sets between commands.
@@ -161,6 +212,31 @@ impl<B: GraphicsBackend> NativeList<B> {
         self.cmds.is_empty()
     }
 
+    /// What was recorded so far as a list of its own, leaving this one empty with its state kept
+    /// (the title goes on recording after a wait with the pipeline and root arguments it had set).
+    pub fn cut(&mut self) -> NativeList<B> {
+        NativeList {
+            cmds: std::mem::take(&mut self.cmds),
+            ..NativeList::default()
+        }
+    }
+
+    /// A copy of the recorded commands (a title may reset and re-record a list it submitted).
+    pub fn snapshot(&self) -> NativeList<B> {
+        NativeList {
+            cmds: self.cmds.clone(),
+            ..NativeList::default()
+        }
+    }
+
+    /// A write of `value`'s low `bytes` (little endian) at title address `at`, in order with the
+    /// rest of the list on the GPU (bottom-of-pipe value writes): byte fills.
+    pub fn write_value(&mut self, at: u64, value: u64, bytes: usize) {
+        for (i, b) in value.to_le_bytes().iter().take(bytes).enumerate() {
+            self.fill(at + i as u64, 1, *b);
+        }
+    }
+
     /// `SetDescriptorHeaps`.
     pub fn set_heaps(
         &mut self,
@@ -185,6 +261,25 @@ impl<B: GraphicsBackend> NativeList<B> {
             slot,
             Root::Constants(words.to_vec()),
         );
+    }
+
+    /// `SetComputeRoot32BitConstant(s)` / `SetGraphicsRoot32BitConstant(s)` at `offset` words into
+    /// the parameter: the words before it keep what was set (zero if nothing was).
+    pub fn set_root_constants_at(&mut self, compute: bool, slot: usize, offset: usize, words: &[u32]) {
+        let root = if compute {
+            &mut self.state.compute_root
+        } else {
+            &mut self.state.graphics_root
+        };
+        let mut all = match root.get(slot) {
+            Some(Some(Root::Constants(c))) => c.clone(),
+            _ => Vec::new(),
+        };
+        if all.len() < offset + words.len() {
+            all.resize(offset + words.len(), 0);
+        }
+        all[offset..offset + words.len()].copy_from_slice(words);
+        set(root, slot, Root::Constants(all));
     }
 
     /// `SetComputeRootShaderResourceView` / `UnorderedAccessView` / `ConstantBufferView`.

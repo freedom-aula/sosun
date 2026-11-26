@@ -562,6 +562,24 @@ fn read_stream(
     (shaders, graphics)
 }
 
+/// A compute pipeline whose shader is `code` (a container, or any bytes).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_compute(code: &[u8]) -> This {
+    let head = ComputeHead {
+        root: std::ptr::null(),
+        stage: Bytecode {
+            code: code.as_ptr(),
+            size: code.len(),
+        },
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_compute(std::ptr::null(), &head, &PIPELINE_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &PIPELINE_IIDS).then_some(this);
     object::answer(PIPELINE, iid, found, out)

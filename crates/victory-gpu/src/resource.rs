@@ -1798,7 +1798,19 @@ fn hand_out_resource(
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
     }
-    object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+    // The native host names a buffer by its object, to decode views of it.
+    #[cfg(target_os = "macos")]
+    let made = (desc.dimension == BUFFER).then(|| (resource.data() as u64, desc.width));
+    let hr = object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out);
+    #[cfg(target_os = "macos")]
+    if hr == S_OK
+        && let Some((address, width)) = made
+        && !out.is_null()
+    {
+        // SAFETY: handed out just now.
+        crate::native::glue::buffer_created(unsafe { *out }, address, width);
+    }
+    hr
 }
 
 /// Title textures with a host copy, by the console memory they start at.
@@ -2163,6 +2175,10 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
     )
 }
 extern "system" fn resource_release(this: This) -> u32 {
+    #[cfg(target_os = "macos")]
+    if !this.is_null() && object::refs(this) == 1 {
+        crate::native::glue::resource_released(this);
+    }
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
@@ -2277,6 +2293,36 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+/// A buffer of `width` bytes in the title memory at `address`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_buffer_at(address: u64, width: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: BUFFER,
+        alignment: 0,
+        width,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 0,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 1,
+        flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_at_address(
+        std::ptr::null(),
+        address,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 #[cfg(test)]
 pub(crate) fn test_buffer(width: u64) -> This {

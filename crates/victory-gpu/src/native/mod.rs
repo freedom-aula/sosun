@@ -9,15 +9,58 @@
 //!
 //! [`memory`] title memory as zero-copy pools (no shadow, watch or copy-back), [`descriptors`]
 //! the title's views for the backend, [`list`] a command list, [`host`] queues, pipelines, heaps and
-//! submission.
+//! submission, [`title`] the title's queues, fences and lists on top of them; `glue` (macOS) is
+//! the one instance the title-facing objects call, and its [`pool_observer`] is what the runtime's
+//! physical-memory observer forwards to.
 
 pub mod descriptors;
+#[cfg(target_os = "macos")]
+pub(crate) mod glue;
 pub mod host;
 pub mod list;
 pub mod memory;
+pub mod title;
 
 #[cfg(target_os = "macos")]
 pub type Host = host::NativeHost<victory_metal::metal::Metal>;
+
+#[cfg(target_os = "macos")]
+pub use glue::{pool_observer, pools, set_event_hook};
+
+/// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped
+/// memory: the kernel checks, nothing faults).
+pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_read_overwrite(
+                task: u32,
+                address: u64,
+                size: u64,
+                data: u64,
+                out_size: *mut u64,
+            ) -> i32;
+        }
+        let mut got = 0u64;
+        // SAFETY: `out` is writable for its length; the kernel validates the source range.
+        let r = unsafe {
+            mach_vm_read_overwrite(
+                mach_task_self_,
+                at as u64,
+                out.len() as u64,
+                out.as_mut_ptr() as u64,
+                &mut got,
+            )
+        };
+        r == 0 && got == out.len() as u64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (at, out);
+        false
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
