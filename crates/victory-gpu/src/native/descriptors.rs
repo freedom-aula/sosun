@@ -80,6 +80,33 @@ pub fn format(dxgi: u32) -> Option<Format> {
         65 => Format::A8Unorm,
         56 => Format::R16Unorm,
         2 => Format::Rgba32Float,
+        16 => Format::Rg32Float,
+        24 => Format::Rgb10a2Unorm,
+        26 => Format::Rg11b10Float,
+        30 => Format::Rgba8Uint,
+        34 => Format::Rg16Float,
+        35 => Format::Rg16Unorm,
+        42 => Format::R32Uint,
+        62 => Format::R8Uint,
+        67 => Format::Rgb9e5Float,
+        99 => Format::Bc7Srgb,
+        3 => Format::Rgba32Uint,
+        11 => Format::Rgba16Unorm,
+        13 => Format::Rgba16Snorm,
+        17 => Format::Rg32Uint,
+        36 => Format::Rg16Uint,
+        49 | 50 => Format::Rg8Unorm,
+        51 => Format::Rg8Uint,
+        54 => Format::R16Float,
+        // R16_TYPELESS: a depth target when the texture is one (`TextureInfo::desc`).
+        53 => Format::R16Unorm,
+        57 => Format::R16Uint,
+        55 => Format::D16Unorm,
+        72 => Format::Bc1Srgb,
+        78 => Format::Bc3Srgb,
+        86 => Format::Bgr5a1Unorm,
+        // B4G4R4A4: its title bytes are converted at upload (`textures::to_host`).
+        115 => Format::Abgr4Unorm,
         _ => return None,
     })
 }
@@ -205,6 +232,27 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_formats_have_the_title_formats_element_size() {
+        for dxgi in [2, 3, 10, 11, 13, 16, 17, 24, 26, 28, 30, 34, 35, 36, 41, 42, 49, 50, 51, 53, 54, 55, 56, 57, 61, 62, 65, 67, 71, 72, 77, 78, 86, 98, 99, 115] {
+            let f = super::format(dxgi).expect("a host format");
+            let (bytes, block) = crate::resource::element(dxgi).expect("a title format");
+            assert_eq!(f.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
+        }
+        assert!(super::format(42).unwrap().is_integer() && !super::format(26).unwrap().is_integer());
+    }
+
+    #[test]
+    fn b4g4r4a4_texels_become_abgr4() {
+        // DXGI: blue 1 in bits 0-3, green 2, red 3, alpha 4 in bits 12-15. Metal: alpha low, red top.
+        let mut t = 0x4321u16.to_le_bytes().to_vec();
+        crate::native::textures::to_host(115, &mut t);
+        assert_eq!(u16::from_le_bytes([t[0], t[1]]), 0x3214);
+        let mut t = 0x4321u16.to_le_bytes().to_vec();
+        crate::native::textures::to_host(86, &mut t);
+        assert_eq!(u16::from_le_bytes([t[0], t[1]]), 0x4321);
+    }
+
     use super::*;
 
     #[test]

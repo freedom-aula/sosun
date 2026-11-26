@@ -652,6 +652,15 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    /// Held by the tests that compile `pipeline`s and submit through registered copies: run
+    /// together, both once failed in `CreateRootSignature` with `E_FAIL` (CI on WARP), and they
+    /// share the copies' registry and the frame counter.
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gpu() -> std::sync::MutexGuard<'static, ()> {
+        GPU.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The pipeline, or none where the HLSL compiler cannot build its
     /// array of views: Wine's (vkd3d-shader) has no shader model 5.1
     /// resource arrays and answers `E_NOTIMPL`.
@@ -726,6 +735,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// dynamic slot.
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
+        let _gpu = gpu();
         use crate::watch::PAGE;
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
@@ -876,6 +886,7 @@ void main() {
     /// writes in the copies.
     #[test]
     fn a_submission_that_missed_leaves_the_copies_at_once() {
+        let _gpu = gpu();
         use crate::watch::PAGE;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {

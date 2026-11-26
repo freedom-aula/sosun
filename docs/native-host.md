@@ -346,7 +346,7 @@ Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which tit
 
 #### Rectangle lists, dropped-command counters, variants (guessed path)
 
-* Rectangle lists (topology 17) of a guessed pipeline are drawn as instances of four vertices (a triangle strip): the vertex shader is translated again with `Options::rect_list`, which reads each fetched attribute for the rectangle's three corners (stage-in elements of corner 0 to 2, index `corner << 28 | slot << 16 | offset`, instance-stepped with three times the bound stride) and picks a corner by vertex id, the fourth being v1 + v2 - v0 (so only affine vertex shaders are right; a uint attribute takes corner 2). Indexed rectangle lists are dropped.
+* Rectangle lists (topology 17) of a guessed pipeline are drawn as instances of four vertices (a triangle strip): the vertex shader is translated again with `Options::rect_list`, which reads each fetched attribute for the rectangle's three corners (stage-in elements of corner 0 to 2, index `corner << 28 | slot << 16 | offset`, instance-stepped with three times the bound stride) and picks a corner by vertex id, the fourth being the two other corners less the right-angle one (so only affine vertex shaders are right; a uint attribute takes a stored corner; see "Rectangle-list corners" below). Indexed rectangle lists are dropped.
 * The 64-frame log line counts dropped command kinds: `mesh`, `mesh_indirect`, `indirect`, `texture_copies`. Frames 2 to ~1000 show 0 of each: no mesh dispatches, indirect executions, texture copies or resolves, in the boot frames. The Bink DLL (`bink2scarlett.dll`) is loaded at start-up, but no compute dispatch or texture copy happens before frame ~695 (so no GPU or upload-based video decode before then); calls into its exports are title code and are not counted.
 * State variants (device slot 0x1b8, `native/gfx-state`) of a guessed base inherit its shaders; their decoded blend/raster/depth state replaces the guessed defaults, and `Graphics::for_draw` adds the inferred vertex layout and bound targets. With them every draw of the boot frames has a host pipeline (`no_pipeline=0`), still all black through frame ~1000.
 * Keep large-frame code out of `PresentX`'s call chain (`queue.rs`, `glue::present`): enlarging its stack frame crashed the title under Rosetta ("unexpectedly need to EmulateForward"); the draw-counter log and the present trace are `#[inline(never)]` helpers for that reason.
@@ -441,3 +441,51 @@ dispatches, texture copies and resolves, and indirect executions (one warning
 per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
+
+#### Rectangle-list corners and the Brightness logo (open)
+
+* The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
+* A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn as a plain strip without its fourth corner, and now warns once.
+* `VICTORY_TRACE_RECTS=1` logs the first three rectangle-list draws of each pipeline with the first three vertices as floats.
+* The Brightness logo (half a rectangle, the cut along one diagonal) is a guessed pipeline (`vertex 511484f3`: float3 position, unorm8x4 colour at 12, float2 uv at 16, 24-byte vertices) drawing one rectangle at (+-0.2, +-0.325) with corners top-left, bottom-left, bottom-right, which is the order the rule expects. Its matrices flip y, so the visible half is the strip's first triangle (which holds the computed corner), and the second triangle is lost. Both triangles wind alike, so culling does not explain it; the next suspects are the guessed depth state (less-equal with writes, `VICTORY_DEBUG_NO_DEPTH`) and the pixel shader on the second triangle. Not settled: the game runs needed were stopped.
+
+#### Raster, depth, stencil and write mask from the register image
+
+In all 23,022 images the registers just before the eight `CB_BLEND<n>_CONTROL` sit at the same
+offsets back from them (the field layouts below match the values seen):
+
+| Bytes before the blend block | Register | Seen |
+|---|---|---|
+| 0x30 | `PA_SU_SC_MODE_CNTL` | 0x201a40 no cull (11,341), 0x201a42 cull back (11,621), 0x201a41 cull front (58), 0x201a46 cull back with clockwise front (2) |
+| 0x2c, 0x28 | constant 0x8, 0x1000 | |
+| 0x24 to 0x1c | floats (polygon offset: 0.003, 29.0, 16.0, 1.0) | not used yet |
+| 0x18 | `DB_DEPTH_CONTROL` | 0x7007f0 depth off (6,895), 0x7007e2 test GREATER_EQUAL without writes (4,999), 0x7007e7 GREATER_EQUAL with writes and stencil (3,325), 0x700796 LESS with writes, 0x7007b6 LESS_EQUAL with writes, 0x2002f1 stencil EQUAL only |
+| 0x14 | `DB_STENCIL_CONTROL` | 0 (keep), 0x30030 pass REPLACE, 0x80080 pass increment-wrap |
+| 0x10, 0xc | `DB_STENCILREFMASK`, `_BF` | 0x100ff00 (read mask 0xff, write mask 0), 0x1ffff00 (both 0xff) |
+| 0x4 | `CB_TARGET_MASK` | 0xffffffff, 0 (depth only), 0xf, 0x3ffff |
+
+`Graphics::guess_from` now reads all of these over the guessed defaults: cull (FACE 0 = counter-clockwise front), depth enable, write and function (hardware + 1 = D3D12), stencil enable, read and write masks, front and back ops and functions (the back face's only with BACKFACE_ENABLE), and each target's write mask. Most depth tests are GREATER_EQUAL (reversed Z), where the guess was LESS_EQUAL with writes. The polygon offset floats are not mapped. `VICTORY_GUESS_BLEND_ONLY=1` keeps the earlier blend-only reading, for comparison. A run past setup to the loading screen gave the same presented images, byte for byte, as without this change. The setup screens were not checked: runs now skip them, probably because the profile is saved.
+
+#### Texture formats the host lacked
+
+The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
+
+| DXGI | Format | First texture seen (flags: 1 render target, 2 depth, 4 unordered access) | Metal |
+|---|---|---|---|
+| 42 | R32_UINT | 1280x720, unordered access (a compute output) | R32Uint |
+| 26 | R11G11B10_FLOAT | 1280x720, unordered access (a compute output) | RG11B10Float |
+| 67 | R9G9B9E5_SHAREDEXP | 1280x720, read only | RGB9E5Float |
+| 16 | R32G32_FLOAT | 160x90, unordered access | RG32Float |
+| 62 | R8_UINT | 640x360, render target and unordered access | R8Uint |
+| 34, 35 | R16G16_FLOAT, R16G16_UNORM | 256x256, 127x128, render targets | RG16Float, RG16Unorm |
+| 24 | R10G10B10A2_UNORM | 32x32 | RGB10A2Unorm |
+| 30 | R8G8B8A8_UINT | 1x1 | RGBA8Uint |
+| 99, 72, 78 | BC7, BC1, BC3 UNORM_SRGB | 512x512, 32x32, 512x512 | the `_sRGB` BC formats |
+| 53 | R16_TYPELESS | 2048x8192 depth (a shadow map) | Depth16Unorm (R16Unorm when not depth) |
+| 55 | D16_UNORM | (its depth views) | Depth16Unorm |
+| 3, 17, 36, 51, 57 | R32G32B32A32, R32G32, R16G16, R8G8, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
+| 11, 13 | R16G16B16A16_UNORM, _SNORM | 128x4, 256x256 | RGBA16Unorm, RGBA16Snorm |
+| 49, 50 | R8G8_TYPELESS, _UNORM | 16x16, 64x64 | RG8Unorm |
+| 54 | R16_FLOAT | 512x512 | R16Float |
+
+Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.

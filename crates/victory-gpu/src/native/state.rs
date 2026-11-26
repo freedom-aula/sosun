@@ -35,6 +35,21 @@ fn cb_blend(r: u32) -> Option<TargetBlend> {
     })
 }
 
+/// A `DB_STENCIL_CONTROL` operation as D3D12's (keep, zero, replace, increment and decrement
+/// clamped, invert, increment and decrement wrapped); KEEP for those D3D12 has none of.
+fn stencil_op_hw(op: u32) -> u32 {
+    match op {
+        1 => 2,
+        3 | 4 => 3,
+        5 => 4,
+        6 => 5,
+        7 => 6,
+        8 => 7,
+        9 => 8,
+        _ => 1,
+    }
+}
+
 /// One colour target of the blend description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TargetBlend {
@@ -285,6 +300,39 @@ impl Graphics {
             if let Some(b) = cb_blend(r) {
                 *t = b;
             }
+        }
+        // Debugging: the blend alone, the rest guessed as before.
+        if std::env::var_os("VICTORY_GUESS_BLEND_ONLY").is_some() {
+            return g;
+        }
+        // The registers before the blend ones (same offsets in every image): PA_SU_SC_MODE_CNTL,
+        // then DB_DEPTH_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK(_BF), CB_TARGET_MASK.
+        let reg = |back: usize| image[at - back / 4];
+        let mode = reg(0x30);
+        g.cull = match mode & 3 {
+            1 => 2,
+            2 => 3,
+            _ => 1,
+        };
+        // FACE 0: counter-clockwise is front.
+        g.front_ccw = mode & 4 == 0;
+        let depth = reg(0x18);
+        g.depth_enable = depth & 2 != 0;
+        g.depth_write = depth & 4 != 0;
+        // The hardware's compare functions are D3D12's less one.
+        g.depth_func = (depth >> 4 & 7) + 1;
+        g.stencil_enable = depth & 1 != 0;
+        let (stencil, refmask) = (reg(0x14), reg(0x10));
+        g.stencil_masks = ((refmask >> 8) as u8, (refmask >> 16) as u8);
+        // Front, then back (the front's unless BACKFACE_ENABLE): fail, pass and depth fail ops.
+        let front = (stencil & 0xfff, depth >> 8 & 7);
+        let back = if depth & 0x80 != 0 { (stencil >> 12 & 0xfff, depth >> 20 & 7) } else { front };
+        for (face, (ops, func)) in g.stencil_faces.iter_mut().zip([front, back]) {
+            *face = [stencil_op_hw(ops & 0xf), stencil_op_hw(ops >> 8 & 0xf), stencil_op_hw(ops >> 4 & 0xf), func + 1];
+        }
+        let mask = reg(0x4);
+        for (t, b) in g.blend.iter_mut().enumerate() {
+            b.mask = (mask >> (4 * t) & 0xf) as u8;
         }
         g
     }
@@ -736,10 +784,22 @@ mod tests {
             image[1] = sections;
             image[at..at + 8].copy_from_slice(&[0xe501_0504, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0xe001_0161]);
             image[at + 8] = 0xffff_ffff;
+            // Cull back; depth on with writes, GREATER_EQUAL; stencil on, EQUAL, pass REPLACE,
+            // read mask 0xff, write mask 0x80; targets 0 and 7 write all channels, target 1 red.
+            image[at - 12] = 0x0020_1a42;
+            image[at - 6] = 0x0020_02e7;
+            image[at - 5] = 0x0003_0030;
+            image[at - 4] = 0x0180_ff00;
+            image[at - 1] = 0xf000_001f;
             let g = Graphics::guess_from(&image);
             assert!(g.independent);
+            assert_eq!((g.cull, g.front_ccw), (3, true));
+            assert_eq!((g.depth_enable, g.depth_write, g.depth_func), (true, true, 7));
+            assert_eq!((g.stencil_enable, g.stencil_masks), (true, (0xff, 0x80)));
+            assert_eq!(g.stencil_faces, [[1, 1, 3, 3]; 2]);
+            assert_eq!((g.blend[1].mask, g.blend[2].mask), (1, 0));
             assert_eq!(g.blend[0], TargetBlend { enable: true, src: 5, dst: 6, op: 1, src_alpha: 2, dst_alpha: 6, op_alpha: 1, mask: 0xf });
-            assert_eq!(g.blend[1], TargetBlend::default());
+            assert_eq!(g.blend[1], TargetBlend { mask: 1, ..TargetBlend::default() });
             // Max of one and one for colour, alpha added.
             assert_eq!(g.blend[7], TargetBlend { enable: true, src: 2, dst: 2, op: 5, src_alpha: 2, dst_alpha: 1, op_alpha: 1, mask: 0xf });
             // Without the marker after the registers, nothing is read.

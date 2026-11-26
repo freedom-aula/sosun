@@ -360,6 +360,9 @@ struct Lower<'a> {
     split_inputs: Map<(usize, u8), usize>,
     /// Debug (`VICTORY_DEBUG_VS_POS`): the last two-dword raw vertex fetch, as floats.
     debug_pos: Option<(V, V)>,
+    /// Rectangle list: which stored corner holds the right angle, `(block, at v0, at v2)`
+    /// (neither: v1), picked from the first two-channel float fetch (the position).
+    rect_corner: Option<(usize, V, V)>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -844,6 +847,7 @@ impl<'a> Lower<'a> {
             mode16: Some(0),
             split_inputs: Map::default(),
             debug_pos: None,
+            rect_corner: None,
         }
     }
 
@@ -10949,6 +10953,7 @@ impl<'a> Lower<'a> {
         *cols = (*cols).max(count as u8);
         ids.push(id);
         }
+        let mut loaded = Vec::new();
         for k in 0..count {
             let mut x = [None; 3];
             for (corner, &id) in ids.iter().enumerate() {
@@ -10957,6 +10962,32 @@ impl<'a> Lower<'a> {
                 };
                 x[corner] = Some(v);
             }
+            loaded.push(x);
+        }
+        let float = !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
+            (&loaded[..], float, self.rect_corner)
+        {
+            // The right angle is opposite the longest side (the corners may come in any order).
+            let c = self.cur;
+            let p: Vec<V> = [*a0, *a1, *b0, *b1, *d0, *d1].map(|v| self.as_float(v)).to_vec();
+            let mut d2 = |i: usize, j: usize| {
+                let dx = self.s.m.bin(c, Bin::Sub, p[2 * i], p[2 * j]);
+                let dy = self.s.m.bin(c, Bin::Sub, p[2 * i + 1], p[2 * j + 1]);
+                let xx = self.s.m.bin(c, Bin::Mul, dx, dx);
+                let yy = self.s.m.bin(c, Bin::Mul, dy, dy);
+                self.s.m.bin(c, Bin::Add, xx, yy)
+            };
+            let (ab, bd, ad) = (d2(0, 1), d2(1, 2), d2(0, 2));
+            let ge1 = self.s.m.cmp(c, pred::OGE, bd, ab);
+            let ge2 = self.s.m.cmp(c, pred::OGE, bd, ad);
+            let at_a = self.s.m.bin(c, Bin::And, ge1, ge2);
+            let ge3 = self.s.m.cmp(c, pred::OGT, ab, ad);
+            let ge4 = self.s.m.cmp(c, pred::OGT, ab, bd);
+            let at_d = self.s.m.bin(c, Bin::And, ge3, ge4);
+            self.rect_corner = Some((c, at_a, at_d));
+        }
+        for (k, x) in loaded.into_iter().enumerate() {
             let Some(mut v) = x[0] else { return Err("a vertex input") };
             if let [Some(a), Some(b), Some(d)] = x {
                 // Rectangle corner by vertex id: 1 and 2 are the stored ones, 3 is b + d - a.
@@ -10966,21 +10997,37 @@ impl<'a> Lower<'a> {
                     let n = l.s.m.i32(n);
                     l.s.m.cmp(c, pred::EQ, vid, n)
                 };
-                let ex = if matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C') {
-                    d
-                } else {
-                    let (fa, fb, fd) = (self.as_float(a), self.as_float(b), self.as_float(d));
-                    // Observed: the corners come as top-left, bottom-left, bottom-right, so the
-                    // missing one is opposite the middle vertex: v0 + v2 - v1.
-                    let sum = self.s.m.bin(c, Bin::Add, fa, fd);
-                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fb);
-                    self.as_int(fourth)
+                // r: the right-angle corner, p and q the others (v1, v0 and v2 unless the
+                // position says otherwise); the missing corner is p + q - r.
+                let (p, r, q) = match self.rect_corner {
+                    Some((block, at_a, at_d)) if block == c => {
+                        let r = self.s.m.select(c, at_d, d, b);
+                        let r = self.s.m.select(c, at_a, a, r);
+                        let p = self.s.m.select(c, at_a, b, a);
+                        let q = self.s.m.select(c, at_d, b, d);
+                        (p, r, q)
+                    }
+                    _ => (a, b, d),
                 };
-                // Strip order v0, v1, the missing corner, v2: both triangles wind alike.
+                let ex = if float {
+                    let (fp, fr, fq) = (self.as_float(p), self.as_float(r), self.as_float(q));
+                    let sum = self.s.m.bin(c, Bin::Add, fp, fq);
+                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fr);
+                    let fourth = self.as_int(fourth);
+                    // A value two corners share is the fourth's exactly (no rounding, NaN or
+                    // flushed denormal from the arithmetic).
+                    let pr = self.s.m.cmp(c, pred::EQ, p, r);
+                    let qr = self.s.m.cmp(c, pred::EQ, q, r);
+                    let v = self.s.m.select(c, qr, p, fourth);
+                    self.s.m.select(c, pr, q, v)
+                } else {
+                    q
+                };
+                // Strip order p, r, the missing corner, q: two triangles sharing the r diagonal.
                 let (c1, c2, c3) = (is(self, 1), is(self, 2), is(self, 3));
-                v = self.s.m.select(c, c1, b, a);
+                v = self.s.m.select(c, c1, r, p);
                 v = self.s.m.select(c, c2, ex, v);
-                v = self.s.m.select(c, c3, d, v);
+                v = self.s.m.select(c, c3, q, v);
             }
             if count == 2 && kind == 'F' {
                 match (k, self.debug_pos) {
