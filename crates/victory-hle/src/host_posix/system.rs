@@ -33,6 +33,7 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const ERROR_NOT_OWNER: u32 = 288;
 const ERROR_INVALID_FLAGS: u32 = 1004;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
 /// 100 ns ticks from 1601 to 1970.
 const EPOCH_DIFFERENCE: u64 = 116_444_736_000_000_000;
@@ -794,6 +795,102 @@ pub extern "system" fn GetCommandLineA() -> *const u8 {
         text.into_bytes().into_iter().chain([0]).collect()
     });
     LINE.as_ptr()
+}
+
+/// The variable `name` of the process environment, which the C runtime's `getenv` reads too:
+/// its own name and its value, matched ignoring case as Windows does.
+fn env_entry(name: &str) -> Option<(String, String)> {
+    std::env::var(name).ok().map(|v| (name.to_string(), v)).or_else(|| {
+        std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    })
+}
+
+/// `GetEnvironmentVariable`'s result for `value` and the title's buffer of `size` units: the
+/// units written without the NUL, or the room the value and its NUL need.
+fn put_env_value<T: Copy + Default>(value: Option<Vec<T>>, buf: *mut T, size: u32) -> u32 {
+    let Some(v) = value else {
+        set_error(ERROR_ENVVAR_NOT_FOUND);
+        return 0;
+    };
+    if buf.is_null() || (size as usize) <= v.len() {
+        return v.len() as u32 + 1;
+    }
+    // SAFETY: the title's buffer of `size` units, which holds the value and its NUL.
+    unsafe {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf, v.len());
+        buf.add(v.len()).write(T::default());
+    }
+    v.len() as u32
+}
+
+/// Sets `name` (an existing variable of any case) to `value`, or removes it for `None`.
+fn set_env(name: &str, value: Option<&str>) -> i32 {
+    // The host's environment takes no `=` in a name (Windows' hidden `=C:` ones included).
+    if name.is_empty() || name.contains('=') {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let key = env_entry(name).map_or_else(|| name.to_string(), |(k, _)| k);
+    // SAFETY: the process environment, changed as the title asks, as `_putenv` does.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(&key, v),
+            None => std::env::remove_var(&key),
+        }
+    }
+    1
+}
+
+pub extern "system" fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: a NUL-terminated name.
+    let name = String::from_utf8_lossy(unsafe { units(name, -1) });
+    put_env_value(env_entry(&name).map(|(_, v)| v.into_bytes()), buf, size)
+}
+
+pub extern "system" fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: u32) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: a NUL-terminated name.
+    let name = String::from_utf16_lossy(unsafe { units(name, -1) });
+    put_env_value(env_entry(&name).map(|(_, v)| v.encode_utf16().collect()), buf, size)
+}
+
+pub extern "system" fn SetEnvironmentVariableA(name: *const u8, value: *const u8) -> i32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: NUL-terminated strings; a null value removes the variable.
+    let (name, value) = unsafe {
+        (
+            String::from_utf8_lossy(units(name, -1)).into_owned(),
+            (!value.is_null()).then(|| String::from_utf8_lossy(units(value, -1)).into_owned()),
+        )
+    };
+    set_env(&name, value.as_deref())
+}
+
+pub extern "system" fn SetEnvironmentVariableW(name: *const u16, value: *const u16) -> i32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: NUL-terminated strings; a null value removes the variable.
+    let (name, value) = unsafe {
+        (
+            String::from_utf16_lossy(units(name, -1)),
+            (!value.is_null()).then(|| String::from_utf16_lossy(units(value, -1))),
+        )
+    };
+    set_env(&name, value.as_deref())
 }
 
 pub extern "system" fn GetModuleHandleExW(
@@ -2009,6 +2106,10 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             GetStartupInfoW,
             GetCommandLineW,
             GetCommandLineA,
+            GetEnvironmentVariableA,
+            GetEnvironmentVariableW,
+            SetEnvironmentVariableA,
+            SetEnvironmentVariableW,
             GetModuleHandleExW,
             VirtualQuery,
             VirtualQueryEx,
@@ -2119,6 +2220,45 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_variables_are_set_read_and_removed_ignoring_case() {
+        // The AMD upscaler imports them through this API set.
+        let api = "api-ms-win-core-processenvironment-l1-1-0.dll";
+        assert!(lookup(api, "GetEnvironmentVariableA").is_some());
+        assert!(lookup(api, "SetEnvironmentVariableA").is_some());
+        let (name, lower) = (b"VICTORY_TEST_ENV_5E2B\0", b"victory_test_env_5e2b\0");
+        let get = |size: u32| {
+            let mut buf = [b'x'; 8];
+            let n = GetEnvironmentVariableA(lower.as_ptr(), buf.as_mut_ptr(), size);
+            (n, buf)
+        };
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), c"abc".as_ptr().cast()), 1);
+        // The C runtime's getenv reads the same environment.
+        assert_eq!(std::env::var("VICTORY_TEST_ENV_5E2B").as_deref(), Ok("abc"));
+        assert_eq!(get(8), (3, *b"abc\0xxxx"));
+        // Too small for the value and its NUL: the room needed, nothing written.
+        assert_eq!(get(3), (4, *b"xxxxxxxx"));
+        assert_eq!(GetEnvironmentVariableA(name.as_ptr(), std::ptr::null_mut(), 0), 4);
+        let wide: Vec<u16> = "victory_test_env_5e2b".encode_utf16().chain([0]).collect();
+        let mut out = [0xFFFFu16; 8];
+        assert_eq!(GetEnvironmentVariableW(wide.as_ptr(), out.as_mut_ptr(), 8), 3);
+        assert_eq!(out[..4], [97, 98, 99, 0]);
+        // Another case names the same variable.
+        let value: Vec<u16> = "xyzw".encode_utf16().chain([0]).collect();
+        assert_eq!(SetEnvironmentVariableW(wide.as_ptr(), value.as_ptr()), 1);
+        assert_eq!(std::env::var("VICTORY_TEST_ENV_5E2B").as_deref(), Ok("xyzw"));
+        assert!(std::env::var("victory_test_env_5e2b").is_err());
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), c"".as_ptr().cast()), 1);
+        assert_eq!(get(8), (0, *b"\0xxxxxxx"));
+        // A null value removes it.
+        assert_eq!(SetEnvironmentVariableA(name.as_ptr(), std::ptr::null()), 1);
+        assert_eq!(get(8), (0, *b"xxxxxxxx"));
+        assert_eq!(super::super::GetLastError(), ERROR_ENVVAR_NOT_FOUND);
+        assert_eq!(SetEnvironmentVariableA(c"".as_ptr().cast(), c"v".as_ptr().cast()), 0);
+        assert_eq!(SetEnvironmentVariableA(c"A=B".as_ptr().cast(), c"v".as_ptr().cast()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
 
     #[test]
     fn file_times_and_system_times_round_trip() {
