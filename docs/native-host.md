@@ -843,7 +843,7 @@ The prologue world load (frame ~2112) is the first place the title uses `Execute
 | 12 | 105, console single-pass dispatch | three group counts (guess, below) | as `DISPATCH` |
 | 16 | 0, `DRAW` | `D3D12_DRAW_ARGUMENTS` | `drawPrimitives:indirectBuffer:` |
 | 20 | 1, `DRAW_INDEXED` | `D3D12_DRAW_INDEXED_ARGUMENTS` | `drawIndexedPrimitives:...indirectBuffer:` |
-| 12 | 10, `DISPATCH_MESH` | three group counts | dropped: the host has no mesh pipelines |
+| 12 | 10, `DISPATCH_MESH` | `D3D12_DISPATCH_MESH_ARGUMENTS`: three group counts | `drawMeshThreadgroupsWithIndirectBuffer` (a guessed mesh pipeline) |
 
 The words the log prints after a dispatch's type (`[2, 1, 0, 0]`, `[105, 0, 60000, 0]`) are not part of its argument description; only root-constant, view and vertex-buffer arguments use them.
 
@@ -854,7 +854,7 @@ A count buffer runs too. D3D12 runs `min(count, max)` records, the count read on
 Still dropped, logged once per signature ("indirect execution dropped"), except rectangle lists, logged once as "native host drops work: an indirect rectangle-list draw":
 
 - Signatures with more than one argument: root constants, root views, vertex or index buffers changed per record. Their values are per record in GPU memory, so they cannot be read on the CPU at submission time. None seen yet.
-- Mesh dispatches (type 10), as direct mesh dispatches are.
+- Mesh dispatches (type 10) under a pipeline that is not a mesh pipeline, and draws of a mesh pipeline ("a mesh dispatch of a vertex pipeline", "a draw of a mesh pipeline"). A guessed pipeline whose vertex program exports primitives is a mesh pipeline (see the guessed-pipelines list); its type-10 records run as `drawMeshThreadgroupsWithIndirectBuffer`, counted ones gated like the rest. Test: `victory-gpu` `a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count`.
 - Indirect draws of a rectangle list (topology 17): the host draws a rectangle list as instances of four vertices, which needs the record's counts rewritten first. The title's indexed signature (stride 20) is one (run 1 dropped it on this path, the only one an indexed record without a count buffer drops on); so are direct indexed rectangle lists, which the host also drops. First windowed run with this change (2026-11-27, Series S): the draw, dispatch and type-105 signatures ran, and only the mesh signature and the indexed rectangle-list draw dropped.
 
 Guess: type 105 is not a D3D12 argument type. It is taken to be the console's single-pass dispatch, with the same three-word record as `DISPATCH` (its flags live in the signature, the title passes none); its stride, 12, fits that.
