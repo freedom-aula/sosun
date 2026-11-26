@@ -1,0 +1,59 @@
+# Working on Native VIctory for macOS (for AI coding agents and humans)
+
+A native macOS port of VIctory, the Xbox Series emulator for GTA VI. The game's x86-64 code runs in our own process under Rosetta. Its Windows/Xbox system calls are reimplemented in Rust (`crates/victory-hle`). Its Direct3D 12 work and GFX10 shaders go to Metal (`crates/victory-gpu`, `crates/victory-metal`, `crates/victory-shader`). Deep notes: `docs/native-host.md`. Open problems in priority order: `docs/ROADMAP.md`.
+
+## Hard rules
+
+- **Nothing from the game goes in the repo:** no executables, data, shaders, disassembly listings, screenshots or audio. `cargo xtask policy` (also a CI test) enforces an allowlist of file types and blocks embedded binary data. Dumps and traces go to a folder outside the repo.
+- Don't vendor Apple's Metal Shader Converter headers or libraries.
+- Don't send game files or bytes to any external service or model.
+- No AI attribution lines (`Co-Authored-By`, "Generated with ...") in commits or PRs.
+- Guesses about undocumented console behaviour are marked in the code and explained in `docs/native-host.md`.
+- New diagnostics are off by default, behind a `VICTORY_*` environment variable, and documented.
+
+## Build and check
+
+The toolchain is pinned in `rust-toolchain.toml` (1.98.1). Put its own `bin` first on PATH, or Homebrew's rustc breaks the build with "can't find crate for std":
+
+```bash
+export PATH="$(rustup run 1.98.1 rustc --print sysroot)/bin:$PATH"
+cargo build --release --target x86_64-apple-darwin -p victory
+```
+
+Before opening a PR, run what CI runs (CI is Windows, so lint for a Windows target):
+
+```bash
+cargo test -p victory-hle -p victory -p victory-gpu -p xtask
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnullvm -- -D warnings
+cargo xtask policy
+```
+
+Known flaky under load: `victory-hle` `native_probe` waits test, and `victory-gpu` `memory::tests::a_submission_that_missed_leaves_the_copies_at_once` (being fixed). The victory-gpu tests also crash when run as x86_64 under Rosetta, so run them on the native arm64 host (no `--target`).
+
+## Running the game
+
+You need your own copy of the game. Windowed, for a person: `tools/macos/run-native.sh <game folder>`. Headless, for agents and scripts: `--headless --seconds N`. Logs go to `runs/<date>/victory.log`. Details and diagnostics are in the `run-game` and `debug-graphics` skills (`.claude/skills/`).
+
+- Run one game at a time. If several agents share a machine, serialise runs with a lock: `/usr/bin/lockf -k <some>/game.lock timeout 150 nice <command>`.
+- Keep builds polite: `-j6` or fewer, under `nice`.
+- The game saves its setup choices in `~/.cache/victory/data/7952987A/storage`. Once setup has been completed, runs skip the setup screens; delete that folder to see them again.
+
+## Where things are
+
+| Area | Code |
+|---|---|
+| Loader, threads, SEH, TEB | `crates/victory-loader/src/native/` |
+| System calls (HLE) | `crates/victory-hle/src/modules/` (Xbox/GDK APIs), `src/host_posix/` (Win32, UCRT, WASAPI, XAudio2 on macOS) |
+| Input | `crates/victory-hle/src/modules/gameinput.rs`, `apps/victory/src/window.rs` |
+| GPU host, pipelines, textures | `crates/victory-gpu/src/native/` |
+| Shader translation (GFX10 to DXIL) | `crates/victory-shader/src/emit/` |
+| Metal backend | `crates/victory-metal/src/` |
+| Setup and run scripts | `tools/macos/` |
+
+## How to work
+
+1. Reproduce with a headless run and the trace variables. Read the log and the image dumps.
+2. Hold one hypothesis at a time and prove it with a trace or dump before changing code.
+3. Fix it in the shared code, with a unit test that fails without the fix.
+4. Update `docs/native-host.md` (what you learned) and, if the status changes, `docs/ROADMAP.md` and the README.
+5. Open a PR against `main`. Every PR needs a passing CI run and the maintainer's review.

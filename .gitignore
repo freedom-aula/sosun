@@ -79,6 +79,5 @@ Thumbs.db
 .DS_Store
 
 # Private notes, kept out of the repository
-AGENTS.md
 HANDOFF.md
 /runs/
