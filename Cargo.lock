@@ -777,6 +777,8 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "objc2",
+ "objc2-foundation",
  "tracing",
  "victory-core",
  "victory-game",

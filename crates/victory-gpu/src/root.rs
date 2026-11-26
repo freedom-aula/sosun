@@ -212,7 +212,7 @@ static FUNCTIONS: Table<24> = {
     f[0] = query as *const ();
     f[2] = release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
-    Table(f)
+    Table::new(f)
 };
 
 #[cfg(test)]

@@ -1531,7 +1531,7 @@ pub(crate) fn is_resource(p: This) -> bool {
     let mut word = [0u8; 8];
     !p.is_null()
         && crate::queue::read_bytes(p as usize, &mut word)
-        && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+        && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.f.as_ptr() as usize
 }
 
 fn resource<'a>(this: This) -> &'a Resource {
@@ -2326,7 +2326,7 @@ static HEAP_FUNCTIONS: Table<24> = {
     f[2] = heap_release as *const ();
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = heap_desc as *const (); // 0x40
-    Table(f)
+    Table::new(f)
 };
 
 /// IUnknown 3, object 4, device child 1, resource 10 (7 as on PC, then 3
@@ -2341,7 +2341,7 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[10] = resource_desc as *const (); // 0x50
     f[11] = gpu_address as *const (); // 0x58
     f[14] = heap_properties as *const (); // 0x70
-    Table(f)
+    Table::new(f)
 };
 
 /// A 2D texture in the title memory at `address`, in the console layout `swizzle`.

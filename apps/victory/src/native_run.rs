@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{Context, Result};
+use victory_hle::modules::xmem_physical::{Observer, PoolInfo};
 use victory_hle::{HleResolver, HostPolicy};
 use victory_loader::native::dll::{self, TitleDll, WithTitleDlls};
 use victory_loader::native::{self, NativeImage, teb};
@@ -210,6 +211,7 @@ pub fn run(
     list_imports: bool,
     console: Console,
     title_args: &[String],
+    headless: bool,
 ) -> Result<u32> {
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -304,9 +306,77 @@ pub fn run(
 
     // The image lives as long as the process: title threads outlive `run`.
     let image: &'static NativeImage = Box::leak(Box::new(image));
-    // SAFETY: imports are bound and the images finalized; from here on we
-    // run title code.
-    let code = unsafe { native::run_entry_with(image, &dlls) }?;
+    connect_gpu();
+    // The title's graphics go to a layer: the window's, or one with no window.
+    let layer = victory_gpu::native::create_layer(crate::window::WIDTH, crate::window::HEIGHT)
+        .map_err(|e| anyhow::anyhow!("no layer to present into: {e}"))?;
+    victory_gpu::native::set_layer(layer.as_ptr())
+        .map_err(|e| anyhow::anyhow!("no layer to present into: {e}"))?;
+    let layer = layer.as_ptr();
+    let launch = Launch(image, dlls);
+    let go = move || {
+        let launch = launch;
+        // SAFETY: imports are bound and the images finalized; from here on we
+        // run title code.
+        unsafe { native::run_entry_with(launch.0, &launch.1) }
+    };
+    let code = if headless {
+        go()?
+    } else {
+        // AppKit owns this (the main) thread; the title runs on its own.
+        crate::window::run(layer, go)?.unwrap_or(0)
+    };
     println!("title exited with {code}");
     Ok(code)
+}
+
+/// What the title launch thread takes along: images that live for the process.
+struct Launch(&'static NativeImage, Vec<&'static TitleDll>);
+// SAFETY: the images are mapped memory that is never freed; the title runs on whichever thread
+// starts it.
+unsafe impl Send for Launch {}
+
+/// Wires the title-facing graphics objects to the native host: their method tables become
+/// bridged ones (the title is Windows x64), the runtime's physical-memory pools feed the GPU's
+/// pool table, and fence events signal the title's event handles.
+fn connect_gpu() {
+    victory_gpu::object::set_bridge(victory_gpu::object::Bridge {
+        is_bridged: native::is_bridged,
+        expose: |this, len, area| {
+            // SAFETY: forwarded: a live object of ours whose first word is such a table.
+            unsafe { native::expose_object(this, len, area) }
+        },
+        declare_win64: native::declare_win64,
+    });
+    victory_hle::modules::xmem_physical::set_observer(Some(std::sync::Arc::new(PoolFeed(
+        victory_gpu::native::pool_observer(),
+    ))));
+    victory_gpu::native::set_event_hook(victory_hle::posix::set_event);
+}
+
+/// `victory_gpu`'s pool observer behind the runtime's (victory-gpu does not know victory-hle).
+struct PoolFeed(std::sync::Arc<dyn victory_gpu::native::memory::PoolObserver>);
+
+fn info(pool: &PoolInfo) -> victory_gpu::native::memory::PoolInfo {
+    victory_gpu::native::memory::PoolInfo {
+        id: pool.id,
+        base: pool.base,
+        len: pool.len,
+        memory_entry: pool.memory_entry,
+    }
+}
+
+impl Observer for PoolFeed {
+    fn pool_created(&self, pool: &PoolInfo) {
+        self.0.pool_created(&info(pool));
+    }
+    fn pool_released(&self, pool: &PoolInfo) {
+        self.0.pool_released(&info(pool));
+    }
+    fn mapped(&self, at: usize, len: usize, pool: &PoolInfo, offset: usize) {
+        self.0.mapped(at, len, &info(pool), offset);
+    }
+    fn unmapped(&self, at: usize, len: usize) {
+        self.0.unmapped(at, len);
+    }
 }

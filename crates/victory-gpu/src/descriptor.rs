@@ -870,7 +870,7 @@ static FUNCTIONS: Table<24> = {
     f[8] = desc as *const (); // 0x40
     f[9] = start as *const (); // 0x48 CPU
     f[10] = start as *const (); // 0x50 GPU
-    Table(f)
+    Table::new(f)
 };
 
 #[cfg(test)]

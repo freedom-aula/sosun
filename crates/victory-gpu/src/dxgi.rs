@@ -191,7 +191,7 @@ static DEVICE_FUNCTIONS: Table<32> = {
     f[0] = device_query as *const ();
     f[6] = device_parent as *const (); // 0x30
     f[7] = device_adapter as *const (); // 0x38
-    Table(f)
+    Table::new(f)
 };
 
 /// IUnknown 3, object 4, adapter 3 + 1 + 1.
@@ -201,7 +201,7 @@ static ADAPTER_FUNCTIONS: Table<24> = {
     f[6] = adapter_parent as *const (); // 0x30
     f[7] = adapter_outputs as *const (); // 0x38
     f[8] = adapter_description as *const (); // 0x40
-    Table(f)
+    Table::new(f)
 };
 
 /// IUnknown 3, object 4, factory 5 + 2 + 11.
@@ -210,7 +210,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
     f[0] = factory_query as *const ();
     f[7] = factory_adapters as *const (); // 0x38
     f[12] = factory_adapters as *const (); // 0x60, the same for version 1
-    Table(f)
+    Table::new(f)
 };
 
 /// A display mode as the console lists it: size, refresh rate (numerator,
@@ -270,7 +270,7 @@ static OUTPUT_FUNCTIONS: Table<32> = {
     f[0] = output_query as *const ();
     f[6] = output_parent as *const (); // 0x30
     f[21] = modes as *const (); // 0xa8
-    Table(f)
+    Table::new(f)
 };
 
 #[cfg(test)]

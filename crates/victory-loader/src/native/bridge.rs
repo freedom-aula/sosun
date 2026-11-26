@@ -129,7 +129,7 @@ core::arch::global_asm!(
     "push r12",
     "push r13",
     "push r14",
-    "sub rsp, 0x120",
+    "sub rsp, 0x140",
     "mov [rsp + 0x60], rcx",
     "mov [rsp + 0x68], rdx",
     "mov [rsp + 0x70], r8",
@@ -149,6 +149,8 @@ core::arch::global_asm!(
     "mov rbx, [r12 + {host_tsd}]",
     "movaps [rsp + 0x40], xmm0",
     "movaps [rsp + 0x50], xmm1",
+    "movaps [rsp + 0x120], xmm2",
+    "movaps [rsp + 0x130], xmm3",
     "mov rdi, rbx",
     "mov eax, {set_gs}",
     "syscall",
@@ -167,6 +169,8 @@ core::arch::global_asm!(
     "mov r9, [rsp + 0x78]",
     "movaps xmm0, [rsp + 0x40]",
     "movaps xmm1, [rsp + 0x50]",
+    "movaps xmm2, [rsp + 0x120]",
+    "movaps xmm3, [rsp + 0x130]",
     "call r13",
     "mov r13, rax",
     "movaps [rsp + 0x40], xmm0",
@@ -185,7 +189,7 @@ core::arch::global_asm!(
     "movaps xmm13, [rsp + 0xF0]",
     "movaps xmm14, [rsp + 0x100]",
     "movaps xmm15, [rsp + 0x110]",
-    "add rsp, 0x120",
+    "add rsp, 0x140",
     "pop r14",
     "pop r13",
     "pop r12",
@@ -423,6 +427,14 @@ pub unsafe fn bridged_table(
     by_raw.insert(raw as usize, copy as usize);
     copies.insert(copy as usize);
     Ok(copy)
+}
+
+/// Whether the method table at `table` is one of our bridged copies.
+pub fn is_bridged(table: *const *const ()) -> bool {
+    let guard = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .is_some_and(|(_, copies)| copies.contains(&(table as usize)))
 }
 
 /// Gives the COM-style object at `this` (first word: its method table of

@@ -13,6 +13,8 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod window;
 
 use std::path::PathBuf;
 
@@ -123,6 +125,9 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// macOS native host: no window; frames are presented to an offscreen layer.
+        #[arg(long)]
+        headless: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -219,6 +224,7 @@ fn main() -> Result<()> {
             execute,
             list_imports,
             console,
+            headless,
             title_args,
         } => {
             let code = run::run(
@@ -229,6 +235,7 @@ fn main() -> Result<()> {
                 list_imports,
                 console,
                 &title_args,
+                headless,
             )?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.

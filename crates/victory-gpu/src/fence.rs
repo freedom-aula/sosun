@@ -220,7 +220,7 @@ static FUNCTIONS: Table<24> = {
     f[10] = signal as *const (); // 0x50
     f[11] = creation_flags as *const (); // 0x58
     f[12] = gpu_address as *const (); // 0x60
-    Table(f)
+    Table::new(f)
 };
 
 #[cfg(test)]

@@ -21,6 +21,11 @@ pub(crate) mod title;
 pub mod posix {
     pub use crate::host_posix::files::{mount, mount_at};
     pub use crate::host_posix::ucrt::set_command_line;
+
+    /// Signals a title event handle (what a fence completion does for `SetEventOnCompletion`).
+    pub fn set_event(handle: usize) {
+        crate::host_posix::SetEvent(handle as *mut std::ffi::c_void);
+    }
 }
 mod registry;
 pub mod runtime;

@@ -945,8 +945,8 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
     f
 }
 
-static FUNCTIONS: Table<36> = Table(queue_table(false));
-static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+static FUNCTIONS: Table<36> = Table::new(queue_table(false));
+static NEWER_FUNCTIONS: Table<36> = Table::new(queue_table(true));
 
 #[cfg(test)]
 mod tests {
@@ -1013,7 +1013,7 @@ mod tests {
     fn signal_slot(q: This) -> usize {
         // SAFETY: one of our queues; its first field is the table.
         let table = unsafe { *q.cast::<*const *const ()>() };
-        if table == NEWER_FUNCTIONS.0.as_ptr() {
+        if table == NEWER_FUNCTIONS.f.as_ptr() {
             0x80
         } else {
             0x70

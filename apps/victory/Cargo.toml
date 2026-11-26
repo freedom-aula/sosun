@@ -22,6 +22,12 @@ clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
 
+# The window of the native macOS host (AppKit through the Objective-C runtime; the crates are
+# already built for victory-metal).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

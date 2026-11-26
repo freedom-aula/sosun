@@ -52,7 +52,7 @@ unsafe impl Sync for Object {}
 impl Object {
     pub(crate) const fn new<const N: usize>(table: &'static Table<N>) -> Self {
         Object {
-            functions: table.0.as_ptr(),
+            functions: table.f.as_ptr(),
             bits: 0,
             refs: AtomicU32::new(0),
         }
@@ -61,8 +61,19 @@ impl Object {
 
 pub(crate) type This = *const Object;
 
-#[repr(transparent)]
-pub(crate) struct Table<const N: usize>(pub [*const (); N]);
+/// A method table, with its length just before the first slot, where
+/// [`expose`] finds it from an object.
+#[repr(C)]
+pub(crate) struct Table<const N: usize> {
+    len: usize,
+    pub f: [*const (); N],
+}
+
+impl<const N: usize> Table<N> {
+    pub(crate) const fn new(f: [*const (); N]) -> Self {
+        Table { len: N, f }
+    }
+}
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
@@ -92,6 +103,7 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
     }
     let hr = match found {
         Some(object) => {
+            expose(object);
             add_ref(object);
             // SAFETY: checked non-null; the title passes room for a pointer.
             unsafe { out.write(object) };
@@ -105,6 +117,46 @@ pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mu
     // SAFETY: checked non-null.
     unsafe { out.write(std::ptr::null()) };
     hr
+}
+
+/// How objects reach title code that is not the host's own ABI (the native macOS path: title code
+/// is Windows x64, ours System V). Set once by the app; without it objects are called as they are.
+pub struct Bridge {
+    /// Whether a method table is already a bridged copy (`victory_loader::native::is_bridged`).
+    pub is_bridged: fn(table: *const *const ()) -> bool,
+    /// Gives the object at `this` (first word: its method table of `len` slots) a table the
+    /// title can call, in place (`victory_loader::native::expose_object`).
+    pub expose: unsafe fn(this: *const (), len: usize, area: &'static str),
+    /// Declares that the function at the address takes floats in the Windows registers
+    /// (`victory_loader::native::declare_win64`).
+    pub declare_win64: fn(usize),
+}
+
+static BRIDGE: std::sync::OnceLock<Bridge> = std::sync::OnceLock::new();
+
+/// Installs the bridge and declares our `extern "win64"` methods to it. Before the title runs.
+pub fn set_bridge(bridge: Bridge) {
+    let declare = bridge.declare_win64;
+    if BRIDGE.set(bridge).is_ok() {
+        for f in crate::list::win64_methods() {
+            declare(f);
+        }
+    }
+}
+
+/// An object leaves for the title: its table becomes one the title can call. Idempotent.
+fn expose(object: This) {
+    let Some(bridge) = BRIDGE.get() else { return };
+    // SAFETY: `object` is one of ours; its first word points at a `Table` (length just before)
+    // unless it was bridged already.
+    unsafe {
+        let functions = (*object).functions;
+        if (bridge.is_bridged)(functions) {
+            return;
+        }
+        let len = *functions.cast::<usize>().sub(1);
+        (bridge.expose)(object.cast(), len, "d3d12");
+    }
 }
 
 /// `IUnknown`, which every COM object answers for.
@@ -399,7 +451,7 @@ mod tests {
         static TABLE: Table<7> = {
             let mut functions = d3d12_object(missing_table::<DEVICE, 7>());
             functions[2] = release_test_object as *const ();
-            Table(functions)
+            Table::new(functions)
         };
         let mut this = std::ptr::null();
         assert_eq!(
@@ -515,7 +567,7 @@ mod tests {
             }
         }
 
-        static TABLE: Table<0> = Table([]);
+        static TABLE: Table<0> = Table::new([]);
         let this: This = Box::into_raw(Box::new(OwnedObject(Object::new(&TABLE)))).cast();
         assert_eq!(add_ref(this), 1);
         for id in [[u8::MIN; 16], TAG, [u8::MAX; 16]] {

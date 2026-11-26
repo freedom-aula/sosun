@@ -1136,7 +1136,44 @@ extern "system" fn clear_rtv(
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
+/// The title calls this with the depth in `xmm3`: Windows x64 on every target that can say so
+/// (on the native macOS path the bridge keeps the registers as they are for it).
+#[cfg(target_arch = "x86_64")]
+extern "win64" fn clear_dsv(
+    this: This,
+    handle: u64,
+    flags: u32,
+    depth: f32,
+    stencil: u8,
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_dsv_impl(this, handle, flags, depth, stencil, count, rects);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 extern "system" fn clear_dsv(
+    this: This,
+    handle: u64,
+    flags: u32,
+    depth: f32,
+    stencil: u8,
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_dsv_impl(this, handle, flags, depth, stencil, count, rects);
+}
+
+/// The methods of ours that take floats in the Windows registers, by address (see
+/// [`crate::object::set_bridge`]).
+pub(crate) fn win64_methods() -> Vec<usize> {
+    #[cfg(target_arch = "x86_64")]
+    return vec![clear_dsv as *const () as usize];
+    #[cfg(not(target_arch = "x86_64"))]
+    Vec::new()
+}
+
+fn clear_dsv_impl(
     this: This,
     handle: u64,
     flags: u32,
@@ -1299,7 +1336,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
     f[7] = object::parent_device as *const (); // 0x38
     f[8] = allocator_reset as *const (); // 0x40
     f[9] = object::ignore as *const (); // 0x48 allocation callback
-    Table(f)
+    Table::new(f)
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
@@ -2115,8 +2152,8 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 
 /// Every slot up to the limit exists and logs, for the methods newer
 /// titles add.
-static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
-static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+static LIST_FUNCTIONS: Table<160> = Table::new(list_table(false));
+static NEWER_LIST_FUNCTIONS: Table<160> = Table::new(list_table(true));
 
 #[cfg(test)]
 mod tests {
@@ -2224,12 +2261,12 @@ mod tests {
     #[test]
     fn unordered_access_clears_have_the_same_slots_in_both_layouts() {
         for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
-            assert_eq!(table.0[0x1a8 / 8], state::clear_unordered_uint as *const ());
+            assert_eq!(table.f[0x1a8 / 8], state::clear_unordered_uint as *const ());
             assert_eq!(
-                table.0[0x1b0 / 8],
+                table.f[0x1b0 / 8],
                 state::clear_unordered_float as *const ()
             );
-            assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+            assert_eq!(table.f[0x1b8 / 8], ignored_state as *const ());
         }
     }
 
