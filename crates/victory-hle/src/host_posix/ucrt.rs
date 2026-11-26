@@ -229,3 +229,43 @@ impl<T> Shared<T> {
         self.0.get()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With `VICTORY_UCRT_IMPORTS` naming a `--list-imports` dry-run output,
+    /// every UCRT import in it must resolve (the HLE registry's own `exit`
+    /// and `abort` are served there first, not here).
+    #[test]
+    fn every_ucrt_import_of_a_dry_run_is_served() {
+        let Some(list) = std::env::var_os("VICTORY_UCRT_IMPORTS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(list).unwrap();
+        let mut missing = Vec::new();
+        let mut checked = 0;
+        for line in text.lines().filter(|l| l.contains("api-ms-win-crt-")) {
+            let Some(item) = line.split_whitespace().last() else {
+                continue;
+            };
+            let Some((dll, name)) = item.split_once('!') else {
+                continue;
+            };
+            checked += 1;
+            if lookup(&dll, name).is_none() {
+                missing.push(item.to_string());
+            }
+        }
+        assert!(checked > 100, "only {checked} UCRT imports in the list");
+        assert!(missing.is_empty(), "not served: {missing:?}");
+    }
+
+    #[test]
+    fn dlls_that_are_not_the_c_runtime_are_left_alone() {
+        assert!(lookup("kernel32.dll", "strlen").is_none());
+        assert!(lookup("ucrtbase.dll", "strlen").is_some());
+        assert!(lookup("api-ms-win-crt-string-l1-1-0.dll", "strlen").is_some());
+        assert!(lookup("ucrtbase.dll", "NoSuchFunction").is_none());
+    }
+}

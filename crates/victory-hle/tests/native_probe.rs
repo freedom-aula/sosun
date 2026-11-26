@@ -32,13 +32,20 @@ fn map_elsewhere(bytes: &[u8]) -> (NativeImage, usize) {
     // The probe tests run in parallel and would pick the same free address.
     static LOOKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = LOOKING.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: reserved and released at once; the image maps there next.
-    let at = unsafe {
-        let p = mem::reserve(None, 1 << 20).unwrap();
-        mem::release(p, 1 << 20).unwrap();
-        p as usize
-    };
-    (NativeImage::map(bytes, Some(at)).unwrap(), at)
+    // Other threads allocate meanwhile, and one may take the address between
+    // the release and the map, so a few tries.
+    for _ in 0..50 {
+        // SAFETY: reserved and released at once; the image maps there next.
+        let at = unsafe {
+            let p = mem::reserve(None, 1 << 20).unwrap();
+            mem::release(p, 1 << 20).unwrap();
+            p as usize
+        };
+        if let Ok(image) = NativeImage::map(bytes, Some(at)) {
+            return (image, at);
+        }
+    }
+    panic!("no free address to map the probe at");
 }
 
 fn probe_bytes() -> Vec<u8> {
@@ -227,6 +234,22 @@ mod run {
         assert_eq!(
             std::fs::read(dir.path().join("written.bin")).unwrap(),
             b"abcd"
+        );
+    }
+
+    #[test]
+    fn the_c_runtime_serves_a_title_that_links_it() {
+        // The probe imports `ucrtbase.dll` and `api-ms-win-crt-math-l1-1-0.dll`:
+        // strings, math (doubles in xmm registers), printf and scanf over a
+        // `va_list`, qsort with a title comparator, files, heap, time,
+        // initializer and exit tables, signals, threads and errno.
+        let dir = tempfile::tempdir().unwrap();
+        let path: Vec<u8> = dir.path().to_str().unwrap().bytes().chain([0]).collect();
+        let result = run_probe("probe_ucrt", path.as_ptr() as u64);
+        assert_all(result, 0x1FFFF, "probe_ucrt");
+        assert!(
+            !dir.path().join("ucrt.bin").exists(),
+            "the probe removes its file"
         );
     }
 
