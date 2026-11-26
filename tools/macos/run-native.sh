@@ -41,6 +41,10 @@ log="$run_dir/victory.log"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
+# There is no live keyboard or gamepad yet: press Enter (the pad's A) every 2 s
+# from 4 s to 80 s so the game gets past its "press A" start screen.
+# shortcut: scripted presses, until real input reaches GameInput.
+export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"
 echo "Running $exe"
 echo "Log: $log"
 

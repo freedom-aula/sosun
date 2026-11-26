@@ -15,7 +15,7 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 </p>
 
 > [!IMPORTANT]
-> **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, and has drawn its first real image (its boot logo, in a debug mode). It currently stops itself about 19 seconds in and normal frames are still black. Both problems are understood well enough to work on, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
+> **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, gets past its "press A" start screen and runs for about 50 seconds (around 1,400 frames). It has drawn its first real image, its boot logo, in a debug mode, but normal frames are still black. We understand where both problems are, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
 ## Why a native port?
 
@@ -40,7 +40,8 @@ Fewer layers means fewer places for things to break, and much better speed: boot
 | GPU: every draw gets a Metal pipeline, built from the console's own pipeline descriptions | ✅ Works (some parts are inferred, see [docs/native-host.md](docs/native-host.md)) |
 | Shaders: GFX10 → DXIL → Metal | 🟡 Most translate; 7 known shapes still refused |
 | First image on screen | 🟡 The boot logo renders when vertex positions are taken from raw data; in normal runs the vertex shader's constant buffer reads zero |
-| Boot past 19 s | 🔴 The game waits for a signal we never send, then hits its own breakpoint |
+| Start screen ("press A") | ✅ Passed with scripted key presses (no live keyboard or gamepad yet) |
+| Running past ~50 s | 🔴 A Metal GPU command times out and frames stop |
 | Apple Silicon recompilation (no Rosetta) | 🟡 The whole game (440,000 functions) recompiles to arm64 and presents its first frame; fixing translation bugs one by one |
 | Gameplay | 🔴 Not yet |
 
@@ -73,7 +74,7 @@ The setup script checks Rosetta, the Xcode command line tools, rustup and the Me
 tools/macos/run-native.sh /path/to/your/game/folder
 ```
 
-Point it at the folder that holds `game_scarlett_master.exe`. A window opens, and the full log is saved under `runs/`. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
+Point it at the folder that holds `game_scarlett_master.exe`. A window opens, and the full log is saved under `runs/`. The script presses Enter for you every two seconds to get past the start screen, because keyboard input isn't wired up yet. Add `--headless` to run without a window, or `--seconds 60` to stop after a minute.
 
 **3. Tell us what happened.** Open a [Tester report](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/new?template=tester-report.yml) and attach the log. Reports from different Macs (M1 to M5, 8 GB to 128 GB) are very useful.
 
@@ -83,7 +84,7 @@ Whatever your background, there is something to do:
 
 - **Testers:** run the game on your Mac and file a tester report. No coding needed.
 - **Graphics and Metal:** find out why the content draws' constant buffer reads zero on the GPU. This is the step to the first proper frame.
-- **Reverse engineering and debugging:** find what the boot is waiting for (the 19-second stop).
+- **Debugging:** the Metal GPU timeout at about 50 s, and live keyboard and gamepad input.
 - **Compilers:** the arm64 recompiler (jump tables, SSE, exceptions).
 - **Rust and systems:** missing Windows and Xbox system calls, speed, tests.
 

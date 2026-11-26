@@ -14,17 +14,15 @@ Updated 26 November 2026. Each problem lists what is already known, so you don't
 
 **Start here:** `crates/victory-gpu/src/native/` (memory, host), the "Guessed graphics pipelines" section of native-host.md.
 
-## 2. The boot stops at about 19 s (system calls)
+## 2. Running past about 50 seconds (GPU timeout) and live input
 
-**Symptom:** the game's main thread waits in a boot loop (an update, `Sleep(33)` and a 100 ms semaphore wait per pass). Each pass appends to a fixed profiling buffer; after about 57 passes it overflows and the game hits its own `int3`.
+**Solved on 26 November:** the old stop at about 19 s was the game's "press A" start screen. The macOS host had no input, so nothing ever accepted it, and the game's profiling buffer overflowed into its own `int3`. `GameInput` now feeds scripted keys (`VICTORY_KEYS`, Enter = A) to a stand-in pad. Getting past it also needed SSE4a `insertq`/`extrq` emulation, cheaper cache-flush handling and clamped Metal texture views.
 
-**Known:**
-- It is time-based, not frame-based, and it happens before the boot movie or any audio starts.
-- The loop ends when a "ready" record is marked by a listener object that never gets called.
-- Ruled out: app-state notifications, fences, frame statistics, clock speed, the Bink movie, XAudio2.
-- **Candidates:** an async system request that never completes (user sign-in, GameInput device arrival, storage, network), or the thread that should release the semaphore being stuck elsewhere.
+**Now:**
+- At about 53 s (about 1,400 frames) a Metal command buffer fails with `kIOGPUCommandBufferCallbackErrorTimeout`. A fence is left one step behind (signal 2836, GPU at 2832) and presents stop. Not investigated yet.
+- There is no live keyboard or gamepad on macOS. Wiring the window's key events and Game Controller framework pads into `GameInput` is a self-contained task.
 
-**Start here:** `crates/victory-hle/src/modules/` (xgameruntime, gameinput, xuser), the "The int3" and "What the boot waits on" sections of native-host.md, and `VICTORY_DUMP_THREADS`.
+**Start here:** `crates/victory-gpu/src/native/` and `queue.rs` for the timeout; `crates/victory-hle/src/modules/gameinput.rs` and `apps/victory/src/window.rs` for input.
 
 ## 3. Shader translation gaps
 
