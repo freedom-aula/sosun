@@ -660,6 +660,42 @@ fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
     assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
 }
 
+/// A dispatch the host cannot give its arguments for another reason (here a root parameter that is
+/// not what its shader reads it as) is dropped by itself, not the whole piece: the value write
+/// recorded after it still runs.
+#[test]
+fn a_dispatch_the_host_cannot_prepare_is_dropped_alone() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let flag = 32768;
+    pool.write(flag, &[0u64]);
+    let pso = Rc::new(super::list::ComputePso {
+        pso: h.backend.create_compute_pipeline(&fixture_affine()).unwrap(),
+        threads: [64, 1, 1],
+        binding: Some(super::list::Binding {
+            dwords: 4,
+            user_data: vec![victory_shader::emit::UserData {
+                index: 0,
+                slot: 0,
+                root: victory_shader::RootType::Constants,
+                dword: 0,
+            }],
+            ..Default::default()
+        }),
+    });
+
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    // Slot 0 holds a root view where the shader reads root constants.
+    l.set_compute_root_view(0, pool.va(0));
+    l.dispatch(1, 1, 1).unwrap();
+    l.write_value(pool.va(flag), 0xD6D, 8);
+    run(&h, &[&l]);
+
+    assert_eq!(h.failed(), 1);
+    assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
+}
+
 /// The triangle pipeline of [`clear_and_draw_into_render_target`].
 fn triangle_pipeline(h: &Host) -> Rc<<Metal as GraphicsBackend>::RenderPipeline> {
     let attr = |format, offset| VertexAttr { format, slot: 0, offset };

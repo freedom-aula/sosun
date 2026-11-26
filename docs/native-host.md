@@ -583,6 +583,12 @@ refusals in one story load). These are counted per host
 (`NativeHost::unmapped`). The first one warns without any switch, as the
 refused piece did, and each one is logged at debug level with its address.
 
+Every other error the host meets preparing one command (root arguments that are not what the
+shader reads them as, a resource heap with no room for the view pairs, a buffer or page table
+the backend did not make) now drops that command alone as well, counted in
+`NativeHost::failed`, with a warning the first time and each at debug level. It used to refuse
+the whole piece, with its value writes, and a queue waiting for one of those values was held.
+
 #### Title memory view pairs of released pools are reused
 
 The pool-offset contract (`native/addr.rs`) has 255 view pairs per resource heap, one per

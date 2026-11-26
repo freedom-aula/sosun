@@ -39,6 +39,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Commands dropped because the host could not prepare them for another reason.
+    failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
 }
@@ -135,6 +137,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
         }
     }
@@ -152,6 +155,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Commands dropped so far because they name title memory outside every mapped pool.
     pub fn unmapped(&self) -> u64 {
         self.unmapped.get()
+    }
+
+    /// Commands dropped so far because the host could not prepare them (not an unset root
+    /// parameter, not unmapped memory).
+    pub fn failed(&self) -> u64 {
+        self.failed.get()
     }
 
     /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
@@ -1002,7 +1011,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
         // metadata can name a root slot the title sets nothing in, 255 observed; what the console
-        // gives such a shader there is not known.) Any other error still refuses the piece.
+        // gives such a shader there is not known.) Any other error drops its command alone too.
         // A dropped command still ends the pass it would have ended: the commands either side of it
         // that it kept apart stay in two passes (`cut`), so the backend still orders their
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
@@ -1071,7 +1080,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
                     dropped.push(c);
                 }
-                Err(e) => return Err(e),
+                // Anything else the host cannot give one command (arguments that are not what the
+                // shader reads, a heap without room for the view pairs, a buffer not made) drops
+                // that command alone too: refusing the piece also dropped its value writes.
+                Err(e) => {
+                    self.failed.set(self.failed.get() + 1);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
+                    });
+                    tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    dropped.push(c);
+                }
             }
         }
 
