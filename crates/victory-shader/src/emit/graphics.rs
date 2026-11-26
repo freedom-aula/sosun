@@ -168,6 +168,23 @@ fn infer(
             });
         }
     }
+    // Guess: the heaps' SGPRs follow the last root parameter's, so root constants the metadata
+    // leaves at one SGPR, with no parameter after them but a heap, reach up to the heap (the
+    // title's mesh programs read b500 as two dwords, the heap SGPR after them).
+    for i in 0..layout.len() {
+        let (start, end) = (layout[i].user_data, u32::from(layout[i].user_data) + layout[i].sgprs);
+        let next = layout.iter().map(|p| p.user_data).filter(|&u| u > start).min();
+        let heap = |u: u8| {
+            layout.iter().any(|p| {
+                p.user_data == u && matches!(p.root, RootType::ResourceHeap | RootType::SamplerHeap)
+            })
+        };
+        if layout[i].root == RootType::Constants
+            && let Some(next) = next.filter(|&u| u32::from(u) > end && heap(u))
+        {
+            layout[i].sgprs = u32::from(next - start);
+        }
+    }
     // A vertex shader's own vertex fetch: usually s0/s1 address the table of vertex buffer
     // descriptors it loads from (observed: `s_load_dwordx4 sN, s[0:1]` before its `buffer_load`),
     // unless metadata already occupies s0..s1 or an inferred vertex table sits at another pair.
@@ -1048,6 +1065,32 @@ mod tests {
         let c = container(HwStage::Vs, &words(code), &meta_with(&[rec(2, 0, 0, 0)])).unwrap();
         let options = super::super::Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
         super::super::translate_with(&c, options)
+    }
+
+    /// The title's mesh programs read root constants of two dwords (b500, user data 13 and 14 in
+    /// their metadata, which gives one) just below the descriptor heap's SGPR (15, inferred).
+    /// The constants reach up to the heap, so the second dword is user data, not a hardware SGPR.
+    #[test]
+    fn root_constants_reach_up_to_an_inferred_heap() {
+        let code = [
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0x8010_0908, // s_add_u32 s16, s8, s9
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_0000, 0x1003_0100, // buffer_load_dword v1, off, s[12:15], s16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ];
+        let meta = meta_with(&[rec(2, 0, 0, 0)]);
+        let (p, _) = infer(HwStage::Vs, &words(&code), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::ResourceHeap && r.user_data == 2), "{:?}", p.layout);
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 0 && r.sgprs == 2), "{:?}", p.layout);
+        mesh(&code).unwrap();
     }
 
     /// The title's G-buffer mesh programs test a uniform value as a lane mask: in the lanes of
