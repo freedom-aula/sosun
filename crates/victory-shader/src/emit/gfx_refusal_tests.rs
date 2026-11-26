@@ -898,6 +898,49 @@ fn absdiff_translates() {
     translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
 }
 
+/// The DS instructions whose LDS address is M0's (and the lane's) translate (values:
+/// `victory-gpu` `addr_tests`), except an append or consume where the host splits the console's
+/// wave (wave64 on 32-lane host waves), which needs one atomic for both halves.
+#[test]
+fn lds_instructions_addressed_by_m0_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |ds: [u32; 2], wave32: bool, threads: u16| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            ds[0],
+            ds[1],
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        // Five user SGPRs and 512 bytes of LDS.
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let rsrc2 = 1 << 15 | 5 << 1;
+        let part = fspx(&bytes_of(&code), rsrc2, [threads, 1, 1], wave32, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let append = [0xD8F8_0000, 0x0100_0000]; // ds_append v1
+    for ds in [
+        append,
+        [0xD8F4_0004, 0x0100_0000], // ds_consume v1 offset:4
+        [0xDAC4_0000, 0x0100_0000], // ds_read_addtid_b32 v1
+    ] {
+        translate_with(&program(ds, true, 32), Options::default()).unwrap();
+    }
+    let host32 = Options { wave32_host: true, ..Options::default() };
+    translate_with(&program(append, false, 32), host32).unwrap();
+    let err = translate_with(&program(append, false, 64), host32).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what == "ds_append or ds_consume in a console wave the host splits"),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [

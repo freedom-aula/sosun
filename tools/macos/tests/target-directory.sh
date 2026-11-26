@@ -177,11 +177,56 @@ test_setup_build_failure() {
   if grep -F 'built ' "$root/output"; then fail "setup claimed success"; fi
 }
 
+# rustup is installed but not on PATH: right after the rustup.rs installer, or
+# Homebrew's keg-only formula. A fake Homebrew prefix keeps a real one out.
+rustup_off_path() {
+  export HOMEBREW_PREFIX="$HOME/homebrew"
+  mkdir -p "$1"
+  if [[ -e "$bin_dir/rustup" ]]; then mv "$bin_dir/rustup" "$1/rustup"; fi
+}
+setup_with_rustup_in() {
+  prepare_setup
+  rustup_off_path "$1"
+  configure "$CARGO_HOME" "$shared"
+  run_script native-setup.sh
+  [[ "$rc" == 0 ]] || fail "setup failed"
+  contains "rustup is in $1 but not on your PATH"
+  contains "built $shared/x86_64-apple-darwin/release/victory"
+}
+test_setup_rustup_in_cargo_home() { setup_with_rustup_in "$CARGO_HOME/bin"; }
+test_setup_rustup_in_homebrew() { setup_with_rustup_in "$HOME/homebrew/opt/rustup/bin"; }
+test_setup_without_rustup() {
+  prepare_setup
+  rustup_off_path "$HOME/empty"
+  rm "$HOME/empty/rustup"
+  run_script native-setup.sh
+  [[ "$rc" != 0 && ! -e "$RECORD" ]] || fail "setup went on without rustup"
+  contains 'rustup is missing'
+}
+# The launcher finds rustup's cargo when nothing else puts cargo on PATH.
+test_launch_rustup_in_cargo_home() {
+  export PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+  rustup_off_path "$CARGO_HOME/bin"
+  printf '#!/bin/bash\nexit 0\n' > "$CARGO_HOME/bin/rustup"
+  printf '#!/bin/bash\nPATH="%s/bin:$PATH" exec "%s" "$@"\n' "$sysroot" "$real_cargo" > "$CARGO_HOME/bin/cargo"
+  chmod +x "$CARGO_HOME/bin/"*
+  launch "$default"
+}
+test_launch_without_cargo() {
+  export PATH="$bin_dir:/usr/bin:/bin:/usr/sbin:/sbin"
+  rustup_off_path "$HOME/empty"
+  reject_launch
+  contains 'Cargo is not on your PATH'
+  contains 'https://rustup.rs'
+}
+
 # Optional names allow the central regression to be checked against old scripts.
 if [[ $# == 0 ]]; then
   set -- default global home_global global_without_default environment \
     build_environment relative_environment project missing not_executable invalid_config \
-    bad_metadata setup setup_metadata_failure setup_build_failure
+    bad_metadata setup setup_metadata_failure setup_build_failure \
+    setup_rustup_in_cargo_home setup_rustup_in_homebrew setup_without_rustup \
+    launch_rustup_in_cargo_home launch_without_cargo
 fi
 for test in "$@"; do
   (prepare "$test"; "test_$test")

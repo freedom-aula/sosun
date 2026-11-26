@@ -39,9 +39,7 @@ const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NO_MORE_FILES: u32 = 18;
-const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_INVALID_PARAMETER: u32 = 87;
-const ERROR_DIR_NOT_EMPTY: u32 = 145;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -144,25 +142,20 @@ pub(super) fn narrow_path(p: *const c_char) -> Option<PathBuf> {
     translate(&text.encode_utf16().collect::<Vec<_>>())
 }
 
-/// The Win32 error for an I/O failure.
+/// The Win32 error for an I/O failure ([`crate::win32_errors`], `ERROR_ACCESS_DENIED` for the
+/// rest). A missing file whose parent folder is missing too is `ERROR_PATH_NOT_FOUND`, as
+/// `CreateFileW` says.
 pub(crate) fn win32_error(e: &io::Error, path: &Path) -> u32 {
-    match e.kind() {
-        io::ErrorKind::NotFound => {
+    match crate::win32_errors::code(e) {
+        Some(ERROR_FILE_NOT_FOUND)
             if path
                 .parent()
-                .is_some_and(|p| !p.as_os_str().is_empty() && !p.exists())
-            {
-                ERROR_PATH_NOT_FOUND
-            } else {
-                ERROR_FILE_NOT_FOUND
-            }
+                .is_some_and(|p| !p.as_os_str().is_empty() && !p.exists()) =>
+        {
+            ERROR_PATH_NOT_FOUND
         }
-        io::ErrorKind::AlreadyExists => ERROR_FILE_EXISTS,
-        io::ErrorKind::PermissionDenied => ERROR_ACCESS_DENIED,
-        _ => match e.raw_os_error() {
-            Some(66) => ERROR_DIR_NOT_EMPTY,
-            _ => ERROR_ACCESS_DENIED,
-        },
+        Some(code) => code,
+        None => ERROR_ACCESS_DENIED,
     }
 }
 
@@ -810,6 +803,22 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// File calls report what Windows would: a missing folder apart from a missing file, and
+    /// running out of descriptors apart from a refusal (`ERROR_ACCESS_DENIED` is the rest).
+    #[test]
+    fn host_errors_reach_file_calls_as_windows_reports_them() {
+        let missing = io::Error::from_raw_os_error(2);
+        let here = std::env::temp_dir().join("victory-no-such-file");
+        assert_eq!(win32_error(&missing, &here), ERROR_FILE_NOT_FOUND);
+        let nowhere = Path::new("/victory-no-such-folder/file");
+        assert_eq!(win32_error(&missing, nowhere), ERROR_PATH_NOT_FOUND);
+        let code = |errno| win32_error(&io::Error::from_raw_os_error(errno), &here);
+        assert_eq!(code(24), 4, "EMFILE: ERROR_TOO_MANY_OPEN_FILES");
+        assert_eq!(code(66), 145, "ENOTEMPTY: ERROR_DIR_NOT_EMPTY, as before");
+        assert_eq!(code(17), 80, "EEXIST: ERROR_FILE_EXISTS, as before");
+        assert_eq!(code(5), ERROR_ACCESS_DENIED, "EIO: the rest, as before");
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
