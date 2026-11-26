@@ -305,11 +305,19 @@ pub extern "system" fn ReadFile(
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    if len > 0 && buffer.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if std::env::var_os("VICTORY_TRACE_FILES").is_some() {
         trace_read(&f.file, len);
     }
-    // SAFETY: the title's buffer of `len` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(buffer, len as usize) };
+    let out = if len == 0 {
+        &mut []
+    } else {
+        // SAFETY: the title's buffer of `len` bytes.
+        unsafe { std::slice::from_raw_parts_mut(buffer, len as usize) }
+    };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
     let at = ov
         .as_ref()
@@ -350,8 +358,16 @@ pub extern "system" fn WriteFile(
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
-    // SAFETY: the title's buffer of `len` bytes.
-    let data = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
+    if len > 0 && buffer.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let data = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: the title's buffer of `len` bytes.
+        unsafe { std::slice::from_raw_parts(buffer, len as usize) }
+    };
     let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
     let at = ov
         .as_ref()
@@ -746,7 +762,14 @@ pub extern "system" fn FindNextFileW(handle: *mut c_void, data: *mut u8) -> i32 
 }
 
 pub extern "system" fn FindClose(handle: *mut c_void) -> i32 {
-    i32::from(lock(&HANDLES).remove(&(handle as usize)).is_some())
+    let mut handles = lock(&HANDLES);
+    if matches!(handles.get(&(handle as usize)), Some(Object::Find(_))) {
+        handles.remove(&(handle as usize));
+        1
+    } else {
+        set_error(ERROR_INVALID_HANDLE);
+        0
+    }
 }
 
 /// Names this module answers for.
@@ -831,6 +854,49 @@ mod tests {
         assert!(m("a?c", "abc"));
         assert!(!m("a?c", "ac"));
         assert!(!m("*.bin", "a.txt"));
+    }
+
+    #[test]
+    fn zero_length_null_io_and_find_close_handle_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let path = wide(&format!("{letter}:\\io.bin"));
+        let h = CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            CREATE_ALWAYS,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(h, invalid_handle());
+
+        // Zero-length reads and writes with a null buffer succeed without UB.
+        let mut count = 99u32;
+        assert_eq!(WriteFile(h, std::ptr::null(), 0, &mut count, std::ptr::null_mut()), 1);
+        assert_eq!(count, 0);
+        count = 99;
+        assert_eq!(ReadFile(h, std::ptr::null_mut(), 0, &mut count, std::ptr::null_mut()), 1);
+        assert_eq!(count, 0);
+
+        // Nonzero-length reads and writes with a null buffer fail with ERROR_INVALID_PARAMETER.
+        assert_eq!(WriteFile(h, std::ptr::null(), 4, &mut count, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(ReadFile(h, std::ptr::null_mut(), 4, &mut count, std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // FindClose rejects non-Find handles without closing them.
+        assert_eq!(FindClose(h), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+        let payload = b"ok";
+        assert_eq!(WriteFile(h, payload.as_ptr(), 2, &mut count, std::ptr::null_mut()), 1);
+        assert_eq!(count, 2);
+        assert_eq!(super::super::CloseHandle(h), 1);
+
+        // FindClose on an invalid handle sets ERROR_INVALID_HANDLE.
+        assert_eq!(FindClose(invalid_handle()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
     }
 }
 

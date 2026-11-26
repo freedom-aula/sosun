@@ -270,8 +270,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The title wrote a view at descriptor `handle` (the call `descriptor::mirror` makes on
-    /// D3D12): decode its record and write the backend's entry. Stale or unsupported views leave
-    /// the entry as it was; returns whether an entry was written.
+    /// D3D12): decode its record and write the backend's entry; returns whether an entry was
+    /// written. A buffer view of memory in no pool gets the null view (no bytes) and the error:
+    /// left as it was, the entry would still show the buffer an earlier view named there, which
+    /// the title may have given to something else since, and the shader would read and write it.
+    /// The entry is not marked mirrored, so the real view is written once the memory is mapped.
+    /// Undecodable records and image or sampler views the host cannot make still leave the entry
+    /// as it was: a buffer in a texture or sampler entry is not something to hand the GPU.
     pub fn mirror(&self, handle: u64) -> Result<bool, String> {
         let found = self.heaps.borrow().iter().find_map(|h| {
             let at = handle.checked_sub(h.start)?;
@@ -294,7 +299,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match decoded {
             Decoded::Buffer { addr, size } => {
-                let (buf, ptr) = self.resolve(addr, u64::from(size))?;
+                let (buf, ptr) = match self.resolve(addr, u64::from(size)) {
+                    Ok(found) => found,
+                    Err(e) => {
+                        let null = self.null_view()?;
+                        self.backend.write_buffer(
+                            &heap.heap,
+                            index,
+                            &null.buf,
+                            null.ptr().cast_const(),
+                            0,
+                        );
+                        return Err(e);
+                    }
+                };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
             }
@@ -468,18 +486,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(table)
     }
 
+    /// The memory of the null view (a page, shown with size 0), made at first use. Borrows the
+    /// contract only for the call.
+    fn null_view(&self) -> Result<Rc<Pages<B>>, String> {
+        let mut c = self.contract.borrow_mut();
+        if c.null.is_none() {
+            c.null = Some(Rc::new(Pages::new(&self.backend, 1)?));
+        }
+        Ok(c.null.clone().expect("made above"))
+    }
+
     /// Writes the view pairs the table names into `heap`'s reserved entries (those it lacks).
     fn write_pairs(&self, heap: &NativeHeap<B>) -> Result<(), String> {
-        let mut c = self.contract.borrow_mut();
+        let null = self.null_view()?;
+        let c = self.contract.borrow();
         let have = heap.pairs.get();
         let want = c.pairs.keys.len() + 1;
         for n in have..want {
             let index = addr::pair_index(heap.count as u32, n as u32) as usize;
             let (buffer, ptr, size) = if n == 0 {
-                if c.null.is_none() {
-                    c.null = Some(Rc::new(Pages::new(&self.backend, 1)?));
-                }
-                let null = c.null.as_ref().expect("made above");
                 (null.buf.clone(), null.ptr().cast_const(), 0)
             } else {
                 let key = c.pairs.keys[n - 1];
