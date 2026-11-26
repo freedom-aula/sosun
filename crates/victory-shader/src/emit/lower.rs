@@ -2283,9 +2283,23 @@ impl<'a> Lower<'a> {
     /// with host lanes (`MaskData::Host`), only wave-size-safe bitwise ops
     /// and selects on host ballots.
     fn mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
-        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        // Each way out names where the mask comes from, so a refusal log says which is missing.
+        const MESH: Why = "a lane mask holding lanes elsewhere read as data: in a mesh program";
+        const INPUT: Why = "a lane mask holding lanes elsewhere read as data: a program input";
+        const VECTOR: Why = "a lane mask holding lanes elsewhere read as data: not written by a \
+                             scalar ALU instruction";
+        const WIDTH: Why = "a lane mask holding lanes elsewhere read as data: written by a scalar \
+                            instruction of the other width";
+        const SAVED: Why = "a lane mask holding lanes elsewhere read as data: the EXEC a saveexec \
+                            keeps, or a mask written with EXEC";
+        const SHIFT: Why =
+            "a lane mask holding lanes elsewhere read as data: shifted on the host's lanes";
+        const OPERAND: Why = "a lane mask holding lanes elsewhere read as data: an operand no SGPR \
+                              or constant gives";
+        const OP: Why =
+            "a lane mask holding lanes elsewhere read as data: a scalar operation not modelled";
         if self.mask_data == MaskData::None {
-            return Err(ELSEWHERE);
+            return Err(MESH);
         }
         let p = self.x.p;
         // A register the compiler reuses: a mask on one path, data on another.
@@ -2297,19 +2311,19 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
+        let &b = self.def_block.get(&lo).ok_or(INPUT)?;
         let inst = p.blocks[b]
             .insts
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+            .ok_or(INPUT)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
             ..
         } = &inst.fields
         else {
-            return Err(ELSEWHERE);
+            return Err(VECTOR);
         };
         let wave64 = self.x.native.wave64;
         let width = if wave64 { "_b64" } else { "_b32" };
@@ -2317,15 +2331,15 @@ impl<'a> Lower<'a> {
             .name()
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
-            .ok_or(ELSEWHERE)?;
+            .ok_or(WIDTH)?;
         // (EXEC written besides the destination: a saveexec's new mask.)
         if inst.write(Reg::S(*code)) != Some(lo)
             || *code != EXEC && inst.write(Reg::S(EXEC)).is_some()
         {
-            return Err(ELSEWHERE);
+            return Err(SAVED);
         }
         if matches!(op, "lshl" | "lshr") && self.mask_data != MaskData::Console {
-            return Err(ELSEWHERE);
+            return Err(SHIFT);
         }
         let at = if b == self.cur_ir {
             self.cur
@@ -2339,11 +2353,11 @@ impl<'a> Lower<'a> {
             let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
                 let x = match src.get(k) {
                     Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                        let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
+                        let v = inst.read(Reg::S(code + h)).ok_or(OPERAND)?;
                         return l.i32_of(v);
                     }
                     Some(&Operand::Const(c)) => {
-                        let x = crate::resource::inline(c).ok_or(ELSEWHERE)?;
+                        let x = crate::resource::inline(c).ok_or(OPERAND)?;
                         match h {
                             0 => x,
                             _ if (x as i32) < 0 => u32::MAX,
@@ -2352,7 +2366,7 @@ impl<'a> Lower<'a> {
                     }
                     Some(&Operand::Literal(x)) if h == 0 => x,
                     Some(Operand::Literal(_)) => 0,
-                    _ => return Err(ELSEWHERE),
+                    _ => return Err(OPERAND),
                 };
                 Ok(l.s.m.i32(x))
             };
@@ -2390,12 +2404,12 @@ impl<'a> Lower<'a> {
                     "not" => self.s.m.bin(at, Bin::Xor, a, ones),
                     "cselect" | "cmov" => {
                         let c = if op == "cmov" {
-                            let old = inst.read(Reg::S(*code + h)).ok_or(ELSEWHERE)?;
+                            let old = inst.read(Reg::S(*code + h)).ok_or(OPERAND)?;
                             self.i32_of(old)?
                         } else {
                             word(self, 1, h)?
                         };
-                        let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                        let scc = inst.read(Reg::Scc).ok_or(OPERAND)?;
                         let cond = match self.get(scc)? {
                             Val::Bit(x) => x,
                             Val::I32(x) => {
@@ -2407,7 +2421,6 @@ impl<'a> Lower<'a> {
                         self.s.m.select(at, cond, a, c)
                     }
                     _ => {
-                        let c = word(self, 1, h)?;
                         // (operation, complement of src1, complement of the result)
                         let (f, not_c, not_r) = match op {
                             "and" => (Bin::And, false, false),
@@ -2418,8 +2431,9 @@ impl<'a> Lower<'a> {
                             "nand" => (Bin::And, false, true),
                             "nor" => (Bin::Or, false, true),
                             "xnor" => (Bin::Xor, false, true),
-                            _ => return Err(ELSEWHERE),
+                            _ => return Err(OP),
                         };
+                        let c = word(self, 1, h)?;
                         let c = if not_c {
                             self.s.m.bin(at, Bin::Xor, c, ones)
                         } else {
