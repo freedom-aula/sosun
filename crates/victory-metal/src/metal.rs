@@ -76,7 +76,8 @@ pub struct Queue(
     /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
     /// tracking cannot see those accesses: command buffers wait for the one before through this
     /// event (and encoders within one through a fence), counted by `.3`.
-    pub(crate) Retained<ProtocolObject<dyn MTLEvent>>,
+    /// A shared event, so that a command buffer the GPU fails can still be paid on the CPU.
+    pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
 );
 pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
@@ -199,7 +200,7 @@ impl ComputeBackend for Metal {
 
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
-        let order = self.dev.newEvent().ok_or("newEvent failed")?;
+        let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
         Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
     }
 

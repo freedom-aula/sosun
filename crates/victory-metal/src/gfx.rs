@@ -879,7 +879,7 @@ impl GraphicsBackend for Metal {
             let n = queue.3.get();
             queue.3.set(n + 1);
             if n > 0 {
-                cb.encodeWaitForEvent_value(&queue.2, n);
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*queue.2), n);
             }
             Order {
                 fence: self.dev.newFence(),
@@ -908,11 +908,12 @@ impl GraphicsBackend for Metal {
             }
         }
         if set_on_queue {
-            cb.encodeSignalEvent_value(&queue.2, queue.3.get());
+            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*queue.2), queue.3.get());
         }
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
+        let owed = Owed::new(queue, work, set_on_queue);
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
         let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
@@ -938,14 +939,15 @@ impl GraphicsBackend for Metal {
                     );
                 }
             }
-            if let Some(e) = done.error()
-                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 }
-            {
-                if trace {
-                    trace_failure(done, &e);
-                } else {
-                    eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+            if let Some(e) = done.error() {
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 } {
+                    if trace {
+                        trace_failure(done, &e);
+                    } else {
+                        eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                    }
                 }
+                owed.recover();
             }
         });
         // SAFETY: the block is retained by Metal until it has run.
@@ -954,6 +956,66 @@ impl GraphicsBackend for Metal {
         match refused {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+}
+
+/// What a submission owes the title once it completes: the order event, the title's fence signals
+/// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and
+/// every fence and barrier word waiting on it would hang; `recover` pays them from the CPU.
+///
+/// Not `Send`: the completed-handler block is only `Fn`, and Metal's objects are thread-safe to use
+/// this way. The fills write title memory the pool keeps mapped while the buffer lives (`buf` is
+/// held here to keep the wrapper alive).
+pub(crate) struct Owed {
+    events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
+    /// Buffer, offset, length, byte.
+    #[allow(clippy::type_complexity)]
+    fills: Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>,
+    signals: usize,
+}
+
+impl Owed {
+    pub(crate) fn new(queue: &Queue, work: &PassSubmission<'_, Metal>, set_on_queue: bool) -> Owed {
+        let mut events = Vec::with_capacity(work.signals.len() + 1);
+        if set_on_queue {
+            events.push((queue.2.clone(), queue.3.get()));
+        }
+        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        let mut fills = Vec::new();
+        for pass in work.passes {
+            if let Pass::Blit(ops) = pass {
+                for op in ops {
+                    // shortcut: copies are not replayed (one may have partly run and its source
+                    // may have changed since), when a title needs a failed copy's data upgrade
+                    // to a replay that checks the source is unchanged.
+                    if let BlitOp::Fill { dst, len, value } = op {
+                        fills.push((dst.0.buf.clone(), dst.1 as usize - dst.0.base as usize, *len, *value));
+                    }
+                }
+            }
+        }
+        Owed { events, fills, signals: work.signals.len() }
+    }
+
+    /// Raises each event (never lowers it) and writes each fill, in order.
+    pub(crate) fn recover(&self) {
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        for (e, v) in &self.events {
+            if e.signaledValue() < *v {
+                e.setSignaledValue(*v);
+            }
+        }
+        for (buf, off, len, value) in &self.fills {
+            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
+        }
+        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            tracing::warn!(
+                "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                self.signals,
+                self.fills.len()
+            );
         }
     }
 }
@@ -1536,4 +1598,46 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+#[cfg(test)]
+mod owed_tests {
+    use super::*;
+    use crate::backend::ComputeBackend;
+    use crate::mem::{Region, page_size};
+
+    #[test]
+    fn a_failed_command_buffer_is_paid_on_the_cpu() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) };
+        let q = m.create_queue().unwrap();
+        q.1.set(true); // as with the pool's residency set: the order event is in play
+        let fence = m.create_fence(0).unwrap();
+        let passes = [Pass::Blit(vec![
+            BlitOp::Fill { dst: (&buf, at(64) as *const u8), len: 8, value: 0xAB },
+            BlitOp::Copy { src: (&buf, at(0) as *const u8), dst: (&buf, at(256) as *const u8), len: 16 },
+        ])];
+        let (s5, s7, s9) = ([(&fence, 5)], [(&fence, 7)], [(&fence, 9)]);
+        let sub = |signals| PassSubmission { waits: &[], passes: &passes, signals };
+        // The recovery a submission signalling the fence to 7 would owe, built as `submit_passes` does.
+        q.3.set(3);
+        let owed = Owed::new(&q, &sub(&s7), true);
+        owed.recover();
+        // SAFETY: bounds as above.
+        let bytes = unsafe { std::slice::from_raw_parts(at(60), 16) };
+        assert_eq!(bytes, [0, 0, 0, 0, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0, 0, 0, 0]);
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { *at(256) }, 0, "copies are not replayed");
+        assert_eq!(m.completed(&fence), 7);
+        assert_eq!(q.2.signaledValue(), 3);
+        // An older submission failing later does not lower anything.
+        Owed::new(&q, &sub(&s5), false).recover();
+        assert_eq!(m.completed(&fence), 7);
+        // A normal submission after it still completes: the queue is not stuck behind the order value.
+        m.submit_passes(&q, &sub(&s9)).unwrap();
+        assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
 }

@@ -542,6 +542,24 @@ refusals in one story load). These are counted per host
 (`NativeHost::unmapped`). The first one warns without any switch, as the
 refused piece did, and each one is logged at debug level with its address.
 
+#### A command buffer the GPU fails still pays its signals and value writes
+
+Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers
+after it with `...InnocentVictim`. A failed buffer runs none of its encoded tail, so the queue's
+order event, the title's fence signals and the bottom-of-pipe value writes (blit fills of title
+memory) never happened. The queue's next buffer waited for the order event for good, the title's
+fences never reached their values, other queues stayed held on the barrier words the fills would
+have written, and 30 s later the title's own watchdog killed the process.
+
+Now: `submit_passes` records what the submission owes (`gfx::Owed`: the order event and its value,
+each `(fence, value)` signal, each fill's buffer, offset, length and byte). When the completed
+handler sees an error it raises those events (never lowers one; the order event is an
+`MTLSharedEvent` for this) and writes the fills on the CPU, in order, and warns for the first few
+times. Draws and dispatches of the failed buffer are lost, and its copies are not replayed (one may
+have partly run, and its source may have changed since). Guess: the console has no equivalent of a
+discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
+policy, not console behaviour.
+
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
