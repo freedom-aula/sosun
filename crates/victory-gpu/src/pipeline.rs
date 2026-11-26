@@ -561,12 +561,29 @@ pub(crate) extern "system" fn create_unread_1c8(
     if !desc.is_null() && std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
         // SAFETY: the title passes a description of this layout.
         match unsafe { graphics_containers(desc.add(8)) } {
-            Ok(stages) => return hand_out(
-                stages,
-                Some(Box::new(crate::native::state::Graphics::guess_base())),
-                iid,
-                out,
-            ),
+            Ok(stages) => {
+                // Pair 0 of the slot is its register image (pointer, size).
+                // SAFETY: the title passes a description of this layout, and the image's bytes.
+                let image: Vec<u32> = unsafe {
+                    let (ptr, size) = (desc.add(8).cast::<usize>().read_unaligned(), desc.add(16).cast::<usize>().read_unaligned());
+                    if ptr == 0 || size > 0x1000 {
+                        Vec::new()
+                    } else {
+                        let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_DESC_DIR") {
+                            let names: Vec<&str> = stages.iter().map(|s| &s.hash[..8]).collect();
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("regs_{}_{ptr:x}.bin", names.join("_"))), bytes);
+                        }
+                        bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect()
+                    }
+                };
+                return hand_out(
+                    stages,
+                    Some(Box::new(crate::native::state::Graphics::guess_from(&image))),
+                    iid,
+                    out,
+                );
+            }
             Err(reason) => {
                 static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
@@ -948,6 +965,10 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(PIPELINE, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(target_os = "macos")]
+    if !this.is_null() && object::refs(this) == 1 {
+        crate::native::glue::pipeline_released(this);
+    }
     object::release_boxed::<Pipeline>(this)
 }
 
