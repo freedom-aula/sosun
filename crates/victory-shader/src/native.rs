@@ -504,7 +504,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let (layout, used) = metadata_resources(meta, FSPX_RECORDS, false)?;
+    let (mut layout, used) = metadata_resources(meta, FSPX_RECORDS, true)?;
+    expand_constants(&mut layout);
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -586,6 +587,26 @@ pub(crate) fn metadata_resources(
         used.push(u);
     }
     Ok((layout, used))
+}
+
+/// shortcut: multi-dword root constants are only expanded when the immediately following root
+/// signature slot (`slot + 1`) is also present in metadata; a trailing multi-dword constant
+/// block stays 1 SGPR until the register image is decoded.
+pub(crate) fn expand_constants(layout: &mut [RootParam]) {
+    for i in 0..layout.len() {
+        if layout[i].root != RootType::Constants {
+            continue;
+        }
+        let (slot, start) = (layout[i].slot, layout[i].user_data);
+        if let Some(next) =
+            layout.iter().find(|p| p.slot == slot.wrapping_add(1) && p.user_data > start)
+        {
+            let span = u32::from(next.user_data - start);
+            if span > layout[i].sgprs && span <= 32 {
+                layout[i].sgprs = span;
+            }
+        }
+    }
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -1338,7 +1359,6 @@ pub(crate) mod tests {
                 .to_string()
         };
         for (root, what) in [
-            (0, "root constants in a compute shader"),
             (5, "a descriptor heap (SM 6.6 dynamic resources)"),
             (6, "a descriptor heap (SM 6.6 dynamic resources)"),
             (2, "an unknown root type"),
@@ -1358,5 +1378,25 @@ pub(crate) mod tests {
         );
         root_constants.truncate(40);
         assert!(native_programs(&root_constants).is_err(), "truncated");
+    }
+
+    /// Root constants (root type 0) in a compute shader were refused as
+    /// "root constants in a compute shader"; they take user SGPRs as in a
+    /// graphics shader, spanning up to the next parameter's first one.
+    #[test]
+    fn compute_root_constants_take_their_user_sgprs() {
+        let code = [0x00, 0x00, 0x81, 0xBF];
+        let records = [
+            fspx_resource(2, 0, 0, 0, 0, 0),
+            fspx_resource(3, 3, 0, 0, 4, 1),
+        ];
+        let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &records)).unwrap()[0];
+        let layout: Vec<_> = p.layout.iter().map(|r| (r.root, r.user_data, r.sgprs)).collect();
+        assert_eq!(layout, [(RootType::Constants, 0, 4), (RootType::Table, 4, 1)]);
+        assert_eq!(p.used.len(), 2);
+        // Trailing constants stay one dword (a guess, as in graphics).
+        let trailing = [fspx_resource(3, 3, 0, 0, 0, 0), fspx_resource(2, 0, 0, 0, 1, 1)];
+        let p = &native_programs(&fspx(&code, 0, [64, 1, 1], false, &trailing)).unwrap()[0];
+        assert_eq!(p.layout[1].sgprs, 1);
     }
 }
