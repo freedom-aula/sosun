@@ -726,6 +726,7 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let indirect = crate::list::indirect_dropped();
     tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, "native draws so far");
+    super::descriptor_trace::log(frame);
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.

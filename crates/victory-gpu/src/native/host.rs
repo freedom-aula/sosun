@@ -374,12 +374,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            let (mut checked, mut changed) = (0, 0);
             for index in *at..(*at + check).min(h.count) {
                 let handle = h.start + index as u64 * Self::step(h.kind);
                 let record = record_at(handle);
+                checked += 1;
                 if h.mirrored.borrow().get(&index) == Some(&record) {
                     continue;
                 }
+                changed += 1;
                 // shortcut: views of resources the host has not realized yet are not made here
                 // (`glue::mirror` does that for device writes); such an entry stays as it was.
                 if let Err(e) = self.mirror(handle) {
@@ -388,6 +391,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 // Tried once per record, whatever the result.
                 h.mirrored.borrow_mut().insert(index, record);
             }
+            super::descriptor_trace::record(h.start, checked, changed);
         }
     }
 
@@ -955,6 +959,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
+        let _counted = super::descriptor_trace::Submission;
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
