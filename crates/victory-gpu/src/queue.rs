@@ -54,8 +54,9 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "command queue");
-    new_queue(crate::device::newer(), desc, iid, out)
+    let hr = new_queue(crate::device::newer(), desc, iid, out);
+    tracing::info!(?desc, hr = format_args!("{:#010x}", hr as u32), "command queue");
+    hr
 }
 
 fn new_queue(newer: bool, desc: QueueDesc, iid: *const Iid, out: *mut This) -> HRESULT {

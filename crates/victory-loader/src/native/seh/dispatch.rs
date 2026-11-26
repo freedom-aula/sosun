@@ -316,6 +316,24 @@ extern "C" fn raise_exception(
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
+    // First-chance log: the title's own handlers may hide where a fault started.
+    // SAFETY: both are ours for this dispatch.
+    unsafe {
+        let (c, r) = (&*ctx, &*rec);
+        if r.code != 0x406d_1388 && r.code != 0xe06d_7363 {
+            let g = &c.gpr;
+            tracing::warn!(
+                code = format_args!("{:#010x}", r.code),
+                at = format_args!("{:#x}", c.rip),
+                image = format_args!("{:#x?}", unwind::image_base_of(c.rip as usize).map(|b| c.rip as usize - b)),
+                info = format_args!("{:x?}", &r.information[..2]),
+                rax = format_args!("{:#x}", g[0]), rcx = format_args!("{:#x}", g[1]),
+                rdx = format_args!("{:#x}", g[2]), rsp = format_args!("{:#x}", g[4]),
+                r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
+                "first-chance exception"
+            );
+        }
+    }
     let mut ptrs = ExceptionPointers {
         record: rec,
         context: ctx,

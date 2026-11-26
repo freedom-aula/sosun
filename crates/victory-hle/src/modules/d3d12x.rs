@@ -23,7 +23,11 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
-    device::create(adapter, parameters, iid, out)
+    let hr = device::create(adapter, parameters, iid, out);
+    // SAFETY: `out` is the title's out pointer when non-null.
+    let made = if out.is_null() { std::ptr::null() } else { unsafe { *out } };
+    tracing::info!(hr = format_args!("{:#010x}", hr as u32), ?made, "D3D12XboxCreateDevice");
+    hr
 }
 
 /// A host GPU failure ends the run like a crash: reported to the crash log,
