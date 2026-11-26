@@ -342,6 +342,11 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
 }
 
 impl<B: GraphicsBackend> NativeList<B> {
+    /// The graphics root parameters and binding the next draw takes (for traces).
+    pub(super) fn graphics_args(&self) -> (&[Option<Root<B>>], Option<&Binding>) {
+        (&self.state.graphics_root, self.state.graphics_binding.as_deref())
+    }
+
     /// `Reset`: forget everything recorded and set.
     pub fn reset(&mut self) {
         *self = NativeList::default();

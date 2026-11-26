@@ -439,3 +439,64 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
         &p[..4]
     );
 }
+
+/// A title's present pass: a target drawn in one pass is sampled through a descriptor table by
+/// the pixel shader of the next pass, in the same submission (both residency modes).
+#[test]
+fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
+    for m in backends() {
+        let s = Scene::new(&m, None);
+        const WHITE: [f32; 4] = [1.0; 4];
+        // Pass 1: green over all of `s.color` (times the white texture).
+        s.arena.write(0, &[v(-1.0, -1.0, GREEN), v(3.0, -1.0, GREEN), v(-1.0, 3.0, GREEN)]);
+        // Pass 2: white over all of `out`, times `s.color` sampled at its centre.
+        s.arena.write(512, &[v(-1.0, -1.0, WHITE), v(3.0, -1.0, WHITE), v(-1.0, 3.0, WHITE)]);
+        let call = DrawCall::Arrays {
+            vertex_count: 3,
+            instance_count: 1,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+        rt.render_target = true;
+        let out = m.create_texture(&rt).unwrap();
+        m.write_texture(&s.res, 1, &s.color, 0.0);
+        let present = Draw {
+            pipeline: &s.pipe,
+            topology: Topology::Triangles,
+            state: DrawState::default(),
+            root: RootArgs::default()
+                .constants(&[0.5f32.to_bits(), 0, 0, 0])
+                .address(m.heap_address(&s.res, 1))
+                .address(m.heap_address(&s.smp, 0)),
+            fragment_root: None,
+            heaps: Heaps {
+                resource: Some(&s.res),
+                sampler: Some(&s.smp),
+            },
+            resources: vec![],
+            vertex_buffers: vec![(&s.arena.buf, s.arena.at(512))],
+            index_buffer: None,
+            call,
+            indirect: None,
+        };
+        let second = Pass::Render(RenderPass {
+            color: vec![ColorTarget {
+                texture: &out,
+                clear: Some([0.0, 0.0, 1.0, 1.0]),
+            }],
+            depth: Some(DepthTarget {
+                texture: &s.depth,
+                clear: Some(1.0),
+                clear_stencil: Some(0),
+            }),
+            draws: vec![present],
+        });
+        s.submit(&[s.pass(vec![s.draw(0.5, call, 0, false)], [1.0, 0.0, 0.0, 1.0]), second]);
+        assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]), "pass 1 drew green");
+        let mut px = vec![0u8; W * W * 4];
+        m.read_texture(&out, 0, 0, &mut px, W * 4, 0);
+        assert_eq!(&px[(8 * W + 8) * 4..][..4], &[0, 255, 0, 255], "pass 2 sampled pass 1's green");
+    }
+}
+
