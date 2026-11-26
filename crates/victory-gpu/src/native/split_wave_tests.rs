@@ -132,3 +132,37 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
     }
     assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
 }
+
+/// `v_ldexp_f32` (a pixel shader of GTA VI's world was refused for it): `s0` scaled by two to
+/// the power `s1`, a signed integer, in range or past it.
+#[test]
+fn ldexp_scales_by_an_integer_power_of_two() {
+    let cases: &[(f32, i32, f32)] = &[
+        (1.5, 3, 12.0),
+        (3.0, -2, 0.75),
+        (1.0, 127, 2f32.powi(127)),
+        (2f32.powi(-126), 200, 2f32.powi(74)),
+        (2f32.powi(100), -200, 2f32.powi(-100)),
+        (1.0, 1000, f32::INFINITY),
+        (-1.0, 1000, f32::NEG_INFINITY),
+        (1.0, -1000, 0.0),
+    ];
+    for &(a, e, want) in cases {
+        let Some(mut t) = title() else { return };
+        let f = Fixture::new(&t);
+        let mut w = vec![
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xD762_0002, // v_ldexp_f32 v2, s0, v2
+            0x0002_0400,
+            V_LSHLREV_V1_2_V0,
+        ];
+        w.extend(GLOBAL_STORE_V2_AT_V1);
+        w.push(S_ENDPGM);
+        let cs = translate_io(&w, 5, 0, 64, shaders::options());
+        let [c, d] = halves(VA_A + 0x4_0000);
+        dispatch(&mut t, &cs, &[a.to_bits(), e as u32, c, d, 0], false);
+        assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+        let got = f.get(DST, 1)[0];
+        assert_eq!(got, want.to_bits(), "ldexp({a}, {e}) = {}, want {want}", f32::from_bits(got));
+    }
+}

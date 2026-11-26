@@ -8047,6 +8047,31 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_ldexp_f32" => {
+                // a * 2^e, e a signed integer: three exact power-of-two factors of at most 2^100
+                // each (e clamped to +-300, past which every finite f32 already overflows or
+                // flushes), so no factor overflows where the product would not.
+                let (a, e) = (f(self, 0)?, s(self, 1)?);
+                let (lo, hi) = (self.s.m.i32(-300i32 as u32), self.s.m.i32(300));
+                let below = self.s.m.cmp(c, pred::SLT, e, lo);
+                let e = self.s.m.select(c, below, lo, e);
+                let above = self.s.m.cmp(c, pred::SGT, e, hi);
+                let e = self.s.m.select(c, above, hi, e);
+                let (three, two) = (self.s.m.i32(3), self.s.m.i32(2));
+                let p1 = self.s.m.bin(c, Bin::SDiv, e, three);
+                let rest = self.s.m.bin(c, Bin::Sub, e, p1);
+                let p2 = self.s.m.bin(c, Bin::SDiv, rest, two);
+                let p3 = self.s.m.bin(c, Bin::Sub, rest, p2);
+                let mut r = a;
+                for p in [p1, p2, p3] {
+                    let (bias, shift) = (self.s.m.i32(127), self.s.m.i32(23));
+                    let biased = self.s.m.bin(c, Bin::Add, p, bias);
+                    let bits = self.s.m.bin(c, Bin::Shl, biased, shift);
+                    let scale = self.as_float(bits);
+                    r = self.s.m.bin(c, Bin::Mul, r, scale);
+                }
+                float(self, r)
+            }
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
                 // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
