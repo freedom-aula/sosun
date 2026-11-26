@@ -15,6 +15,8 @@ No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own 
 > [!IMPORTANT]
 > **Not playable yet.** The game boots natively on a Mac, loads its data, runs its GPU work on Metal at about 30 fps, gets past its "press A" start screen and runs for about 50 seconds (around 1,400 frames). Its menus now render on Metal: the start screen and the setup menus draw correctly into the game's UI target. The presented window is still black, and some text draws as boxes. We know where to look for both, and we need help. **No game files are included here, ever.** You need your own legally obtained copy of the game.
 
+📸 **[See the latest screenshots](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/5)** (the game's start screen and setup menus, rendered natively on Metal).
+
 ## Why a native port?
 
 The [Wine-based route](https://github.com/pragyaangaur/VIctory-macOS) stacks the game on Wine, a Windows Direct3D 12 layer and Apple's D3DMetal. This project removes those layers:
