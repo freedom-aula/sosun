@@ -13,7 +13,7 @@ use victory_metal::mem::{Alias, page_size};
 fn pool(id: usize, pages: usize) -> Option<Pool> {
     // Needs a device; the title is made on first use.
     with_title(|_| ())?;
-    let mem = Alias::new(pages * page_size()).unwrap();
+    let mem = Alias::new(pages * page_size().max(16384)).unwrap();
     let info = PoolInfo {
         id,
         base: mem.primary as usize,
