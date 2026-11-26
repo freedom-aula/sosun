@@ -314,6 +314,31 @@ pub fn run(
     victory_gpu::native::set_layer(layer.as_ptr())
         .map_err(|e| anyhow::anyhow!("no layer to present into: {e}"))?;
     let layer = layer.as_ptr();
+    // Debugging aid: VICTORY_FRAME_DUMP=<seconds>,<file.ppm> saves the last frame presented and
+    // logs the frame count and the shader work refused so far, once.
+    if let Some((secs, path)) = std::env::var("VICTORY_FRAME_DUMP")
+        .ok()
+        .and_then(|v| {
+            v.split_once(',')
+                .map(|(s, p)| (s.parse::<u64>().ok(), p.to_owned()))
+        })
+        .and_then(|(s, p)| Some((s?, p)))
+    {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            tracing::warn!(
+                frames = victory_gpu::native::frames_presented(),
+                shaders = ?victory_gpu::native::shader_stats(),
+                "frame dump"
+            );
+            if let Some((w, h, bgra)) = victory_gpu::native::last_frame() {
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                out.extend(bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]));
+                let _ = std::fs::write(&path, out);
+                tracing::warn!(w, h, path, "frame saved");
+            }
+        });
+    }
     let launch = Launch(image, dlls);
     let go = move || {
         let launch = launch;
