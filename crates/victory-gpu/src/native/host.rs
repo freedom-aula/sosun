@@ -254,6 +254,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(heap)
     }
 
+    /// Each heap's descriptor records, `[start, end)` in the title's memory (its own view, which
+    /// the device's view calls and the title's stores write).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn heap_ranges(&self) -> Vec<(usize, usize)> {
+        self.heaps
+            .borrow()
+            .iter()
+            .map(|h| {
+                let end = h.start + h.count as u64 * Self::step(h.kind);
+                (h.start as usize, end as usize)
+            })
+            .collect()
+    }
+
     /// The heap `handle` (a descriptor's address, a root table's) lies in, and the entry's index.
     pub fn heap_at(&self, handle: u64) -> Option<(Rc<NativeHeap<B>>, usize)> {
         self.heaps.borrow().iter().find_map(|h| {

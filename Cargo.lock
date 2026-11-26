@@ -831,6 +831,7 @@ dependencies = [
  "victory-formats",
  "victory-metal",
  "victory-pipeline",
+ "victory-platform",
  "victory-shader",
  "windows",
  "windows-sys",

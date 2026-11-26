@@ -14,6 +14,14 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_DESCRIPTORS").is_some())
 }
 
+/// `VICTORY_TRACE_DESCRIPTORS=sites`: also the title's store sites, through the write watch of
+/// `victory_platform::watch` over the heaps' pages, closed again at each submission.
+#[cfg(target_os = "macos")]
+pub(crate) fn sites() -> bool {
+    static SITES: OnceLock<bool> = OnceLock::new();
+    *SITES.get_or_init(|| std::env::var("VICTORY_TRACE_DESCRIPTORS").is_ok_and(|v| v == "sites"))
+}
+
 /// One heap's records checked and found changed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Heap {
@@ -113,7 +121,27 @@ pub(crate) fn log(frame: u64) {
     };
     let taken = std::mem::take(&mut *counts());
     tracing::info!(frame, "descriptor remirror: {}", taken.summary(frames));
+    if sites() {
+        let (sites, overflow) = victory_platform::watch::sites();
+        let top: Vec<String> = sites
+            .iter()
+            .take(SITES_LOGGED)
+            .map(|(at, n)| format!("image+{at:#x} {n}"))
+            .collect();
+        tracing::info!(
+            frame,
+            distinct = sites.len(),
+            overflow,
+            "descriptor store sites since the start (first store per page per submission), most \
+             first: {}",
+            top.join(", ")
+        );
+    }
 }
+
+/// Store sites a summary names (all are counted in `distinct`).
+#[cfg(target_os = "macos")]
+const SITES_LOGGED: usize = 64;
 
 #[cfg(test)]
 mod tests {
