@@ -504,6 +504,48 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
     );
 }
 
+#[test]
+fn a_pass_refused_mid_encoding_closes_its_encoder() {
+    // An indexed record without an index buffer is refused after the render encoder is open; the
+    // encoder must still be ended, or the next pass cannot open its own.
+    let Some(m) = backend() else { return };
+    let s = Scene::new(&m, Some((true, Compare::Less)));
+    s.arena.write(0, &[v(-0.5, -0.5, GREEN), v(0.5, -0.5, GREEN), v(0.0, 0.5, GREEN)]);
+    s.arena.write(6144, &[3u32, 1, 0, 0, 0]);
+    let indexed = DrawCall::Indexed {
+        index_count: 0,
+        instance_count: 0,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+        wide: false,
+    };
+    let mut bad = s.draw(0.5, indexed, 0, false);
+    bad.indirect = Some((&s.arena.buf, s.arena.at(6144) as *const u8));
+    let args = DrawCall::Arrays {
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    let q = m.create_queue().unwrap();
+    let f = m.create_fence(0).unwrap();
+    let refused = m.submit_passes(
+        &q,
+        &PassSubmission {
+            waits: &[],
+            passes: &[
+                s.pass(vec![bad], [0.0, 0.0, 1.0, 1.0]),
+                s.pass(vec![s.draw(0.5, args, 0, false)], [0.0, 0.0, 0.0, 1.0]),
+            ],
+            signals: &[(&f, 1)],
+        },
+    );
+    assert!(refused.is_err(), "the indexed record without an index buffer is refused");
+    assert!(m.wait(&f, 1, 10_000), "the fence signal still landed");
+    assert!(s.pixels().iter().any(|c| c[1] > 100), "the pass after the refused one drew");
+}
+
 /// A title's present pass: a target drawn in one pass is sampled through a descriptor table by
 /// the pixel shader of the next pass, in the same submission (both residency modes).
 #[test]

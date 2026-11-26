@@ -602,6 +602,10 @@ have partly run, and its source may have changed since). Guess: the console has 
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery
 policy, not console behaviour.
 
+#### A pass refused mid-encoding ends its encoder
+
+`submit_passes` refuses a pass it cannot encode and still encodes the passes after it. A refusal after the pass's encoder was opened (a counted record whose gate fails, an indexed indirect draw without an index buffer) now ends that encoder first; it used to leave it open, and Metal aborted the process (`A command encoder is already encoding to this command buffer`) when the next pass opened its own.
+
 #### Heap samplers live as long as the backend
 
 A sampler heap entry holds only the sampler's resource ID. The host used to drop its `MTLSamplerState` right after writing the entry, and Metal gives a freed sampler's ID to the next sampler made, so an older entry then sampled with a newer descriptor's filter and address modes. `create_sampler` now keeps every sampler it makes, one per distinct `SamplerDesc` (few exist), and hands the same one back for the same descriptor.

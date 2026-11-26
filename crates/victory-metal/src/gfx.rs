@@ -1513,7 +1513,8 @@ impl Metal {
         for d in dispatches {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
-                    Some(self.encode_gate(&e, count, record, 3, set_on_queue)?)
+                    // An open encoder left behind makes Metal abort at the next pass's encoder.
+                    Some(self.encode_gate(&e, count, record, 3, set_on_queue).inspect_err(|_| e.endEncoding())?)
                 }
                 _ => None,
             };
@@ -1651,7 +1652,7 @@ impl Metal {
                 };
                 gates.push(match (d.count, d.indirect) {
                     (Some(count), Some(record)) => {
-                        Some(self.encode_gate(&c, count, record, words, set_on_queue)?)
+                        Some(self.encode_gate(&c, count, record, words, set_on_queue).inspect_err(|_| c.endEncoding())?)
                     }
                     _ => None,
                 });
@@ -1856,7 +1857,10 @@ impl Metal {
                             )
                         };
                     }
-                    (DrawCall::Indexed { .. }, None) => return Err("indexed draw without an index buffer".into()),
+                    (DrawCall::Indexed { .. }, None) => {
+                        e.endEncoding();
+                        return Err("indexed draw without an index buffer".into());
+                    }
                 }
                 continue;
             }
