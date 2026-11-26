@@ -359,7 +359,7 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 
 ### Why guessed draws leave the target black (findings)
 
-Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which title textures were drawn to or cleared (address, format, size) and which was presented, plus texture copies and resolves the host drops; `VICTORY_DUMP_TARGETS=<dir>,<seconds>` writes the 8-bit colour targets drawn since the last present as PPMs; `VICTORY_DEBUG_PS_RED=1` makes every translated pixel shader write red, `VICTORY_DEBUG_VS_TRI=1` makes every translated vertex shader position a triangle covering the target (translator debugging, `emit/lower.rs`).
+Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which title textures were drawn to or cleared (address, format, size) and which was presented, plus texture copies and resolves the host drops, and a warning the first time a draw, dispatch or clear is dropped at submission ("Dropped work is logged loudly" below); `VICTORY_DUMP_TARGETS=<dir>,<seconds>` writes the 8-bit colour targets drawn since the last present as PPMs; `VICTORY_DEBUG_PS_RED=1` makes every translated pixel shader write red, `VICTORY_DEBUG_VS_TRI=1` makes every translated vertex shader position a triangle covering the target (translator debugging, `emit/lower.rs`).
 
 * The first frames are 3840x2160, one MRT draw per frame into the swapchain buffer, a second RGBA8 target and a depth target; no texture copy or resolve was ever dropped, no UAV or compute work touches them before frame ~700. The presented buffer is the one drawn to.
 * Host textures are separate host allocations (`Textures::realize`), not views of pool memory; only sampled textures are uploaded from title memory, render targets never are.
@@ -471,6 +471,24 @@ dispatches, texture copies and resolves, and indirect executions (one warning
 per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
+
+Two more kinds are dropped one command at a time when a piece is submitted
+(`NativeHost::execute`), where the whole piece used to be refused: a draw or
+dispatch that reads a root parameter the title never set, and a draw or clear
+none of whose targets has a host texture (Metal opens no render pass without
+an attachment). The rest of the piece still runs, and so do its value writes
+and fence signals: a queue waiting for one of those values used to be held for
+good. A dropped command still ends the pass it would have ended. Two draws
+into the same targets with a dropped dispatch between them stay two render
+passes (likewise two dispatches around a dropped draw, and blits), so the
+backend still orders their pool-buffer accesses; a dropped command of the same
+kind as both its neighbours parts nothing, as before. These two are counted
+per host (`NativeHost::unset_roots`, `NativeHost::no_targets`), not in the
+"native draws so far" line, and they warn (once each, "native host drops work:
+...") only with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console gives a
+shader in a root slot the title set nothing in. A title shader's metadata can
+name such a slot (255 observed); the host draws nothing for it, which is a
+fallback, not the console's behaviour.
 
 #### Rectangle-list corners and the Brightness logo (open)
 
