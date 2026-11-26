@@ -111,6 +111,60 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
     }
 }
 
+/// macOS key code to the Windows virtual key the game's stand-in pad reads (README lists the
+/// mapping); `None` for keys the pad does not use.
+fn virtual_key(code: u16) -> Option<u8> {
+    Some(match code {
+        36 | 76 => 0x0D, // Return, keypad Enter
+        48 => 0x09,      // Tab
+        49 => 0x20,      // Space
+        51 => 0x08,      // Delete (Backspace)
+        53 => 0x1B,      // Escape
+        123 => 0x25,     // arrows
+        126 => 0x26,
+        124 => 0x27,
+        125 => 0x28,
+        0 => b'A',
+        1 => b'S',
+        2 => b'D',
+        3 => b'F',
+        4 => b'H',
+        6 => b'Z',
+        7 => b'X',
+        8 => b'C',
+        9 => b'V',
+        12 => b'Q',
+        13 => b'W',
+        14 => b'E',
+        16 => b'Y',
+        34 => b'I',
+        38 => b'J',
+        40 => b'K',
+        37 => b'L',
+        _ => return None,
+    })
+}
+
+/// Hands a key-down or key-up to the stand-in pad. True when it was one (Command shortcuts
+/// such as Cmd+Q are left to AppKit), so the caller does not forward it, and AppKit does not beep.
+unsafe fn key_event(event: *mut AnyObject) -> bool {
+    // SAFETY: `event` is a live NSEvent; these are its plain getters.
+    let (kind, code, flags): (usize, u16, usize) = unsafe {
+        (
+            msg_send![event, type],
+            msg_send![event, keyCode],
+            msg_send![event, modifierFlags],
+        )
+    };
+    if !matches!(kind, 10 | 11) || flags & (1 << 20) != 0 {
+        return false;
+    }
+    if let Some(vk) = virtual_key(code) {
+        victory_hle::modules::gameinput::set_live_key(vk, kind == 10);
+    }
+    true
+}
+
 /// Runs the loop until `finished`, or the window is gone.
 unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
     let mode = NSString::from_str("kCFRunLoopDefaultMode"); // NSDefaultRunLoopMode
@@ -128,8 +182,13 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
                     inMode: &*mode,
                     dequeue: Bool::YES
                 ];
-                if !event.is_null() {
+                if !event.is_null() && !key_event(event) {
                     let _: () = msg_send![app, sendEvent: event];
+                }
+                let key: Bool = msg_send![window, isKeyWindow];
+                if !key.as_bool() {
+                    // A key-up sent to another window never reaches us.
+                    victory_hle::modules::gameinput::release_live_keys();
                 }
                 let _: () = msg_send![app, updateWindows];
                 let shown: Bool = msg_send![window, isVisible];
@@ -149,5 +208,20 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
             }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::virtual_key;
+
+    #[test]
+    fn keys_map_to_the_pad_keys() {
+        // Return, Space, Esc, Delete, Tab, Left; W (13), A (0), D (2), Q (12), E (14), Z (6), C (8).
+        let got = [36, 49, 53, 51, 48, 123, 13, 0, 2, 12, 14, 6, 8].map(virtual_key);
+        let want = [0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, b'W', b'A', b'D', b'Q', b'E', b'Z', b'C'];
+        assert_eq!(got, want.map(Some));
+        assert_eq!(virtual_key(10), None); // section sign: not a pad key
+        assert_eq!(virtual_key(50), None);
     }
 }

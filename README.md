@@ -111,6 +111,23 @@ tools/macos/victory.sh run --execute <the game's executable>
 
 For now this gets as far as VIctory does on Windows, as the note at the top explains.
 
+### Quick start: playing the native macOS host
+
+`tools/macos/run-native.sh <game folder>` opens a window; click it and the keyboard drives the game's gamepad while a key is held:
+
+| Keys | Pad |
+| --- | --- |
+| Enter, Space | A |
+| Escape, Backspace | B |
+| X, Y | X, Y |
+| Arrow keys | D-pad |
+| W A S D | left stick (full deflection) |
+| Tab | Menu (Start) |
+| Q, E | left, right shoulder |
+| Z, C | left, right trigger |
+
+`VICTORY_KEYS` still works and is combined with the live keys. Real controllers (the Game Controller framework) are not supported yet.
+
 ## Running the tests
 
 These commands are useful for anyone who works on the code. The first runs the tests natively on the Mac, and the second runs them as Windows programs on Wine with D3DMetal, which includes the GPU tests.
