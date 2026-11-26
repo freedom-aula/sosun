@@ -244,16 +244,10 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     drop(slots);
 }
 
-/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
-/// naming each entry at each draw made frame time grow with the entries the title fills. Two
-/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
-#[test]
-fn a_heap_is_named_once_per_encoder() {
-    let Some(h) = host() else { return };
-    if h.backend.residency_sets() {
-        return;
-    }
-    let pool = Pool::new(&h, 4);
+/// What one encoder is named for a heap (two entries naming one pool buffer: one allocation), for
+/// one dispatch through the heap and then for five; the dispatches' results are checked.
+fn named_for_a_heap(h: &Host) -> [u64; 2] {
+    let pool = Pool::new(h, 4);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..64u32).collect::<Vec<_>>());
     let slots = vec![0u32; 8 * 8];
@@ -285,13 +279,44 @@ fn a_heap_is_named_once_per_encoder() {
         for _ in 0..dispatches {
             l.dispatch(1, 1, 1).unwrap();
         }
-        run(&h, &[&l]);
+        run(h, &[&l]);
         h.backend.residency_counts().heap_resources - before
     };
-    assert_eq!(named(1), 2, "the heap buffer and the one pool buffer");
-    assert_eq!(named(5), 2, "five dispatches in one encoder");
+    let named = [named(1), named(5)];
     assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
     drop(slots);
+    named
+}
+
+/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
+/// naming each entry at each draw made frame time grow with the entries the title fills. Two
+/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
+#[test]
+fn a_heap_is_named_once_per_encoder() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(false));
+    // The heap buffer and the one pool buffer, for one dispatch as for five in one encoder.
+    assert_eq!(named_for_a_heap(&h), [2, 2]);
+}
+
+/// By default what a heap names is resident through the heap's own set, given to the command
+/// buffer: nothing is named to the encoders for it (in GTA VI's world that was 37,000 allocations
+/// for every pass, about 155 ms of kernel time per drawing render pass), and the title's pools
+/// are in no set of their own (all of title memory would stay resident).
+#[test]
+fn a_heap_is_resident_through_its_set_by_default() {
+    let Some(h) = host() else { return };
+    if !h.backend.residency_sets() {
+        eprintln!("skipped: no residency sets on this system");
+        return;
+    }
+    assert_eq!(named_for_a_heap(&h), [0, 0]);
+    let c = h.backend.residency_counts();
+    assert_eq!((c.heap_allocations, c.added, c.queues), (1, 0, 0), "{c:?}");
+    // The heap buffer and the pool buffer its entries name.
+    assert!(c.heap_set_bytes >= 4 * 16384, "{c:?}");
 }
 
 type Vertex = [f32; 8];
@@ -854,11 +879,12 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
 /// names every buffer on every dispatch, and gives the same results.
 #[test]
 fn pool_buffers_are_resident_through_one_set_per_queue() {
-    let Some(on) = host() else { return };
-    if !on.backend.residency_sets() {
+    let Some(default) = host() else { return };
+    if !default.backend.residency_sets() {
         eprintln!("skipped: no residency sets on this system");
         return;
     }
+    let on = Host::new(Metal::new().unwrap().with_residency_sets(true));
     let off = Host::new(Metal::new().unwrap().with_residency_sets(false));
 
     let work = |h: &Host, queues: usize, submissions: usize| {
@@ -900,10 +926,11 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
 /// A pool that goes away takes its buffer out of the set (and does not break the next work).
 #[test]
 fn a_released_pool_leaves_the_residency_set() {
-    let Some(h) = host() else { return };
-    if !h.backend.residency_sets() {
+    let Some(default) = host() else { return };
+    if !default.backend.residency_sets() {
         return;
     }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(true));
     let pool = Pool::new(&h, 2);
     pool.write(0, &(0..64u32).collect::<Vec<_>>());
     let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();

@@ -16,11 +16,12 @@ pub fn backend() -> Option<Metal> {
     Some(Metal::new().unwrap())
 }
 
-/// The residency modes every heap test runs in: `MTLResidencySet` and `useResource` per encoder.
+/// The residency modes every heap test runs in: the default (a set per heap, pool buffers named
+/// by the encoders), sets for the pool too, and `useResource` per encoder for everything.
 pub fn backends() -> Vec<Metal> {
     let Some(m) = backend() else { return vec![] };
-    let n = Metal::new().unwrap().with_residency_sets(false);
-    vec![m.with_residency_sets(true), n]
+    let new = || Metal::new().unwrap();
+    vec![m, new().with_residency_sets(true), new().with_residency_sets(false)]
 }
 
 /// Page-aligned zero-copy memory wrapped as one buffer.

@@ -389,18 +389,42 @@ next dispatch follows it) and by every sampling test below.
 
 Resources reached only through a heap entry are **not** resident unless named. Measured: with neither a
 residency set nor `useResource`, every heap test returns wrong data (Apple Silicon does not make an
-unnamed resource work by luck). A heap can carry its own `MTLResidencySet` holding the heap buffer and
-each resource written into it (`addAllocation` on every `write_*`, `commit` before the next command
-buffer that uses it, then `useResidencySet` on that command buffer), but it is **off by default**:
-a set never forgets an allocation, so with the title's thousands of heap-named textures and buffers it
-held all of title memory (about 6.7 GB here) plus the host's texture copies resident for the whole
-process, and command buffers began to time out (`kIOGPUCommandBufferCallbackErrorTimeout`) after the
-world load. `VICTORY_METAL_RESIDENCY_SETS=1` turns it on; by default every heap entry is named to every
-encoder with `useResource` instead, so residency follows the frame. The heap tests run in both modes
-(`common::backends()`). Not done: removing a replaced entry's old resource from the set (it stays
-resident until the heap is dropped); a set for the title pools (they are named with `useResource` per
-dispatch through `Dispatch::resources`, a handful of buffers; a queue-level `addResidencySet` is the
-cheaper end state); `useHeap` for `MTLHeap`-placed textures.
+unnamed resource work by luck).
+
+By default a heap carries its own `MTLResidencySet`: the heap buffer and each allocation its entries
+name. An allocation is added when an entry first names it and removed (and the set committed) before
+the last entry naming it is overwritten or the heap is dropped; the set does not retain what it holds,
+the heap does. The set is committed when entries changed and given to each command buffer that uses
+the heap (`useResidencySet`), so what the heap names is resident while that command buffer runs:
+residency follows the frame, and nothing is rebuilt per command buffer.
+
+`VICTORY_METAL_RESIDENCY_SETS=0` names every allocation a heap names to every encoder with
+`useResource` instead, which was the default before. In GTA VI's world the heap names about 37,000
+allocations (130,000 entries), and the kernel took about 155 ms to take that list for each render pass
+that draws (10 ms for a compute pass), whatever the pass's shaders, with the GPU idle. Measured with
+each pass in its own command buffer: 164 drawing passes, 0.153 s each between the kernel taking the
+command buffer and the GPU starting it; with the sets, 0. The 35 drawing passes of a world frame's
+main submission were 5.4 s. With the same build and only the switch changed, world frames went from
+0.07 fps (15 frames in 218 s) to 0.47 fps (101 frames in 213 s; 0.6 once the world's pipelines are
+made) on an M5 Pro with 48 GB, and the process's footprint at the first world frame was 16 GB either
+way.
+
+`VICTORY_METAL_RESIDENCY_SETS=1` also puts the title's pool buffers in one set on every queue (below).
+That keeps all of title memory (about 6.7 GB on a Series S profile) resident for the whole process:
+on an M3 Pro with 18 GB, command buffers began to time out after the world load
+(`kIOGPUCommandBufferCallbackErrorTimeout`, and `...OutOfMemory` with the host's texture copies). So
+by default pool buffers are still named by the encoders that use them (`Dispatch::resources`, a
+handful per pass).
+
+With a heap's set, Metal's hazard tracking no longer sees what a pass reaches through the heap, so the
+host orders the queue's work itself (the queue event and the fence under **Residency** below).
+The heap tests run in all three modes (`common::backends()`).
+
+Not known: how the default does on a Mac with 16 or 18 GB; it was run with 48 GB. The frame line
+(`native draws so far`, every 64 frames) logs `heap_set_mb`, the most bytes one heap's set held
+(pool buffers its entries name count whole), and `heap_allocations`. Not done: an entry that names a
+texture the title has released keeps it, alive and in the set, until the title overwrites the entry,
+as naming per encoder did; `useHeap` for `MTLHeap`-placed textures.
 
 ### Textures and samplers
 
@@ -628,12 +652,14 @@ and raises fence values.
 - **Present**: `native::set_layer(CAMetalLayer*)` (the app's, or `native::create_layer` for one without a
   window) and `PresentX` draws the first resource of the largest plane over the next drawable with a
   full-screen triangle, after the queue's earlier work (`PresentBackend`).
-- **Residency**: pool buffers join one `MTLResidencySet` when first used by a submission, the set is added
-  to each queue once, and encoders skip `useResource` for them; a buffer leaves the set when dropped.
-  `useResource` also told Metal's hazard tracking which buffers an encoder touches by GPU address; without
-  it nothing orders a copy before the dispatch that reads its result (the one flaky test that showed it), so
-  on a queue with the set every command buffer waits for the previous one through a queue `MTLEvent` and
-  every encoder for the one before through an `MTLFence`: work on a queue is serial. D3D12 barriers
+- **Residency**: with `VICTORY_METAL_RESIDENCY_SETS=1`, pool buffers join one `MTLResidencySet` when first
+  used by a submission, the set is added to each queue once, and encoders skip `useResource` for them; a
+  buffer leaves the set when dropped. By default they are named by the encoders (see "Residency (what a
+  heap needs)"). `useResource` also told Metal's hazard tracking which buffers an encoder touches by GPU
+  address; without it nothing orders a copy before the dispatch that reads its result (the one flaky test
+  that showed it), so on a queue whose work uses sets (the heaps' own by default, the pool's too with the
+  switch) every command buffer waits for the previous one through a queue `MTLEvent` and every encoder
+  for the one before through an `MTLFence`: work on a queue is serial. D3D12 barriers
   (`ResourceBarrier`) are still not translated; a title's UAV barriers are covered by that serialisation.
 
 ### What is left

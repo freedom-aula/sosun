@@ -19,6 +19,9 @@ pub struct Metal {
     pub(crate) msc: Result<Msc, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
+    /// The title's pool buffers in one set on every queue too (`VICTORY_METAL_RESIDENCY_SETS=1`);
+    /// off = named by the encoders that use them.
+    pub(crate) pool_sets: bool,
     /// The set of the title's pool buffers, made when the first one is.
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
@@ -58,6 +61,9 @@ pub struct ResidencyCounts {
     /// one heap named to an encoder.
     pub heap_entries: u64,
     pub heap_allocations: u64,
+    /// The most bytes one heap's set held when it was committed (the heap buffer and everything
+    /// its entries name: resident while a command buffer that uses the heap runs).
+    pub heap_set_bytes: u64,
     /// Buffers added to the pool set.
     pub added: u64,
     /// Queues the pool set was added to.
@@ -86,11 +92,12 @@ static LIBRARIES: AtomicU64 = AtomicU64::new(0);
 
 pub struct Queue(
     pub(crate) Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Whether the pool residency set was added to it.
+    /// Whether the host orders its work: residency sets are in use (the heaps' own, and the
+    /// pool's once it was added to the queue).
     pub(crate) std::cell::Cell<bool>,
-    /// With the set, encoders no longer name the buffers they reach by address, and Metal's hazard
-    /// tracking cannot see those accesses: command buffers wait for the one before through this
-    /// event (and encoders within one through a fence), counted by `.3`.
+    /// With sets, encoders no longer name what they reach through a heap or by address, and
+    /// Metal's hazard tracking cannot see those accesses: command buffers wait for the one before
+    /// through this event (and encoders within one through a fence), counted by `.3`.
     /// A shared event, so that a command buffer the GPU fails can still be paid on the CPU.
     pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
@@ -131,18 +138,22 @@ impl Metal {
     /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
-        // Residency is per encoder (`useResource`) unless `VICTORY_METAL_RESIDENCY_SETS=1`. A
-        // residency set keeps every allocation it was given resident for as long as the holder
-        // lives, and the title names thousands of textures and buffers in its descriptor heaps, so
-        // the set held all of title memory (about 6.7 GB here) plus the host's texture copies
-        // permanently. That is what preceded `kIOGPUCommandBufferCallbackErrorTimeout` (and, with
-        // the copies, `...OutOfMemory`). Per encoder, residency follows the frame instead.
-        let residency_sets = std::env::var_os("VICTORY_METAL_RESIDENCY_SETS").is_some()
+        // What a descriptor heap names is resident through the heap's own set, given to each
+        // command buffer that uses the heap, so residency follows the frame. Naming it to every
+        // encoder with `useResource` instead (`VICTORY_METAL_RESIDENCY_SETS=0`) cost the kernel
+        // about 155 ms per drawing render pass in GTA VI's world, whose heap names 37,000
+        // allocations. The title's pool buffers stay named by the encoders that use them: in a
+        // set on the queue (`VICTORY_METAL_RESIDENCY_SETS=1`) all of title memory (about 6.7 GB
+        // here) is resident for the whole process, which on an 18 GB Mac preceded
+        // `kIOGPUCommandBufferCallbackErrorTimeout` and `...OutOfMemory`.
+        let asked = std::env::var("VICTORY_METAL_RESIDENCY_SETS").ok();
+        let residency_sets = asked.as_deref() != Some("0")
             && dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:));
         Ok(Metal {
             dev,
             msc: Msc::try_open_default(),
             residency_sets,
+            pool_sets: residency_sets && asked.is_some(),
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
@@ -189,9 +200,12 @@ impl Metal {
         self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
-    /// Heap residency through `MTLResidencySet` (`true`) or `useResource` in every encoder (`false`).
+    /// All residency through `MTLResidencySet` (`true`: the heaps' sets and the pool's on the
+    /// queues) or `useResource` in every encoder (`false`). [`Metal::new`] is in between: the
+    /// heaps' sets alone.
     pub fn with_residency_sets(mut self, on: bool) -> Metal {
         self.residency_sets = on;
+        self.pool_sets = on;
         self
     }
 
@@ -223,7 +237,10 @@ impl ComputeBackend for Metal {
     fn create_queue(&self) -> Result<Queue, String> {
         let q = self.dev.newCommandQueue().ok_or("newCommandQueue failed")?;
         let order = self.dev.newSharedEvent().ok_or("newSharedEvent failed")?;
-        Ok(Queue(q, std::cell::Cell::new(false), order, std::cell::Cell::new(0)))
+        // With the heaps' sets alone the host orders the queue's work from the start; with the
+        // pool's set too, from when that set joins the queue (`make_resident`).
+        let ordered = self.residency_sets && !self.pool_sets;
+        Ok(Queue(q, std::cell::Cell::new(ordered), order, std::cell::Cell::new(0)))
     }
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
@@ -267,7 +284,7 @@ impl ComputeBackend for Metal {
     }
 
     fn make_resident(&self, queue: &Queue, buffers: &[&Buffer]) -> Result<(), String> {
-        if !self.residency_sets {
+        if !self.pool_sets {
             return Ok(());
         }
         let set = {
