@@ -383,6 +383,10 @@ impl Graphics {
     }
 
     pub fn depth_test(&self) -> Option<(bool, Compare)> {
+        // Debugging: no depth test at all.
+        if self.guess.is_some() && std::env::var_os("VICTORY_DEBUG_NO_DEPTH").is_some() {
+            return None;
+        }
         self.depth_enable
             .then(|| (self.depth_write, compare(self.depth_func)))
     }
