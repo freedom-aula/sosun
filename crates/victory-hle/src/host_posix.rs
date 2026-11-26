@@ -1219,13 +1219,50 @@ mod memory_tests {
         assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         assert_ne!(pool_shown_at(r as usize), Some(pool));
         assert_eq!(TRIPS.with(|t| t.borrow().len()), 1, "only the decommit");
-        // Address space no region holds.
-        let q = reserve_granular(None, GRANULARITY).expect("reserved");
+        // Free address space no region holds: found high up, where other tests' reservations
+        // do not land between the release and the mapping.
+        // SAFETY: fresh address space, given back at once; only mapped over below.
+        let q = unsafe {
+            mem::reserve_in(0x5000_0000_0000, 0x5fff_ffff_ffff, GRANULARITY, GRANULARITY)
+        }
+        .expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::release(q, GRANULARITY) }.expect("released");
         assert_eq!(XMemMapPhysicalPages(q.cast(), 1, pages.as_ptr()), q.cast());
         assert_eq!(trips(OUTSIDE), [(pool, 0)]);
         assert_eq!(XMemMapPhysicalPages(q.cast(), 1, std::ptr::null()), q.cast());
-        // SAFETY: the reservation just made, no longer mapped.
+        // SAFETY: the address mapped just above, no longer a view.
         unsafe { mem::release(q, GRANULARITY) }.expect("released");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Physical pages are mapped over a region of ours, a view of ours or free address space,
+    /// never over memory the host has there: on macOS the mapping replaced it silently.
+    #[test]
+    fn physical_pages_are_not_mapped_over_host_memory() {
+        use crate::modules::xmem::{
+            XMemAllocatePhysicalPages, XMemFreePhysicalPages, XMemMapPhysicalPages,
+            XMemMapPhysicalPagesScatter, map_alias,
+        };
+        let (mut n, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        // Host memory no region holds, with bytes in it.
+        let host = reserve_granular(None, 2 * GRANULARITY).expect("reserved");
+        // SAFETY: the reservation just made.
+        unsafe { mem::commit(host, 2 * GRANULARITY, Protect::READ_WRITE) }.expect("committed");
+        // SAFETY: committed read-write above.
+        unsafe { host.write(9) };
+        assert!(XMemMapPhysicalPages(host.cast(), 2, pages.as_ptr()).is_null());
+        let addresses = [host.cast::<c_void>(), host.wrapping_add(GRANULARITY).cast()];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, pages.as_ptr()), 0);
+        let r = VirtualAlloc(std::ptr::null_mut(), GRANULARITY, MEM_RESERVE, 0x01);
+        assert_eq!(XMemMapPhysicalPages(r, 1, pages.as_ptr()), r);
+        assert!(!map_alias(host as u64, r as u64, GRANULARITY as u64));
+        // SAFETY: still the host's, read-write.
+        assert_eq!(unsafe { host.read() }, 9, "the host's bytes are left alone");
+        // SAFETY: the reservation made above, never mapped over.
+        unsafe { mem::release(host, 2 * GRANULARITY) }.expect("released");
+        assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
