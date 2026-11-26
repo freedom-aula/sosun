@@ -85,8 +85,16 @@ unsafe fn units<'a, T: Copy + Default + PartialEq>(p: *const T, n: i32) -> &'a [
 /// needed if `size` is 0, else the count written, 0 with
 /// `ERROR_INSUFFICIENT_BUFFER` if it does not fit.
 fn copy_out<T: Copy>(text: &[T], out: *mut T, size: i32) -> i32 {
+    if size < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if size == 0 {
         return text.len() as i32;
+    }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
     }
     if text.len() > size as usize {
         set_error(ERROR_INSUFFICIENT_BUFFER);
@@ -131,7 +139,7 @@ pub extern "system" fn WideCharToMultiByte(
     src_len: i32,
     out: *mut u8,
     size: i32,
-    _default: *const u8,
+    default: *const u8,
     used_default: *mut i32,
 ) -> i32 {
     if src.is_null() {
@@ -145,13 +153,30 @@ pub extern "system" fn WideCharToMultiByte(
     // SAFETY: see above.
     let text =
         String::from_utf16_lossy(unsafe { units(src, if src_len < 0 { -1 } else { src_len }) });
+    let mut replaced = false;
+    let fallback = if default.is_null() {
+        b'?'
+    } else {
+        // SAFETY: the title passes a pointer to a single default byte.
+        unsafe { default.read() }
+    };
     let mut bytes: Vec<u8> = if matches!(code_page, 1252 | 28591) {
         text.chars()
-            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .map(|c| match u8::try_from(u32::from(c)) {
+                Ok(b) => b,
+                Err(_) => {
+                    replaced = true;
+                    fallback
+                }
+            })
             .collect()
     } else {
         text.into_bytes()
     };
+    if replaced && !used_default.is_null() {
+        // SAFETY: see above.
+        unsafe { used_default.write(1) };
+    }
     if src_len < 0 {
         bytes.push(0);
     }
@@ -275,6 +300,10 @@ pub extern "system" fn LCMapStringEx(
     _reserved: *const c_void,
     _param: isize,
 ) -> i32 {
+    if src.is_null() || len == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: see above.
     let mut text = unsafe { units(src, len) }.to_vec();
     for unit in &mut text {
@@ -291,6 +320,9 @@ pub extern "system" fn LCMapStringEx(
         if let Some(m) = mapped.filter(|m| (*m as u32) < 0x1_0000) {
             *unit = m as u32 as u16;
         }
+    }
+    if len < 0 {
+        text.push(0);
     }
     copy_out(&text, out, size)
 }
@@ -439,14 +471,36 @@ fn to_system_time(ticks: u64) -> SystemTimeFields {
     ]
 }
 
+fn days_in_month(year: u16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 fn from_system_time(t: &SystemTimeFields) -> Option<u64> {
     let [y, m, _, d, h, mi, s, ms] = *t;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 || ms > 999 {
+    if !(1601..=30827).contains(&y)
+        || !(1..=12).contains(&m)
+        || d == 0
+        || d > days_in_month(y, m)
+        || h > 23
+        || mi > 59
+        || s > 59
+        || ms > 999
+    {
         return None;
     }
     let days = days_from_civil(i64::from(y), u32::from(m), u32::from(d)) + DAYS_1601_TO_1970;
+    let days = u64::try_from(days).ok()?;
     let seconds = u64::from(h) * 3600 + u64::from(mi) * 60 + u64::from(s);
-    Some(days as u64 * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
+    Some(days * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
 }
 
 pub extern "system" fn GetSystemTimeAsFileTime(out: *mut u64) {
@@ -470,12 +524,20 @@ pub extern "system" fn GetLocalTime(out: *mut SystemTimeFields) {
 }
 
 pub extern "system" fn FileTimeToSystemTime(ft: *const u64, out: *mut SystemTimeFields) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a FILETIME and a SYSTEMTIME.
     unsafe { out.write_unaligned(to_system_time(ft.read_unaligned())) };
     1
 }
 
 pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *mut u64) -> i32 {
+    if st.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a SYSTEMTIME and a FILETIME.
     let fields = unsafe { st.read_unaligned() };
     match from_system_time(&fields) {
@@ -492,6 +554,10 @@ pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *m
 }
 
 pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -503,6 +569,10 @@ pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) ->
 }
 
 pub extern "system" fn LocalFileTimeToFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -605,13 +675,17 @@ pub extern "system" fn GlobalMemoryStatusEx(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn GetLogicalProcessorInformation(out: *mut u8, length: *mut u32) -> i32 {
+    if length.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes: one entry per
     // core, and one for the package.
     let n = cpus().min(64);
     let needed = (n + 1) * 32;
     // SAFETY: the title's length word and buffer.
     unsafe {
-        if length.read_unaligned() < needed {
+        if out.is_null() || length.read_unaligned() < needed {
             length.write_unaligned(needed);
             set_error(ERROR_INSUFFICIENT_BUFFER);
             return 0;
@@ -1627,6 +1701,10 @@ pub extern "system" fn GetTempPathW(size: u32, out: *mut u16) -> u32 {
     if (size as usize) < text.len() {
         return text.len() as u32;
     }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: the title's buffer of `size` units.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
     (text.len() - 1) as u32
@@ -1794,6 +1872,9 @@ pub extern "system" fn CoCreateGuid(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn StringFromGUID2(guid: *const u8, out: *mut u16, size: i32) -> i32 {
+    if guid.is_null() || out.is_null() || size <= 0 {
+        return 0;
+    }
     // SAFETY: a 16-byte GUID.
     let g = unsafe { std::slice::from_raw_parts(guid, 16) };
     let text = format!(
@@ -2424,6 +2505,91 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(CancelWaitableTimer(timer), 1);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn system_time_rejects_pre_1601_and_invalid_calendar_dates() {
+        let mut ft = 0u64;
+        for bad in [
+            [1600, 12, 0, 31, 0, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 0],
+            [2023, 2, 0, 29, 0, 0, 0, 0],
+            [1900, 2, 0, 29, 0, 0, 0, 0],
+            [2024, 4, 0, 31, 0, 0, 0, 0],
+            [30828, 1, 0, 1, 0, 0, 0, 0],
+        ] {
+            assert_eq!(SystemTimeToFileTime(&bad, &mut ft), 0, "accepted {bad:?}");
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+        // Leap-year 2000-02-29 and epoch 1601-01-01 are valid.
+        assert_eq!(SystemTimeToFileTime(&[1601, 1, 0, 1, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(ft, 0);
+        assert_eq!(SystemTimeToFileTime(&[2000, 2, 0, 29, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(SystemTimeToFileTime(std::ptr::null(), &mut ft), 0);
+        assert_eq!(FileTimeToSystemTime(&ft, std::ptr::null_mut()), 0);
+    }
+
+    #[test]
+    fn string_guid_and_processor_helpers_guard_edge_cases() {
+        // LCMapStringEx with len < 0 includes the terminating NUL.
+        let src: Vec<u16> = "AbC\0".encode_utf16().collect();
+        let mut out = [0xFFFFu16; 8];
+        let n = LCMapStringEx(
+            std::ptr::null(),
+            LCMAP_LOWERCASE,
+            src.as_ptr(),
+            -1,
+            out.as_mut_ptr(),
+            8,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        assert_eq!(
+            LCMapStringEx(
+                std::ptr::null(),
+                LCMAP_LOWERCASE,
+                src.as_ptr(),
+                -1,
+                out.as_mut_ptr(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // WideCharToMultiByte reports used_default and honors a custom default byte.
+        let wide: Vec<u16> = "A\u{20AC}B".encode_utf16().collect();
+        let mut mb = [0u8; 8];
+        let mut used = 0i32;
+        let def = b'#';
+        assert_eq!(
+            WideCharToMultiByte(1252, 0, wide.as_ptr(), 3, mb.as_mut_ptr(), 8, &def, &mut used),
+            3
+        );
+        assert_eq!((&mb[..3], used), (&b"A#B"[..], 1));
+
+        // Negative buffer size in copy_out / StringFromGUID2 and null buffer in GetLogicalProcessorInformation.
+        assert_eq!(
+            MultiByteToWideChar(65001, 0, c"hi".as_ptr().cast(), -1, out.as_mut_ptr(), -1),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        let guid = [0u8; 16];
+        assert_eq!(StringFromGUID2(guid.as_ptr(), out.as_mut_ptr(), -1), 0);
+        assert_eq!(StringFromGUID2(std::ptr::null(), out.as_mut_ptr(), 64), 0);
+
+        let mut len = 1024u32;
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert!(len >= 64);
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
     }
 }
 
