@@ -1526,11 +1526,11 @@ impl Resource {
 
 /// Whether `p` points at one of our resource objects: its first word, read
 /// without faulting, is the resource method table.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn is_resource(p: This) -> bool {
     let mut word = [0u8; 8];
     !p.is_null()
-        && crate::host::read_into(p.cast(), &mut word)
+        && crate::queue::read_bytes(p as usize, &mut word)
         && usize::from_le_bytes(word) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
 }
 

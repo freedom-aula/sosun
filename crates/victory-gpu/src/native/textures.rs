@@ -136,7 +136,7 @@ pub fn placed_key(address: u64, description: &[u32; 14]) -> usize {
     (u64::from_le_bytes(b.as_bytes()[..8].try_into().expect("8 bytes")) | 1 << 63) as usize
 }
 
-impl<B: GraphicsBackend> Title<B> {
+impl<B: PresentBackend> Title<B> {
     /// A title texture exists. Its host texture is made when a view, a render target or a clear
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.

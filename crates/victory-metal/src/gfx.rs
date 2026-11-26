@@ -46,6 +46,20 @@ pub struct Texture {
     tex: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
+impl Texture {
+    /// The texture as the bytes it holds when it is sRGB (a view in the plain format), else itself.
+    pub(crate) fn view_without_srgb(&self, _m: &Metal) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        let plain = match self.tex.pixelFormat() {
+            MTLPixelFormat::RGBA8Unorm_sRGB => MTLPixelFormat::RGBA8Unorm,
+            MTLPixelFormat::BGRA8Unorm_sRGB => MTLPixelFormat::BGRA8Unorm,
+            _ => return self.tex.clone(),
+        };
+        self.tex
+            .newTextureViewWithPixelFormat(plain)
+            .unwrap_or_else(|| self.tex.clone())
+    }
+}
+
 pub struct Sampler(Retained<ProtocolObject<dyn MTLSamplerState>>);
 
 pub struct RenderPipeline {

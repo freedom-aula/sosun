@@ -519,16 +519,42 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Bytes of this process's memory, false if they cannot be read.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn read_bytes(at: usize, out: &mut [u8]) -> bool {
+    #[cfg(windows)]
+    return crate::host::read_into(at as *const u8, out);
+    #[cfg(not(windows))]
+    return crate::native::safe_read(at as *const u8, out);
+}
+
+/// The plane to show on the native host: `VICTORY_PRESENT_PLANE` or the one whose first resource
+/// has the most pixels.
+#[cfg(target_os = "macos")]
+fn shown_plane(found: &[Vec<This>]) -> usize {
+    let want = std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.parse().ok());
+    let areas: Vec<u64> = found
+        .iter()
+        .map(|plane| {
+            plane
+                .first()
+                .and_then(|&r| crate::resource::texture_info(r))
+                .map_or(0, |t| u64::from(t.width) * u64::from(t.height))
+        })
+        .collect();
+    pick_plane(want, &areas)
+}
+
 /// Every plane's resources. Only the start of a plane description is
 /// known (token, count, resources), so the planes after the first are
 /// found by their stride: the first offset past the first plane where the
 /// same frame token is followed by a count of 1 to 16 and a list whose
 /// first entry is one of our resources. All reads there are checked.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn plane_resources(planes: u32, plane: *const Plane) -> Vec<Vec<This>> {
     let read_u64 = |at: usize| {
         let mut b = [0u8; 8];
-        crate::host::read_into(at as *const u8, &mut b).then(|| u64::from_le_bytes(b))
+        read_bytes(at, &mut b).then(|| u64::from_le_bytes(b))
     };
     let list = |at: usize| -> Option<Vec<This>> {
         let count = read_u64(at + 8)? as u32;
@@ -630,7 +656,7 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 
 /// The plane to show given an override and each plane's first resource
 /// area (0 when unknown): the override when in range, else the largest.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, target_os = "macos"))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
         && w < areas.len()
@@ -652,11 +678,13 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(not(target_os = "macos"))]
+    let _ = this;
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
@@ -736,7 +764,16 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
-    #[cfg(not(windows))]
+    // On the native host: the first resource of the shown plane goes to the app's layer.
+    #[cfg(target_os = "macos")]
+    {
+        let found = plane_resources(planes, plane_parameters);
+        let shown = shown_plane(&found);
+        if let Some(&resource) = found.get(shown).and_then(|p| p.first()) {
+            crate::native::glue::present(this, resource);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (planes, plane_parameters);
     S_OK
 }

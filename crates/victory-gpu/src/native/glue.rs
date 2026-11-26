@@ -197,6 +197,42 @@ pub(crate) fn fence_wait(fence: This, value: u64, timeout: std::time::Duration) 
     }
 }
 
+// --- present ---
+
+/// Gives the host the app's drawable layer (a `CAMetalLayer`, by address; it must outlive the
+/// host): frames the title presents are drawn into it from then on. Without one, `PresentX` shows
+/// nothing.
+pub fn set_layer(layer: *mut std::ffi::c_void) -> Result<(), String> {
+    with_title(|t| t.set_surface(layer)).unwrap_or_else(|| Err("no native host GPU".into()))
+}
+
+/// A layer drawing to the host's device, `width` by `height`, for an app that has none (or a test):
+/// hand [`victory_metal::present::Layer::as_ptr`] to [`set_layer`] and keep the layer alive.
+pub fn create_layer(width: usize, height: usize) -> Result<victory_metal::present::Layer, String> {
+    with_title(|t| t.host.backend.create_layer(width, height)).ok_or_else(|| "no native host GPU".into())
+}
+
+/// `PresentX` on title queue `queue`: title texture `resource` over the layer.
+pub(crate) fn present(queue: This, resource: This) {
+    let shown = with_title(|t| {
+        let _ = t.ensure_queue(queue as usize);
+        t.present(queue as usize, resource as usize)
+    });
+    if let Some(Err(e)) = shown {
+        tracing::warn!(error = %e, "a frame was not presented");
+    }
+}
+
+/// Frames presented to the layer so far.
+pub fn frames_presented() -> u64 {
+    with_title(|t| t.surface().map_or(0, |s| s.frames())).unwrap_or(0)
+}
+
+/// The pixels (BGRA) of the last frame presented, once the GPU has drawn it; for tests.
+pub fn last_frame() -> Option<(usize, usize, Vec<u8>)> {
+    with_title(|t| t.surface().and_then(|s| s.read_last())).flatten()
+}
+
 // --- resources and descriptors ---
 
 /// A buffer resource object `res` of `len` bytes at title address `addr`.

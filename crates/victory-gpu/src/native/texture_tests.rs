@@ -211,3 +211,73 @@ fn an_undetilable_layout_is_counted_not_fatal() {
     });
     assert_eq!(with_title(|t| t.stats.undetilable).unwrap(), before + 1, "once per content");
 }
+
+/// `PresentX`: the first resource of the largest plane is drawn over the app's layer (scaled,
+/// whatever its channel order), after the queue's earlier work. Offscreen: the layer is not in a
+/// window; its last drawable is read back.
+#[test]
+fn present_draws_the_back_buffer_over_the_apps_layer() {
+    let Some(pool) = pool(9106, 4) else { return };
+    let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_S.0, 1);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    let layer = glue::create_layer(32, 32).expect("a layer");
+    glue::set_layer(layer.as_ptr()).expect("a surface");
+    let (q, f) = (crate::queue::test_queue(false), {
+        let mut f = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+        f
+    });
+    let list = crate::list::test_list(false, std::ptr::null());
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+        list,
+        1,
+        &handle,
+        0,
+        std::ptr::null(),
+    );
+    // Red in the title's RGBA.
+    let color = [1.0f32, 0.0, 0.0, 1.0];
+    slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const u8)>(list, 0x1a0)(
+        list,
+        handle,
+        &color,
+        0,
+        std::ptr::null(),
+    );
+    slot::<extern "system" fn(This) -> i32>(list, 0x48)(list);
+    slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+    // One plane: the frame token, one resource, its address.
+    #[repr(C)]
+    struct Plane {
+        token: u64,
+        count: u32,
+        pad: u32,
+        resources: *const This,
+    }
+    let plane = Plane {
+        token: 1,
+        count: 1,
+        pad: 0,
+        resources: &rt,
+    };
+    let before = glue::frames_presented();
+    let present = slot::<extern "system" fn(This, u32, *const Plane, *const u8) -> i32>(q, 0xf0);
+    assert_eq!(present(q, 1, &plane, std::ptr::null()), 0);
+    assert_eq!(glue::frames_presented(), before + 1);
+    // A signal after the present: the frame is drawn when the fence is reached.
+    slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    assert_eq!(
+        slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(f, 1, std::ptr::null_mut()),
+        0
+    );
+    let (w, h, bgra) = glue::last_frame().expect("a frame");
+    assert_eq!((w, h), (32, 32));
+    assert!(
+        bgra.chunks(4).all(|p| p == [0, 0, 255, 255]),
+        "red as BGRA: {:?}",
+        &bgra[..8]
+    );
+    drop(layer);
+}

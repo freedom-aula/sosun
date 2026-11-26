@@ -478,3 +478,21 @@ pub trait GraphicsBackend: ResourceBackend {
         work: &PassSubmission<'_, Self>,
     ) -> Result<(), String>;
 }
+
+/// Showing a texture of the title in a window.
+pub trait PresentBackend: GraphicsBackend {
+    /// Where frames go: a layer of the app's window.
+    type Surface;
+
+    /// A surface over the app's drawable layer (`CAMetalLayer` on Metal), passed by address; the
+    /// layer must stay alive while the surface does.
+    fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
+    /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
+    /// presents it after the work already submitted to `queue`. Never waits for the GPU.
+    fn present(
+        &self,
+        queue: &Self::Queue,
+        surface: &Self::Surface,
+        source: &Self::Texture,
+    ) -> Result<(), String>;
+}

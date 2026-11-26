@@ -126,7 +126,7 @@ impl<B: GraphicsBackend> Default for Libraries<B> {
     }
 }
 
-impl<B: GraphicsBackend> Title<B> {
+impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {

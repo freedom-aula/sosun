@@ -17,7 +17,7 @@ use crate::hold::{Held, Item, ValueWait, World};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use victory_backend::resources::GraphicsBackend;
+use victory_backend::resources::{GraphicsBackend, PresentBackend};
 
 /// A wait for a memory value (`Wait32BitValueX`, `Wait64BitValueX`): the value at `address`
 /// (`bytes` 4 or 8, masked) compared with `reference` by a D3D12 comparison function.
@@ -136,7 +136,7 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
     }
 }
 
-pub struct Title<B: GraphicsBackend> {
+pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
@@ -144,6 +144,8 @@ pub struct Title<B: GraphicsBackend> {
     pub shaders: super::shaders::ShaderStats,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
+    /// Where `Present` shows frames, if the app gave a layer.
+    pub(super) surface: Option<B::Surface>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -155,7 +157,7 @@ pub struct Title<B: GraphicsBackend> {
     pub stats: Stats,
 }
 
-impl<B: GraphicsBackend> Title<B> {
+impl<B: PresentBackend> Title<B> {
     pub fn new(backend: B, memory: Arc<PoolTable>) -> Self {
         Title {
             host: NativeHost::with_memory(backend, memory),
@@ -163,6 +165,7 @@ impl<B: GraphicsBackend> Title<B> {
             shaders: Default::default(),
             libraries: Default::default(),
             textures: Default::default(),
+            surface: None,
             pending: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
@@ -333,6 +336,36 @@ impl<B: GraphicsBackend> Title<B> {
             signal: &mut signal,
         });
         stats.waited += done.waited.len() as u64;
+    }
+
+    /// Gives the host the app's drawable layer (`CAMetalLayer` on Metal, by address): frames the
+    /// title presents are shown there from now on.
+    pub fn set_surface(&mut self, layer: *mut std::ffi::c_void) -> Result<(), String> {
+        self.surface = Some(self.host.backend.create_surface(layer)?);
+        Ok(())
+    }
+
+    /// `PresentX`: title texture `key` shown over the surface, after the work queue `queue` has
+    /// been given. shortcut: not behind work the queue still holds back (the frame is shown as
+    /// far as it ran); `Ok(false)` when there is no surface or the title has no such texture.
+    pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
+        self.pump();
+        if self.surface.is_none() {
+            return Ok(false);
+        }
+        let Some(tex) = self.texture_of(key) else {
+            return Ok(false);
+        };
+        let q = self.queue(queue)?;
+        if let Some(surface) = &self.surface {
+            self.host.backend.present(&q, surface, &tex)?;
+        }
+        Ok(true)
+    }
+
+    /// The surface presented to (to read the frame counter, say).
+    pub fn surface(&self) -> Option<&B::Surface> {
+        self.surface.as_ref()
     }
 
     /// Whether any queue holds work (a timer should test it again soon).
