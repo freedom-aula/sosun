@@ -710,3 +710,17 @@ Still dropped, logged once per signature ("indirect execution dropped"), except 
 - Indirect draws of a rectangle list (topology 17): the host draws a rectangle list as instances of four vertices, which needs the record's counts rewritten first. The title's indexed signature (stride 20) is one (run 1 dropped it on this path, the only one an indexed record without a count buffer drops on); so are direct indexed rectangle lists, which the host also drops. First windowed run with this change (2026-11-27, Series S): the draw, dispatch and type-105 signatures ran, and only the mesh signature and the indexed rectangle-list draw dropped.
 
 Guess: type 105 is not a D3D12 argument type. It is taken to be the console's single-pass dispatch, with the same three-word record as `DISPATCH` (its flags live in the signature, the title passes none); its stride, 12, fits that.
+
+## Descriptor dwords read as data
+
+The console compiler computes sizes from descriptor bits instead of querying them; those fields
+are rebuilt from the host view (`Lower::descriptor_data`). Other dwords have no host value and
+were refused as "a descriptor's address or format read as data". That text is now followed by a
+colon and the dword: "a buffer's base address (dword 0)", "a buffer's dword 1 (address high
+bits, stride, swizzle)", "a buffer's dword 3 (format and type)", "an image's base address (dword
+0)", "an image's dwords 5 to 7" or "a dword outside the descriptor". Nothing is lowered: the
+native Metal host serves no view addresses or formats to shaders, and would have to first.
+`pipeline::pieces_tests::the_host_refuses_a_descriptor_dword_read_as_data_naming_it`
+(`victory-gpu`) checks the refusal on the native host's own path: the container made from the
+title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
+compute programs refused with the old message.

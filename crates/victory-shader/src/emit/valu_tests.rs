@@ -1945,7 +1945,8 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         matches!(
             refused,
             Err(crate::ShaderError::Unsupported {
-                what: "a descriptor's address or format read as data",
+                what: "a descriptor's address or format read as data: a buffer's base address \
+                       (dword 0)",
                 ..
             })
         ),
