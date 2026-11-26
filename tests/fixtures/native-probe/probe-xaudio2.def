@@ -1,0 +1,3 @@
+LIBRARY xaudio2_9.dll
+EXPORTS
+XAudio2Create @1 NONAME

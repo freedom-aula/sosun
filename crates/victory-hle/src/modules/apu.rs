@@ -14,8 +14,17 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+// The native macOS host's own events: the title waits on the handle through
+// `host_posix`'s `WaitForSingleObject`.
+#[cfg(not(windows))]
+use crate::host_posix::{CloseHandle, CreateEventW, SetEvent};
+#[cfg(not(windows))]
+type HANDLE = *mut c_void;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -428,6 +437,37 @@ mod tests {
             options: 0,
             context: 0x1234,
         }
+    }
+
+    /// The result event is a handle the title waits on: ours on both hosts.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_result_signals_the_connections_event() {
+        use crate::host_posix::WaitForSingleObject;
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 1,
+            commands_per_stream: 2,
+            memory: 0x1000,
+            frames_per_output: 0,
+            options: RESULT_EVENT,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        assert!(!output.result_event.is_null());
+        assert_eq!(WaitForSingleObject(output.result_event, 0), 0x102);
+        let mut notify = id(NOTIFY, 0);
+        notify.options = SIGNAL;
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const notify).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(WaitForSingleObject(output.result_event, 1000), 0);
+        assert_eq!(XApuDisconnect(handle), S_OK);
     }
 
     #[test]

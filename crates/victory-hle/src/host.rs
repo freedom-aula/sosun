@@ -237,10 +237,14 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
+        // Ordinals look up `#n`, as in the HLE registry.
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        if let victory_pe::ImportSymbol::Name { name, .. } = _symbol {
-            return crate::host_posix::lookup(_dll, name);
+        {
+            crate::host_posix::lookup(_dll, &_symbol.to_string())
         }
-        None
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        {
+            None
+        }
     }
 }

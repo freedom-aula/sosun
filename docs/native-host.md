@@ -23,7 +23,12 @@ Wine-based work continues on the `test/run-C*` branches. This branch (`native/ho
 | kernel32 and friends beyond the first slice (`host_posix/system.rs`) | Time and time zones, strings and locales, system information, mutexes, waitable timers, the thread pool, FLS, SLists, `InitOnce`, registry/ETW/COM/crypt32/bcrypt/user32 message stubs. The C runtime (`api-ms-win-crt-*`) is separate |
 | `GetModuleHandle`/`LoadLibrary`/`GetProcAddress` on system DLLs (`kernel32.dll`, `api-ms-win-core-*`, `ucrtbase.dll`, ...) | Done (`host_posix/fake_dll.rs`): one stable handle per normalised name, a 64 KiB read-only region holding a minimal PE header (no sections, no exports) so header reads do not crash; `GetProcAddress` (name or ordinal) resolves through the binder's resolver and returns a cached bridge stub (`bridge::stub_for`), NULL with `ERROR_PROC_NOT_FOUND` otherwise; `GetModuleFileName` gives `C:\Windows\System32\<name>`; `FreeLibrary` succeeds |
 | Universal C runtime (`api-ms-win-crt-*`, `ucrtbase.dll`) | Done (`host_posix/ucrt.rs`): about 700 exports, see below |
-| Window and audio on macOS | Not started (see below) |
+| Winsock (`host_posix/winsock.rs`) | Done: startup/cleanup, sockets (a `SOCKET` is a handle of ours), connect/bind/listen/accept, send/recv/sendto/recvfrom, `select`, `WSAPoll`, `ioctlsocket` (`FIONBIO`, `FIONREAD`), socket options with Windows constants mapped (`SO_LINGER`, timeouts, `TCP_KEEPALIVE`, ...), `getaddrinfo`/`getnameinfo`/`gethostbyname` with Windows layouts, `inet_*`, byte order, `WSAGetLastError` is `GetLastError` with `WSAE*` codes from `errno`. Imports by name and by ordinal (`#n`, Wine's `ws2_32.spec`). Same policy as `modules::net`: loopback only, `localhost` and IP literals only, wildcard binds narrowed. No overlapped I/O |
+| WinHTTP (`host_posix/winhttp.rs`) | Done, offline: handles, options, timeouts, headers, status callbacks (`HANDLE_CLOSING` is delivered on close), `WinHttpCrackUrl`; `WinHttpSendRequest` fails with `ERROR_WINHTTP_CANNOT_CONNECT` and the calls that need a sent request fail with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`. Nothing leaves the machine |
+| Media Foundation (`host_posix/mf.rs`) | `MFStartup`/`MFShutdown`/`MFGetSystemTime` work; `MFCreateAttributes`, `MFCreateMediaType`, `MFCreateSourceResolver` and the source readers fail with `MF_E_UNSUPPORTED_BYTESTREAM_TYPE` and a null object, so a title skips its video paths. No COM objects; AVFoundation is the way to a real reader |
+| Audio decoder (`xapu.dll`, `modules::apu`) | Done on macOS: the same module as on Windows, its result event is a `host_posix` event handle |
+| XAudio2 (`host_posix/xaudio2.rs`, `mixer.rs`, `coreaudio.rs`) | Done for PCM and float sources: `XAudio2Create` (ordinal 1) returns an `IXAudio2` whose methods are `extern "win64"` behind bridge stubs (`native::host_callbacks`), source/submix/mastering voices, buffer queues with loops, volume, channel volumes, output matrix, frequency ratio, voice callbacks (`OnBufferStart/End`, `OnLoopEnd`, `OnStreamEnd`) from a thread of ours. The mixer is plain Rust over float frames; the output is a trait with an AudioToolbox `AudioQueue` (a small FFI, no crate) and a silent clock when there is no device. Not done: effects, filters, submix mixing (a submix is a gain group), ADPCM/XMA/xWMA sources, engine callbacks |
+| Window on macOS | Not started (see below) |
 | Remaining Win32 call sites in `victory-hle` and `victory-gpu` moved to the seam | Not started |
 
 Run the tests with:
@@ -107,7 +112,7 @@ Known Rosetta constraint, from `docs/macos.md`: a fault inside a masked or `vcvt
 
 ### Not in these groups, still needed
 
-Window and input (`CreateWindowExW`, message loop, XInput; `lifecycle.rs`, `gameinput.rs`) go to AppKit and `GameController`. Sockets (`net.rs`) go to BSD sockets (names change, semantics mostly do not). Audio (`audio`, `apu.rs`, XAudio2 ordinal 1) goes to CoreAudio. Media Foundation (`media.rs`) goes to AVFoundation. Crypto (`bcrypt`, `crypt32`) goes to CommonCrypto and Security. These are each separate pieces of work, after the core is up.
+Window and input (`CreateWindowExW`, message loop, XInput; `lifecycle.rs`, `gameinput.rs`) go to AppKit and `GameController`. Media Foundation video (`media.rs`) would go to AVFoundation. (Sockets, audio and the audio decoder are done: see the table above.) Crypto (`bcrypt`, `crypt32`) goes to CommonCrypto and Security. These are each separate pieces of work, after the core is up.
 
 ## The platform seam
 
