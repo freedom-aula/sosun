@@ -26,6 +26,7 @@ use victory_platform::thread;
 pub(crate) mod files;
 mod sync;
 mod system;
+mod mf;
 mod winhttp;
 mod winsock;
 
@@ -726,7 +727,8 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
     if let Some(address) = system::lookup(&dll, name)
         .or_else(|| winsock::lookup(&dll, name))
-        .or_else(|| winhttp::lookup(&dll, name)) {
+        .or_else(|| winhttp::lookup(&dll, name))
+        .or_else(|| mf::lookup(&dll, name)) {
         return Some(address);
     }
     // The API sets and kernelbase forward to kernel32's functions; the
