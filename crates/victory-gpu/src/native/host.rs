@@ -28,6 +28,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
+    /// The pool table's mappings as [`Self::mapping_list`] last read them, and their generation.
+    maps: RefCell<Option<(u64, Rc<[Mapping]>)>>,
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
     resources: RefCell<HashMap<usize, Res<B>>>,
@@ -131,6 +133,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             memory,
             buffers: RefCell::default(),
             released: RefCell::default(),
+            maps: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
@@ -528,23 +531,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.count
             ));
         }
-        let (generation, mappings) = self.memory.mappings();
         if let Some((g, t)) = &*heap.table.borrow()
-            && *g == generation
+            && *g == self.memory.generation()
         {
             return Ok(t.clone());
         }
-        let maps: Vec<Mapping> = mappings
-            .iter()
-            .map(|(at, len, pool, offset)| Mapping {
-                at: *at as u64,
-                len: *len as u64,
-                pool: pool.id,
-                base: pool.base,
-                pool_len: pool.len as u64,
-                offset: *offset as u64,
-            })
-            .collect();
+        let (generation, maps) = self.mapping_list();
         let mut c = self.contract.borrow_mut();
         let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
         let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
@@ -597,15 +589,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
-        let maps = self.mapping_list();
+        let (_, maps) = self.mapping_list();
         addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
     }
 
-    /// The pool table as the page table builder reads it.
-    fn mapping_list(&self) -> Vec<Mapping> {
-        self.memory
-            .mappings()
-            .1
+    /// The pool table as the page table builder reads it, and its generation: made again only
+    /// when the pool table changed.
+    fn mapping_list(&self) -> (u64, Rc<[Mapping]>) {
+        if let Some((g, maps)) = &*self.maps.borrow()
+            && *g == self.memory.generation()
+        {
+            return (*g, maps.clone());
+        }
+        let (generation, mappings) = self.memory.mappings();
+        let maps: Rc<[Mapping]> = mappings
             .iter()
             .map(|(at, len, pool, offset)| Mapping {
                 at: *at as u64,
@@ -615,7 +612,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 pool_len: pool.len as u64,
                 offset: *offset as u64,
             })
-            .collect()
+            .collect();
+        *self.maps.borrow_mut() = Some((generation, maps.clone()));
+        (generation, maps)
     }
 
     /// What a shader that finds title memory through the page table is given besides its user data:
@@ -1361,5 +1360,22 @@ mod tests {
         assert_eq!(table_check_count(1, Some(&vs), 16), 16);
         assert_eq!(table_check_count(2, Some(&vs), 16), 30);
         assert_eq!(table_check_count(3, Some(&vs), 16), 19);
+    }
+
+    /// The mappings are read from the pool table once per generation, not at every root view.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mapping_list_is_read_again_only_when_the_pool_table_changes() {
+        use super::super::memory::{PoolInfo, PoolObserver};
+        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        let h = NativeHost::new(metal);
+        let pool = PoolInfo { id: 1, base: 0x1000_0000, len: 0x10_0000, memory_entry: None };
+        h.memory().mapped(0x7000_0000, 0x1_0000, &pool, 0);
+        let (g, a) = h.mapping_list();
+        let (_, b) = h.mapping_list();
+        assert!(Rc::ptr_eq(&a, &b));
+        h.memory().mapped(0x7001_0000, 0x1_0000, &pool, 0x1_0000);
+        let (g2, c) = h.mapping_list();
+        assert!(g2 != g && c.len() == 2);
     }
 }
