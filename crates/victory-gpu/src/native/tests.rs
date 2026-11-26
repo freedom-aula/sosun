@@ -978,3 +978,55 @@ fn a_released_pool_leaves_the_residency_set() {
     assert_eq!(h.backend.residency_counts().added, 2);
     assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
 }
+
+#[test]
+fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
+    let Some(h) = host() else { return };
+    let mut l = NativeList::default();
+    assert!(l.dispatch(0, 1, 1).is_err());
+    assert!(l.dispatch_threads([0, 1, 1]).is_err());
+    assert!(l.draw_instanced(0, 1, 0, 0).is_err());
+    assert!(l.dispatch_mesh(0, 1, 1).is_err());
+
+    let cs = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    l.set_compute_pipeline(&cs);
+    l.dispatch(0, 1, 1).unwrap();
+    l.dispatch(1, 0, 1).unwrap();
+    l.dispatch(1, 1, 0).unwrap();
+    l.dispatch_threads([0, 1, 1]).unwrap();
+    l.dispatch_threads([64, 0, 1]).unwrap();
+    l.copy_buffer_region(0x1000, 0x2000, 0);
+    l.fill(0x1000, 0, 0xAB);
+
+    let gfx = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &[
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+            ],
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    l.set_graphics_pipeline(&gfx, Topology::Triangles);
+    l.set_index_buffer(0x1000, false);
+    l.draw_instanced(0, 1, 0, 0).unwrap();
+    l.draw_instanced(3, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(0, 1, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(3, 0, 0, 0, 0).unwrap();
+    l.dispatch_mesh(0, 1, 1).unwrap();
+    assert!(l.is_empty());
+}

@@ -535,6 +535,9 @@ fn first_send(inner: &Inner, sends: *const u8) -> Option<VoiceId> {
             return None;
         }
         let descriptors = sends.add(8).cast::<*const u8>().read_unaligned();
+        if descriptors.is_null() {
+            return None;
+        }
         let voice = descriptors.add(8).cast::<*const Voice>().read_unaligned();
         (!voice.is_null()).then(|| (*voice).id)
     }
@@ -945,7 +948,7 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
     } else {
         (loop_begin, loop_begin + loop_length)
     };
-    if loops > 0 && (loop_end > frames || loop_begin >= loop_end) {
+    if loops > 0 && (loop_end > end || loop_end <= play_begin || loop_begin >= loop_end) {
         return XAUDIO2_E_INVALID_CALL;
     }
     let buffer = Buffer {
@@ -994,6 +997,9 @@ extern "win64" fn source_get_state(this: *mut Voice, state: *mut u8, _flags: u32
 }
 
 extern "win64" fn source_set_ratio(this: *mut Voice, ratio: f32, _set: u32) -> HRESULT {
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return E_INVALIDARG;
+    }
     with_voice(this, |_| (), |_| (), |s| s.ratio = ratio.clamp(1.0 / 1024.0, 1024.0));
     S_OK
 }
@@ -1492,5 +1498,62 @@ mod tests {
         assert!(lookup("xaudio2_9.dll", "#1").is_some());
         assert!(lookup("xaudio2_8.dll", "#1").is_none());
         assert_eq!(XAudio2Create(std::ptr::null_mut(), 0, 0), E_INVALIDARG);
+    }
+
+    #[test]
+    fn invalid_ratios_loop_bounds_and_null_send_descriptors_are_rejected() {
+        let engine = new_engine(open_held);
+        let w = wave(1, 48_000, 16, 1);
+        // XAUDIO2_VOICE_SENDS with SendCount=1 and pSends=NULL must not dereference NULL.
+        let mut bad_sends = [0u8; 16];
+        bad_sends[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let mut voice = std::ptr::null_mut();
+        assert_eq!(
+            create_source_voice(
+                engine,
+                &mut voice,
+                w.as_ptr(),
+                0,
+                2.0,
+                std::ptr::null_mut(),
+                bad_sends.as_ptr(),
+                std::ptr::null()
+            ),
+            S_OK
+        );
+
+        // Non-finite and non-positive ratios fail with E_INVALIDARG and preserve the current ratio.
+        assert_eq!(source_set_ratio(voice, 1.5, 0), S_OK);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.5] {
+            assert_eq!(source_set_ratio(voice, bad, 0), E_INVALIDARG);
+        }
+        let mut ratio = 0.0f32;
+        source_get_ratio(voice, &mut ratio);
+        assert_eq!(ratio, 1.5);
+
+        // Loop regions outside [play_begin, play_end] are refused.
+        let pcm = [0i16; 100];
+        let mut buf = [0u8; 48];
+        buf[4..8].copy_from_slice(&(size_of_val(&pcm) as u32).to_le_bytes());
+        buf[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
+        buf[16..20].copy_from_slice(&50u32.to_le_bytes()); // PlayBegin = 50
+        buf[20..24].copy_from_slice(&40u32.to_le_bytes()); // PlayLength = 40 (end = 90)
+        buf[24..28].copy_from_slice(&10u32.to_le_bytes()); // LoopBegin = 10
+        buf[28..32].copy_from_slice(&20u32.to_le_bytes()); // LoopLength = 20 (loop_end = 30 <= play_begin)
+        buf[32..36].copy_from_slice(&1u32.to_le_bytes()); // LoopCount = 1
+        assert_eq!(
+            source_submit(voice, buf.as_ptr(), std::ptr::null()),
+            XAUDIO2_E_INVALID_CALL
+        );
+        // LoopEnd past PlayEnd is also refused.
+        buf[24..28].copy_from_slice(&60u32.to_le_bytes());
+        buf[28..32].copy_from_slice(&35u32.to_le_bytes()); // loop_end = 95 > 90
+        assert_eq!(
+            source_submit(voice, buf.as_ptr(), std::ptr::null()),
+            XAUDIO2_E_INVALID_CALL
+        );
+
+        destroy_voice(voice);
+        assert_eq!(engine_release(engine), 0);
     }
 }

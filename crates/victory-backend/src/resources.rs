@@ -94,6 +94,12 @@ impl Format {
         matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
     }
 
+    /// A depth or depth-stencil format.
+    pub fn is_depth(self) -> bool {
+        use Format::*;
+        matches!(self, D32Float | D32FloatS8 | D16Unorm)
+    }
+
     /// Bytes of one row of `width` texels (of blocks, for BC).
     pub fn row_bytes(self, width: usize) -> usize {
         let (b, n) = self.block();
@@ -139,7 +145,7 @@ impl TextureDesc {
 }
 
 /// A view of part of a texture, possibly in another (size-compatible) format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewDesc {
     pub format: Format,
     /// First mip, count.

@@ -131,8 +131,12 @@ extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i3
     let mut bytes = Vec::with_capacity(37);
     bytes.extend_from_slice(&text);
     bytes.push(0);
+    let allocated = allocate(&bytes);
+    if allocated.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(allocated.cast()) };
     OK
 }
 
@@ -148,8 +152,12 @@ extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     let mut units: Vec<u16> = text.iter().map(|&b| u16::from(b)).collect();
     units.push(0);
     let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let allocated = allocate(&bytes);
+    if allocated.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(allocated.cast()) };
     OK
 }
 
@@ -203,13 +211,23 @@ fn format(g: &Guid) -> [u8; 36] {
 fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
     let mut digits = [0u8; 32];
     let mut n = 0;
+    let mut braced = false;
+    let mut saw_char = false;
     for c in &mut chars {
         let c = c.into();
-        if n == 32 {
-            // Only the closing brace may follow the last digit.
-            return (c == u32::from(b'}')).then(|| assemble(&digits));
+        if !saw_char {
+            saw_char = true;
+            if c == u32::from(b'{') {
+                braced = true;
+                continue;
+            }
         }
-        if c == u32::from(b'-') || (n == 0 && c == u32::from(b'{')) {
+        if n == 32 {
+            // Only the matching closing brace at the end of the string may follow.
+            return (braced && c == u32::from(b'}') && chars.next().is_none())
+                .then(|| assemble(&digits));
+        }
+        if c == u32::from(b'-') {
             continue;
         }
         let digit = match c {
@@ -221,7 +239,7 @@ fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
         digits[n] = digit as u8;
         n += 1;
     }
-    (n == 32).then(|| assemble(&digits))
+    (n == 32 && !braced).then(|| assemble(&digits))
 }
 
 fn assemble(digits: &[u8; 32]) -> Guid {
@@ -334,6 +352,23 @@ mod tests {
         );
         assert_eq!(
             parse(b"1234abcd-00ef-4a5b-8012-3456789abcdeZ".iter().copied()),
+            None
+        );
+        // Unmatched braces, repeated opening braces, and trailing text after `}`.
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd-00ef-4a5b-8012-3456789abcde}".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"{{1234abcd-00ef-4a5b-8012-3456789abcde}".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde}extra".iter().copied()),
             None
         );
     }
