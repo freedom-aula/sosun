@@ -448,3 +448,27 @@ fn packed_16_bit_channel_order() {
         assert_eq!(g.run(&t), want, "{f:?}");
     }
 }
+
+/// Overwriting heap entries (including sharing one texture across multiple slots) detaches
+/// replaced allocations from the heap's residency set before dropping them, and dropping the
+/// heap detaches all remaining allocations cleanly.
+#[test]
+fn heap_overwrite_detaches_replaced_residency_allocations() {
+    for m in backends() {
+        let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+        let t1 = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let t2 = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        // Bind t1 in two slots, then replace one (t1 still resident via slot 1), then the other.
+        m.write_texture(&heap, 0, &t1, 0.0);
+        m.write_texture(&heap, 1, &t1, 0.0);
+        m.write_texture(&heap, 0, &t2, 0.0);
+        m.write_texture(&heap, 1, &t2, 0.0);
+        drop(t1);
+        // Overwrite with a new texture and drop both heap and remaining textures.
+        let t3 = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        m.write_texture(&heap, 0, &t3, 0.0);
+        drop(t2);
+        drop(heap);
+        drop(t3);
+    }
+}
