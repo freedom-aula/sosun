@@ -319,6 +319,10 @@ Locale is "C" only (`setlocale` rejects anything else; `localeconv` is the C loc
 - The relocated-image test picks a free address and maps there a moment later; another thread could take it in between (it has not).
 - The probe's `.tls` handling is hand-written (`_tls_used`, `_tls_start`, `_tls_end`), since it links no CRT. A real MinGW or MSVC title brings its own.
 
+## Constant operands of packed 16-bit instructions
+
+`v_pk_fmac_f16` (VOP2, no `op_sel`) with a constant source was refused ("a constant operand of v_pk_fmac_f16"). It now reads the constant as the 32-bit value its two halves come from, as the VOP3P path (`packed_src`) already did: an inline float constant is its f16 in the low half and 0 in the high one, an integer inline constant its sign-extended 32 bits, a literal its own two halves. Source: LLVM's assembler, not AMD's ISA text, which does not say: `llvm-mc -mcpu=gfx1030` (LLVM 23) encodes `0x3c00` as the inline constant `1.0` but needs a literal for `0x3c003c00`, and `0xffffffff` as `-1` but `0xffff` as a literal. The Windows GPU test `packed_fmac_reads_constant_halves` checks the translation on the host, not the console's result.
+
 ## Root signatures without a host `d3d12.dll`
 
 `D3D12SerializeRootSignature`, its versioned form and `D3D12CreateRootSignatureDeserializer` call the host's `d3d12.dll` when there is one (Windows). On macOS `victory-gpu/src/rootser.rs` does both in Rust: it writes `RTS0` blobs (versions 1.0 and 1.1) and reads them back, bare or as the `RTS0` part of a DXBC container, into an `ID3D12RootSignatureDeserializer` whose description lives as long as the object. A malformed blob (truncated, an offset or count outside the blob, more than 4096 parameters or 2048 static samplers, a version other than 1 or 2, a parameter type above 4) gives `E_INVALIDARG` and no object. The AMD FidelityFX upscaler deserializes its root signatures at the first world frame (29 calls in testers' logs, which used to fail with `E_NOTIMPL`).

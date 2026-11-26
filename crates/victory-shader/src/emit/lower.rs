@@ -8966,18 +8966,18 @@ impl<'a> Lower<'a> {
     }
 
     /// Half `high` of source `k` of `v_pk_fmac_f16`, in the low 16 bits: a
-    /// VOP2 operation (no op_sel) whose third source is its destination.
+    /// VOP2 operation (no op_sel) whose third source is its destination. A
+    /// constant is the 32-bit value its halves come from: an inline float
+    /// constant's f16 with a high half of 0, an integer one's 32 bits, a
+    /// literal's (llvm-mc's packed 16-bit operands: `1.0` stands for
+    /// 0x00003C00, `-1` for 0xFFFFFFFF; 0x3C003C00 needs a literal).
     fn fmac_half(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = if k == 2 { v.dst } else { v.src.get(k).copied() };
         let op = op.ok_or("a missing operand")?;
-        if matches!(op, Operand::Const(_) | Operand::Literal(_)) {
-            // shortcut: no constant operand seen; its high half is not known.
-            return Err("a constant operand of v_pk_fmac_f16");
-        }
-        let x = self.operand(inst, &op)?;
+        let x = self.f16_operand(inst, &op)?;
         let c = self.cur;
         let x = if high {
             let k16 = self.s.m.i32(16);
