@@ -242,7 +242,8 @@ pub extern "system" fn VirtualAlloc(
     let page = mem::page_size();
     let len = size.next_multiple_of(page);
     let at = address as usize;
-    let result = if kind & MEM_RESERVE != 0 {
+    // A commit with no address reserves too, as on Windows.
+    let result = if kind & MEM_RESERVE != 0 || at == 0 {
         let len = size.next_multiple_of(GRANULARITY);
         let at = (at != 0).then_some(at & !(GRANULARITY - 1));
         reserve_granular(at, len).and_then(|p| {
@@ -1152,6 +1153,16 @@ mod memory_tests {
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
         }
+    }
+
+    /// `VirtualAlloc(NULL, n, MEM_COMMIT)` reserves as well, as on Windows.
+    #[test]
+    fn a_commit_without_an_address_reserves() {
+        let p = VirtualAlloc(std::ptr::null_mut(), 100, MEM_COMMIT, 0x04);
+        assert!(!p.is_null());
+        // SAFETY: committed read-write.
+        unsafe { p.cast::<u8>().write(1) };
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
     }
 
     /// `VirtualFree(MEM_DECOMMIT)` keeps the bytes of a physical page another address still
