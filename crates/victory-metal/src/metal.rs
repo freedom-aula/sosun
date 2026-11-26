@@ -30,6 +30,9 @@ pub struct Metal {
     /// Pipeline state pointer to name, kept only when tracing.
     pub(crate) trace_enc: std::cell::RefCell<Vec<String>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
+    pub(crate) gate:
+        std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
 }
 
 /// Seconds since the first `Metal::new` (about process start), for the failure trace.
@@ -137,6 +140,7 @@ impl Metal {
             },
             pipe_names: Default::default(),
             trace_enc: Default::default(),
+            gate: Default::default(),
         })
     }
 
@@ -393,6 +397,7 @@ mod tests {
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,
+            count: None,
         }
     }
 

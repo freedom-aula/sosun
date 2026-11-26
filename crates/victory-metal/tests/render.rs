@@ -127,6 +127,7 @@ impl<'a> Scene<'a> {
             index_buffer: idx.then(|| (&self.arena.buf, self.arena.at(4096) as *const u8)),
             call,
             indirect: None,
+            count: None,
         }
     }
 
@@ -283,6 +284,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
         indirect: None,
+        count: None,
     }];
     s.submit(&[
         s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0]),
@@ -328,6 +330,68 @@ fn depth_test_rejects_a_draw_behind() {
     let (a, b) = (s.draw(0.25, call, 0, false), s.draw(0.75, call, 512, false));
     s.submit(&[s.pass(vec![a, b], [0.0, 0.0, 0.0, 1.0])]);
     assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]));
+}
+
+#[test]
+fn a_count_buffer_limits_the_indirect_draws_that_run() {
+    let Some(m) = backend() else { return };
+    for (count, red) in [(1u32, false), (2, true), (0, false)] {
+        let s = Scene::new(&m, Some((true, Compare::Less)));
+        // The records of `indirect_draws_read_their_records_from_title_memory`: a green quad
+        // (record 0, indexed) and a red triangle (record 1) over the right half, with the count of
+        // records to run in title memory too (D3D12 runs min(count, records)).
+        s.arena.write(
+            0,
+            &[
+                v(-1.0, -1.0, GREEN),
+                v(0.0, -1.0, GREEN),
+                v(0.0, 1.0, GREEN),
+                v(-1.0, 1.0, GREEN),
+            ],
+        );
+        s.arena.write(4096, &[0u16, 1, 2, 0, 2, 3]);
+        s.arena.write(
+            512,
+            &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)],
+        );
+        s.arena.write(6144, &[6u32, 1, 0, 0, 0]);
+        s.arena.write(6164, &[3u32, 1, 0, 0]);
+        s.arena.write(6200, &[count]);
+        let none = DrawCall::Arrays {
+            vertex_count: 0,
+            instance_count: 0,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        let record = |at: usize| Some((&s.arena.buf, s.arena.at(at) as *const u8));
+        let counted = |i: u32| Some((&s.arena.buf, s.arena.at(6200) as *const u8, i));
+        let indexed = DrawCall::Indexed {
+            index_count: 0,
+            instance_count: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+            wide: false,
+        };
+        let mut quad = s.draw(0.25, indexed, 0, true);
+        (quad.indirect, quad.count) = (record(6144), counted(0));
+        let mut tri = s.draw(0.75, none, 512, false);
+        (tri.indirect, tri.count) = (record(6164), counted(1));
+        s.submit(&[s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0])]);
+        let p = s.pixels();
+        let green = if count > 0 {
+            [0, 255, 0, 255]
+        } else {
+            [0, 0, 0, 255]
+        };
+        assert_eq!(px(&p, 4, 8), green, "count {count}: the quad");
+        let right = if red {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 0, 255]
+        };
+        assert_eq!(px(&p, 12, 8), right, "count {count}: the triangle");
+    }
 }
 
 #[test]

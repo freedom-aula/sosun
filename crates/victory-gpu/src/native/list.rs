@@ -201,6 +201,8 @@ pub enum Cmd<B: GraphicsBackend> {
         groups: [usize; 3],
         /// `ExecuteIndirect`: the title address of the group counts, read on the GPU.
         indirect: Option<u64>,
+        /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
+        count: Option<(u64, u32)>,
     },
     Copy {
         dst: u64,
@@ -230,6 +232,8 @@ pub enum Cmd<B: GraphicsBackend> {
         /// `ExecuteIndirect`: the title address of the argument record, read on the GPU (`call`
         /// gives only its kind).
         indirect: Option<u64>,
+        /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
+        count: Option<(u64, u32)>,
     },
 }
 
@@ -242,12 +246,14 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 heaps,
                 groups,
                 indirect,
+                count,
             } => Cmd::Dispatch {
                 pso: pso.clone(),
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
                 indirect: *indirect,
+                count: *count,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -275,6 +281,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 state,
                 call,
                 indirect,
+                count,
             } => Cmd::Draw {
                 pso: pso.clone(),
                 binding: binding.clone(),
@@ -287,6 +294,7 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 state: *state,
                 call: *call,
                 indirect: *indirect,
+                count: *count,
             },
         }
     }
@@ -469,16 +477,32 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `Dispatch`. Needs the compute pipeline set.
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) -> Result<(), String> {
-        self.dispatch_from([x as usize, y as usize, z as usize], None)
+        self.dispatch_from([x as usize, y as usize, z as usize], None, None)
     }
 
     /// One dispatch of `ExecuteIndirect`: its group counts are the three words at title address
     /// `record`, read on the GPU.
     pub fn dispatch_indirect(&mut self, record: u64) -> Result<(), String> {
-        self.dispatch_from([0; 3], Some(record))
+        self.dispatch_from([0; 3], Some(record), None)
     }
 
-    fn dispatch_from(&mut self, groups: [usize; 3], indirect: Option<u64>) -> Result<(), String> {
+    /// Record `index` of an `ExecuteIndirect` of dispatches with a count buffer at title address
+    /// `count`: it runs only if `index` is below the count, read on the GPU when it runs.
+    pub fn dispatch_indirect_counted(
+        &mut self,
+        record: u64,
+        count: u64,
+        index: u32,
+    ) -> Result<(), String> {
+        self.dispatch_from([0; 3], Some(record), Some((count, index)))
+    }
+
+    fn dispatch_from(
+        &mut self,
+        groups: [usize; 3],
+        indirect: Option<u64>,
+        count: Option<(u64, u32)>,
+    ) -> Result<(), String> {
         let pso = self
             .state
             .compute
@@ -490,6 +514,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             heaps: self.state.heaps.clone(),
             groups,
             indirect,
+            count,
         });
         Ok(())
     }
@@ -582,12 +607,33 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
-        self.draw_from(call, None)
+        self.draw_from(call, None, None)
     }
 
     /// One draw of `ExecuteIndirect`: its counts are the record at title address `record`
     /// (`D3D12_DRAW_INDEXED_ARGUMENTS` when `indexed`, else `D3D12_DRAW_ARGUMENTS`), read on the GPU.
     pub fn draw_indirect(&mut self, record: u64, indexed: bool) -> Result<(), String> {
+        self.draw_indirect_from(record, indexed, None)
+    }
+
+    /// Record `index` of an `ExecuteIndirect` of draws with a count buffer at title address
+    /// `count`: it draws only if `index` is below the count, read on the GPU when it runs.
+    pub fn draw_indirect_counted(
+        &mut self,
+        record: u64,
+        indexed: bool,
+        count: u64,
+        index: u32,
+    ) -> Result<(), String> {
+        self.draw_indirect_from(record, indexed, Some((count, index)))
+    }
+
+    fn draw_indirect_from(
+        &mut self,
+        record: u64,
+        indexed: bool,
+        count: Option<(u64, u32)>,
+    ) -> Result<(), String> {
         let call = if indexed {
             DrawCall::Indexed {
                 index_count: 0,
@@ -609,10 +655,15 @@ impl<B: GraphicsBackend> NativeList<B> {
                 first_instance: 0,
             }
         };
-        self.draw_from(call, Some(record))
+        self.draw_from(call, Some(record), count)
     }
 
-    fn draw_from(&mut self, call: DrawCall, indirect: Option<u64>) -> Result<(), String> {
+    fn draw_from(
+        &mut self,
+        call: DrawCall,
+        indirect: Option<u64>,
+        count: Option<(u64, u32)>,
+    ) -> Result<(), String> {
         let (pso, topology) = self
             .state
             .graphics
@@ -630,6 +681,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             state: self.state.draw,
             call,
             indirect,
+            count,
         });
         Ok(())
     }

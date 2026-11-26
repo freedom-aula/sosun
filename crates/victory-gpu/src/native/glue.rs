@@ -1060,10 +1060,19 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
     });
 }
 
-/// `ExecuteIndirect` of a single-command signature without a count buffer: `max` draws or
-/// dispatches, record `i` at title address `records + i * stride`, each read on the GPU. False
-/// when the host cannot run it (mesh dispatches); the caller logs that. Rectangle lists drop here.
-pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, stride: u32, max: u32, records: u64) -> bool {
+/// `ExecuteIndirect` of a single-command signature: `max` draws or dispatches, record `i` at title
+/// address `records + i * stride`, each read on the GPU; with a count buffer at title address
+/// `count`, record `i` runs only if `i` is below the count, also read on the GPU (D3D12 runs
+/// min(count, max) records). False when the host cannot run it (mesh dispatches); the caller logs
+/// that. Rectangle lists drop here.
+pub(crate) fn execute_indirect(
+    this: This,
+    command: crate::signature::Command,
+    stride: u32,
+    max: u32,
+    records: u64,
+    count: Option<u64>,
+) -> bool {
     use crate::signature::Command;
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
     match command {
@@ -1073,7 +1082,11 @@ pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, s
                 Pipe::Compute(pso) => {
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
-                        if let Err(e) = l.list.dispatch_indirect(at(i)) {
+                        let r = match count {
+                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
+                            None => l.list.dispatch_indirect(at(i)),
+                        };
+                        if let Err(e) = r {
                             tracing::warn!(error = %e, "indirect dispatch");
                         }
                     }
@@ -1093,7 +1106,12 @@ pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, s
                 }
                 Some(false) => {
                     for i in 0..max {
-                        match l.list.draw_indirect(at(i), command == Command::DrawIndexed) {
+                        let indexed = command == Command::DrawIndexed;
+                        let r = match count {
+                            Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
+                            None => l.list.draw_indirect(at(i), indexed),
+                        };
+                        match r {
                             Ok(()) => {
                                 ENCODED.fetch_add(1, Ordering::Relaxed);
                                 l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
