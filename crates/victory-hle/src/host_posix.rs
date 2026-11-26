@@ -23,14 +23,14 @@ use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
 use victory_platform::thread;
 
+mod coreaudio;
 pub(crate) mod fake_dll;
 pub(crate) mod files;
+mod mf;
+mod mixer;
 mod sync;
 mod system;
 pub(crate) mod ucrt;
-mod coreaudio;
-mod mf;
-mod mixer;
 mod winhttp;
 mod winsock;
 mod xaudio2;
@@ -51,6 +51,8 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const DEFAULT_STACK: usize = 1 << 20;
 const STILL_ACTIVE: u32 = 259;
 /// `VirtualAlloc`'s allocation granularity: where a reservation starts, and
@@ -225,7 +227,22 @@ pub extern "system" fn VirtualAlloc(
 }
 
 pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
-    let ok = if kind & MEM_RELEASE != 0 {
+    let ok = if kind & MEM_RELEASE != 0
+        && kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0
+    {
+        // Splitting or merging a placeholder: a placeholder is plain reserved
+        // address space here (see `xmem`), so there is nothing to change, only
+        // a range inside a region of ours to vouch for.
+        let at = address as usize;
+        let inside = lock(&REGIONS)
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(&base, &len)| at + size <= base + len);
+        if !inside {
+            set_error(ERROR_INVALID_PARAMETER);
+        }
+        return i32::from(inside);
+    } else if kind & MEM_RELEASE != 0 {
         let Some(len) = lock(&REGIONS).remove(&(address as usize)) else {
             set_error(ERROR_INVALID_PARAMETER);
             return 0;
@@ -865,6 +882,16 @@ mod memory_tests {
         let again = VirtualAlloc(fixed.wrapping_byte_add(0x5000), 1, MEM_RESERVE, 0x01);
         assert_eq!(again, fixed);
         bases.push(again);
+        // Splitting a placeholder inside a region succeeds, outside it fails.
+        let r = bases[3];
+        assert_eq!(
+            VirtualFree(r, GRANULARITY / 2, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+            1
+        );
+        assert_eq!(
+            VirtualFree(r, 1 << 30, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+            0
+        );
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
             assert!(!lock(&REGIONS).contains_key(&(p as usize)));
