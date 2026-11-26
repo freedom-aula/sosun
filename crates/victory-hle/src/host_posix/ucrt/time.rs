@@ -2,11 +2,12 @@
 //! Rust, local time through libSystem's zone rules), `strftime` and
 //! `wcsftime` in the "C" locale, `clock` and `_ftime64`.
 
+use std::ffi::c_void;
 use std::sync::LazyLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::runtime::bad_param;
-use super::{EINVAL, ERANGE, exports, leak_cstr, set_errno};
+use super::{Ch, EINVAL, ERANGE, exports, heap, leak_cstr, set_errno, units};
 
 /// MSVC's `struct tm`.
 #[repr(C)]
@@ -303,13 +304,17 @@ pub extern "system" fn _ftime64(out: *mut u8) {
 
 /// Seconds east of UTC at `t`.
 fn zone_offset(t: i64) -> Option<i32> {
+    Some(local_zone(t)?.gmtoff as i32)
+}
+
+fn local_zone(t: i64) -> Option<MacTm> {
     let mut m = MacTm {
         f: [0; 9],
         gmtoff: 0,
         zone: std::ptr::null(),
     };
     // SAFETY: libSystem fills the structure.
-    (!unsafe { localtime_r(&t, &mut m) }.is_null()).then_some(m.gmtoff as i32)
+    (!unsafe { localtime_r(&t, &mut m) }.is_null()).then_some(m)
 }
 
 pub extern "system" fn timespec_get(out: *mut i64, base: i32) -> i32 {
@@ -420,13 +425,155 @@ const MONTHS: [&str; 12] = [
     "December",
 ];
 
+// The narrow and wide parts of the x64 __crt_lc_time_data layout.
+#[repr(C)]
+struct TimeNames<T> {
+    wday_abbr: [T; 7],
+    wday: [T; 7],
+    month_abbr: [T; 12],
+    month: [T; 12],
+    ampm: [T; 2],
+    short_date: T,
+    long_date: T,
+    time: T,
+}
+
+impl<T: Copy> TimeNames<T> {
+    fn map<U>(&self, mut f: impl FnMut(T) -> U) -> TimeNames<U> {
+        TimeNames {
+            wday_abbr: self.wday_abbr.map(&mut f),
+            wday: self.wday.map(&mut f),
+            month_abbr: self.month_abbr.map(&mut f),
+            month: self.month.map(&mut f),
+            ampm: self.ampm.map(&mut f),
+            short_date: f(self.short_date),
+            long_date: f(self.long_date),
+            time: f(self.time),
+        }
+    }
+}
+
+#[repr(C)]
+struct TimeData {
+    narrow: TimeNames<*const u8>,
+    calendar: i32,
+    refcount: i32,
+    wide: TimeNames<*const u16>,
+    locale_name: *const u16,
+}
+
+const fn abbreviations<const N: usize>(names: [&str; N]) -> [&str; N] {
+    let mut abbr = names;
+    let mut i = 0;
+    while i < N {
+        abbr[i] = names[i].split_at(3).0;
+        i += 1;
+    }
+    abbr
+}
+
+const C_TIME: TimeNames<&str> = TimeNames {
+    wday_abbr: abbreviations(DAYS),
+    wday: DAYS,
+    month_abbr: abbreviations(MONTHS),
+    month: MONTHS,
+    ampm: ["AM", "PM"],
+    short_date: "MM/dd/yy",
+    long_date: "dddd, MMMM dd, yyyy",
+    time: "HH:mm:ss",
+};
+
+fn alloc_time_data() -> *mut TimeData {
+    let mut count = 0;
+    C_TIME.map(|s| count += s.len() + 1);
+    let data = heap::malloc(size_of::<TimeData>() + 3 * count).cast::<TimeData>();
+    if data.is_null() {
+        return data;
+    }
+    // Both sets of strings follow the struct in the same allocation, wide
+    // first for alignment. The caller only has to free the struct pointer.
+    // SAFETY: all fields and strings fit in the allocation calculated above.
+    unsafe {
+        let mut wide = data.add(1).cast::<u16>();
+        let wide_names = C_TIME.map(|s| {
+            let start = wide;
+            for b in s.bytes().chain([0]) {
+                wide.write(u16::from(b));
+                wide = wide.add(1);
+            }
+            start.cast_const()
+        });
+        let mut narrow = wide.cast::<u8>();
+        let narrow_names = C_TIME.map(|s| {
+            let start = narrow;
+            std::ptr::copy_nonoverlapping(s.as_ptr(), narrow, s.len());
+            narrow = narrow.add(s.len());
+            narrow.write(0);
+            narrow = narrow.add(1);
+            start.cast_const()
+        });
+        data.write(TimeData {
+            narrow: narrow_names,
+            calendar: 1, // Gregorian
+            refcount: 0,
+            wide: wide_names,
+            locale_name: std::ptr::null(),
+        });
+    }
+    data
+}
+
+fn name_list<C: Ch>(abbr: &[&str], full: &[&str]) -> *mut C {
+    let mut text = String::new();
+    for (short, long) in abbr.iter().zip(full) {
+        text.push(':');
+        text.push_str(short);
+        text.push(':');
+        text.push_str(long);
+    }
+    let buf = heap::malloc((text.len() + 1) * size_of::<C>()).cast::<C>();
+    if !buf.is_null() {
+        // SAFETY: all the ASCII names and the NUL fit in the allocation.
+        unsafe {
+            for (i, b) in text.bytes().chain([0]).enumerate() {
+                buf.add(i).write(C::make(u32::from(b)));
+            }
+        }
+    }
+    buf
+}
+
+pub extern "system" fn _Getdays() -> *mut u8 {
+    name_list(&C_TIME.wday_abbr, &DAYS)
+}
+
+pub extern "system" fn _Getmonths() -> *mut u8 {
+    name_list(&C_TIME.month_abbr, &MONTHS)
+}
+
+pub extern "system" fn _W_Getdays() -> *mut u16 {
+    name_list(&C_TIME.wday_abbr, &DAYS)
+}
+
+pub extern "system" fn _W_Getmonths() -> *mut u16 {
+    name_list(&C_TIME.month_abbr, &MONTHS)
+}
+
+pub extern "system" fn _Gettnames() -> *mut c_void {
+    alloc_time_data().cast()
+}
+
+pub extern "system" fn _W_Gettnames() -> *mut c_void {
+    alloc_time_data().cast()
+}
+
 fn valid(tm: &Tm) -> bool {
     (0..=60).contains(&tm.sec)
         && (0..=59).contains(&tm.min)
         && (0..=23).contains(&tm.hour)
         && (1..=31).contains(&tm.mday)
         && (0..=11).contains(&tm.mon)
-        && tm.year >= -1900
+        && (-1900..=i32::MAX - 1901).contains(&tm.year)
         && (0..=6).contains(&tm.wday)
         && (0..=365).contains(&tm.yday)
 }
@@ -451,125 +598,254 @@ fn iso_week(tm: &Tm) -> (i32, i32) {
     (week, year)
 }
 
-/// Formats `tm` by `fmt` in the "C" locale; `None` for an unknown specifier.
-pub(super) fn strftime_text(fmt: &[u8], tm: &Tm) -> Option<String> {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < fmt.len() {
-        let c = fmt[i];
-        i += 1;
-        if c != b'%' {
-            out.push(c as char);
-            continue;
-        }
-        let mut strip = false;
-        if fmt.get(i) == Some(&b'#') {
-            strip = true;
-            i += 1;
-        }
-        // `%E` and `%O` modifiers only choose alternate digits.
-        while matches!(fmt.get(i), Some(b'E' | b'O')) {
-            i += 1;
-        }
-        let spec = *fmt.get(i)?;
-        i += 1;
-        let num = |v: i32, width: usize| {
-            if strip {
-                v.to_string()
-            } else {
-                format!("{v:0>width$}")
-            }
-        };
-        let hour12 = if tm.hour % 12 == 0 { 12 } else { tm.hour % 12 };
-        let sub = |f: &str| strftime_text(f.as_bytes(), tm);
-        match spec {
-            b'a' => out.push_str(&DAYS[tm.wday as usize][..3]),
-            b'A' => out.push_str(DAYS[tm.wday as usize]),
-            b'b' | b'h' => out.push_str(&MONTHS[tm.mon as usize][..3]),
-            b'B' => out.push_str(MONTHS[tm.mon as usize]),
-            b'c' => out.push_str(&sub(if strip {
-                "%A, %B %d, %Y %H:%M:%S"
-            } else {
-                "%m/%d/%y %H:%M:%S"
-            })?),
-            b'x' => out.push_str(&sub(if strip { "%A, %B %d, %Y" } else { "%m/%d/%y" })?),
-            b'X' | b'T' => out.push_str(&sub("%H:%M:%S")?),
-            b'C' => out.push_str(&num((tm.year + 1900).div_euclid(100), 2)),
-            b'd' => out.push_str(&num(tm.mday, 2)),
-            b'D' => out.push_str(&sub("%m/%d/%y")?),
-            b'e' => out.push_str(&if strip {
-                tm.mday.to_string()
-            } else {
-                format!("{:>2}", tm.mday)
-            }),
-            b'F' => out.push_str(&sub("%Y-%m-%d")?),
-            b'g' => out.push_str(&num(iso_week(tm).1.rem_euclid(100), 2)),
-            b'G' => out.push_str(&iso_week(tm).1.to_string()),
-            b'H' => out.push_str(&num(tm.hour, 2)),
-            b'I' => out.push_str(&num(hour12, 2)),
-            b'j' => out.push_str(&num(tm.yday + 1, 3)),
-            b'm' => out.push_str(&num(tm.mon + 1, 2)),
-            b'M' => out.push_str(&num(tm.min, 2)),
-            b'n' => out.push('\n'),
-            b'p' => out.push_str(if tm.hour < 12 { "AM" } else { "PM" }),
-            b'r' => out.push_str(&sub("%I:%M:%S %p")?),
-            b'R' => out.push_str(&sub("%H:%M")?),
-            b'S' => out.push_str(&num(tm.sec, 2)),
-            b't' => out.push('\t'),
-            b'u' => out.push_str(&(if tm.wday == 0 { 7 } else { tm.wday }).to_string()),
-            b'U' => out.push_str(&num((tm.yday + 7 - tm.wday) / 7, 2)),
-            b'V' => out.push_str(&num(iso_week(tm).0, 2)),
-            b'w' => out.push_str(&tm.wday.to_string()),
-            b'W' => out.push_str(&num((tm.yday + 7 - (tm.wday + 6) % 7) / 7, 2)),
-            b'y' => out.push_str(&num((tm.year + 1900).rem_euclid(100), 2)),
-            b'Y' => out.push_str(&(tm.year + 1900).to_string()),
-            b'z' | b'Z' => {
-                let mut copy = *tm;
-                let off = mktime_local(&mut copy).and_then(zone_offset).unwrap_or(0);
-                if spec == b'z' {
-                    let (sign, a) = if off < 0 { ('-', -off) } else { ('+', off) };
-                    out.push_str(&format!("{sign}{:02}{:02}", a / 3600, a / 60 % 60));
-                } else {
-                    out.push_str("UTC");
-                }
-            }
-            b'%' => out.push('%'),
-            _ => return None,
-        }
-    }
-    Some(out)
+struct TimeFormatter<'a, C> {
+    names: &'a TimeNames<*const C>,
+    tm: &'a Tm,
+    out: Vec<C>,
 }
 
-pub extern "system" fn strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm) -> usize {
-    if buf.is_null() || max == 0 || fmt.is_null() || tm.is_null() {
+impl<C: Ch> TimeFormatter<'_, C> {
+    fn ascii(&mut self, s: &str) {
+        self.out.extend(s.bytes().map(|b| C::make(u32::from(b))));
+    }
+
+    fn number(&mut self, value: i32, width: usize) {
+        self.ascii(&format!("{value:0>width$}"));
+    }
+
+    fn name(&mut self, s: *const C) {
+        // SAFETY: a name from the caller's time data or the C locale.
+        self.out.extend_from_slice(unsafe { units(s) });
+    }
+
+    fn hour12(&self) -> i32 {
+        (self.tm.hour + 11) % 12 + 1
+    }
+
+    fn ampm(&self) -> *const C {
+        self.names.ampm[usize::from(self.tm.hour >= 12)]
+    }
+
+    /// Expands a Windows date or time picture (e.g. "dddd, MMMM dd, yyyy").
+    fn picture(&mut self, pattern: *const C) {
+        // SAFETY: a NUL-terminated picture in the time data.
+        let mut rest = unsafe { units(pattern) };
+        let mut quoted = false;
+        let tm = self.tm;
+        while let Some((&c, tail)) = rest.split_first() {
+            let ch = char::from_u32(c.get());
+            if ch == Some('\'') {
+                if tail.first() == Some(&c) {
+                    self.out.push(c);
+                    rest = &tail[1..];
+                } else {
+                    quoted = !quoted;
+                    rest = tail;
+                }
+                continue;
+            }
+            if quoted {
+                self.out.push(c);
+                rest = tail;
+                continue;
+            }
+            let count = 1 + tail.iter().take_while(|&&next| next == c).count();
+            match (ch, count) {
+                (Some('d'), 3) => self.name(self.names.wday_abbr[tm.wday as usize]),
+                (Some('d'), 4) => self.name(self.names.wday[tm.wday as usize]),
+                (Some('d'), 1 | 2) => self.number(tm.mday, count),
+                (Some('M'), 3) => self.name(self.names.month_abbr[tm.mon as usize]),
+                (Some('M'), 4) => self.name(self.names.month[tm.mon as usize]),
+                (Some('M'), 1 | 2) => self.number(tm.mon + 1, count),
+                (Some('y'), 1 | 2) => self.number((tm.year + 1900) % 100, count),
+                (Some('y'), 3..=5) => self.number(tm.year + 1900, count),
+                (Some('H'), 1 | 2) => self.number(tm.hour, count),
+                (Some('h'), 1 | 2) => self.number(self.hour12(), count),
+                (Some('m'), 1 | 2) => self.number(tm.min, count),
+                (Some('s'), 1 | 2) => self.number(tm.sec, count),
+                (Some('t'), 1 | 2) => {
+                    // SAFETY: the locale's NUL-terminated AM or PM indicator.
+                    let ampm = unsafe { units(self.ampm()) };
+                    let len = if count == 1 {
+                        ampm.len().min(1)
+                    } else {
+                        ampm.len()
+                    };
+                    self.out.extend_from_slice(&ampm[..len]);
+                }
+                _ => self.out.extend_from_slice(&rest[..count]),
+            }
+            rest = &rest[count..];
+        }
+    }
+
+    fn format(&mut self, mut fmt: impl Iterator<Item = C>, strip: bool) -> Option<()> {
+        let tm = self.tm;
+        while let Some(c) = fmt.next() {
+            if c.get() != u32::from(b'%') {
+                self.out.push(c);
+                continue;
+            }
+            let mut spec = char::from_u32(fmt.next()?.get())?;
+            let strip = if spec == '#' {
+                spec = char::from_u32(fmt.next()?.get())?;
+                true
+            } else {
+                strip
+            };
+            // The existing formatter accepts alternate-digit modifiers.
+            while matches!(spec, 'E' | 'O') {
+                spec = char::from_u32(fmt.next()?.get())?;
+            }
+            let width = |n| if strip { 0 } else { n };
+            match spec {
+                'a' => self.name(self.names.wday_abbr[tm.wday as usize]),
+                'A' => self.name(self.names.wday[tm.wday as usize]),
+                'b' | 'h' => self.name(self.names.month_abbr[tm.mon as usize]),
+                'B' => self.name(self.names.month[tm.mon as usize]),
+                'c' | 'x' => {
+                    self.picture(if strip {
+                        self.names.long_date
+                    } else {
+                        self.names.short_date
+                    });
+                    if spec == 'c' {
+                        self.ascii(" ");
+                        self.picture(self.names.time);
+                    }
+                }
+                'X' => self.picture(self.names.time),
+                'C' => self.number((tm.year + 1900) / 100, width(2)),
+                'd' => self.number(tm.mday, width(2)),
+                'D' => self.composite(b"%m/%d/%y", strip)?,
+                'e' => self.ascii(&format!("{:>width$}", tm.mday, width = width(2))),
+                'F' => self.composite(b"%Y-%m-%d", strip)?,
+                'g' => self.number(iso_week(tm).1.rem_euclid(100), 2),
+                'G' => self.number(iso_week(tm).1, 4),
+                'H' => self.number(tm.hour, width(2)),
+                'I' => self.number(self.hour12(), width(2)),
+                'j' => self.number(tm.yday + 1, width(3)),
+                'm' => self.number(tm.mon + 1, width(2)),
+                'M' => self.number(tm.min, width(2)),
+                'n' => self.ascii("\n"),
+                'p' => self.name(self.ampm()),
+                'r' => self.composite(b"%I:%M:%S %p", strip)?,
+                'R' => self.composite(b"%H:%M", strip)?,
+                'S' => self.number(tm.sec, width(2)),
+                't' => self.ascii("\t"),
+                'T' => self.composite(b"%H:%M:%S", strip)?,
+                'u' => self.number(if tm.wday == 0 { 7 } else { tm.wday }, 0),
+                'U' => self.number((tm.yday + 7 - tm.wday) / 7, width(2)),
+                'V' => self.number(iso_week(tm).0, width(2)),
+                'w' => self.number(tm.wday, 0),
+                'W' => self.number((tm.yday + 7 - (tm.wday + 6) % 7) / 7, width(2)),
+                'y' => self.number((tm.year + 1900) % 100, width(2)),
+                'Y' => self.number(tm.year + 1900, width(4)),
+                'z' | 'Z' => {
+                    let mut copy = *tm;
+                    if tm.isdst >= 0
+                        && let Some(zone) = mktime_local(&mut copy).and_then(local_zone)
+                    {
+                        if spec == 'z' {
+                            let off = zone.gmtoff;
+                            let (sign, a) = if off < 0 { ('-', -off) } else { ('+', off) };
+                            self.ascii(&format!("{sign}{:02}{:02}", a / 3600, a / 60 % 60));
+                        } else if !zone.zone.is_null() {
+                            // SAFETY: libSystem supplied a NUL-terminated zone abbreviation.
+                            let name = unsafe { super::bytes(zone.zone) };
+                            self.out.extend(name.iter().map(|&b| C::make(u32::from(b))));
+                        }
+                    }
+                }
+                '%' => self.ascii("%"),
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    fn composite(&mut self, fmt: &[u8], strip: bool) -> Option<()> {
+        self.format(fmt.iter().map(|&b| C::make(u32::from(b))), strip)
+    }
+}
+
+fn format_time<C: Ch>(
+    buf: *mut C,
+    max: usize,
+    fmt: *const C,
+    tm: *const Tm,
+    data: *const c_void,
+    names: impl FnOnce(&TimeData) -> &TimeNames<*const C>,
+) -> usize {
+    if buf.is_null() || max == 0 {
         bad_param(EINVAL);
         return 0;
     }
-    // SAFETY: the title's `tm` and NUL-terminated format.
-    let (tm, f) = unsafe { (tm.read(), super::bytes(fmt)) };
-    let text = if valid(&tm) {
-        strftime_text(f, &tm)
-    } else {
-        None
-    };
-    let Some(text) = text else {
-        // SAFETY: the title's buffer.
-        unsafe { buf.write(0) };
+    // SAFETY: the caller provided space for at least one unit.
+    unsafe { buf.write(C::default()) };
+    // SAFETY: the title's `tm`, checked before dereferencing.
+    let Some(tm) = (unsafe { tm.as_ref() }).filter(|t| valid(t)) else {
         bad_param(EINVAL);
         return 0;
     };
-    if text.len() + 1 > max {
-        // SAFETY: the title's buffer.
-        unsafe { buf.write(0) };
+    if fmt.is_null() {
+        bad_param(EINVAL);
+        return 0;
+    }
+    let data = if data.is_null() {
+        static DEFAULT_TIME: LazyLock<usize> = LazyLock::new(|| alloc_time_data() as usize);
+        if *DEFAULT_TIME == 0 {
+            set_errno(super::ENOMEM);
+            return 0;
+        }
+        *DEFAULT_TIME as *const TimeData
+    } else {
+        data.cast()
+    };
+    // SAFETY: the supplied or default time-data block and title's NUL-terminated format.
+    let (names, fmt) = unsafe { (names(&*data), units(fmt)) };
+    let mut formatter = TimeFormatter {
+        tm,
+        names,
+        out: Vec::new(),
+    };
+    if formatter.format(fmt.iter().copied(), false).is_none() {
+        bad_param(EINVAL);
+        return 0;
+    }
+    let mut text = formatter.out;
+    if text.len() >= max {
         set_errno(ERANGE);
         return 0;
     }
-    // SAFETY: the title's buffer of `max`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(text.as_ptr(), buf, text.len());
-        buf.add(text.len()).write(0);
-    }
-    text.len()
+    text.push(C::default());
+    // SAFETY: the caller's buffer has room for the result and terminator.
+    unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), buf, text.len()) };
+    text.len() - 1
+}
+
+pub extern "system" fn _Strftime(
+    buf: *mut u8,
+    max: usize,
+    fmt: *const u8,
+    tm: *const Tm,
+    data: *const c_void,
+) -> usize {
+    format_time(buf, max, fmt, tm, data, |loc| &loc.narrow)
+}
+
+pub extern "system" fn _Wcsftime(
+    buf: *mut u16,
+    max: usize,
+    fmt: *const u16,
+    tm: *const Tm,
+    data: *const c_void,
+) -> usize {
+    format_time(buf, max, fmt, tm, data, |loc| &loc.wide)
+}
+
+pub extern "system" fn strftime(buf: *mut u8, max: usize, fmt: *const u8, tm: *const Tm) -> usize {
+    _Strftime(buf, max, fmt, tm, std::ptr::null())
 }
 
 pub extern "system" fn wcsftime(
@@ -578,32 +854,7 @@ pub extern "system" fn wcsftime(
     fmt: *const u16,
     tm: *const Tm,
 ) -> usize {
-    if buf.is_null() || max == 0 || fmt.is_null() || tm.is_null() {
-        bad_param(EINVAL);
-        return 0;
-    }
-    // SAFETY: the title's `tm` and NUL-terminated format.
-    let (tm, f) = unsafe { (tm.read(), super::wide(fmt)) };
-    let f: Vec<u8> = f.iter().map(|&c| u8::try_from(c).unwrap_or(b'?')).collect();
-    let text = if valid(&tm) {
-        strftime_text(&f, &tm)
-    } else {
-        None
-    };
-    let Some(text) = text.filter(|t| t.len() < max) else {
-        // SAFETY: the title's buffer.
-        unsafe { buf.write(0) };
-        set_errno(EINVAL);
-        return 0;
-    };
-    // SAFETY: the title's buffer of `max`.
-    unsafe {
-        for (i, b) in text.bytes().enumerate() {
-            buf.add(i).write(u16::from(b));
-        }
-        buf.add(text.len()).write(0);
-    }
-    text.len()
+    _Wcsftime(buf, max, fmt, tm, std::ptr::null())
 }
 
 /// `"Sun Sep 16 01:03:52 1973\n"`.
@@ -685,7 +936,8 @@ exports!(pub(super) fn lookup;
     _time64, _difftime64, _gmtime64_s, _localtime64_s, _gmtime64, _localtime64, _mktime64,
     _mkgmtime64, clock, _ftime64_s, _ftime64, timespec_get, _tzset, __p__timezone,
     __p__daylight, __p__dstbias, __p__tzname, _get_timezone, _get_daylight, _get_dstbias,
-    strftime, wcsftime, asctime, _asctime_s, _ctime64_s, _ctime64;
+    strftime, wcsftime, _Strftime, _Wcsftime, _Getdays, _Getmonths, _Gettnames,
+    _W_Getdays, _W_Getmonths, _W_Gettnames, asctime, _asctime_s, _ctime64_s, _ctime64;
     "time" => _time64, "difftime" => _difftime64, "_timespec64_get" => timespec_get,
     "_strftime_l" => strftime, "_wcsftime_l" => wcsftime, "asctime_s" => _asctime_s);
 
@@ -694,7 +946,128 @@ mod tests {
     use super::*;
 
     fn text(fmt: &str, tm: &Tm) -> String {
-        strftime_text(fmt.as_bytes(), tm).unwrap()
+        let mut buf = [0u8; 128];
+        let fmt = std::ffi::CString::new(fmt).unwrap();
+        let len = strftime(buf.as_mut_ptr(), buf.len(), fmt.as_ptr().cast(), tm);
+        String::from_utf8(buf[..len].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn getdays_and_getmonths_return_colon_separated_names_in_both_widths() {
+        let days = concat!(
+            ":Sun:Sunday:Mon:Monday:Tue:Tuesday:Wed:Wednesday:Thu:Thursday",
+            ":Fri:Friday:Sat:Saturday"
+        );
+        let months = concat!(
+            ":Jan:January:Feb:February:Mar:March:Apr:April:May:May:Jun:June",
+            ":Jul:July:Aug:August:Sep:September:Oct:October:Nov:November:Dec:December"
+        );
+        for (narrow, wide, expected) in [
+            (_Getdays(), _W_Getdays(), days),
+            (_Getmonths(), _W_Getmonths(), months),
+        ] {
+            assert!(!narrow.is_null() && !wide.is_null());
+            assert_eq!(unsafe { super::super::bytes(narrow) }, expected.as_bytes());
+            assert_eq!(
+                String::from_utf16(unsafe { super::super::wide(wide) }).unwrap(),
+                expected
+            );
+            heap::free(narrow.cast());
+            heap::free(wide.cast());
+        }
+    }
+
+    #[test]
+    fn gettnames_and_w_gettnames_return_independent_x64_time_blocks() {
+        assert_eq!(size_of::<TimeData>(), 704);
+        assert_eq!(std::mem::offset_of!(TimeData, calendar), 344);
+        assert_eq!(std::mem::offset_of!(TimeData, refcount), 348);
+        assert_eq!(std::mem::offset_of!(TimeData, wide), 352);
+        assert_eq!(std::mem::offset_of!(TimeData, locale_name), 696);
+        let narrow = _Gettnames();
+        let wide = _W_Gettnames();
+        assert!(!narrow.is_null() && !wide.is_null());
+        assert_ne!(narrow, wide);
+        for data in [narrow, wide] {
+            let names = unsafe { &*data.cast::<TimeData>() };
+            let start = data as usize + size_of::<TimeData>();
+            let end = data as usize + heap::_msize(data);
+            names
+                .narrow
+                .map(|s| assert!((start..end).contains(&(s as usize))));
+            names
+                .wide
+                .map(|s| assert!((start..end).contains(&(s as usize))));
+            assert_eq!(names.calendar, 1);
+            assert!(names.locale_name.is_null());
+            unsafe {
+                assert_eq!(units(names.narrow.wday_abbr[0]), b"Sun");
+                assert_eq!(units(names.narrow.wday[6]), b"Saturday");
+                assert_eq!(units(names.narrow.month_abbr[0]), b"Jan");
+                assert_eq!(units(names.narrow.month[11]), b"December");
+                assert_eq!(units(names.narrow.ampm[1]), b"PM");
+                assert_eq!(units(names.narrow.short_date), b"MM/dd/yy");
+                assert_eq!(units(names.narrow.long_date), b"dddd, MMMM dd, yyyy");
+                assert_eq!(units(names.narrow.time), b"HH:mm:ss");
+                assert_eq!(units(names.wide.wday_abbr[0]), [83, 117, 110]);
+                assert_eq!(units(names.wide.ampm[0]), [65, 77]);
+            }
+            heap::free(data);
+        }
+    }
+
+    #[test]
+    fn strftime_uses_supplied_narrow_time_data_and_checks_capacity() {
+        let tm = gmtime(951_827_696);
+        let data = _Gettnames();
+        assert!(!data.is_null());
+        unsafe {
+            let loc = &mut *data.cast::<TimeData>();
+            loc.narrow.wday[2] = c"mardi".as_ptr().cast();
+            loc.narrow.ampm[1] = c"pm".as_ptr().cast();
+            loc.narrow.short_date = c"yyyy-MM-dd".as_ptr().cast();
+            loc.narrow.time = c"h:mm tt".as_ptr().cast();
+        }
+        let fmt = c"café %A %c".as_ptr().cast();
+        let mut buf = [0u8; 64];
+        let len = _Strftime(buf.as_mut_ptr(), buf.len(), fmt, &tm, data);
+        assert_eq!(&buf[..=len], "café mardi 2000-02-29 12:34 pm\0".as_bytes());
+        assert_eq!(_Strftime(buf.as_mut_ptr(), len, fmt, &tm, data), 0);
+        assert_eq!(buf[0], 0);
+        let n = _Strftime(buf.as_mut_ptr(), buf.len(), fmt, &tm, std::ptr::null());
+        assert_eq!(&buf[..n], "café Tuesday 02/29/00 12:34:56".as_bytes());
+        heap::free(data);
+    }
+
+    #[test]
+    fn wcsftime_uses_supplied_wide_time_data_and_counts_utf16_units() {
+        let tm = gmtime(0);
+        let data = _W_Gettnames();
+        assert!(!data.is_null());
+        let w = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let day = w("木曜日");
+        let date = w("yyyy'年'M'月'd'日'");
+        unsafe {
+            let loc = &mut *data.cast::<TimeData>();
+            loc.wide.wday[4] = day.as_ptr();
+            loc.wide.long_date = date.as_ptr();
+        }
+        let fmt = w("📅 %A %#x");
+        let expected = w("📅 木曜日 1970年1月1日");
+        let mut buf = [0u16; 64];
+        let len = _Wcsftime(buf.as_mut_ptr(), expected.len(), fmt.as_ptr(), &tm, data);
+        assert_eq!(&buf[..=len], expected);
+        assert_eq!(_Wcsftime(buf.as_mut_ptr(), len, fmt.as_ptr(), &tm, data), 0);
+        assert_eq!(buf[0], 0);
+        let n = _Wcsftime(
+            buf.as_mut_ptr(),
+            buf.len(),
+            fmt.as_ptr(),
+            &tm,
+            std::ptr::null(),
+        );
+        assert_eq!(&buf[..=n], w("📅 Thursday Thursday, January 01, 1970"));
+        heap::free(data);
     }
 
     #[test]
@@ -758,7 +1131,8 @@ mod tests {
             text("%F %T %R %D %r", &tm),
             "2000-02-29 12:34:56 12:34 02/29/00 12:34:56 PM"
         );
-        assert!(strftime_text(b"%Q", &tm).is_none());
+        assert_eq!(text("%Q", &tm), "");
+        assert_eq!(super::super::errno(), EINVAL);
         // 2021-01-03 is a Sunday in ISO week 53 of 2020.
         let tm = gmtime(1_609_632_000);
         assert_eq!(text("%V %G", &tm), "53 2020");
