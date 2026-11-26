@@ -41,15 +41,25 @@ fn track(base: usize, len: usize) {
     crate::host_posix::adopt_region(base, len);
 }
 
+/// What releasing `[base, base + len)` owes the physical pages behind it, whichever call releases
+/// it: the title's `VirtualFree(MEM_RELEASE)` (`host_posix`, which gives the address space back
+/// itself) as well as [`release_reservation`]. Left behind, the pool views kept the old pool
+/// mapped there for the GPU and aliases while the next allocation got the same address: two
+/// memories at one title address.
+pub(crate) fn forget_physical(base: usize, len: usize) {
+    reservations().remove(&base);
+    super::xmem_physical::release_pool_backing(base, len);
+}
+
 /// Gives back a reservation `XMemVirtualAlloc` made (the title's
-/// `VirtualFree(MEM_RELEASE)` does the same through `host_posix`).
+/// `VirtualFree(MEM_RELEASE)` does the same through `host_posix` and [`forget_physical`]).
 pub(super) fn release_reservation(base: usize) {
-    let Some(len) = reservations().remove(&base) else {
+    let Some(len) = reservations().get(&base).copied() else {
         return;
     };
     #[cfg(target_arch = "x86_64")]
     crate::host_posix::forget_region(base);
-    super::xmem_physical::release_pool_backing(base, len);
+    forget_physical(base, len);
     // SAFETY: a reservation we made and no longer track.
     if let Err(error) = unsafe { mem::release(base as *mut u8, len) } {
         tracing::warn!(base, len, %error, "releasing an xmem reservation failed");
@@ -336,7 +346,11 @@ mod tests {
         // A query inside reports the rest of the region.
         let inside = query(p.cast::<u8>().wrapping_add(MIB + 5).cast());
         assert_eq!(inside.region_size, 3 * MIB);
+        let pool = super::super::xmem_physical::pool_shown_at(p as usize).expect("pool-backed");
         release_reservation(p as usize);
+        // Another test may take the address again at once, but with a pool of its own.
+        let shown = super::super::xmem_physical::pool_shown_at(p as usize);
+        assert_ne!(shown, Some(pool), "the pool views went with the release");
         let freed = query(p);
         assert_eq!((freed.state, freed.flags), (MEM_FREE, 0));
         // No address field: above the 32-bit range and below 2^40, where the
@@ -353,6 +367,30 @@ mod tests {
         let info = query(p);
         assert_eq!((info.state, info.flags), (MEM_RESERVE, 0));
         release_reservation(p as usize);
+    }
+
+    /// The title's own `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory gives the pool
+    /// views back too, as `XMemFreeDefault` does. It used to give back only the address space:
+    /// the old pool stayed mapped there for the GPU and aliases while the next allocation, given
+    /// the same address, wrote other memory (issue #15, pages owned twice).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn virtual_free_gives_the_pool_backing_back_too() {
+        const MEM_RELEASE: u32 = 0x8000;
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            GRANULE,
+            MEM_RESERVE | MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert!(!p.is_null());
+        let pool = super::super::xmem_physical::pool_shown_at(p as usize).expect("pool-backed");
+        assert_eq!(crate::host_posix::VirtualFree(p, 0, MEM_RELEASE), 1);
+        // Another test may take the address again at once, but with a pool of its own.
+        let shown = super::super::xmem_physical::pool_shown_at(p as usize);
+        assert_ne!(shown, Some(pool), "the old pool is still mapped at a freed address");
+        assert!(!reservations().contains_key(&(p as usize)), "the reservation is forgotten");
     }
 
     #[test]
