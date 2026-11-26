@@ -167,6 +167,17 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
             return;
         }
+        if code.starts_with(&[0x0F, 0x01, 0xFA]) || code.starts_with(&[0x0F, 0x01, 0xFB]) {
+            // monitorx and mwaitx (AMD, not in Rosetta) wait for a write to a
+            // watched line, and may wake for any reason: the caller rereads
+            // its flag, so yielding is a wait.
+            if code[2] == 0xFB {
+                std::thread::yield_now();
+            }
+            // SAFETY: the saved rip, past the instruction.
+            unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
+            return;
+        }
         if let Some(len) = cache_hint_len(code) {
             // SAFETY: the saved rip, past the hint.
             unsafe {
