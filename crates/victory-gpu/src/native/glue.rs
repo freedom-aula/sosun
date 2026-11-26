@@ -69,7 +69,14 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
         }
         match Metal::new() {
             Ok(metal) => {
-                tracing::info!("native host: Metal");
+                let console = crate::console::current();
+                let (gpu_optimal, standard) = console.title_memory();
+                tracing::info!(
+                    console = console.name(),
+                    title_memory_mib = (gpu_optimal + standard) / (1 << 20),
+                    recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    "native host: Metal"
+                );
                 *guard = Some(Shared(Title::new(metal, pools().clone())));
                 start_timer();
             }

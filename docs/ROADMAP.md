@@ -26,7 +26,7 @@ Two problems stop it, in this order:
 ## 2. Frame rate and memory in the world
 
 - In the world, fps falls from about 15 to about 7 over 4 minutes. Something grows every frame; host texture copies are the main suspect (one tester counted 26,000 by frame 4096). Being investigated on `fix/fps-decay`.
-- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies is proposed in #110. Series S is the default on 16 GB Macs.
+- Series X can run out of GPU memory at the world load, even on 24 GB ([#8](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/8), [#79](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/79), [#110](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/110)). A byte budget on host texture copies is proposed in #110. Series S is the default on 16 GB Macs. The native host now logs Metal's own recommended working set size alongside the title's declared budget at startup, so a tester's log carries the numbers needed to set a real threshold.
 - The game rewrites about 40,000 descriptor records a frame with plain stores. Patching its store sites instead of remirroring is being measured ([#43](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/43); `VICTORY_TRACE_DESCRIPTORS=sites`).
 - Textures the GPU writes and the CPU reads back (the water simulation) are not copied back yet ([#46](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/46)).
 
