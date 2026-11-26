@@ -855,11 +855,24 @@ impl GraphicsBackend for Metal {
             }
         });
         let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
+        // A pass that cannot be encoded must not take the submission's fence signals and
+        // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
+        // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
+        // is dropped, the command buffer still commits, and the caller is told.
+        let mut refused: Option<String> = None;
         for pass in work.passes {
-            match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order)?,
-                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order)?,
-                Pass::Blit(ops) => self.encode_blit(&cb, ops, order)?,
+            let encoded = match pass {
+                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order),
+                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order),
+                Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+            };
+            if let Err(e) = encoded {
+                // A pass that cannot be encoded (a render target with no attachments, a piece
+                // whose root arguments were never set) is dropped; the passes after it still run,
+                // so one bad pass does not cost the frame's whole picture.
+                if refused.is_none() {
+                    refused = Some(e);
+                }
             }
         }
         if set_on_queue {
@@ -882,7 +895,10 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
-        Ok(())
+        match refused {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -985,6 +1001,19 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
     ) -> Result<(), String> {
+        if rp.color.is_empty() && rp.depth.is_none() {
+            // The title drew with no render targets. D3D12 runs it (it writes nothing visible);
+            // Metal needs an attachment to make an encoder, and Metal refuses one without. The
+            // pass is skipped rather than refused, so the rest of the submission still runs.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "metal: a pass with no render targets is skipped ({} draws, writes nothing)",
+                    rp.draws.len()
+                );
+            });
+            return Ok(());
+        }
         let desc = MTLRenderPassDescriptor::new();
         for (i, c) in rp.color.iter().enumerate() {
             // SAFETY: colour attachment index below 8.
@@ -1029,9 +1058,20 @@ impl Metal {
                 }
             }
         }
-        let e = cb
-            .renderCommandEncoderWithDescriptor(&desc)
-            .ok_or("no render encoder")?;
+        let e = cb.renderCommandEncoderWithDescriptor(&desc).ok_or_else(|| {
+            // Metal refuses an encoder whose attachments disagree (size, sample count, format
+            // kind); the caller's log then says which targets the pass named.
+            let size = |t: &ProtocolObject<dyn MTLTexture>| {
+                format!("{}x{} fmt {}", t.width(), t.height(), t.pixelFormat().0)
+            };
+            let color: Vec<String> = rp.color.iter().map(|c| size(&c.texture.tex)).collect();
+            let depth = rp.depth.as_ref().map(|d| size(&d.texture.tex));
+            format!(
+                "no render encoder: {} colour {color:?}, depth {depth:?}, {} draws",
+                rp.color.len(),
+                rp.draws.len()
+            )
+        })?;
         if let Some((f, started)) = order
             && started.get()
         {
