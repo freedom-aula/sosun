@@ -256,6 +256,29 @@ fn watch<R>(f: impl FnOnce(&mut Watch) -> R) -> R {
     f(WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
+fn scan_round(
+    snapshot: &HashMap<usize, (usize, usize, bool)>,
+    seen: &mut HashMap<usize, blake3::Hash>,
+    buf: &mut [u8],
+    mut mark_dirty: impl FnMut(usize),
+) {
+    seen.retain(|k, _| snapshot.contains_key(k));
+    for (&key, &(at, size, target)) in snapshot {
+        let mut h = blake3::Hasher::new();
+        for off in (0..size).step_by(buf.len()) {
+            let n = buf.len().min(size - off);
+            buf[..n].fill(0);
+            let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+            h.update(&buf[..n]);
+        }
+        let h = h.finalize();
+        let before = seen.insert(key, h);
+        if before != Some(h) && !(target && before.is_none()) {
+            mark_dirty(key);
+        }
+    }
+}
+
 fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -263,23 +286,10 @@ fn start_scanner() {
             let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                let list: Vec<(usize, (usize, usize, bool))> =
-                    watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
-                seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for &(key, (at, size, target)) in &list {
-                    let mut h = blake3::Hasher::new();
-                    for off in (0..size).step_by(buf.len()) {
-                        let n = buf.len().min(size - off);
-                        buf[..n].fill(0);
-                        let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
-                        h.update(&buf[..n]);
-                    }
-                    let h = h.finalize();
-                    let before = seen.insert(key, h);
-                    if before != Some(h) && !(target && before.is_none()) {
-                        watch(|w| w.dirty.insert(key));
-                    }
-                }
+                let snapshot = watch(|w| w.entries.clone());
+                scan_round(&snapshot, &mut seen, &mut buf, |key| {
+                    watch(|w| w.dirty.insert(key));
+                });
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
@@ -818,6 +828,48 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    fn dirty_this_round(
+        entries: &HashMap<usize, (usize, usize, bool)>,
+        seen: &mut HashMap<usize, blake3::Hash>,
+    ) -> std::collections::HashSet<usize> {
+        let mut dirty = std::collections::HashSet::new();
+        scan_round(entries, seen, &mut [0; 2], |key| {
+            dirty.insert(key);
+        });
+        dirty
+    }
+
+    #[test]
+    fn scanner_forgets_removed_keys_and_reports_them_when_they_reappear() {
+        let bytes = [1u8, 2, 3];
+        let entry = (bytes.as_ptr() as usize, bytes.len(), false);
+        let mut entries = HashMap::from([(1, entry), (2, entry)]);
+        let mut seen = HashMap::new();
+
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1, 2].into());
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+
+        entries.remove(&1);
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+        assert_eq!(seen, HashMap::from([(2, blake3::hash(&bytes))]));
+
+        entries.insert(1, entry);
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1].into());
+    }
+
+    #[test]
+    fn scanner_uses_the_first_render_target_hash_as_its_baseline() {
+        let mut bytes = [3u8];
+        let entries = HashMap::from([(1, (bytes.as_ptr() as usize, bytes.len(), true))]);
+        let mut seen = HashMap::new();
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+        assert_eq!(seen[&1], blake3::hash(&bytes));
+
+        bytes[0] = 4;
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1].into());
+        assert_eq!(seen[&1], blake3::hash(&bytes));
+    }
 
     /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
     /// element sizes 1 to 8, the shapes a world run names (#46).
