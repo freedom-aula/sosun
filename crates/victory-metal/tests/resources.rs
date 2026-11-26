@@ -533,11 +533,15 @@ fn heap_overwrite_detaches_replaced_residency_allocations() {
     }
 }
 
+/// The indirect tests' arena: the source at 0, the records after it, the destination at half.
+/// In bytes, not pages: 4 KiB pages (x86_64 under Rosetta) would leave 3 pages too small.
+const INDIRECT_ARENA: usize = 48 * 1024;
+
 #[test]
 fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, 3);
+        let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
         let (dst, record) = (a.region.len / 2, N * 4);
         a.write(0, &(0..N as u32).collect::<Vec<_>>());
         // `D3D12_DISPATCH_ARGUMENTS`: half the groups.
@@ -573,7 +577,7 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         // Three records of 2, 4 and 8 groups of 64: what ran shows in how much was written.
         for (count, written) in [(2u32, 256), (0, 0), (5, 512)] {
-            let a = Arena::new(&m, 3);
+            let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
             let (dst, records, counter) = (a.region.len / 2, N * 4, N * 4 + 64);
             a.write(0, &(0..N as u32).collect::<Vec<_>>());
             a.write(records, &[2u32, 1, 1, 4, 1, 1, 8, 1, 1]);
