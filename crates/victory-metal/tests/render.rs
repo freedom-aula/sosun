@@ -452,37 +452,32 @@ fn indirect_draws_read_their_records_from_title_memory() {
 #[test]
 fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
     // The submission commits even when a pass cannot be encoded (its fence signals and the value
-    // writes other queues wait on must still go out), and the passes after it still run. The first
-    // pass here asks for a depth attachment of another size, which Metal refuses an encoder for.
+    // writes other queues wait on must still go out), and the passes after it still run.
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Less)));
     s.arena.write(
         0,
         &[v(-0.5, -0.5, GREEN), v(0.5, -0.5, GREEN), v(0.0, 0.5, GREEN)],
     );
-    // A depth attachment of another size than the colour one: the host refuses that pass (Metal
-    // would render to the intersection without a word).
-    let bad_depth = m
-        .create_texture(&TextureDesc::d2(Format::D32Float, W + 1, W + 1))
-        .unwrap();
     let args = || DrawCall::Arrays {
         vertex_count: 3,
         instance_count: 1,
         first_vertex: 0,
         first_instance: 0,
     };
-    let bad = Pass::Render(RenderPass {
-        color: vec![ColorTarget {
-            texture: &s.color,
-            clear: Some([0.0, 0.0, 1.0, 1.0]),
-        }],
-        depth: Some(DepthTarget {
-            texture: &bad_depth,
-            clear: Some(1.0),
-            clear_stencil: Some(0),
-        }),
-        draws: vec![s.draw(0.5, args(), 0, false)],
-    });
+    // An indexed record without an index buffer: the host refuses that pass.
+    s.arena.write(6144, &[3u32, 1, 0, 0, 0]);
+    let indexed = DrawCall::Indexed {
+        index_count: 0,
+        instance_count: 0,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+        wide: false,
+    };
+    let mut bad_draw = s.draw(0.5, indexed, 0, false);
+    bad_draw.indirect = Some((&s.arena.buf, s.arena.at(6144) as *const u8));
+    let bad = s.pass(vec![bad_draw], [0.0, 0.0, 1.0, 1.0]);
     let good = s.pass(vec![s.draw(0.5, args(), 0, false)], [0.0, 0.0, 0.0, 1.0]);
     let q = m.create_queue().unwrap();
     let f = m.create_fence(0).unwrap();
@@ -494,7 +489,7 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
             signals: &[(&f, 1)],
         },
     );
-    assert!(refused.is_err(), "the mismatched pass is refused");
+    assert!(refused.is_err(), "the indexed record without an index buffer is refused");
     assert!(m.wait(&f, 1, 10_000), "the fence signal still landed");
     let p = s.pixels();
     assert!(
