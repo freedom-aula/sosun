@@ -1859,6 +1859,30 @@ fn packed_fmac_accumulates_each_half() {
     );
 }
 
+/// `v_pk_fmac_f16` with a constant first source: an inline float constant
+/// multiplies the low halves alone (its high half is 0), a literal gives
+/// each half its own factor.
+#[test]
+fn packed_fmac_reads_constant_halves() {
+    for (fmac, want) in [
+        // (0, 1.0) * (3.0, 4.0) + (1.0, 0.5) = (1.0, 4.5)
+        (vec![0x3C << 25 | 2 << 9 | 242], 0x3C00_4480), // v_pk_fmac_f16 v0, 1.0, v2
+        // (2.0, 1.0) * (3.0, 4.0) + (1.0, 0.5) = (7.0, 4.5)
+        (vec![0x3C << 25 | 2 << 9 | 255, 0x4000_3C00], 0x4700_4480), // literal 0x40003c00
+    ] {
+        let mut words = vec![vop1(0x001, 0, vgpr(3))]; // v_mov_b32 v0, v3
+        words.extend(&fmac);
+        let shader = build_valu_cs(&words);
+        run_cases(
+            &shader,
+            &[[0, 0x4200_4400, 0x3C00_3800, 0]],
+            |backend, _, _, got| {
+                assert_eq!(got, want, "{backend}: {fmac:08x?}");
+            },
+        );
+    }
+}
+
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
 #[test]
 fn src_scc_reads_as_zero_or_one() {

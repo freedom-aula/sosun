@@ -18,6 +18,37 @@ fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// `v_pk_fmac_f16` (VOP2) with a constant first source translates: an inline float constant is
+/// its f16 in the low half and 0 in the high one, an integer one its 32-bit value, a literal its
+/// two halves (llvm-mc's encodings for gfx1030). Values: `valu_tests`.
+#[test]
+fn packed_fmac_takes_constant_operands() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |fmac: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        code.extend_from_slice(fmac);
+        code.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    for fmac in [
+        &[0x7800_00F2][..],          // v_pk_fmac_f16 v0, 1.0, v0
+        &[0x7800_00C1],              // v_pk_fmac_f16 v0, -1, v0
+        &[0x7800_00FF, 0x4000_3C00], // v_pk_fmac_f16 v0, 0x40003c00, v0
+    ] {
+        translate_with(&program(fmac), Options::default()).unwrap();
+    }
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
