@@ -316,6 +316,14 @@ impl Graphics {
         };
         // FACE 0: counter-clockwise is front.
         g.front_ccw = mode & 4 == 0;
+        // Guess (docs/native-host.md, "Polygon offset"): the three floats are
+        // PA_SU_POLY_OFFSET_CLAMP, _FRONT_SCALE and _FRONT_OFFSET in register order, written as
+        // AMD's PAL writes them: the slope scale in the hardware's 1/16ths, D3D12's integer bias as
+        // a float. Only with POLY_OFFSET_FRONT_ENABLE, which every image seen sets.
+        if mode & 1 << 11 != 0 {
+            let float = |back: usize| f32::from_bits(reg(back));
+            g.bias = (float(0x1c) as i32, float(0x24), float(0x20) / 16.0);
+        }
         let depth = reg(0x18);
         g.depth_enable = depth & 2 != 0;
         g.depth_write = depth & 4 != 0;
@@ -791,6 +799,10 @@ mod tests {
             image[at - 5] = 0x0003_0030;
             image[at - 4] = 0x0180_ff00;
             image[at - 1] = 0xf000_001f;
+            // Polygon offset: clamp 0.003, slope scale 16 (1.0 in D3D12's units), bias 29.
+            image[at - 9] = 0.003f32.to_bits();
+            image[at - 8] = 16.0f32.to_bits();
+            image[at - 7] = 29.0f32.to_bits();
             let g = Graphics::guess_from(&image);
             assert!(g.independent);
             assert_eq!((g.cull, g.front_ccw), (3, true));
@@ -802,6 +814,12 @@ mod tests {
             assert_eq!(g.blend[1], TargetBlend { mask: 1, ..TargetBlend::default() });
             // Max of one and one for colour, alpha added.
             assert_eq!(g.blend[7], TargetBlend { enable: true, src: 2, dst: 2, op: 5, src_alpha: 2, dst_alpha: 1, op_alpha: 1, mask: 0xf });
+            assert_eq!(g.bias, (29, 0.003, 1.0));
+            // Metal's order: bias, slope scale, clamp.
+            assert_eq!(g.raster().depth_bias, (29.0, 1.0, 0.003));
+            // Without POLY_OFFSET_FRONT_ENABLE there is no bias.
+            image[at - 12] &= !(1 << 11);
+            assert_eq!(Graphics::guess_from(&image).bias, (0, 0.0, 0.0));
             // Without the marker after the registers, nothing is read.
             image[at + 8] = 0;
             assert_eq!(Graphics::guess_from(&image), Graphics::guess_base());
