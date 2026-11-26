@@ -2556,6 +2556,18 @@ fn sop1_probe(op: u16, inputs: Vec<[u32; 4]>, f: fn(u32) -> (u32, Option<bool>))
 fn scalar_probes() -> Vec<Probe> {
     let ab = pairs(&U32_EDGES[..24], &U32_EDGES[..24]);
     let shifts = pairs(&U32_EDGES[..24], &[0, 1, 16, 31, 32, 33, 63, 0xFFFF_FFE1]);
+    let mut signed = ab.clone();
+    signed.extend(
+        [
+            (0x7FFF_FFFF, 1),
+            (0x8000_0000, 0xFFFF_FFFF),
+            (0xFFFF_FFFF, 1),
+            (0x8000_0000, 1),
+            (0, 0x8000_0000),
+            (0, 1),
+        ]
+        .map(|(a, b)| [a, b, 0, OLD]),
+    );
     let fields: Vec<[u32; 4]> = [0u32, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678, 0xD2F9_0159]
         .iter()
         .flat_map(|&a| {
@@ -2585,8 +2597,20 @@ fn scalar_probes() -> Vec<Probe> {
         }
     };
     let mut p = vec![
-        // (SCC of the adds, their carry or overflow, the lowering refuses.)
-        sop2_probe(0x02, ab.clone(), |a, b| (a.wrapping_add(b), None)),
+        // SCC of s_add_i32 and s_sub_i32: the signed overflow (RDNA2 ISA).
+        sop2_probe(0x02, signed.clone(), |a, b| {
+            (
+                a.wrapping_add(b),
+                Some((a as i32).overflowing_add(b as i32).1),
+            )
+        }),
+        sop2_probe(0x03, signed.clone(), |a, b| {
+            (
+                a.wrapping_sub(b),
+                Some((a as i32).overflowing_sub(b as i32).1),
+            )
+        }),
+        // (SCC of s_add_u32, its carry, is not checked here.)
         sop2_probe(0x00, ab.clone(), |a, b| (a.wrapping_add(b), None)),
         sop2_probe(0x0E, ab.clone(), |a, b| (a & b, Some(a & b != 0))),
         sop2_probe(0x10, ab.clone(), |a, b| (a | b, Some(a | b != 0))),
@@ -2683,6 +2707,24 @@ fn scalar_probes() -> Vec<Probe> {
             ],
             ab.clone(),
             move |i| vec![if f(i[0], i[1]) { i[2] } else { i[3] }],
+        ));
+    }
+    // s_addk_i32 s20, k on s20 = s16: SCC is the signed overflow, the
+    // constant sign-extended (RDNA2 ISA, SOPK 15).
+    for k in [0u16, 1, 0x7FFF, 0x8000, 0xFFFF] {
+        p.push(scalar(
+            [
+                sop1(0x03, 20, s(16)),
+                0xB794_0000 | u32::from(k),
+                sop2(0x0A, 21, int(1), int(0)),
+                vop1(0x01, 6, s(21)),
+                vop1(0x01, 5, s(20)),
+            ],
+            unary(U32_EDGES),
+            move |i| {
+                let (r, o) = (i[0] as i32).overflowing_add(i32::from(k as i16));
+                vec![r as u32, u32::from(o)]
+            },
         ));
     }
     // SCC as a vector operand (`src_scc`).
