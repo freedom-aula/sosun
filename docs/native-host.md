@@ -594,8 +594,9 @@ have written, and 30 s later the title's own watchdog killed the process.
 
 Now: `submit_passes` records what the submission owes (`gfx::Owed`: the order event and its value,
 each `(fence, value)` signal, each fill's buffer, offset, length and byte). When the completed
-handler sees an error it raises those events (never lowers one; the order event is an
-`MTLSharedEvent` for this) and writes the fills on the CPU, in order, and warns for the first few
+handler sees an error it writes the fills on the CPU, in order, then raises those events (never
+lowers one; the order event is an `MTLSharedEvent` for this), so a waiter that sees its fence
+reached also sees the fills before it, and warns for the first few
 times. Draws and dispatches of the failed buffer are lost, and its copies are not replayed (one may
 have partly run, and its source may have changed since). Guess: the console has no equivalent of a
 discarded command buffer, so finishing the signals and barrier writes on the CPU is our recovery

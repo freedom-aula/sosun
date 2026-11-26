@@ -1249,17 +1249,19 @@ impl Owed {
         Owed { events, fills, signals: work.signals.len() }
     }
 
-    /// Raises each event (never lowers it) and writes each fill, in order.
+    /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
+    /// its fence reached reads the values the submission wrote before it.
     pub(crate) fn recover(&self) {
         static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        for (buf, off, len, value) in &self.fills {
+            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         for (e, v) in &self.events {
             if e.signaledValue() < *v {
                 e.setSignaledValue(*v);
             }
-        }
-        for (buf, off, len, value) in &self.fills {
-            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
-            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
         }
         if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
             tracing::warn!(
@@ -2044,6 +2046,33 @@ mod owed_tests {
         // A normal submission after it still completes: the queue is not stuck behind the order value.
         m.submit_passes(&q, &sub(&s9)).unwrap();
         assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
+
+    #[test]
+    fn recovery_writes_the_fills_before_it_signals() {
+        struct Send<T>(T);
+        // SAFETY: test only; the recovery runs on one other thread while this one only reads.
+        unsafe impl<T> std::marker::Send for Send<T> {}
+        let m = Metal::new().unwrap();
+        let len = 64 << 20;
+        let region = Region::new(len, None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len, value: 1 }])];
+        let signals = [(&fence, 1)];
+        let owed = Send(Owed::new(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }, false));
+        let t = std::thread::spawn(move || {
+            let owed = owed;
+            owed.0.recover();
+        });
+        while fence.0.signaledValue() < 1 {
+            std::hint::spin_loop();
+        }
+        // SAFETY: inside the region; read as the title would once the fence is reached.
+        let last = unsafe { std::ptr::read_volatile(region.ptr.add(len - 1)) };
+        t.join().unwrap();
+        assert_eq!(last, 1, "the fence was reached before the fill it covers was written");
     }
 }
 
