@@ -429,3 +429,15 @@ Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which tit
 * With it the legal-notices screen is right: text, the purple gradient background and the faded art behind it (scratchpad `legal-notices-blend.png`); the white block and stepped black areas were opaque quads too. Still guessed: culling, depth, stencil and the write mask (the word before the blend registers is not the target mask: it is 0 for the text pipeline).
 * Two fixes found on the way: title threads get at least 8 MiB of stack (`host_posix::MIN_STACK`; the title's 1 MiB overflowed while the host built a Metal pipeline at the first guessed draw), and a released pipeline object's host pipelines are forgotten (`glue::pipeline_released`), as a new object at a freed one's address got the old one's pipeline.
 * `VICTORY_DUMP_DESC_DIR=<dir>` (with `VICTORY_GUESS_GRAPHICS=1`) writes each guessed pipeline's register image as `regs_<vs>_<ps>_<address>.bin`.
+
+#### Dropped work is logged loudly
+
+Every kind of work the native host drops now logs one `warn!` the first time it
+happens ("native host drops work: ..."), and each drop still counts in the
+periodic "native draws so far" line. The kinds are: a draw or dispatch with no
+host pipeline (refused or not translated), a topology the host does not draw,
+an indexed rectangle list, a guessed mesh pipeline, mesh and indirect mesh
+dispatches, texture copies and resolves, and indirect executions (one warning
+per signature). A texture in a format the host cannot realize warns once per
+format value, with its size and flags. No switch is needed; `RUST_LOG` filters
+them as usual.

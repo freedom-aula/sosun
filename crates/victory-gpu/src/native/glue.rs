@@ -333,6 +333,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
+    warn_once("a texture copy or resolve");
     if tracing_targets() {
         DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
     }
@@ -612,8 +613,20 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn dropped() {
+/// Counts a draw or dispatch the host drops, and warns the first time for each `why`.
+fn dropped(why: &'static str) {
     DROPPED.fetch_add(1, Ordering::Relaxed);
+    warn_once(why);
+}
+
+/// A warning logged once per distinct `what` for the run.
+pub(crate) fn warn_once(what: &'static str) {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&what) {
+        seen.push(what);
+        tracing::warn!("native host drops work: {what} (first time; counted in \"native draws so far\")");
+    }
 }
 
 /// Draws the title recorded, and those that went on to the host list.
@@ -738,7 +751,7 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
                 tracing::warn!(error = %e, "dispatch");
             }
         }
-        _ => dropped(),
+        _ => dropped("a dispatch without a host compute pipeline"),
     });
 }
 
@@ -863,11 +876,14 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let targets = l.targets.clone();
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
-        Pipe::Skipped => return None,
+        Pipe::Skipped => {
+            warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
+            return None;
+        }
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {
-        dropped();
+        dropped("a draw without a host render pipeline (refused or not translated)");
         return None;
     };
     let topology = if rect {
@@ -878,9 +894,9 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let Some(topology) = topology else {
         static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if l.topology < 64 && SEEN.fetch_or(1 << l.topology, Ordering::Relaxed) >> l.topology & 1 == 0 {
-            tracing::info!(topology = l.topology, "a draw dropped for its primitive topology");
+            tracing::warn!(topology = l.topology, "a draw dropped for its primitive topology");
         }
-        dropped();
+        dropped("a draw of a primitive topology the host does not draw");
         return None;
     };
     l.list.set_graphics_pipeline(&pso, topology);
@@ -932,7 +948,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
         if let Some(rect) = graphics(t, l) {
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
-                dropped();
+                dropped("an indexed rectangle-list draw");
                 return;
             }
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {

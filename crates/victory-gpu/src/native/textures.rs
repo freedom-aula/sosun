@@ -241,7 +241,13 @@ impl<B: PresentBackend> Title<B> {
             return false;
         };
         let Some(desc) = info.desc() else {
-            tracing::debug!(format = info.format, "title texture the host does not represent");
+            // Loud once per format: views of it get no texture and their draws sample nothing.
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&info.format) {
+                seen.push(info.format);
+                tracing::warn!(format = info.format, w = info.width, h = info.height, flags = info.flags, "a title texture format the host does not represent (first of this format)");
+            }
             return false;
         };
         let tex = match self.host.texture(&desc) {
