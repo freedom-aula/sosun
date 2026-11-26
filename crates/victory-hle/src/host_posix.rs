@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use victory_gpu::clock;
 use victory_loader::native::seh::context::Context;
 use victory_loader::native::{self, seh, teb};
 use victory_platform::mem::{self, Protect};
@@ -85,27 +86,20 @@ pub extern "system" fn GetCurrentProcessId() -> u32 {
     std::process::id()
 }
 
-fn epoch() -> Instant {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    *START
-}
-
 pub extern "system" fn QueryPerformanceFrequency(out: *mut i64) -> i32 {
     // SAFETY: the title passes a valid pointer.
-    unsafe { out.write(1_000_000_000) };
+    unsafe { out.write(clock::counter_frequency() as i64) };
     1
 }
 
 pub extern "system" fn QueryPerformanceCounter(out: *mut i64) -> i32 {
-    // One tick is a nanosecond; the epoch's first read is not zero.
-    let ticks = epoch().elapsed().as_nanos() as i64 + 1;
     // SAFETY: the title passes a valid pointer.
-    unsafe { out.write(ticks) };
+    unsafe { out.write(clock::counter() as i64) };
     1
 }
 
 pub extern "system" fn GetTickCount64() -> u64 {
-    epoch().elapsed().as_millis() as u64
+    clock::ticks(1_000)
 }
 
 pub extern "system" fn GetTickCount() -> u32 {
@@ -842,6 +836,130 @@ fn exceptions(name: &str) -> Option<usize> {
         "RemoveVectoredExceptionHandler" => Some(api::remove_vectored as *const () as usize),
         "SetUnhandledExceptionFilter" => Some(api::set_unhandled as *const () as usize),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn qpc() -> u64 {
+        let mut ticks = 0;
+        assert_eq!(QueryPerformanceCounter(&mut ticks), 1);
+        ticks as u64
+    }
+
+    fn crt<F: Copy>(name: &str) -> F {
+        let address = ucrt::lookup("ucrtbase.dll", name).unwrap();
+        // SAFETY: the caller supplies the CRT export's function type.
+        unsafe { std::mem::transmute_copy(&address) }
+    }
+
+    fn readings() -> impl Iterator<Item = u128> {
+        let crt_clock: extern "system" fn() -> i32 = crt("clock");
+        let timespec_get: extern "system" fn(*mut i64, i32) -> i32 = crt("timespec_get");
+        let time64: extern "system" fn(*mut i64) -> i64 = crt("_time64");
+        let mut timespec = [0i64; 2];
+        let (mut filetime, mut precise) = (0, 0);
+        let mut calendar = [0; 8];
+        const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+        let wall_before = clock::unix_time().as_nanos();
+        let before = qpc();
+        let tick = GetTickCount();
+        let tick64 = GetTickCount64();
+        let crt_ms = crt_clock();
+        let input = crate::modules::gameinput::now();
+        let after = qpc();
+        system::GetSystemTimeAsFileTime(&mut filetime);
+        system::GetSystemTimePreciseAsFileTime(&mut precise);
+        system::GetSystemTime(&mut calendar);
+        let mf = mf::MFGetSystemTime();
+        assert_eq!(timespec_get(timespec.as_mut_ptr(), 1), 1);
+        let seconds = time64(std::ptr::null_mut());
+        let wall_after = clock::unix_time().as_nanos();
+        let mut calendar_filetime = 0;
+        assert_eq!(
+            system::SystemTimeToFileTime(&calendar, &mut calendar_filetime),
+            1
+        );
+        let unix_ns = |ft| u128::from(ft - FILETIME_UNIX_EPOCH) * 100;
+        let monotonic = [
+            (u128::from(tick) * 1_000_000, 1_000_000),
+            (u128::from(tick64) * 1_000_000, 1_000_000),
+            (crt_ms as u128 * 1_000_000, 1_000_000),
+            (u128::from(input) * 1_000, 1_000),
+        ];
+        let wall = [
+            (unix_ns(filetime), 100),
+            (unix_ns(precise), 100),
+            (unix_ns(calendar_filetime), 1_000_000),
+            (unix_ns(mf as u64), 100),
+            (timespec[0] as u128 * 1_000_000_000 + timespec[1] as u128, 1),
+            (seconds as u128 * 1_000_000_000, 1_000_000_000),
+        ];
+        for (samples, low, high) in [
+            (&monotonic[..], u128::from(before), u128::from(after)),
+            (&wall[..], wall_before, wall_after),
+        ] {
+            for &(ns, quantum) in samples {
+                assert!(
+                    ns >= low.saturating_sub(quantum - 1) && ns <= high,
+                    "{ns} ns (tick {quantum} ns) outside {low}..={high}"
+                );
+            }
+        }
+        monotonic.into_iter().chain(wall).map(|(ns, _)| ns)
+    }
+
+    fn check_rate(rate: f64) {
+        let mut hz = 0;
+        assert_eq!(QueryPerformanceFrequency(&mut hz), 1);
+        assert_eq!(hz, 1_000_000_000);
+        clock::initialize();
+        std::thread::sleep(Duration::from_millis(20));
+        let before_first = Instant::now();
+        let first = qpc();
+        let first_utc = clock::unix_time();
+        let after_first = Instant::now();
+        let first_readings = readings();
+        std::thread::sleep(Duration::from_millis(20));
+        let second_readings = readings();
+        let before_second = Instant::now();
+        let second = qpc();
+        let second_utc = clock::unix_time();
+        let after_second = Instant::now();
+        for (a, b) in first_readings.zip(second_readings) {
+            assert!(a <= b, "{a} ns followed by {b} ns");
+        }
+        let low = (before_second - after_first).as_nanos() as f64 * rate;
+        let high = (after_second - before_first).as_nanos() as f64 * rate;
+        for actual in [(second - first) as f64, (second_utc - first_utc).as_nanos() as f64] {
+            assert!(
+                (low - 1.0..=high + 1.0).contains(&actual),
+                "{actual} ns at rate {rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_clocks_agree_and_slow_down_together() {
+        const NAME: &str = "host_posix::clock_tests::guest_clocks_agree_and_slow_down_together";
+        const CHILD: &str = "VICTORY_TEST_CLOCK_RATE";
+        if let Ok(rate) = std::env::var(CHILD) {
+            check_rate(rate.parse().unwrap());
+            return;
+        }
+        for (rate, setting) in [("1", None), ("0.25", Some("0.25"))] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", NAME]).env(CHILD, rate);
+            match setting {
+                Some(setting) => child.env("VICTORY_CLOCK_SLOW", setting),
+                None => child.env_remove("VICTORY_CLOCK_SLOW"),
+            };
+            let status = child.status().unwrap();
+            assert!(status.success(), "clock rate {rate}: {status}");
+        }
     }
 }
 

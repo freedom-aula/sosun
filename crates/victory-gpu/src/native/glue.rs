@@ -798,7 +798,13 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
             & !super::state::texcoords(&base_vs.dxil, victory_shader::FourCC::OSG1)
     });
     let widened = if extra != 0 {
-        match g.vs_source.translate_extra(rect, extra) {
+        let mut copy = [0u8; 32];
+        for &(orig, new) in g.ps.as_ref().map_or(&[][..], |ps| &ps.splits[..]) {
+            if orig < 32 && new < 32 {
+                copy[new as usize] = orig as u8 + 1;
+            }
+        }
+        match g.vs_source.translate_extra(rect, extra, copy) {
             Ok(h) => Some(h),
             Err(e) => {
                 t.refused_translation(&g.name, format!("extra outputs: {e}"));

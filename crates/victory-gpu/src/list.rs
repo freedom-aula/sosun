@@ -1296,8 +1296,7 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// (type 2) are the GPU clock then; occlusion counts (0) say a million
 /// samples passed and binary occlusion (1) visible, so nothing is culled
 /// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// shortcut: query results are synthesized on the CPU, use host query samples when a title needs measured GPU results.
 extern "system" fn resolve_queries(
     this: This,
     _heap: This,
@@ -2068,8 +2067,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
-    // On the native host the write runs on the GPU in order with the list's other work.
     #[cfg(target_os = "macos")]
+    // shortcut: native timestamps are sampled while recording, use calibrated Metal counter samples for GPU completion timing.
     if crate::native::glue::write_value(this, address, what.value(), bytes) {
         return;
     }

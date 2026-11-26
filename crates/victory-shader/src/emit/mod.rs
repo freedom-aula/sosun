@@ -343,6 +343,9 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Pixel inputs split off an input the code reads two ways: (original, new) `TEXCOORD`
+    /// indices. The vertex shader must write the new one with the original's values.
+    pub splits: Vec<(u32, u32)>,
 }
 
 impl HostShader {
@@ -427,6 +430,9 @@ pub struct Options {
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
     pub extra_params: u32,
+    /// For the extra parameters: `copy_params[m] = n + 1` writes the values of `TEXCOORD` n to
+    /// `TEXCOORD` m too (a pixel input split off one read two ways, [`HostShader::splits`]).
+    pub copy_params: [u8; 32],
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -582,6 +588,7 @@ pub fn emit_with(
         wave32_host: options.wave32_host,
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
+        copy_params: options.copy_params,
     };
     let guessed = graphics::is_guessed(c);
     let l = match lower::lower_graphics(&parts(st, res), guessed) {
@@ -623,6 +630,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        splits: l.splits,
     })
 }
 
@@ -1144,6 +1152,7 @@ mod tests {
             }
         };
         let ps = super::HostShader {
+            splits: Vec::new(),
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1161,6 +1170,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                splits: Vec::new(),
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),

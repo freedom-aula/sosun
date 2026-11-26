@@ -100,6 +100,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let lowered = lowered(&native)?;
     Ok(HostShader {
+        splits: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -142,6 +143,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })
 }

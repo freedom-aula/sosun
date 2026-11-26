@@ -199,10 +199,9 @@ fn open_for_reading(path: *const u16, _name: &str) -> std::io::Result<std::fs::F
     std::fs::File::open(host)
 }
 
-// shortcut: non-native POSIX builds open host paths, use the drive table when they gain the native host.
 #[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
 fn open_for_reading(_path: *const u16, name: &str) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(name.replace('\\', "/"))
+    std::fs::File::open(name)
 }
 
 /// `(capacity, name, iid, out)`.

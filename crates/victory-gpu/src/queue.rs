@@ -6,6 +6,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::clock;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -462,12 +463,24 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 
+extern "system" fn clock_calibration(_: This, gpu: *mut u64, cpu: *mut u64) -> HRESULT {
+    if gpu.is_null() || cpu.is_null() {
+        return E_INVALIDARG;
+    }
+    let count = clock::counter();
+    // SAFETY: both out pointers were checked for null.
+    unsafe {
+        gpu.write(clock::ticks_from_counter(count, TIMESTAMP_FREQUENCY));
+        cpu.write(count);
+    }
+    S_OK
+}
+
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
     Value(u64),
-    /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
-    /// process started (our GPU work is done on the CPU's timeline).
+    /// The guest clock in [`TIMESTAMP_FREQUENCY`] ticks per second.
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
@@ -491,26 +504,10 @@ impl Written {
     pub(crate) fn value(self) -> u64 {
         match self {
             Written::Value(v) => v,
-            Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
-            }
-            Written::SystemTimestamp => system_timestamp(),
+            Written::GpuTimestamp => clock::ticks(TIMESTAMP_FREQUENCY),
+            Written::SystemTimestamp => clock::counter(),
         }
     }
-}
-
-fn system_timestamp() -> u64 {
-    #[cfg(windows)]
-    {
-        let mut count = 0;
-        // SAFETY: a valid out pointer.
-        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) };
-        count as u64
-    }
-    #[cfg(not(windows))]
-    0
 }
 
 /// Frames presented so far.
@@ -913,7 +910,7 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 16] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -924,6 +921,7 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (17, clock_calibration as *const ()),    // 0x88
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -1083,6 +1081,42 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn clock_calibration_matches_gpu_and_system_timestamps() {
+        let null = std::ptr::null();
+        for (newer, offset) in [(false, 0x80), (true, 0x90)] {
+            let mut q = null;
+            let desc = QueueDesc {
+                kind: 0,
+                priority: 0,
+                flags: 0,
+                nodes: 1,
+            };
+            assert_eq!(new_queue(newer, desc, &QUEUE_IIDS[0], &mut q), S_OK);
+            let frequency: extern "system" fn(This, *mut u64) -> HRESULT = slot(q, offset);
+            let calibrate: extern "system" fn(This, *mut u64, *mut u64) -> HRESULT =
+                slot(q, offset + 8);
+            let mut hz = 0;
+            assert_eq!(frequency(q, &mut hz), S_OK);
+            assert_eq!(hz, 100_000_000);
+            let cpu_hz = u128::from(clock::counter_frequency());
+            let pair = || {
+                let (mut gpu, mut cpu) = (0, 0);
+                assert_eq!(calibrate(q, &mut gpu, &mut cpu), S_OK);
+                assert_eq!(u128::from(gpu), u128::from(cpu) * u128::from(hz) / cpu_hz);
+                (gpu, cpu)
+            };
+            let before = pair();
+            let gpu = Written::GpuTimestamp.value();
+            let cpu = Written::SystemTimestamp.value();
+            let after = pair();
+            assert!((before.0..=after.0).contains(&gpu));
+            assert!((before.1..=after.1).contains(&cpu));
+            assert_eq!(calibrate(q, std::ptr::null_mut(), &mut hz), E_INVALIDARG);
+            release(q);
+        }
     }
 
     #[test]
