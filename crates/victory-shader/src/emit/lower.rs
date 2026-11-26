@@ -85,6 +85,9 @@ pub(crate) struct Lowered {
     /// Whether the DXIL holds the group-shared array host waves exchange in.
     #[cfg(test)]
     pub exchanges: bool,
+    /// The sample and gather calls, with their constant arguments.
+    #[cfg(test)]
+    pub texture_calls: Vec<(String, Vec<Option<i64>>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1590,6 +1593,12 @@ impl<'a> Lower<'a> {
             barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             exchanges: self.s.xchg_used(),
+            #[cfg(test)]
+            texture_calls: [
+                self.s.m.written_call_args("dx.op.sample"),
+                self.s.m.written_call_args("dx.op.textureGather"),
+            ]
+            .concat(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -10403,8 +10412,16 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+        // `_o`: texel offsets, the first address (RDNA2 ISA 8.2.5), for any
+        // sample or gather below.
+        let base = match name.strip_suffix("_o") {
+            Some(base) if base.starts_with("image_sample") || base.starts_with("image_gather4") => {
+                base
+            }
+            _ => name,
+        };
+        let (op, sample) = match base {
+            "image_sample" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -10412,8 +10429,9 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
-            | "image_gather4_l_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_l" => (73, true),
+            // DXIL gathers from level 0 only, so with a comparison only `_lz`.
+            "image_gather4_c_lz" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -10464,7 +10482,7 @@ impl<'a> Lower<'a> {
                 .get(&(site, true))
                 .copied()
                 .ok_or("an untracked sampler")?;
-            if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
+            if base == "image_gather4_l" {
                 if *a16 || *d16 || *unorm || kind != 2 {
                     return Err(
                         "a gather at a level of 16-bit values, texel coordinates or not 2D",
@@ -10479,7 +10497,7 @@ impl<'a> Lower<'a> {
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -10488,7 +10506,7 @@ impl<'a> Lower<'a> {
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
             let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+                usize::from(offset_word) + usize::from(base == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -10567,36 +10585,40 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            if offset_word && !matches!(op, 73 | 74) {
+                if kind == 5 {
+                    return Err("a cube sample with texel offsets");
+                }
+                // DXIL takes immediate offsets in -8..=7; the console's are
+                // 6-bit signed (x in bits 0-5, y 8-13, z 16-21) and may be
+                // computed.
+                let w = addr_val(self, 0)?;
+                let w = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("a sample offset that is not constant")? as u32;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = (w >> (8 * k) & 0x3F) as i32;
+                    let x = if x >= 32 { x - 64 } else { x };
+                    if !(-8..=7).contains(&x) {
+                        return Err("a sample offset past -8..7");
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
+            }
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
                 60 => {
-                    if offset_word {
-                        // DXIL takes immediate offsets in -8..=7; the
-                        // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
-                        let w = self
-                            .s
-                            .m
-                            .int_value(w)
-                            .ok_or("a sample offset that is not constant")?
-                            as u32;
-                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
-                            let x = (w >> (8 * k) & 0x3F) as i32;
-                            let x = if x >= 32 { x - 64 } else { x };
-                            if !(-8..=7).contains(&x) {
-                                return Err("a sample offset past -8..7");
-                            }
-                            *o = self.s.m.i32(x as u32);
-                        }
-                    }
                     args.extend(&os);
                     args.push(fu);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    // After the offset, if any.
+                    let bias = addr_val(self, usize::from(offset_word))?;
                     let bias = to_float(self, bias);
                     if self.x.bias_as_gradients && self.x.native.stage == HwStage::Cs {
                         // D3DMetal ignores SampleBias in compute shaders
@@ -10671,7 +10693,7 @@ impl<'a> Lower<'a> {
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
                     let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if name.ends_with("_cl") {
+                    if base.ends_with("_cl") {
                         let x = addr_val(self, first + grads + coords)?;
                         let clamp = to_float(self, x);
                         lod = self.binary(35, lod, clamp);
@@ -10702,7 +10724,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     // `_cl`: the least level of detail, after the coordinates.
-                    let clamp = if name.ends_with("_cl") {
+                    let clamp = if base.ends_with("_cl") {
                         let x = addr_val(self, first + grads + coords)?;
                         to_float(self, x)
                     } else {
@@ -10733,8 +10755,9 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                    // The level follows the coordinates.
+                    let lod = if base == "image_sample_l" {
+                        let x = addr_val(self, first + coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -10751,11 +10774,16 @@ impl<'a> Lower<'a> {
                     )
                 }
                 _ => {
-                    if name == "image_gather4" {
+                    if base == "image_gather4" {
                         return Err("a gather with implicit level");
                     }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
+                    }
+                    // Guess: a comparison gather compares the channel dmask
+                    // picks; DXIL's compares red only, so only red is taken.
+                    if op == 74 && *dmask != 1 {
+                        return Err("a comparison gather of another channel than red");
                     }
                     if offset_word {
                         let w = addr_val(self, 0)?;
@@ -10769,14 +10797,15 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    let name = if op == 74 {
+                        let reference = addr_val(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        "textureGatherCmp.f32"
+                    } else {
+                        "textureGather.f32"
+                    };
+                    self.s
+                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
             }
         } else {
@@ -10808,7 +10837,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
