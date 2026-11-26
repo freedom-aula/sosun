@@ -6,7 +6,7 @@
 //! An update is all or nothing, as documented: each one writes a complete
 //! new version of the container (`v<N>.new/`, unchanged blobs hard-linked
 //! from the previous version), flushed to disk, and one directory rename
-//! commits it (`v<N>`); the highest committed version is the container.
+//! commits it (`v<N>`); the highest complete version is the container.
 //! A crash leaves the old version or the new one, never a mix; leftovers
 //! are removed on sight. Deleting a container renames it away first.
 //!
@@ -186,8 +186,8 @@ fn version_number(file: &str) -> Option<u64> {
     (n > 0 && format!("v{n}") == file).then_some(n)
 }
 
-/// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// The container, display and blob names from a complete version.
+/// A missing or malformed manifest or a missing or non-file blob gives `None`.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -198,14 +198,21 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    for i in 0..blobs.len() {
+        match std::fs::symlink_metadata(dir.join(i.to_string())) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
 
 /// The container's newest readable committed version, if any. Removes what
 /// a crash left: unfinished versions, and versions older than that one.
-/// An unreadable newer folder (a stray, or a broken manifest) is neither
-/// taken nor removed, and never costs the version below it.
+/// Skips and preserves incomplete newer versions.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     let mut highest = 0;
@@ -244,7 +251,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     // Versions exist but none reads: keep them all, and refuse.
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "no save version has a readable manifest",
+        "no complete save version",
     ))
 }
 
@@ -1526,12 +1533,16 @@ mod tests {
     #[test]
     fn an_unreadable_newer_version_does_not_cost_the_save() {
         type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
+        let strays: [(&str, Make); 4] = [
             ("empty folder", |p| std::fs::create_dir(p).unwrap()),
             ("file", |p| std::fs::write(p, b"not a version").unwrap()),
             ("broken manifest", |p| {
                 std::fs::create_dir(p).unwrap();
                 std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+            ("directory in place of a blob", |p| {
+                std::fs::create_dir_all(p.join("0")).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "two", &["a"])).unwrap();
             }),
         ];
         for (what, make) in strays {
@@ -1562,6 +1573,37 @@ mod tests {
             // Read again: the new version stays the container.
             assert_eq!(state(root), after, "{what}: second read");
         }
+    }
+
+    fn commit_two_versions(slot: &Path) {
+        for (number, display, data) in [(1, "one", b"old"), (2, "two", b"new")] {
+            let blobs = [("a", Source::Data(data)), ("b", Source::Data(b""))];
+            commit(slot, number, "Slot", display, &blobs).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_keeps_v1_when_v2_is_missing_a_listed_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = container_dir(dir.path(), "Slot");
+        commit_two_versions(&slot);
+        std::fs::remove_file(slot.join("v2/1")).unwrap();
+
+        assert_eq!(current(&slot).unwrap().unwrap().dir, slot.join("v1"));
+        assert_eq!(std::fs::read(slot.join("v1/0")).unwrap(), b"old");
+        assert_eq!(std::fs::read(slot.join("v1/1")).unwrap(), b"");
+    }
+
+    #[test]
+    fn recovery_selects_v2_when_all_listed_blobs_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = container_dir(dir.path(), "Slot");
+        commit_two_versions(&slot);
+
+        assert_eq!(current(&slot).unwrap().unwrap().dir, slot.join("v2"));
+        assert_eq!(std::fs::read(slot.join("v2/0")).unwrap(), b"new");
+        assert_eq!(std::fs::read(slot.join("v2/1")).unwrap(), b"");
+        assert!(!slot.join("v1").exists());
     }
 
     /// With no readable version at all, reads and updates fail and nothing
