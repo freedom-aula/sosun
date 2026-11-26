@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod native_run;
 #[cfg(windows)]
 mod prebuild;
 mod run;
@@ -114,6 +116,10 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// macOS native host: load and bind, print every import as served
+        /// or stubbed, and exit without running the entry point.
+        #[arg(long, conflicts_with = "execute")]
+        list_imports: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -211,10 +217,11 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
+            list_imports,
             console,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(&exe, unimplemented, strict, execute, list_imports, console)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

@@ -41,6 +41,7 @@ pub fn run(
     unimplemented: Unimplemented,
     strict: bool,
     execute: bool,
+    _list_imports: bool,
     console: Console,
 ) -> Result<u32> {
     use std::sync::Arc;
@@ -71,7 +72,10 @@ pub fn run(
     }
     // Rosetta cannot resume these when they fault partway (#14, #50).
     let masked = victory_loader::masked::masked_stores(&prepared.info, &original);
-    println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    println!(
+        "masked stores  {}",
+        victory_loader::masked::summary(&masked)
+    );
     // The file's bytes (the exe's size, 114 MB) are kept only to patch the
     // masked stores after the mapping.
     let patching = std::env::var("VICTORY_PATCH_MASKED").ok();
@@ -595,7 +599,19 @@ mod cpu_check_tests {
     }
 }
 
-#[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
-    anyhow::bail!("running titles requires Windows")
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub fn run(
+    exe: &Path,
+    unimplemented: Unimplemented,
+    strict: bool,
+    execute: bool,
+    list_imports: bool,
+    console: Console,
+) -> Result<u32> {
+    crate::native_run::run(exe, unimplemented, strict, execute, list_imports, console)
+}
+
+#[cfg(not(any(windows, all(target_os = "macos", target_arch = "x86_64"))))]
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: bool, _: Console) -> Result<u32> {
+    anyhow::bail!("running titles requires Windows, or macOS on x86-64 (native host)")
 }

@@ -15,6 +15,11 @@ mod host;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod host_posix;
 pub mod modules;
+/// What the native macOS run path needs of the POSIX host: the drive table.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub mod posix {
+    pub use crate::host_posix::files::{mount, mount_at};
+}
 mod registry;
 pub mod runtime;
 
