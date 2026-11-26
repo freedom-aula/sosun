@@ -57,6 +57,10 @@ pub struct TitleList<B: GraphicsBackend> {
     pub topology: u32,
     /// The formats of the targets `OMSetRenderTargets` bound last.
     pub targets: TargetFormats,
+    /// Whether every target `OMSetRenderTargets` bound last has a host texture. When one has
+    /// none the binding is refused (a partial one would renumber the slots) and draws are
+    /// dropped until the title binds a set the host can make.
+    pub targets_ready: bool,
     /// The strides of the bound vertex buffers by slot, which a guessed pipeline is made from at
     /// its draw, and the title resources bound as targets (for the target trace).
     pub strides: Vec<u32>,
@@ -80,6 +84,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             pipeline: 0,
             topology: 0,
             targets: TargetFormats::default(),
+            targets_ready: true,
             strides: Vec::new(),
             target_keys: Vec::new(),
         }

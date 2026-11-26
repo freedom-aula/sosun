@@ -346,6 +346,12 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// The native clear command addresses mip 0 of a single-sampled 1D or 2D texture.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_dsv_base_view(&self) -> bool {
+        self.described == 0 || (matches!(self.desc[1], 1 | 3) && self.desc[3] == 0)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

@@ -1225,8 +1225,8 @@ fn clear_dsv_impl(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (stencil, count, rects);
-        crate::native::glue::clear_dsv(this, handle, flags, depth);
+        let _ = rects;
+        crate::native::glue::clear_dsv(this, handle, flags, depth, stencil, count);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
@@ -2210,6 +2210,65 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    /// Exercise the title-facing ABI and real descriptor lookup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_dsv_clear_rejects_rectangles_and_unrepresented_views() {
+        if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
+            && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
+        {
+            eprintln!("skipped: Metal Shader Converter not installed");
+            return;
+        }
+        use crate::resource::{HeapProperties, ResourceDesc, create_committed};
+        let null = std::ptr::null();
+        let heap = [1u32, 0, 0, 0, 0];
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
+        let mut storage = [0u64; 14];
+        let handle = storage.as_mut_ptr() as u64;
+        let rect = Rect { left: 1, top: 1, right: 2, bottom: 2 };
+        let release = |o| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        // Resource dimension, height, samples, mips, DSV dimension, full-clear support.
+        for (dimension, height, samples, mips, view_dimension, supported) in [
+            (3u64, 16, 1, 2, 3, true),
+            (2, 1, 1, 2, 1, true),
+            (3, 16, 4, 1, 5, false),
+        ] {
+            // Public D3D12_RESOURCE_DESC ABI: one layer, D32_FLOAT_S8X24_UINT,
+            // ALLOW_DEPTH_STENCIL. Multisampled resources have just one mip.
+            let desc = [dimension, 0, 16, height | (1 << 32) | (mips << 48),
+                20 | (samples << 32), 0, 2];
+            let mut resource = null;
+            assert_eq!(create_committed(null, heap.as_ptr().cast::<HeapProperties>(), 0,
+                desc.as_ptr().cast::<ResourceDesc>(), 0x10, null.cast(),
+                &PAGEABLE_IIDS[0], &mut resource), S_OK);
+            for flags in [1, 2, 3] {
+                for (view, count, rectangles, expected) in [
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, &rect as *const Rect, false),
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, null.cast(), false),
+                    (Some([20, view_dimension, 0, 1, 0, 0]), 0, null.cast(), false),
+                    (Some([20, view_dimension + 1, 0, 0, 1, 1]), 0, null.cast(), false),
+                    (Some([20, 0, 0, 0, 0, 0]), 0, null.cast(), false),
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 0, &rect as *const Rect, supported),
+                    (None, 0, null.cast(), supported),
+                ] {
+                    crate::native::glue::with_list(list, |_, l| l.list.reset()).expect("Metal device");
+                    crate::descriptor::create_dsv(null, resource,
+                        view.as_ref().map_or(null.cast(), std::ptr::from_ref), handle);
+                    clear_dsv(list, handle, flags, 0.25, 173, count, rectangles);
+                    let recorded = crate::native::glue::with_list(list, |_, l| !l.list.is_empty()).unwrap();
+                    assert_eq!(recorded, expected, "dimension={dimension}, samples={samples}, flags={flags}, view={view:?}, count={count}");
+                }
+            }
+            release(resource);
+        }
+        release(list);
+        release(allocator);
+    }
 
     struct PipelineBinds(Arc<AtomicUsize>);
 

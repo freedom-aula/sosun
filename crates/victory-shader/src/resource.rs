@@ -555,18 +555,34 @@ impl<'a> Tracer<'a> {
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
+    ///
+    /// A sweep reads some arguments as this sweep made them and others as
+    /// the last one did, so a phi whose arguments are all copies of one
+    /// value can see them disagree, stand for itself for a sweep, and
+    /// return to the copy once they agree again. Where such phis feed each
+    /// other across nested loops that repeats without end (the test
+    /// `copies_restored_in_nested_loops_settle`). So after [`MAX_ROUNDS`]
+    /// sweeps a phi that still changes stands for itself for good, as any
+    /// real join does: that names no wrong origin, only fewer copies.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
         let order = crate::ir::reverse_postorder(&self.p.blocks);
-        for _ in 0..MAX_ROUNDS {
+        // Once pinning, a phi changes at most twice, and a sweep without
+        // such a change settles the moves that follow their sources.
+        for round in 0..MAX_ROUNDS + 2 * n + 2 {
+            let pinning = round >= MAX_ROUNDS;
             let mut changed = false;
             for &b in &order {
                 let block = &self.p.blocks[b];
                 for phi in &block.phis {
                     let own = Term::Value(phi.value);
+                    let old = o[phi.value.0 as usize];
+                    if pinning && old == Some(own) {
+                        continue;
+                    }
                     let mut args = phi
                         .args
                         .iter()
@@ -574,8 +590,12 @@ impl<'a> Tracer<'a> {
                         .filter(|&t| t != own);
                     let new = args
                         .next()
-                        .map(|first| if args.all(|t| t == first) { first } else { own });
-                    if new.is_some() && new != o[phi.value.0 as usize] {
+                        .map(|first| if args.all(|t| t == first) { first } else { own })
+                        .map(|new| match old {
+                            Some(t) if pinning && t != new => own,
+                            _ => new,
+                        });
+                    if new.is_some() && new != old {
                         o[phi.value.0 as usize] = new;
                         changed = true;
                     }
@@ -2933,6 +2953,53 @@ pub(crate) mod tests {
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
+    }
+
+    /// A register kept in a second one across an inner loop that restores
+    /// it, inside a loop whose entry value is itself a loop's phi: s2 at
+    /// 0x08 and at 0x0c is s2 at 0x04 whichever way it is reached. The
+    /// origins must settle, and name no value the register does not hold.
+    #[test]
+    fn copies_restored_in_nested_loops_settle() {
+        let words = [
+            0xBE87_0380, // 0x00 s_mov_b32 s7, 0
+            0xBF06_8006, // 0x04 s_cmp_eq_u32 s6, 0
+            0xBE83_0302, // 0x08 s_mov_b32 s3, s2
+            0xBF06_8004, // 0x0c s_cmp_eq_u32 s4, 0
+            0xBF85_0002, // 0x10 s_cbranch_scc1 -> 0x1c
+            0xBE82_0303, // 0x14 s_mov_b32 s2, s3
+            0xBF82_FFFC, // 0x18 s_branch -> 0x0c
+            0xBF06_8005, // 0x1c s_cmp_eq_u32 s5, 0
+            0xBF85_FFF9, // 0x20 s_cbranch_scc1 -> 0x08
+            0x8002_8102, // 0x24 s_add_u32 s2, s2, 1
+            0xBF06_8006, // 0x28 s_cmp_eq_u32 s6, 0
+            0xBF85_FFF5, // 0x2c s_cbranch_scc1 -> 0x04
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let t = Tracer::new(&p, &[], HwStage::Ps, None).unwrap();
+        let block = |offset| &p.blocks[block_at(&words, offset)];
+        let phi = |offset| {
+            let phis = &block(offset).phis;
+            phis.iter().find(|phi| phi.reg == Reg::S(2)).unwrap().value
+        };
+        let write = |offset: usize, name| {
+            let inst = block(offset).insts.iter().find(|i| i.name() == name);
+            inst.unwrap().writes[0].1
+        };
+        let (outer, middle, inner) = (phi(0x04), phi(0x08), phi(0x0c));
+        let sum = write(0x24, "s_add_u32");
+        // The outer phi joins the entry value and the sum, which is no copy.
+        assert_eq!(t.origin(sum), Term::Value(sum));
+        assert_eq!(t.origin(outer), Term::Value(outer));
+        // Both inner phis hold the outer one's value; a phi may stand for itself.
+        let held = [Term::Value(outer), Term::Value(middle)];
+        assert!(held.contains(&t.origin(middle)));
+        assert!(held.contains(&t.origin(inner)) || t.origin(inner) == Term::Value(inner));
+        // The moves are copies of the middle phi.
+        assert_eq!(t.origin(write(0x08, "s_mov_b32")), t.origin(middle));
+        assert_eq!(t.origin(write(0x14, "s_mov_b32")), t.origin(middle));
     }
 
     #[test]
