@@ -398,6 +398,25 @@ fn a_shifted_or_built_mask_needs_the_consoles_lanes() {
     }
 }
 
+/// A mask holding lanes elsewhere read as data is refused saying where it
+/// comes from: here a saveexec of the other width (32 bits in a wave64
+/// program).
+#[test]
+fn masks_holding_lanes_elsewhere_say_where_they_come_from() {
+    const SAVEEXEC32_DATA: &[u32] = &[
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+        0x7E02_0202, // v_mov_b32_e32 v1, s2
+    ];
+    let r = lowered(SAVEEXEC32_DATA, 64, false).err();
+    let why = "a lane mask holding lanes elsewhere read as data: written by a scalar \
+               instruction of the other width";
+    assert!(
+        matches!(r, Some(crate::ShaderError::Unsupported { what, .. }) if what == why),
+        "{r:?}"
+    );
+}
+
 /// What is not translated stays refused, saying what.
 #[test]
 fn what_has_no_form_is_refused_clearly() {
