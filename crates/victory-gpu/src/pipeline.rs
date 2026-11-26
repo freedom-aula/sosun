@@ -1346,7 +1346,7 @@ mod pieces_tests {
 
     /// The container the host makes from a compute description's pieces: wave32 code of 32
     /// threads with 5 user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
-    fn section_pieces(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
+    fn container_of(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
         let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
         let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
@@ -1394,7 +1394,7 @@ mod pieces_tests {
                 0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
                 0xBF81_0000, // s_endpgm
             ]);
-            section_pieces(&code, &[uav])
+            container_of(&code, &[uav])
         };
         let prefix = "a whole-wave section step the simulation does not follow: ";
         for (step, why) in [
@@ -1446,29 +1446,6 @@ mod pieces_tests {
         assert!(unsafe { compute_container(Some(&root), record.as_ptr()) }.is_none());
     }
 
-    /// The container the host makes from a compute description's pieces: wave32 code of 32
-    /// threads with 5 user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
-    fn descriptor_pieces(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
-        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        // Thread-group size 32, 1, 1; wave32; 16 VGPRs; 5 user SGPRs.
-        let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, 5 << 1]);
-        let code = words(code);
-        let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
-        metadata.extend([0x40, 4, records.len() as u8, 0]);
-        records.iter().for_each(|r| metadata.extend(r));
-        metadata.extend([0x43].into_iter().chain([0; 31]));
-        let size = metadata.len() as u32 - 0x14;
-        metadata[4..8].copy_from_slice(&size.to_le_bytes());
-        let pieces = [registers, vec![0; 0x14], code, metadata];
-        let mut record = Vec::new();
-        for p in &pieces {
-            record.extend((p.as_ptr() as u64).to_le_bytes());
-            record.extend((p.len() as u64).to_le_bytes());
-        }
-        // SAFETY: four pairs over live vectors.
-        unsafe { compute_container(None, record.as_ptr()) }.expect("a container")
-    }
-
     /// On the native host's path (the container made from the title's pieces, translated with
     /// the host's options), a buffer descriptor's dword that is no size, read as data, is refused
     /// naming the dword; that text is what the refusal log line shows.
@@ -1501,7 +1478,7 @@ mod pieces_tests {
                 0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
                 0xBF81_0000, // s_endpgm
             ];
-            descriptor_pieces(&code, &[table(3, 0), table(0, 8)])
+            container_of(&code, &[table(3, 0), table(0, 8)])
         };
         let prefix = "a descriptor's address or format read as data: ";
         for (read, why) in [
