@@ -1421,6 +1421,275 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
     });
 }
 
+fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) -> Option<(usize, usize)> {
+    let mips = info.layout.mips.len().max(1);
+    let slices = if info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        info.layout.slices.max(1) as usize
+    };
+    let sub = subresource as usize;
+    (sub < mips * slices).then(|| (sub % mips, sub / mips))
+}
+
+fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
+    [
+        (info.width as usize >> mip).max(1),
+        (info.height.max(1) as usize >> mip).max(1),
+        info.layout.subresource_depth(mip as u32).max(1) as usize,
+    ]
+}
+
+fn copy_box(
+    info: &super::textures::TextureInfo,
+    mip: usize,
+    source_box: Option<[u32; 6]>,
+) -> Option<([usize; 3], [usize; 3])> {
+    let dims = mip_dims(info, mip);
+    let Some([l, t, f, r, b, back]) = source_box else {
+        return Some(([0, 0, 0], dims));
+    };
+    if r < l || b < t || back < f {
+        return None;
+    }
+    let origin = [l as usize, t as usize, f as usize];
+    let size = [(r - l) as usize, (b - t) as usize, (back - f) as usize];
+    (0..3).all(|i| origin[i].saturating_add(size[i]) <= dims[i]).then_some((origin, size))
+}
+
+fn footprint_span(
+    res: This,
+    fp: &crate::resource::PlacedFootprint,
+    at: [u32; 3],
+    size: [u32; 3],
+) -> Option<(u64, usize, usize, usize)> {
+    // 115 (B4G4R4A4_UNORM) needs CPU nibble rotation; depth formats need plane-separated copies.
+    if fp.format == 115 {
+        return None;
+    }
+    let fmt = super::descriptors::format(fp.format)?;
+    if matches!(
+        fmt,
+        victory_backend::resources::Format::D32Float
+            | victory_backend::resources::Format::D32FloatS8
+            | victory_backend::resources::Format::D16Unorm
+    ) {
+        return None;
+    }
+    let (element, block) = crate::resource::element(fp.format)?;
+    let (base, buf_size) = crate::resource::buffer_bytes(res)?;
+    let rows = fp.rows(at, size)?;
+    let start = rows.first()?.0;
+    let end = rows.last().map_or(start, |&(o, n)| o + n);
+    let byte_end = fp.offset.checked_add(end)?;
+    if byte_end > buf_size {
+        return None;
+    }
+    let addr = (base as u64).checked_add(fp.offset + start)?;
+    let len = usize::try_from(end - start).ok()?;
+    let row_pitch = fp.row_pitch as usize;
+    let slice_pitch = row_pitch.checked_mul((fp.height as usize).div_ceil(block as usize))?;
+    let _ = element;
+    Some((addr, len, row_pitch, slice_pitch))
+}
+
+/// `CopyResource` between two title textures. Returns `false` if the host cannot copy them.
+pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
+    let (Some(src_info), Some(dst_info)) = (
+        crate::resource::texture_info(src),
+        crate::resource::texture_info(dst),
+    ) else {
+        return false;
+    };
+    let mips = src_info.layout.mips.len().max(1).min(dst_info.layout.mips.len().max(1));
+    let src_slices = if src_info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        src_info.layout.slices.max(1) as usize
+    };
+    let dst_slices = if dst_info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        dst_info.layout.slices.max(1) as usize
+    };
+    let slices = src_slices.min(dst_slices);
+    with_list(this, |t, l| {
+        let (Some(src_tex), Some(dst_tex)) = (t.texture_of(src as usize), t.texture_of(dst as usize)) else {
+            return false;
+        };
+        for slice in 0..slices {
+            for mip in 0..mips {
+                let s = mip_dims(&src_info, mip);
+                let d = mip_dims(&dst_info, mip);
+                let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
+                l.list.copy_texture_region(
+                    &src_tex,
+                    mip,
+                    slice,
+                    [0, 0, 0],
+                    size,
+                    &dst_tex,
+                    mip,
+                    slice,
+                    [0, 0, 0],
+                );
+            }
+        }
+        trace_bump(dst as usize, 0);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// `CopyTextureRegion` on macOS: texture-to-texture and placed footprint <-> texture.
+pub(crate) fn copy_texture_region(
+    this: This,
+    dst: crate::list::CopyLocation,
+    origin: [u32; 3],
+    src: crate::list::CopyLocation,
+    source_box: Option<[u32; 6]>,
+) -> bool {
+    const SUBRESOURCE: u32 = 0;
+    const FOOTPRINT: u32 = 1;
+    let dst_origin = [origin[0] as usize, origin[1] as usize, origin[2] as usize];
+    match (dst.kind, src.kind) {
+        (SUBRESOURCE, SUBRESOURCE) => {
+            let (Some(src_info), Some(dst_info)) = (
+                crate::resource::texture_info(src.resource),
+                crate::resource::texture_info(dst.resource),
+            ) else {
+                return false;
+            };
+            let Some((src_mip, src_slice)) = subresource_mip_slice(&src_info, src.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((dst_mip, dst_slice)) = subresource_mip_slice(&dst_info, dst.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((src_origin, size)) = copy_box(&src_info, src_mip, source_box) else {
+                return false;
+            };
+            let dst_dims = mip_dims(&dst_info, dst_mip);
+            if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
+                return false;
+            }
+            if size.contains(&0) {
+                return true;
+            }
+            with_list(this, |t, l| {
+                let (Some(src_tex), Some(dst_tex)) =
+                    (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
+                else {
+                    return false;
+                };
+                l.list.copy_texture_region(
+                    &src_tex,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size,
+                    &dst_tex,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                );
+                trace_bump(dst.resource as usize, 0);
+                true
+            })
+            .unwrap_or(false)
+        }
+        (SUBRESOURCE, FOOTPRINT) => {
+            let Some(dst_info) = crate::resource::texture_info(dst.resource) else {
+                return false;
+            };
+            let Some((dst_mip, dst_slice)) = subresource_mip_slice(&dst_info, dst.footprint.offset as u32) else {
+                return false;
+            };
+            let (src_at, size_u32) = match source_box {
+                Some([l, t, f, r, b, back]) if r >= l && b >= t && back >= f => {
+                    ([l, t, f], [r - l, b - t, back - f])
+                }
+                Some(_) => return false,
+                None => (
+                    [0, 0, 0],
+                    [src.footprint.width, src.footprint.height, src.footprint.depth],
+                ),
+            };
+            let size = size_u32.map(|v| v as usize);
+            if size.contains(&0) {
+                return true;
+            }
+            let dst_dims = mip_dims(&dst_info, dst_mip);
+            if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
+                return false;
+            }
+            let Some((src_addr, len, row_pitch, slice_pitch)) =
+                footprint_span(src.resource, &src.footprint, src_at, size_u32)
+            else {
+                return false;
+            };
+            with_list(this, |t, l| {
+                let Some(dst_tex) = t.texture_of(dst.resource as usize) else {
+                    return false;
+                };
+                l.list.copy_buffer_to_texture(
+                    src_addr,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                    size,
+                    &dst_tex,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                );
+                trace_bump(dst.resource as usize, 0);
+                true
+            })
+            .unwrap_or(false)
+        }
+        (FOOTPRINT, SUBRESOURCE) => {
+            let Some(src_info) = crate::resource::texture_info(src.resource) else {
+                return false;
+            };
+            let Some((src_mip, src_slice)) = subresource_mip_slice(&src_info, src.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((src_origin, size)) = copy_box(&src_info, src_mip, source_box) else {
+                return false;
+            };
+            if size.contains(&0) {
+                return true;
+            }
+            let size_u32 = size.map(|v| v as u32);
+            let Some((dst_addr, len, row_pitch, slice_pitch)) =
+                footprint_span(dst.resource, &dst.footprint, origin, size_u32)
+            else {
+                return false;
+            };
+            with_list(this, |t, l| {
+                let Some(src_tex) = t.texture_of(src.resource as usize) else {
+                    return false;
+                };
+                l.list.copy_texture_to_buffer(
+                    &src_tex,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size,
+                    dst_addr,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                );
+                true
+            })
+            .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
     if env_set!("VICTORY_TRACE_WRITES") {

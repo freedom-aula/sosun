@@ -267,6 +267,39 @@ pub enum Cmd<B: GraphicsBackend> {
         len: usize,
         value: u8,
     },
+    CopyTexture {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
         depth: Option<DepthClear<B::Texture>>,
@@ -319,6 +352,69 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 dst: *dst,
                 len: *len,
                 value: *value,
+            },
+            Cmd::CopyTexture {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyTexture {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyBufferToTexture {
+                src,
+                len,
+                row_pitch,
+                slice_pitch,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyBufferToTexture {
+                src: *src,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyTextureToBuffer {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                len,
+                row_pitch,
+                slice_pitch,
+            } => Cmd::CopyTextureToBuffer {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: *dst,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
             },
             Cmd::Clear { color, depth } => Cmd::Clear {
                 color: color.clone(),
@@ -606,6 +702,96 @@ impl<B: GraphicsBackend> NativeList<B> {
         if len > 0 {
             self.cmds.push(Cmd::Fill { dst, len, value });
         }
+    }
+
+    /// Texture-to-texture region copy, ordered on the GPU with the rest of the list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_region(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTexture {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Linear buffer footprint to texture region copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyBufferToTexture {
+            src,
+            len,
+            row_pitch,
+            slice_pitch,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Texture region to linear buffer footprint copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_to_buffer(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTextureToBuffer {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst,
+            len,
+            row_pitch,
+            slice_pitch,
+        });
     }
 
     /// `OMSetRenderTargets`.
