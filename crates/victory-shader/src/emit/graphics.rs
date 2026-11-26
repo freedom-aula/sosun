@@ -1133,12 +1133,21 @@ mod tests {
     /// lane set) is that bit, in every lane.
     #[test]
     fn a_mesh_program_keeps_the_scc_of_a_uniform_lane_mask() {
-        let program = |cmp: [u32; 2]| {
-            [
+        // EXEC as a v_cmpx sets it, or as the join of two lane conditions.
+        let cmpx: &[u32] = &[0x7DA8_0008]; // v_cmpx_gt_u32 s8, v0
+        let join: &[u32] = &[
+            0xD4C4_001E, 0x0002_0008, // v_cmp_gt_u32 s[30:31], s8, v0
+            0xD4C1_0020, 0x0002_0208, // v_cmp_lt_u32 s[32:33], s8, v1
+            0x88FE_201E, // s_or_b64 exec, s[30:31], s[32:33]
+        ];
+        let program = |exec: &[u32], cmp: [u32; 2]| {
+            let mut code = vec![
                 0xBEFE_0481, // s_mov_b64 exec, 1
                 0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
                 0xBEFE_04C1, // s_mov_b64 exec, -1
-                0x7DA8_0008, // v_cmpx_gt_u32 s8, v0
+            ];
+            code.extend(exec);
+            code.extend([
                 0xBF88_0007, // s_cbranch_execz 7
                 cmp[0], cmp[1], // v_cmp_ge_f32 vcc, <src0>, 0
                 0x8796_7E6A, // s_and_b64 s[22:23], vcc, exec
@@ -1150,11 +1159,15 @@ mod tests {
                 0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
                 0xF800_0941, 0x0000_0001, // exp prim v1 done
                 ENDPGM,
-            ]
+            ]);
+            code
         };
-        mesh(&program([0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
-        // A compare of a VGPR differs between lanes: SCC is a ballot the mesh stage cannot take.
-        let e = mesh(&program([0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
-        assert!(e.to_string().contains("lane mask"), "{e}");
+        for exec in [cmpx, join] {
+            mesh(&program(exec, [0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
+            // A compare of a VGPR differs between lanes: SCC is a ballot the mesh stage cannot
+            // take.
+            let e = mesh(&program(exec, [0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
+            assert!(e.to_string().contains("lane mask"), "{e}");
+        }
     }
 }

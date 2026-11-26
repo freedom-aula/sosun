@@ -338,9 +338,9 @@ struct Lower<'a> {
     /// SCC written by a scalar operation on masks, by value: the dwords of
     /// the mask result it says is not zero.
     mask_scc: Map<Value, (Value, Option<Value>)>,
-    /// Mesh: SCC of a uniform lane mask ANDed with EXEC ([`Self::uniform_and_exec`]): the
-    /// mask's bit, with the atoms EXEC decides fixed.
-    uniform_scc: Map<Value, (Bool, Vec<(Atom, bool)>)>,
+    /// Mesh: SCC of a uniform compare ANDed with EXEC ([`Self::uniform_and_exec`]): the
+    /// compare's result value.
+    uniform_scc: Map<Value, Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -2062,14 +2062,13 @@ impl<'a> Lower<'a> {
         if self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
             return self.mask_dword(v).map(Val::I32);
         }
-        if let (Some(Val::Missing(_)), Some((m, fixed))) = (found, self.uniform_scc.get(&v)) {
-            let (m, fixed) = (*m, fixed.clone());
+        if let (Some(Val::Missing(_)), Some(&u)) = (found, self.uniform_scc.get(&v)) {
             let at = match self.def_block.get(&v) {
                 None => self.s.entry,
                 Some(&b) if b == self.cur_ir => self.cur,
                 Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
             };
-            let any = Val::Bit(self.boolean_given(m, &fixed, at, &mut Map::default())?);
+            let any = Val::Bit(self.atom(Atom::Lane(u), at)?);
             self.vals.insert(v, any);
             return Ok(any);
         }
@@ -12885,13 +12884,14 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// `s_and` of a lane mask and EXEC (the console compiler's form of a wave-uniform boolean,
-    /// `v_cmp` of SGPRs then `s_and_b64 sN, vcc, exec`) whose bit is the same in every lane of
-    /// EXEC: the mask, and the values EXEC gives its other atoms. Its SCC (some lane set) is
-    /// then that bit in every lane, those outside EXEC included, as the console's wave has it.
+    /// `s_and` of EXEC and a compare of SGPRs and constants made under the same EXEC (the
+    /// console compiler's form of a wave-uniform boolean, `v_cmp_* vcc, s, k` then
+    /// `s_and_b64 sN, vcc, exec`): the compare's result. The compare holds the same bit in every
+    /// lane, so SCC (some lane set) is that bit, in every lane, those outside EXEC included, as
+    /// the console's wave holds it.
     // Guess: EXEC is not empty where the title's programs do this (they branch around their
     // EXEC regions with `s_cbranch_execz`); with an empty EXEC the console's SCC is 0.
-    fn uniform_and_exec(&self, inst: &Inst) -> Option<(Bool, Vec<(Atom, bool)>)> {
+    fn uniform_and_exec(&self, inst: &Inst) -> Option<Value> {
         let width = if self.x.native.wave64 { "s_and_b64" } else { "s_and_b32" };
         let Fields::Sop { src, .. } = &inst.fields else { return None };
         if inst.name() != width || src.len() != 2 {
@@ -12905,44 +12905,12 @@ impl<'a> Lower<'a> {
             (EXEC, c) | (c, EXEC) if c != EXEC => c,
             _ => return None,
         };
-        let st = &self.x.st;
-        let m = *st.masks.get(&inst.read(Reg::S(other))?)?;
-        let exec = *st.masks.get(&inst.read(Reg::S(EXEC))?)?;
-        let mut fixed = Vec::new();
-        for a in st.bools.support(m) {
-            if !self.uniform_atom(a) {
-                fixed.push((a, st.bools.decides(&[(exec, true)], a)?));
-            }
-        }
-        Some((m, fixed))
-    }
-
-    /// [`Self::boolean`] of `b` with the atoms of `fixed` set.
-    fn boolean_given(
-        &mut self,
-        b: Bool,
-        fixed: &[(Atom, bool)],
-        at: usize,
-        memo: &mut Map<Bool, V>,
-    ) -> Result<V, Why> {
-        let Some((atom, lo, hi)) = self.x.st.bools.node(b) else {
-            return Ok(self.s.m.bool(b == Bool::TRUE));
-        };
-        if let Some(&v) = memo.get(&b) {
-            return Ok(v);
-        }
-        let v = match fixed.iter().find(|f| f.0 == atom) {
-            Some(&(_, true)) => self.boolean_given(hi, fixed, at, memo)?,
-            Some(&(_, false)) => self.boolean_given(lo, fixed, at, memo)?,
-            None => {
-                let a = self.atom(atom, at)?;
-                let h = self.boolean_given(hi, fixed, at, memo)?;
-                let l = self.boolean_given(lo, fixed, at, memo)?;
-                self.s.m.select(at, a, h, l)
-            }
-        };
-        memo.insert(b, v);
-        Ok(v)
+        let u = inst.read(Reg::S(other))?;
+        let cmp = self.def_inst(u)?;
+        let same_exec = (EXEC..=EXEC + u8::from(self.x.native.wave64))
+            .all(|r| cmp.read(Reg::S(r)).is_some() && cmp.read(Reg::S(r)) == inst.read(Reg::S(r)));
+        (matches!(cmp.fields, Fields::Valu(_)) && same_exec && self.uniform_atom(Atom::Lane(u)))
+            .then_some(u)
     }
 
     /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a
