@@ -760,3 +760,92 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
     assert_eq!(f.get(0x2_0000 + 1280, 64), ids, "wave64 ds_read_addtid_b32");
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+/// A structured buffer view (16-byte elements) whose descriptor the program loads and then clears
+/// the stride of (`s_and_b32` of dword 1 with 0xc000ffff, a title's form): every lane loads by
+/// index and offset, so with stride 0 it reads dword `lane` (index × 0 + lane × 4, RDNA2 ISA
+/// 8.1.5), and stores it to a raw view.
+const STRIDE_CLEARED: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xF408_0302, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x8709_FF09, 0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+    0xE030_3000, 0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_1000, 0x8003_0201, // buffer_store_dword v2, v1, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
+    use victory_shader::native::{ResourceType, UsedResource};
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    let src: Vec<u32> = (0..64).map(|i| i * 7 + 3).collect();
+    f.put(0x2_1000, &src);
+    f.put(0x2_2000, &[0u32; 64]);
+    // The title's heap: a structured SRV of 16-byte elements, then a raw UAV.
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let (rs, rd) = (0x57D_0001usize, 0x57D_0002usize);
+    t.host.register_buffer(rs, VA_A + 0x1000, 4096);
+    t.host.register_buffer(rd, VA_A + 0x2000, 4096);
+    let mut srv = [0u32; 10];
+    (srv[1], srv[6], srv[7]) = (1, 16, 16);
+    let mut uav = [0u32; 10];
+    (uav[1], uav[4], uav[8]) = (1, 64, 1);
+    crate::descriptor::create_srv(std::ptr::null(), rs as _, &srv, start);
+    crate::descriptor::create_uav(std::ptr::null(), rd as _, std::ptr::null(), &uav, start + 32);
+    assert!(t.host.mirror(start).unwrap() && t.host.mirror(start + 32).unwrap());
+    let used = |kind, table_offset_dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 4,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: vec![used(ResourceType::Srv, 0, 16), used(ResourceType::Uav, 8, 0)],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
+        code: STRIDE_CLEARED.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty).expect("container");
+    let cs = emit_with(&c, &native, &p, &st, &io, &res, shaders::options()).expect("emit");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "stride") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_2000, 32), src[..32]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}

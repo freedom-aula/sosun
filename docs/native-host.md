@@ -335,8 +335,28 @@ constant", "comes from another load or place in it", "masked or merged (s_and, s
 "chosen by a select or a join", "is a program input" or "computed otherwise". Nothing new is
 lowered: the next tester log tells which forms to lower (a V# base address moved by an offset in
 dwords 0 and 1, the record count in dword 2, per the RDNA2 ISA's buffer resource layout).
+One form is lowered: a buffer descriptor loaded whole except dword 1, which is the loaded dword 1
+ANDed with a constant that clears the whole stride and nothing else (bits 16-29 cleared; the base
+address bits 0-15 and the swizzle bits 30-31 kept; a partial clear may leave a stride, so it stays
+refused), as in a real run's `s_and_b32` with 0xc000ffff, for a buffer access that
+is not typed (`Tracer::stride_cleared`). With stride 0 the address is the base plus the offsets,
+index × stride adding nothing (RDNA2 ISA 8.1.5): the access reads the loaded view raw and drops its
+index (`Resources::unstrided`). Guess: the bounds stay the host view's size, which is the console's
+when the title's V# checks raw bounds in bytes (OOB_SELECT 3 without swizzle: offset + payload >
+num_records, in bytes with stride 0, ISA tables 33 and 35); OOB_SELECT 0 would put every access out
+of range, and OOB_SELECT 1 would check the index against num_records on the console, a check the
+dropped index no longer makes here. Typed accesses and other masks stay refused.
+`addr_tests::a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu` (`victory-gpu`)
+reads a structured view (16-byte elements) by index and offset on Metal: each lane gets dword
+`lane`, not `lane × 4 + lane`.
 `pipeline::changed_descriptor_tests` (`victory-gpu`) checks the refusal on the native host's own
 path: the container made from the title's pieces, the host's options.
+A mask or merge by a scalar ALU instruction names it and its constant operands (for a 64-bit one,
+the half the dword is), for example "dword 1 masked or merged (s_and_b32 with 0x3fffffff)", or
+"with computed values" when none is constant: a real run's 78 refusals at dword 1 (base address
+bits 47:32, stride, swizzle in a buffer V#, RDNA2 ISA 8.1.5) need the exact form. These texts are
+made at run time; refusals are `&'static str`, so each distinct one is kept for the program's life
+(`resource::interned`).
 
 ## Known limits of this slice
 
