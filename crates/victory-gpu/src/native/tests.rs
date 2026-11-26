@@ -18,6 +18,8 @@ use victory_metal::metal::Metal;
 mod addr_tests;
 #[path = "shader_tests.rs"]
 mod shader_tests;
+#[path = "split_wave_tests.rs"]
+mod split_wave_tests;
 #[path = "state_tests.rs"]
 mod state_tests;
 #[path = "texture_tests.rs"]

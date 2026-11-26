@@ -66,7 +66,7 @@ impl Lower<'_> {
         {
             return Ok(());
         }
-        Err("a cross-lane operation between host waves in divergent code")
+        Err(super::DIVERGENT_EXCHANGE)
     }
 
     /// The group-shared slot `index`.

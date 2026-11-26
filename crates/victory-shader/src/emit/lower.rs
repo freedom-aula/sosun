@@ -688,7 +688,7 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p) {
+                if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -705,7 +705,7 @@ impl<'a> Lower<'a> {
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
-                    refuse = Some("LDS shared in a wave the host splits, in divergent code");
+                    refuse = Some(SPLIT_LDS);
                 }
                 console_lanes |= halves;
                 if console_lanes {
@@ -13124,6 +13124,11 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The refusal of LDS a split console wave shares in divergent code.
+pub(crate) const SPLIT_LDS: &str = "LDS shared in a wave the host splits, in divergent code";
+/// The refusal of a cross-lane operation between host waves in divergent code.
+pub(crate) const DIVERGENT_EXCHANGE: &str = "a cross-lane operation between host waves in divergent code";
+
 /// Blocks each lane runs exactly once: no cycle through them, and on every
 /// path from the entry to an end. Group barriers go only there.
 pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
@@ -13154,6 +13159,28 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
         .collect()
 }
 
+/// Blocks every lane of a one-wave group runs together, at most once: those
+/// of [`once_blocks`], and those outside any cycle reached by uniform (SCC)
+/// branches alone, which the whole console wave takes or skips at once.
+fn wave_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+    let n = p.blocks.len();
+    let mut once = once_blocks(p);
+    for (b, once) in once.iter_mut().enumerate() {
+        let mut seen = vec![false; n];
+        let mut stack = p.blocks[b].exit.successors();
+        let mut cycle = false;
+        while let Some(x) = stack.pop() {
+            cycle |= x == b;
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        *once |= !cycle
+            && st.bools.support(st.reach[b]).iter().all(|a| matches!(a, Atom::Uniform(_)));
+    }
+    once
+}
+
 /// Where a compute group that is one console wave needs group barriers
 /// when the host splits it into narrower waves: (block, instruction) to
 /// sync before, instruction index = the block's length for its end.
@@ -13167,10 +13194,10 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
 /// at its end syncs there when a successor is not one, so divergent code
 /// after it reads clean LDS. `None`: a read in divergent code may see a
 /// write made in divergent code since the last such block.
-pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
+pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_blocks(p);
+    let uniform = wave_blocks(p, st);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut dirty_out = vec![false; n];
     loop {
@@ -14388,7 +14415,7 @@ mod tests {
         w.extend(DS_WRITE_V1_V0);
         w.extend(DS_READ_V2_V1_4);
         w.push(S_ENDPGM);
-        let at = super::split_wave_barriers(&wave64(&w)).unwrap();
+        let at = super::split_wave_barriers(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).unwrap();
         assert_eq!(at.into_iter().collect::<Vec<_>>(), [(0, 2)]);
         assert_eq!(split_barriers(&w, 64, true), 1);
         // Option off, or a group one host wave holds: as before.
@@ -14410,7 +14437,7 @@ mod tests {
         w.extend(DS_READ_V2_V1_4);
         w.push(S_ENDPGM);
         let p = wave64(&w);
-        let at: Vec<_> = super::split_wave_barriers(&p)
+        let at: Vec<_> = super::split_wave_barriers(&p, &structure::structure(&p).unwrap())
             .unwrap()
             .into_iter()
             .collect();
@@ -14430,7 +14457,7 @@ mod tests {
         w.push(RESTORE_EXEC);
         w.push(S_ENDPGM);
         let p = wave64(&w);
-        let at: Vec<_> = super::split_wave_barriers(&p)
+        let at: Vec<_> = super::split_wave_barriers(&p, &structure::structure(&p).unwrap())
             .unwrap()
             .into_iter()
             .collect();
@@ -14446,7 +14473,7 @@ mod tests {
         w.extend(DS_READ_V2_V1_4);
         w.push(RESTORE_EXEC);
         w.push(S_ENDPGM);
-        assert!(super::split_wave_barriers(&wave64(&w)).is_none());
+        assert!(super::split_wave_barriers(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_none());
         assert_eq!(split_barriers(&w, 64, true), 0);
     }
 
