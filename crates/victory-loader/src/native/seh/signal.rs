@@ -169,6 +169,9 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             if int3 {
                 rec.code = EXCEPTION_BREAKPOINT;
                 rec.address = rip as usize - 1;
+                // Windows x64 reports the int3 itself in the CONTEXT too; a
+                // handler that continues must step past it.
+                ctx.rip = rip - 1;
                 rec.number_parameters = 1;
             } else {
                 rec.code = EXCEPTION_SINGLE_STEP;
