@@ -1025,7 +1025,10 @@ pub extern "system" fn _lseek(fd: i32, offset: i32, origin: i32) -> i32 {
 }
 
 pub extern "system" fn _telli64(fd: i32) -> i64 {
-    fd_of(fd).map_or(-1, |s| lock(&s).tell().map_or(-1, |p| p as i64))
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
+    lock(&s).tell().map_or(-1, |p| p as i64)
 }
 
 pub extern "system" fn _tell(fd: i32) -> i32 {
@@ -1033,7 +1036,9 @@ pub extern "system" fn _tell(fd: i32) -> i32 {
 }
 
 pub extern "system" fn _filelengthi64(fd: i32) -> i64 {
-    let Some(s) = fd_of(fd) else { return -1 };
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
     match &lock(&s).io {
         Io::File(f) => f.metadata().map_or(-1, |m| m.len() as i64),
         _ => -1,
@@ -1722,6 +1727,25 @@ mod tests {
         assert_eq!(_fileno(f), -1);
         assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_bad_descriptor_sets_ebadf_for_its_length_and_position() {
+        // Microsoft documents -1 with EBADF for an invalid descriptor in `_filelength`,
+        // `_tell` and `_eof` (and their 64-bit forms).
+        let fd = 9999;
+        for name in ["_filelengthi64", "_filelength", "_telli64", "_tell", "_eof"] {
+            set_errno(0);
+            let r = match name {
+                "_filelengthi64" => _filelengthi64(fd),
+                "_filelength" => i64::from(_filelength(fd)),
+                "_telli64" => _telli64(fd),
+                "_tell" => i64::from(_tell(fd)),
+                _ => i64::from(_eof(fd)),
+            };
+            assert_eq!(r, -1, "{name}");
+            assert_eq!(errno(), EBADF, "{name}");
+        }
     }
 
     #[test]
