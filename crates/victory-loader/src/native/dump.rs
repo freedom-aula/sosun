@@ -55,7 +55,26 @@ pub fn start_mem_watch() {
 pub fn start() {
     let Some(secs) = seconds() else { return };
     std::thread::spawn(move || {
+        // 0: only at the title's first breakpoint (`report_at_break`).
+        if secs == 0 {
+            return;
+        }
         std::thread::sleep(Duration::from_secs(secs));
+        report();
+    });
+}
+
+/// With `VICTORY_DUMP_THREADS=0`, the dump is taken when the title first hits a breakpoint
+/// (its asserts), from the thread that hit it.
+pub fn report_at_break() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if seconds() == Some(0) {
+        ONCE.call_once(report);
+    }
+}
+
+fn report() {
+    {
         tracing::warn!(
             "clzero emulations so far: {}",
             super::seh::signal::EMULATED.load(std::sync::atomic::Ordering::Relaxed)
@@ -69,11 +88,106 @@ pub fn start() {
                 .collect();
             tracing::warn!("memory at {at:#x}: {}", words.join(" "));
         }
+        if let Ok(list) = std::env::var("VICTORY_FIND_QWORD") {
+            // `@<hex>`: the qword at that address (an object's method table pointer, say).
+            let values: Vec<u64> = list
+                .split(',')
+                .filter_map(|v| match v.strip_prefix('@') {
+                    Some(at) => read_checked(usize::from_str_radix(at, 16).ok()?).map(|x| x as u64),
+                    None => u64::from_str_radix(v.trim_start_matches("0x"), 16).ok(),
+                })
+                .collect();
+            find_qwords(&values);
+        }
         super::bridge::report_callbacks();
         for line in collect() {
             tracing::warn!("{line}");
         }
-    });
+    }
+}
+
+/// `VICTORY_FIND_QWORD=<hex>,<hex>,...` (with `VICTORY_DUMP_THREADS`): every aligned qword of
+/// resident readable memory equal to one of the values is logged with the 0x100 bytes from it
+/// (for finding heap objects by their method table, data only). `@<hex>` stands for the qword
+/// at that address.
+fn find_qwords(values: &[u64]) {
+    let mut at = 0x1_0000usize;
+    let mut found = 0;
+    let mut chunk = vec![0u64; 0x2_0000];
+    while let Some(r) = victory_platform::mem::next_region(at) {
+        // A region that grows while we look is seen again from where we stopped.
+        let (start, end) = (r.base.max(at), r.base + r.len);
+        at = end;
+        if r.protect.0 & 1 == 0 || found >= 64 {
+            continue;
+        }
+        let mut p = start;
+        while p < end && found < 64 {
+            let n = (end - p).min(chunk.len() * 8);
+            // Pages never touched would take minutes to read in huge reservations.
+            if resident(p, n) && read_into(p, &mut chunk[..n / 8]) {
+                for (i, &w) in chunk[..n / 8].iter().enumerate() {
+                    // Not our own buffer or locals.
+                    let own = chunk.as_ptr_range();
+                    let near_stack = (p + 8 * i).abs_diff(&raw const found as usize) < 0x1_0000;
+                    if values.contains(&w)
+                        && !own.contains(&((p + 8 * i) as *const u64))
+                        && !near_stack
+                    {
+                        let hit = p + 8 * i;
+                        let words: Vec<String> = (0..32)
+                            .map(|k| {
+                                read_checked(hit + 8 * k).map_or("-".into(), |x| format!("{x:x}"))
+                            })
+                            .collect();
+                        tracing::warn!("qword {w:#x} at {hit:#x}: {}", words.join(" "));
+                        found += 1;
+                    }
+                }
+            }
+            p += n;
+        }
+    }
+    tracing::warn!("qwords {values:x?}: {found} found");
+}
+
+/// Whether any page of the range is in memory.
+fn resident(at: usize, len: usize) -> bool {
+    unsafe extern "C" {
+        fn mincore(addr: *const std::ffi::c_void, len: usize, vec: *mut u8) -> i32;
+    }
+    let mut pages = vec![0u8; len.div_ceil(0x1000)];
+    // SAFETY: `pages` has one byte per page of the range.
+    unsafe {
+        mincore(at as *const _, len, pages.as_mut_ptr()) == 0 && pages.iter().any(|&b| b & 1 != 0)
+    }
+}
+
+/// Reads `out.len()` qwords from `at`, if the kernel can.
+fn read_into(at: usize, out: &mut [u64]) -> bool {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_read_overwrite(
+            task: u32,
+            address: u64,
+            size: u64,
+            data: u64,
+            out: *mut u64,
+        ) -> i32;
+    }
+    let mut got = 0u64;
+    let size = (out.len() * 8) as u64;
+    // SAFETY: `out` is that many writable bytes; the kernel checks the source.
+    let r = unsafe {
+        mach_vm_read_overwrite(
+            mach_task_self_,
+            at as u64,
+            size,
+            out.as_mut_ptr() as u64,
+            &mut got,
+        )
+    };
+    r == 0 && got == size
 }
 
 /// A qword at `at`, if the kernel says it can be read.

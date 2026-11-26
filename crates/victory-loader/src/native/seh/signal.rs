@@ -121,8 +121,99 @@ fn clzero_loop_limit(code: &[u8]) -> Option<usize> {
     (rex & 0xFB == 0x48 && modrm >> 6 == 3 && modrm & 7 == 0 && rex & 1 == 0).then_some(reg)
 }
 
+/// The thread-state slot (macOS order: rax rbx rcx rdx rdi rsi rbp rsp r8..r15) of a
+/// register by its x86 encoding number.
+fn slot(reg: usize) -> usize {
+    [0, 2, 3, 1, 7, 6, 5, 4].get(reg).copied().unwrap_or(reg)
+}
+
+/// For a cache line write-back loop, `clwb [p]` or `clflushopt [p]`; `add p, 0x40`;
+/// `cmp p, limit`; `jbe` or `jb` back: the registers (encoding numbers) of `p` and the
+/// limit, whether the limit is inclusive (`jbe`), and the loop's length. The title
+/// flushes buffers of many megabytes this way, one signal per line without this.
+fn cache_hint_loop(code: &[u8]) -> Option<(usize, usize, bool, usize)> {
+    let hint = cache_hint_len(code)?;
+    let rex_b = usize::from(hint == 5 && code[1] & 1 != 0);
+    let modrm = code[hint - 1];
+    if modrm >> 6 != 0 || matches!(modrm & 7, 4 | 5) {
+        return None;
+    }
+    let p = modrm as usize & 7 | rex_b << 3;
+    let rest = code.get(hint..hint + 9)?;
+    let w = 0x48 | rex_b as u8;
+    let [add_rex, 0x83, add, 0x40, cmp_rex, 0x39, cmp, jump, back] = *rest else {
+        return None;
+    };
+    let limit = usize::from(cmp >> 3 & 7) | usize::from(cmp_rex & 4) << 1;
+    let ok = add_rex == w
+        && add == 0xC0 | (p & 7) as u8
+        && cmp_rex & 0xFB == w
+        && cmp >> 6 == 3
+        && usize::from(cmp & 7) == p & 7
+        && matches!(jump, 0x72 | 0x76)
+        && back as i8 as isize == -((hint + 9) as isize);
+    ok.then_some((p, limit, jump == 0x76, hint + 9))
+}
+
 /// Instructions emulated so far (`clzero`), for the thread dump.
 pub static EMULATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Runs an SSE4a `insertq` or `extrq` (AMD, not in Rosetta; register forms
+/// only, as the instructions have no others) at the start of `code` on the
+/// 16 XMM registers, and returns its length. The upper halves of the
+/// destination are undefined after them; they are left as they were.
+fn sse4a(code: &[u8], xmm: &mut [[u8; 16]; 16]) -> Option<usize> {
+    let insert = match code.first()? {
+        0xF2 => true,
+        0x66 => false,
+        _ => return None,
+    };
+    let mut i = 1;
+    let rex = code
+        .get(i)
+        .filter(|b| *b & 0xF0 == 0x40)
+        .copied()
+        .unwrap_or(0);
+    i += usize::from(rex != 0);
+    let op = match code.get(i..i + 2)? {
+        [0x0F, op @ (0x78 | 0x79)] => *op,
+        _ => return None,
+    };
+    let modrm = *code.get(i + 2)?;
+    if modrm >> 6 != 3 {
+        return None;
+    }
+    let reg = usize::from(modrm >> 3 & 7 | (rex & 4) << 1);
+    let rm = usize::from(modrm & 7 | (rex & 1) << 3);
+    let low = |r: &[u8; 16]| u64::from_le_bytes(r[..8].try_into().unwrap());
+    let (dst, len, idx, value, size) = match (insert, op) {
+        (true, 0x78) => (
+            reg,
+            *code.get(i + 3)?,
+            *code.get(i + 4)?,
+            low(&xmm[rm]),
+            i + 5,
+        ),
+        (true, _) => (reg, xmm[rm][8], xmm[rm][9], low(&xmm[rm]), i + 3),
+        (false, 0x78) if reg & 7 == 0 => (rm, *code.get(i + 3)?, *code.get(i + 4)?, 0, i + 5),
+        (false, 0x79) => (reg, xmm[rm][0], xmm[rm][1], 0, i + 3),
+        _ => return None,
+    };
+    let (len, idx) = (u32::from(len & 63), u32::from(idx & 63));
+    let mask = if len == 0 {
+        u64::MAX
+    } else {
+        (1u64 << len) - 1
+    };
+    let old = low(&xmm[dst]);
+    let new = if insert {
+        old & !mask.wrapping_shl(idx) | (value & mask).wrapping_shl(idx)
+    } else {
+        old.wrapping_shr(idx) & mask
+    };
+    xmm[dst][..8].copy_from_slice(&new.to_le_bytes());
+    Some(size)
+}
 
 /// Length of a `clwb` or `clflushopt` (66 [REX] 0F AE /6 or /7) at the start
 /// of `code`. Rosetta does not implement them; they only write a cache line
@@ -203,7 +294,7 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             // jb back` over thousands of lines: one signal per line is too
             // slow, so the whole loop is done here.
             if let Some(reg) = clzero_loop_limit(code) {
-                let limit = word(reg);
+                let limit = word(slot(reg));
                 rax += 64;
                 while rax < limit {
                     // SAFETY: the loop would have written each line.
@@ -228,6 +319,41 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             }
             // SAFETY: the saved rip, past the instruction.
             unsafe { mc.add(MC_THREAD + T_RIP * 8).cast::<u64>().write(rip + 3) };
+            return;
+        }
+        // The XMM registers in the float state's FXSAVE image (after its 8-byte header).
+        // SAFETY: 16 registers of 16 bytes at offset 160 of the image.
+        let xmm = unsafe { &mut *mc.add(MC_FLOAT + 8 + 160).cast::<[[u8; 16]; 16]>() };
+        if let Some(len) = sse4a(code, xmm) {
+            EMULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the saved rip, past the instruction.
+            unsafe {
+                mc.add(MC_THREAD + T_RIP * 8)
+                    .cast::<u64>()
+                    .write(rip + len as u64)
+            };
+            return;
+        }
+        if let Some((p, limit, inclusive, len)) = cache_hint_loop(code) {
+            // Write-backs do nothing here: the loop ends where it would have.
+            let (start, limit) = (word(slot(p)), word(slot(limit)));
+            let mut end = start.wrapping_add(64);
+            if inclusive && limit >= end {
+                end += (limit - end) / 64 * 64 + 64;
+            } else if !inclusive && limit > end {
+                end += (limit - end).div_ceil(64) * 64;
+            }
+            // SAFETY: inside the thread state.
+            unsafe {
+                let set = |i: usize, v: u64| mc.add(MC_THREAD + i * 8).cast::<u64>().write(v);
+                set(slot(p), end);
+                // The flags of its last `cmp p, limit`: not below, equal or above.
+                set(
+                    T_RFLAGS,
+                    word(T_RFLAGS) & !0x8d5 | u64::from(end == limit) << 6 | 0x2,
+                );
+                set(T_RIP, rip + len as u64);
+            }
             return;
         }
         if let Some(len) = cache_hint_len(code) {
@@ -376,7 +502,60 @@ unsafe fn chain(signal: i32, info: *mut u8, uc: *mut u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_hint_len, clzero_loop_limit};
+    use super::{cache_hint_len, cache_hint_loop, clzero_loop_limit, sse4a};
+
+    #[test]
+    fn cache_hint_loops_are_recognised() {
+        // clwb [rax]; add rax, 0x40; cmp rax, rcx; jbe back
+        let rax = [
+            0x66, 0x0F, 0xAE, 0x30, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xC8, 0x76, 0xF3,
+        ];
+        assert_eq!(cache_hint_loop(&rax), Some((0, 1, true, 13)));
+        // clwb [r9]; add r9, 0x40; cmp r9, rax; jbe back
+        let r9 = [
+            0x66, 0x41, 0x0F, 0xAE, 0x31, 0x49, 0x83, 0xC1, 0x40, 0x49, 0x39, 0xC1, 0x76, 0xF2,
+        ];
+        assert_eq!(cache_hint_loop(&r9), Some((9, 0, true, 14)));
+        let mut other = rax;
+        other[12] = 0xF0; // jumps elsewhere
+        assert_eq!(cache_hint_loop(&other), None);
+        assert_eq!(cache_hint_loop(&rax[..12]), None);
+    }
+
+    #[test]
+    fn sse4a_inserts_and_extracts() {
+        let mut xmm = [[0u8; 16]; 16];
+        xmm[0] = [0xFF; 16];
+        xmm[1][..8].copy_from_slice(&0x1234u64.to_le_bytes());
+        // insertq xmm0, xmm1, 0x10, 0x10: bits 16..32 of xmm0 = low 16 of xmm1.
+        assert_eq!(
+            sse4a(&[0xF2, 0x0F, 0x78, 0xC1, 0x10, 0x10, 0x90], &mut xmm),
+            Some(6)
+        );
+        assert_eq!(xmm[0][..8], 0xFFFF_FFFF_1234_FFFFu64.to_le_bytes());
+        assert_eq!(xmm[0][8..], [0xFF; 8]);
+        // extrq xmm0, 8, 16 (66 0F 78 /0): bits 16..24 to the bottom.
+        assert_eq!(
+            sse4a(&[0x66, 0x0F, 0x78, 0xC0, 0x08, 0x10], &mut xmm),
+            Some(6)
+        );
+        assert_eq!(xmm[0][..8], 0x34u64.to_le_bytes());
+        // insertq xmm9, xmm2 (F2 44 0F 79 CA): length and index from xmm2[64..80].
+        xmm[2] = [0; 16];
+        xmm[2][..8].copy_from_slice(&0xABu64.to_le_bytes());
+        xmm[2][8] = 8;
+        xmm[2][9] = 4;
+        assert_eq!(sse4a(&[0xF2, 0x44, 0x0F, 0x79, 0xCA], &mut xmm), Some(5));
+        assert_eq!(xmm[9][..8], 0xAB0u64.to_le_bytes());
+        // A length of 0 means 64.
+        assert_eq!(
+            sse4a(&[0xF2, 0x0F, 0x78, 0xD9, 0x00, 0x00], &mut xmm),
+            Some(6)
+        );
+        assert_eq!(xmm[3][..8], 0x1234u64.to_le_bytes());
+        assert_eq!(sse4a(&[0xF2, 0x0F, 0x78, 0x01, 0x10, 0x10], &mut xmm), None); // memory form
+        assert_eq!(sse4a(&[0x66, 0x0F, 0x78, 0xC8, 0x10, 0x10], &mut xmm), None); // extrq /1
+    }
 
     #[test]
     fn the_clzero_loop_is_recognised() {

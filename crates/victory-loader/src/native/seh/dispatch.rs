@@ -371,6 +371,9 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
+            if r.code == 0x8000_0003 {
+                super::super::dump::report_at_break();
+            }
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
             // the faulting image.
             if let (Ok(list), Some(base)) = (
