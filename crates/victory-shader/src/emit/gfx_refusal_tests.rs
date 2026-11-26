@@ -2021,3 +2021,49 @@ fn indexed_table_buffers_without_a_stride_use_the_view_stride_table() {
         assert!(!l.dxil.is_empty());
     }
 }
+
+/// A compute program adds dword 2 of 4-dword root constants (s6) to a 1-dword constant (s2) and
+/// stores the sum through the table two slots on (s8): each read names its parameter and dword.
+/// Without the root signature the 4-dword block is guessed one dword (no slot 2), so s6 is
+/// refused.
+#[test]
+fn compute_root_constants_reach_the_user_data() {
+    use crate::native::tests::{fspx_resource, fspx_with, rts0};
+    let code = bytes_of(&[
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xF408_0304,
+        0xFA00_0000, // s_load_dwordx4 s[12:15], s[8:9], 0x0
+        0x7E00_0206, // v_mov_b32 v0, s6
+        0x4A00_0002, // v_add_nc_u32 v0, s2, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000,
+        0x8003_0001, // buffer_store_dword v0, v1, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let records = [
+        fspx_resource(2, 0, 0, 0, 2, 0),
+        fspx_resource(2, 0, 0, 1, 4, 1),
+        fspx_resource(3, 3, 0, 0, 8, 3),
+    ];
+    let container = |root: Option<&[u8]>| {
+        let part = fspx_with(&code, 9 << 1, [64, 1, 1], true, &records, root);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let root = rts0(&[(1, 1), (1, 4), (0, 0), (0, 0)]);
+    let shader = translate_with(&container(Some(&root)), Options::default()).unwrap();
+    let reads: Vec<_> = shader
+        .user_data
+        .iter()
+        .map(|u| (u.index, u.slot, u.root, u.dword))
+        .collect();
+    for read in [
+        (2, 0, RootType::Constants, 0),
+        (6, 1, RootType::Constants, 2),
+        (8, 3, RootType::Table, 0),
+    ] {
+        assert!(reads.contains(&read), "{reads:?}");
+    }
+    let err = translate_with(&container(None), Options::default()).unwrap_err();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
