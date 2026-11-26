@@ -93,8 +93,8 @@ fn map_imports(
 }
 
 /// The file called `name` in `dir`, whatever its case (volumes can be case
-/// sensitive; imports are not).
-fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+/// sensitive; imports and the title's manifest name are not).
+pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let direct = dir.join(name);
     if direct.is_file() {
         return Some(direct);
@@ -226,5 +226,26 @@ impl ImportResolver for WithTitleDlls<'_> {
             Resolution::Missing => self.lookup_in_dlls(dll, symbol, 0),
             found => found,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_found_whatever_its_case_and_only_if_it_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MSVCP140.DLL"), b"").unwrap();
+        std::fs::write(dir.path().join("microsoftgame.config"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("bink2scarlett.dll")).unwrap();
+
+        let found = find_file(dir.path(), "msvcp140.dll").unwrap();
+        assert!(found.is_file());
+        let config = find_file(dir.path(), "MicrosoftGame.config").unwrap();
+        assert!(config.is_file());
+        assert_eq!(find_file(dir.path(), "vcruntime140.dll"), None);
+        // A folder of that name is not the DLL.
+        assert_eq!(find_file(dir.path(), "bink2scarlett.dll"), None);
     }
 }
