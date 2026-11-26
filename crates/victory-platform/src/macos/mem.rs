@@ -252,6 +252,22 @@ pub unsafe fn reserve_in(
     len: usize,
     align: usize,
 ) -> io::Result<*mut u8> {
+    // A gap the walk sees as free may not be (a test binary's page zero is
+    // not a region): the next one up then.
+    let mut from = lowest;
+    while let Some(start) = free_gap(from, highest, len, align) {
+        // SAFETY: the gap is free as far as the region walk saw; FIXED fails if not.
+        if let Ok(p) = unsafe { reserve(Some(start), len) } {
+            return Ok(p);
+        }
+        from = start + align.max(page_size());
+    }
+    Err(io::Error::other("no free address range below the limit"))
+}
+
+/// The lowest address at or above `lowest`, a multiple of `align`, where
+/// `len` bytes lie free and end at or below `highest`.
+fn free_gap(lowest: usize, highest: usize, len: usize, align: usize) -> Option<usize> {
     // Walk the mapped regions for the first gap that fits: the kernel's own
     // "anywhere" placement ignores the hint when the process is full of
     // libraries (a window brings Metal's) and lands above `highest`.
@@ -259,20 +275,13 @@ pub unsafe fn reserve_in(
     let up = |a: usize| a.checked_add(align - 1).map(|v| v & !(align - 1));
     let mut at = up(lowest);
     while let Some(start) = at {
-        let end = start.checked_add(len).filter(|&e| e - 1 <= highest);
-        let Some(end) = end else { break };
+        let end = start.checked_add(len).filter(|&e| e - 1 <= highest)?;
         match next_region(start) {
             Some(r) if r.base < end => at = up(r.base + r.len),
-            _ => {
-                // SAFETY: the gap is free as far as the region walk saw; FIXED fails if not.
-                if let Ok(p) = unsafe { reserve(Some(start), len) } {
-                    return Ok(p);
-                }
-                at = up(end);
-            }
+            _ => return Some(start),
         }
     }
-    Err(io::Error::other("no free address range below the limit"))
+    None
 }
 
 /// The process's memory footprint in bytes (what the system charges it for).
@@ -426,35 +435,40 @@ impl PagePool {
         if offset.checked_add(len).is_none_or(|end| end > self.len) {
             return Err(io::Error::other("range outside the page pool"));
         }
-        let mut addr = at.unwrap_or(0) as u64;
-        let flags = if at.is_some() {
-            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE
-        } else {
-            VM_FLAGS_ANYWHERE
+        let try_map = |at: u64, flags: i32, mask: u64| -> io::Result<*mut u8> {
+            let mut addr = at;
+            // SAFETY: maps our own memory entry; FIXED|OVERWRITE replaces the
+            // caller's range, which the caller guaranteed.
+            check("mach_vm_map", unsafe {
+                mach_vm_map(
+                    task(),
+                    &mut addr,
+                    len as u64,
+                    mask,
+                    flags,
+                    self.entry,
+                    offset as u64,
+                    0,
+                    prot.0 as i32,
+                    VM_PROT_READ | VM_PROT_WRITE,
+                    VM_INHERIT_NONE,
+                )
+            })?;
+            Ok(addr as *mut u8)
         };
-        // SAFETY: maps our own memory entry; FIXED|OVERWRITE replaces the
-        // caller's range, which the caller guaranteed.
-        check("mach_vm_map", unsafe {
-            mach_vm_map(
-                task(),
-                &mut addr,
-                len as u64,
-                // 16 KiB aligned anywhere, also under Rosetta (4 KiB there).
-                if at.is_some() {
-                    0
-                } else {
-                    KERNEL_PAGE as u64 - 1
-                },
-                flags,
-                self.entry,
-                offset as u64,
-                0,
-                prot.0 as i32,
-                VM_PROT_READ | VM_PROT_WRITE,
-                VM_INHERIT_NONE,
-            )
-        })?;
-        Ok(addr as *mut u8)
+        if let Some(at) = at {
+            return try_map(at as u64, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, 0);
+        }
+        // A mapping of our own goes above 4 GiB, which the kernel does not
+        // do by itself: the low 4 GiB is where 32-bit `XMemAlloc` memory
+        // must come from, and gigabytes of pool bases would fill it.
+        if let Some(high) = free_gap(1 << 32, 1 << 46, len, KERNEL_PAGE)
+            && let Ok(p) = try_map(high as u64, VM_FLAGS_FIXED, 0)
+        {
+            return Ok(p);
+        }
+        // 16 KiB aligned anywhere, also under Rosetta (4 KiB there).
+        try_map(0, VM_FLAGS_ANYWHERE, KERNEL_PAGE as u64 - 1)
     }
 
     /// Maps `[offset, offset + len)` at `at`, in place of what is there (a
