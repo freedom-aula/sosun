@@ -1014,7 +1014,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
 
 /// `ExecuteIndirect` of a single-command signature without a count buffer: `max` draws or
 /// dispatches, record `i` at title address `records + i * stride`, each read on the GPU. False
-/// when the host cannot run it (mesh dispatches, rectangle lists); the caller logs that.
+/// when the host cannot run it (mesh dispatches); the caller logs that. Rectangle lists drop here.
 pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, stride: u32, max: u32, records: u64) -> bool {
     use crate::signature::Command;
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
@@ -1039,7 +1039,10 @@ pub(crate) fn execute_indirect(this: This, command: crate::signature::Command, s
             with_list(this, |t, l| match graphics(t, l) {
                 // shortcut: a rectangle list's records count vertices of three-corner rectangles;
                 // drawing them needs the counts rewritten on the GPU first.
-                Some(true) => false,
+                Some(true) => {
+                    dropped("an indirect rectangle-list draw");
+                    true
+                }
                 Some(false) => {
                     for i in 0..max {
                         match l.list.draw_indirect(at(i), command == Command::DrawIndexed) {
