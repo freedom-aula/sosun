@@ -943,3 +943,42 @@ native Metal host serves no view addresses or formats to shaders, and would have
 (`victory-gpu`) checks the refusal on the native host's own path: the container made from the
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
+
+## Reverb and convolution DSP (`chad.dll`), a CPU fallback (`VICTORY_GUESS_DSP=1`)
+
+The title's audio DSP coprocessor convolves blocks of float samples with an impulse response
+(`crates/victory-hle/src/modules/dsp.rs`). `XDspActivate`'s `StreamDesc::ir` holds that response,
+but in the hardware's own partitioned frequency-domain layout, which is not documented anywhere
+we have found, so it is not read. Issue #17: outputs were always zeroed, so reverb and
+convolution effects played back silent (dry sound, which does not go through this path, was
+unaffected).
+
+Guess, marked in code (`synthetic_ir`, `convolve_merged`), off by default behind
+`VICTORY_GUESS_DSP=1` since it is unverified against a real run (without the variable, behaviour
+is unchanged: silence, as before): a convolution stream (`StreamDesc::kind == CONVOLUTION`) gets a
+fixed, deterministic ~100 ms (4,800 tap at 48 kHz) synthetic decaying-noise impulse, unrelated to
+the title's own response, convolved with the input per channel and scaled by the command's
+`gains`. `gains` is itself a second guess: it is read as one gain per output channel, as likely to
+actually be `[dry, wet]`, in which case a mono stream's second element is never read.
+
+The tail is carried across blocks (`Stream::history`, the last `ir.len() - 1` frames of input,
+fed back in as the start of the next block) rather than reset at every boundary, so a continuous
+input does not click at the block rate. This is still a CPU-fallback coloration, not the title's
+actual reverb: a real room's decay is 300 ms or more, well past what a per-sample scalar
+convolution can do without an FFT-based engine. `Stream::scratch` is reused every call instead of
+allocating, and the title's input is always copied into it before any write to the output buffer,
+in case the two happen to alias.
+
+`VICTORY_TRACE_DSP=1` logs the leading floats of a convolution stream's own `StreamDesc::ir` at
+activation (`trace_ir`). It exists to let a future run with the real game settle what format that
+data is actually in (time-domain samples, in which case `ir_floats` for a given `ir_seconds` would
+land near `ir_seconds * 48000`, or something else) and replace this guess with the real thing.
+
+Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
+`convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
+hand-computed values), `a_block_split_matches_one_convolution_over_the_whole_signal` (splitting one
+signal into two blocks and carrying history gives the same result as convolving it in one go — the
+property that stops the tail from clicking at block boundaries), and
+`convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
+`VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
+input).

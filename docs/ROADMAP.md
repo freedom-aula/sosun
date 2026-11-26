@@ -51,7 +51,7 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 
 ## 5. Everything after that
 
-- Reverb: the audio DSP's convolution is not emulated, so reverb returns are silent ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)).
+- Reverb: the audio DSP's convolution has a synthetic CPU fallback behind `VICTORY_GUESS_DSP=1` (a fixed decaying-noise tail, not the title's own impulse response); default behaviour is unchanged (silence) until a real run judges whether it sounds right ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)). The hardware's impulse-response layout is still undocumented; `VICTORY_TRACE_DSP=1` logs the title's own `ir` data to help settle it.
 - The Brightness logo draws as half a rectangle ([#16](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/16)).
 - Mesh-shader pipelines: indirect mesh dispatches still drop.
 - Culling, depth, stencil and write mask in guessed pipelines are still partly guessed.
