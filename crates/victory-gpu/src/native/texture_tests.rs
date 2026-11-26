@@ -108,10 +108,15 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
     }
 }
 
+/// Held by the tests that count on a texture staying hot: the many submissions of
+/// `a_texture_blank_for_thousands_of_submissions_is_still_probed` cool every other test's textures.
+static AGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A texture uploaded blank and written whole later (a movie's planes) is uploaded again at the
 /// next submission, not a scanner round later (a round is seconds long once the title streams).
 #[test]
 fn a_texture_uploaded_blank_is_probed_at_each_submission() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     // 256 KiB: 64 pages, more than a sampling probe reads.
     let Some(pool) = pool(9105, (256 << 10) / page_size() + 1) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
@@ -135,11 +140,66 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     });
 }
 
+/// A texture uploaded blank stays hot however long it stays blank: the boot movie's planes are
+/// made about 40 s (thousands of submissions) before the movie decodes into them, and once cold
+/// their first frames waited seconds for the scanner (green).
+#[test]
+fn a_texture_blank_for_thousands_of_submissions_is_still_probed() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pool) = pool(9123, (256 << 10) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    with_title(|t| {
+        assert!(t.realize(key));
+        for _ in 0..2000 {
+            t.sync_dirty();
+        }
+        assert_eq!(t.uploads_of(key), 1, "the blank first upload");
+    });
+    pool.write(0, &vec![0xABu8; info.size]);
+    // Within a few submissions: other tests' blank textures share the probe's time budget.
+    with_title(|t| {
+        let n = (1..=4).find(|_| {
+            t.sync_dirty();
+            t.uploads_of(key) == 2
+        });
+        assert!(n.is_some(), "the first frame is uploaded within a few submissions");
+    });
+}
+
+/// A texture rewritten whole (a movie's chroma plane) is not read whole at every submission, yet
+/// a small write its samples miss is still seen within `WHOLE_EVERY` submissions, and from then
+/// on at the next one (a glyph atlas).
+#[test]
+fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pool) = pool(9124, (256 << 10) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    let sync = || with_title(|t| { t.sync_dirty(); t.uploads_of(key) }).unwrap();
+    with_title(|t| assert!(t.realize(key)));
+    assert_eq!(sync(), 1, "the blank first upload");
+    for (i, n) in [(1u8, 2), (2, 3), (3, 4)] {
+        pool.write(0, &vec![i; info.size]);
+        assert_eq!(sync(), n, "a whole rewrite is seen by the samples at once");
+        sync();
+    }
+    // A glyph's worth of bytes in page 3 (a page the samples skip).
+    pool.write(3 * 4096 + 100, &[9u8; 16]);
+    let n = (1..=crate::native::textures::WHOLE_EVERY + 1).find(|_| sync() == 5);
+    assert!(n.is_some(), "a write the samples miss is seen within a whole-read period");
+    pool.write(5 * 4096 + 100, &[9u8; 16]);
+    assert_eq!(sync(), 6, "and the next one at the next submission");
+}
+
 /// A movie plane uploaded blank among hundreds of other hot textures (a title streaming) is still
 /// probed at the next submission: a count limit on the probes left its first frames green.
 /// (Every texture is written, so which one a limited probe reaches first does not matter.)
 #[test]
 fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     const N: usize = 200;
     const STRIDE: usize = 64 << 10;
     let Some(pool) = pool(9121, N * STRIDE / page_size() + 1) else { return };

@@ -193,20 +193,28 @@ pub struct Tracked<B: ResourceBackend> {
     /// scanner (0: cold), and the hash of what the last probe read.
     hot: u32,
     probe: Option<blake3::Hash>,
+    /// Whether its writes show in the sampled probe (a movie's planes, rewritten whole): then it is
+    /// read whole only every `WHOLE_EVERY` probes, and probes skipped since. A change the samples
+    /// missed clears it.
+    sampled_sees_writes: bool,
+    skipped: u32,
+    /// Its last upload was all zeros: it is probed (`Title::blank_keys`) until written, however
+    /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
+    /// them; once left to the scanner, their first frames showed green for a second or two).
+    blank: bool,
 }
 
-/// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
-/// further change.
+/// Submissions a texture whose memory changed stays hot without a further change.
 const HOT: u32 = 600;
-/// Time one submission spends probing hot textures. Boot movies and UI glyph caches have a few
-/// hundred hot textures (the movie's planes among them, blank until the title decodes into them),
-/// all of which a submission must reach: a count limit left a plane's first frames unseen (solid
-/// green) for hot / limit submissions. When world streaming realizes thousands of blank textures
-/// the time bounds the probing and the cursor resumes where the last submission stopped, while
-/// the scanner thread catches the rest off the host lock.
+/// Time one submission spends probing hot textures, and again blank ones. Boot movies and UI
+/// glyph caches have a few hot textures and a few hundred blank ones (the movie's planes among
+/// them, blank until the title decodes into them), all of which a submission must reach: a count
+/// limit left a plane's first frames unseen (solid green). When world streaming realizes thousands
+/// of blank textures the time bounds the probing and the cursor resumes where the last submission
+/// stopped, while the scanner thread catches the rest off the host lock.
 ///
-/// shortcut: past a few thousand hot textures a write is noticed a few submissions late (unless
-/// the scanner catches it first); at least `MIN_SYNC_HOT` are probed whatever the time.
+/// shortcut: past a few thousand blank textures a write is noticed a few submissions late (unless
+/// the scanner catches it first); at least `MIN_SYNC_HOT` of each are probed whatever the time.
 const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 /// Hot textures a submission probes at least, however long the probes take.
 const MIN_SYNC_HOT: usize = 32;
@@ -219,13 +227,43 @@ const PROBE_SAMPLE: usize = 256;
 /// probing all of them whole looked about 15% slower in one run.
 const PROBE_WHOLE: usize = 4 << 20;
 
-/// Hash of the bytes a probe of `size` bytes at `at` reads: all of them if `whole`, else
+/// A hot texture whose writes show in its samples is read whole once in this many probes, to
+/// catch the write that misses them (a glyph added to an atlas a movie-like rewrite went through).
+/// Reading the movie's chroma planes whole at every submission cost 15 ms a submission, halving
+/// the movie's frame rate.
+pub(super) const WHOLE_EVERY: u32 = 8;
+
+/// Hash of the bytes a probe of `size` bytes at `at` reads ([`probe_read`]).
+fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    probe_read(at, size, whole, scratch, |b| {
+        hasher.update(b);
+    });
+    hasher.finalize()
+}
+
+/// Whether the `PROBE_SAMPLE` bytes in the middle of the `size` bytes at `at` are not all zero:
+/// a blank texture's probe, one read (a few hundred blank textures are probed every submission).
+///
+/// shortcut: a first write that misses the middle (a glyph in a blank atlas) waits for the
+/// scanner; textures written whole (streaming, a movie's planes) are seen at once.
+fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
+    let off = (size / 2) & !4095;
+    let n = PROBE_SAMPLE.min(size - off);
+    if scratch.len() < n {
+        scratch.resize(n, 0);
+    }
+    scratch[..n].fill(0);
+    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+    scratch[..n].iter().any(|&b| b != 0)
+}
+
+/// Hands `seen` the bytes a probe of `size` bytes at `at` reads: all of them if `whole`, else
 /// `PROBE_PAGES` samples of `PROBE_SAMPLE` bytes spread across the texture, reusing `scratch`.
 ///
 /// shortcut: when sampled, a write that misses every sampled window goes unseen until the
 /// scanner's next round; a texture the title rewrites whole (a movie's planes) is caught at once.
-fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> blake3::Hash {
-    let mut hasher = blake3::Hasher::new();
+fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut seen: impl FnMut(&[u8])) {
     if whole || size <= PROBE_PAGES * PROBE_SAMPLE {
         const CHUNK: usize = 1 << 20;
         let cap = size.min(CHUNK);
@@ -236,9 +274,9 @@ fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> bla
             let n = CHUNK.min(size - off);
             scratch[..n].fill(0);
             let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
-            hasher.update(&scratch[..n]);
+            seen(&scratch[..n]);
         }
-        return hasher.finalize();
+        return;
     }
     const PAGE: usize = 4096;
     let pages = size.div_ceil(PAGE);
@@ -250,9 +288,81 @@ fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> bla
         let n = PROBE_SAMPLE.min(size - off);
         scratch[..n].fill(0);
         let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
-        hasher.update(&scratch[..n]);
+        seen(&scratch[..n]);
     }
-    hasher.finalize()
+}
+
+/// Probes `keys` round-robin from `cursor`, each at most once, until `until` once
+/// `MIN_SYNC_HOT` were probed; those whose memory changed go to `dirty`. Hot textures that stay
+/// unchanged cool down and leave; blank ones (`blank`) stay until they are written.
+fn probe_round<B: ResourceBackend>(
+    textures: &mut Textures<B>,
+    keys: &mut Vec<usize>,
+    cursor: &mut usize,
+    until: std::time::Instant,
+    blank: bool,
+    scratch: &mut Vec<u8>,
+    dirty: &mut std::collections::HashSet<usize>,
+) {
+    let mut left = keys.len();
+    let mut probed = 0;
+    while left > 0 && !keys.is_empty() {
+        if probed >= MIN_SYNC_HOT && std::time::Instant::now() >= until {
+            break;
+        }
+        left -= 1;
+        let idx = *cursor % keys.len();
+        let key = keys[idx];
+        let Some(t) = textures.get_mut(&key).filter(|t| if blank { t.blank } else { t.hot > 0 }) else {
+            keys.swap_remove(idx);
+            continue;
+        };
+        probed += 1;
+        let at = t.info.memory as usize;
+        let leave = if blank {
+            // Written at last.
+            let written = probe_nonzero(at, t.info.size, scratch);
+            if written {
+                dirty.insert(key);
+                t.blank = false;
+            }
+            written
+        } else {
+            let sampled = probe_hash(at, t.info.size, false, scratch);
+            let before = t.probe.replace(sampled);
+            let mut changed = before != Some(sampled);
+            if changed && before.is_some() {
+                // Its writes reach the samples (a movie's planes): no need to read it whole.
+                t.sampled_sees_writes = true;
+            }
+            if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
+                t.skipped = if t.sampled_sees_writes { t.skipped + 1 } else { WHOLE_EVERY };
+                if t.skipped >= WHOLE_EVERY {
+                    t.skipped = 0;
+                    // The same hash as the upload's (`last`): what the GPU has.
+                    changed = t.last != Some(probe_hash(at, t.info.size, true, scratch));
+                    if changed {
+                        // A write the samples missed (a glyph): read it whole every time again.
+                        t.sampled_sees_writes = false;
+                    }
+                }
+            }
+            if changed {
+                dirty.insert(key);
+            } else {
+                t.hot -= 1;
+            }
+            if t.hot == 0 {
+                t.probe = None;
+            }
+            t.hot == 0
+        };
+        if leave {
+            keys.swap_remove(idx);
+        } else {
+            *cursor = idx + 1;
+        }
+    }
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -329,6 +439,9 @@ impl<B: PresentBackend> Title<B> {
                 uploads: 0,
                 hot: 0,
                 probe: None,
+                sampled_sees_writes: false,
+                skipped: 0,
+                blank: false,
             },
         );
         true
@@ -355,6 +468,7 @@ impl<B: PresentBackend> Title<B> {
         self.pending.remove(&key);
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
+        self.blank_keys.retain(|&k| k != key);
         watch(|w| {
             w.entries.remove(&key);
             w.dirty.remove(&key);
@@ -377,43 +491,20 @@ impl<B: PresentBackend> Title<B> {
     /// found changed since.
     pub fn sync_dirty(&mut self) {
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
-        // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
-        // a time budget so world streaming (thousands of blank textures) never stalls submissions.
-        let start = std::time::Instant::now();
-        let mut budget = self.hot_keys.len();
-        let mut probed = 0;
-        while budget > 0 && !self.hot_keys.is_empty() {
-            if probed >= MIN_SYNC_HOT && start.elapsed() >= PROBE_BUDGET {
-                break;
-            }
-            budget -= 1;
-            probed += 1;
-            let idx = self.hot_cursor % self.hot_keys.len();
-            let key = self.hot_keys[idx];
-            let Some(t) = self.textures.get_mut(&key) else {
-                self.hot_keys.swap_remove(idx);
-                continue;
-            };
-            if t.hot == 0 {
-                self.hot_keys.swap_remove(idx);
-                continue;
-            }
-            let whole = t.uploads >= 2 && t.info.size <= PROBE_WHOLE;
-            let now = probe_hash(t.info.memory as usize, t.info.size, whole, &mut self.probe_buf);
-            let before = t.probe.replace(now);
-            if before != Some(now) {
-                dirty.insert(key);
-                self.hot_cursor = idx + 1;
-            } else {
-                t.hot -= 1;
-                if t.hot == 0 {
-                    t.probe = None;
-                    self.hot_keys.swap_remove(idx);
-                } else {
-                    self.hot_cursor = idx + 1;
-                }
+        for key in &dirty {
+            // Missed by the sampled probe, so read it whole while it stays hot.
+            if let Some(t) = self.textures.get_mut(key) {
+                t.sampled_sees_writes = false;
             }
         }
+        // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
+        // a time budget so world streaming (thousands of blank textures) never stalls submissions;
+        // the ones that changed lately first, then the blank ones.
+        let until = std::time::Instant::now() + PROBE_BUDGET;
+        probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
+        // The blank ones get a budget of their own: a busy movie must not starve its next planes.
+        let until = std::time::Instant::now() + PROBE_BUDGET;
+        probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
         let unloaded = std::mem::take(&mut self.unloaded);
         if unloaded.is_empty() && dirty.is_empty() {
             return;
@@ -432,6 +523,7 @@ impl<B: PresentBackend> Title<B> {
             host,
             textures,
             hot_keys,
+            blank_keys,
             stats,
             ..
         } = self;
@@ -444,12 +536,18 @@ impl<B: PresentBackend> Title<B> {
             if t.last == Some(hash) {
                 continue;
             }
-            // Written again after its first upload, or blank at it (written later): hot.
-            if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
-                if t.hot == 0 {
-                    hot_keys.push(key);
+            let blank = tiled.iter().all(|&b| b == 0);
+            if !t.info.render_target() {
+                if blank && !t.blank {
+                    blank_keys.push(key);
+                } else if !blank && t.uploads > 0 {
+                    // Written again after its first upload: hot.
+                    if t.hot == 0 {
+                        hot_keys.push(key);
+                    }
+                    t.hot = HOT;
                 }
-                t.hot = HOT;
+                t.blank = blank;
             }
             match upload(&host.backend, &t.texture, &t.info, &tiled) {
                 Ok(()) => {

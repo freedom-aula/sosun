@@ -205,6 +205,9 @@ pub struct Title<B: PresentBackend> {
     pub(super) hot_keys: Vec<usize>,
     /// Round-robin cursor into `hot_keys` when the time budget ends before all are probed.
     pub(super) hot_cursor: usize,
+    /// Keys of textures whose last upload was blank, probed after `hot_keys` until written.
+    pub(super) blank_keys: Vec<usize>,
+    pub(super) blank_cursor: usize,
     /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
     pub(super) probe_buf: Vec<u8>,
     /// Where `Present` shows frames, if the app gave a layer.
@@ -236,6 +239,8 @@ impl<B: PresentBackend> Title<B> {
             unloaded: std::collections::HashSet::new(),
             hot_keys: Vec::new(),
             hot_cursor: 0,
+            blank_keys: Vec::new(),
+            blank_cursor: 0,
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
