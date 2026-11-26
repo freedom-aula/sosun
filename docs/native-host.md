@@ -525,6 +525,16 @@ shader in a root slot the title set nothing in. A title shader's metadata can
 name such a slot (255 observed); the host draws nothing for it, which is a
 fallback, not the console's behaviour.
 
+A third kind is dropped the same way: any command (draw, dispatch, copy, fill
+or value write) that names title memory outside every mapped pool ("title
+address ... is not in a mapped pool"). The GPU cannot reach that memory, so
+the command is still not encoded and causes no GPU fault, but the rest of the
+piece runs. Refusing the whole piece also dropped its valid dispatches, copies
+and value writes, so the title read their buffers stale (issue #15: 229 such
+refusals in one story load). These are counted per host
+(`NativeHost::unmapped`). The first one warns without any switch, as the
+refused piece did, and each one is logged at debug level with its address.
+
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).

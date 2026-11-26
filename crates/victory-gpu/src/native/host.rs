@@ -35,6 +35,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     unset_roots: std::cell::Cell<u64>,
     /// Draws and clears dropped because none of their targets has a host texture.
     no_targets: std::cell::Cell<u64>,
+    /// Commands dropped because they name title memory outside every mapped pool.
+    unmapped: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
 }
@@ -42,6 +44,10 @@ pub struct NativeHost<B: GraphicsBackend> {
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
 /// drops that draw or dispatch alone).
 const NEVER_SET: &str = "was never set";
+
+/// How the error of title memory outside every mapped pool ends ([`NativeHost::execute`] drops
+/// that command alone).
+const NOT_MAPPED: &str = "is not in a mapped pool";
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
@@ -123,6 +129,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
+            unmapped: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
         }
     }
@@ -135,6 +142,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Draws and dispatches dropped so far because they read a root parameter never set.
     pub fn unset_roots(&self) -> u64 {
         self.unset_roots.get()
+    }
+
+    /// Commands dropped so far because they name title memory outside every mapped pool.
+    pub fn unmapped(&self) -> u64 {
+        self.unmapped.get()
     }
 
     /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
@@ -156,7 +168,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let (pool, ptr) = self
             .memory
             .resolve(addr, len)
-            .ok_or_else(|| format!("title address {addr:#x}+{len:#x} is not in a mapped pool"))?;
+            .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}"))?;
         drop(buffers);
         Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
     }
@@ -974,6 +986,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             tracing::warn!(error = %e, "native host drops work: a draw or dispatch that reads a root parameter the title never set (first time)");
                         });
                     }
+                    dropped.push(c);
+                }
+                // The GPU cannot reach that memory, so the command is not encoded (no GPU fault),
+                // but the rest of the piece still runs: refusing it all dropped its valid
+                // dispatches, copies and value writes too, and the title read their buffers stale.
+                Err(e) if e.ends_with(NOT_MAPPED) => {
+                    self.unmapped.set(self.unmapped.get() + 1);
+                    // Logged without a switch, as the refused piece was: each one at debug level.
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
+                    });
+                    tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
                     dropped.push(c);
                 }
                 Err(e) => return Err(e),
