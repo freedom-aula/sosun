@@ -269,7 +269,7 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{time}_{n}.ppm")), out);
         }
     });
@@ -310,11 +310,11 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut px, w * 4, w * h * 4);
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}.ppm")), out);
             // The alpha channel as grey.
             let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
-            alpha.extend(px.chunks_exact(4).flat_map(|p| [p[3], p[3], p[3]]));
+            alpha.extend(px.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[3], p[3]]));
             let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_alpha.ppm")), alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }

@@ -615,7 +615,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
         let ppm = |name: String, w: usize, h: usize, px: &[u8], bgra: bool| {
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-            out.extend(px.chunks_exact(4).flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
+            out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
             let _ = std::fs::write(std::path::Path::new(&dir).join(name), out);
         };
         let kinds: Vec<String> = root
@@ -638,7 +638,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         let mut b = vec![0u8; (size as usize).min(1 << 16)];
                         let ok = super::safe_read(a as *const u8, &mut b);
                         let nz = b.iter().filter(|&&x| x != 0).count();
-                        let floats: Vec<f32> = b.chunks_exact(4).take(24).map(|w| f32::from_le_bytes(w.try_into().unwrap())).collect();
+                        let floats: Vec<f32> = b.as_chunks::<4>().0.iter().take(24).map(|w| f32::from_le_bytes(*w)).collect();
                         tracing::info!(draw = n, slot, entry = k, addr = format!("{a:#x}"), size, readable = ok, nonzero = nz, ?floats, "content: constant buffer");
                         continue;
                     }
@@ -717,7 +717,6 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heaps,
                 vertex,
                 index,
-                targets,
                 ..
             } => {
                 if !vertex.is_empty() {
