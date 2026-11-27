@@ -192,9 +192,10 @@ fn far_jump<'a>(
         return Ok(None);
     };
     let literal = i64::from(literal as i32);
-    // The inline high operand must sign-extend the low literal (0 or -1).
-    let extension = if literal < 0 { 0xC1 } else { 0x80 };
-    if src1(high) != extension {
+    // The high operand must sign-extend the low literal (0 or -1): inline, or as a literal
+    // (a relocated `@rel32@hi` stays a 32-bit literal even when it resolves to 0 or -1).
+    let (inline, extension) = if literal < 0 { (0xC1, u32::MAX) } else { (0x80, 0) };
+    if src1(high) != inline && !(src1(high) == 0xFF && high.words.get(1) == Some(&extension)) {
         return Ok(None);
     }
     let delta = match (low.name(), high.name()) {
@@ -504,6 +505,25 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    #[test]
+    fn follows_far_jump_with_a_literal_high_dword() {
+        let code = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            24,          // s_add_u32 s8, s8, 24  -> 4 + 24 = 28
+            0x8209_FF09,
+            0,           // s_addc_u32 s9, s9, 0 (as a literal)
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert!(summary(&code).iter().any(|i| i.0 == 28 && i.2 == "s_endpgm"));
+        // A literal high dword that does not sign-extend the low one is not a far jump.
+        let mut wrong = code;
+        wrong[4] = 1;
+        assert!(!summary(&wrong).iter().any(|i| i.0 == 28));
     }
 
     #[test]
