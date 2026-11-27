@@ -1,6 +1,0 @@
-LIBRARY victory-probe-host.dll
-EXPORTS
-ProbeSum8
-ProbeScale
-ProbeCall
-ProbeNotImplemented
