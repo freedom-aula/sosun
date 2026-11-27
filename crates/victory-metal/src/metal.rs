@@ -226,6 +226,7 @@ impl Metal {
 
     fn compute_from(
         &self,
+        crash_key: &str,
         converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
         layout: Option<&RootLayout>,
     ) -> Result<Pipeline, String> {
@@ -237,12 +238,11 @@ impl Metal {
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
+        let d = MTLComputePipelineDescriptor::new();
+        d.setComputeFunction(Some(&f));
         let p = match self.archive() {
-            Some(a) => a.compute(&self.dev, &f)?,
-            None => self
-                .dev
-                .newComputePipelineStateWithFunction_error(&f)
-                .map_err(|e| e.localizedDescription().to_string())?,
+            Some(a) => a.compute(&self.dev, &d, crash_key)?,
+            None => crate::archive::compile_compute(&self.dev, &d, crash_key)?,
         };
         Ok(Pipeline(p, self.static_samplers(layout)?))
     }
@@ -394,7 +394,11 @@ impl ComputeBackend for Metal {
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc()?.convert(dxil, None), None)
+        let crash_key = crate::disk::key(&[dxil]);
+        if crate::disk::crashed(crash_key.as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
+        self.compute_from(&crash_key, self.msc()?.convert(dxil, None), None)
     }
 
     fn create_compute_pipeline_with(
@@ -402,7 +406,12 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
+        let crash_key = crate::disk::key(&[dxil]);
+        if crate::disk::crashed(crash_key.as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
         self.compute_from(
+            &crash_key,
             self.msc()?.convert_with(dxil, None, Some(layout), false),
             Some(layout),
         )
