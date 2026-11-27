@@ -75,7 +75,7 @@ pub(crate) enum Item<S> {
     FenceWait(usize, u64),
 }
 
-/// What a pump did, for the frame's accounting.
+/// Work completed by a pump.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub(crate) struct Pumped {
     /// Pieces given to the host GPU, and the segments in them.
@@ -84,6 +84,8 @@ pub(crate) struct Pumped {
     /// Of those, segments that had waited (not run when submitted): their
     /// queue and how long.
     pub(crate) waited: Vec<(usize, Duration)>,
+    /// Tokens of fence waits popped from the queues during this pump.
+    pub(crate) retired_waits: Vec<usize>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
 }
@@ -185,8 +187,8 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(..)) => {}
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::FenceWait(token, _)) => done.retired_waits.push(token),
+                        Some(Item::Signal(..)) | None => {}
                     }
                 }
                 if !piece.is_empty() {
@@ -216,12 +218,6 @@ impl<S> Held<S> {
                 Some((*q, items.len(), since.elapsed(), unmet))
             })
             .collect()
-    }
-
-    pub(crate) fn waits_for(&self, token: usize) -> bool {
-        self.queues.iter().any(|(_, items)| items.iter().any(|(item, ..)| {
-            matches!(item, Item::FenceWait(f, _) if *f == token)
-        }))
     }
 
     /// Whether no queue holds anything.
@@ -291,6 +287,36 @@ mod tests {
             true
         };
         held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+    }
+
+    #[test]
+    fn blocked_pumps_check_only_the_head_and_report_each_satisfied_wait_once() {
+        let mut held = Held::<()>::new();
+        for token in 0..1024 {
+            held.push(1, Item::FenceWait(token, 1));
+        }
+        let value = std::cell::Cell::new(0);
+        let checked = RefCell::new(Vec::new());
+        let mut world = World {
+            read: &|_, _| None,
+            fence: &|token| {
+                checked.borrow_mut().push(token);
+                value.get()
+            },
+            run: &mut |_, _| unreachable!(),
+            signal: &mut |_, _| unreachable!(),
+        };
+        for _ in 0..2 {
+            assert!(held.pump(&mut world).retired_waits.is_empty());
+            assert_eq!(checked.take(), [0]);
+        }
+
+        value.set(1);
+        let tokens: Vec<_> = (0..1024).collect();
+        assert_eq!(held.pump(&mut world).retired_waits, tokens);
+        assert_eq!(checked.take(), tokens);
+        assert!(held.pump(&mut world).retired_waits.is_empty());
+        assert!(checked.take().is_empty());
     }
 
     #[test]

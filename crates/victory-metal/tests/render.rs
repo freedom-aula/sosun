@@ -89,7 +89,8 @@ impl<'a> Scene<'a> {
         m.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
         let s = m
             .create_sampler(&SamplerDesc {
-                min_mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
                 border_color: BorderColor::TransparentBlack,
@@ -270,7 +271,8 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
     m.write_buffer(&res, 1, &out.buf, out.at(0), (cells * 16) as u32);
     let sm = m
         .create_sampler(&SamplerDesc {
-            min_mag: Filter::Nearest,
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
             border_color: BorderColor::TransparentBlack,
