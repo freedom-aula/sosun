@@ -755,7 +755,12 @@ Residency itself: what a descriptor heap names is resident through the heap's ow
 
 Every kind of work the native host drops now logs one `warn!` the first time it
 happens ("native host drops work: ..."), and each drop still counts in the
-periodic "native draws so far" line. The kinds are: a draw or dispatch with no
+periodic "native draws so far" line, which also carries `dropped_reasons`:
+the drops since the previous one broken down by the reason string (the same
+messages the warnings name, with their counts), always counted - before, the
+breakdown needed `VICTORY_TRACE_TARGETS=1`, whose per-present `frame targets`
+line still reports it between presents (whichever line comes first drains the
+batch). The kinds are: a draw or dispatch with no
 host pipeline (refused or not translated), a topology the host does not draw,
 an indexed rectangle list, a guessed mesh pipeline, mesh and indirect mesh
 dispatches, texture copies and resolves, and indirect executions (one warning

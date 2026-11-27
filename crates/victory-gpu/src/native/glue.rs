@@ -287,7 +287,9 @@ pub(crate) fn tracing_targets() -> bool {
 
 /// Draws and clears by title texture since the last present, and dropped texture operations.
 static TRACE: Mutex<Option<std::collections::HashMap<usize, [u32; 3]>>> = Mutex::new(None);
-/// Draws dropped since the last present, by reason (with `VICTORY_TRACE_TARGETS`).
+/// Work dropped since the last take, by reason: always counted (a dropped operation already
+/// holds `warn_once`'s lock, so this adds no lock where none was taken), drained by the frame log's
+/// `dropped_reasons` and by `VICTORY_TRACE_TARGETS`' per-present line.
 static DROP_REASONS: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
 /// Draws dropped since the last present for want of a host pipeline, by shaders and targets.
 static DROP_PIPES: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
@@ -547,7 +549,7 @@ fn trace_record_writers() {
 fn trace_present(resource: This) {
         let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
-        let reasons = std::mem::take(&mut *DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner()));
+        let reasons = take_drop_reasons();
         let mut pipes = std::mem::take(&mut *DROP_PIPES.lock().unwrap_or_else(|e| e.into_inner()));
         pipes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         for (what, n) in &pipes {
@@ -1017,14 +1019,18 @@ pub(crate) fn trace_drop_pipe(key: String) {
     }
 }
 
-/// Work dropped since the last present, by reason, for the `VICTORY_TRACE_TARGETS` frame line.
+/// Work dropped since the last take, by reason, in the order first dropped.
+pub(crate) fn take_drop_reasons() -> Vec<(&'static str, u32)> {
+    std::mem::take(&mut *DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Counts work dropped for `why`, for the frame log's `dropped_reasons` (always) and the
+/// `VICTORY_TRACE_TARGETS` per-present line.
 pub(crate) fn trace_reason(why: &'static str) {
-    if tracing_targets() {
-        let mut r = DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner());
-        match r.iter_mut().find(|(w, _)| *w == why) {
-            Some((_, n)) => *n += 1,
-            None => r.push((why, 1)),
-        }
+    let mut r = DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner());
+    match r.iter_mut().find(|(w, _)| *w == why) {
+        Some((_, n)) => *n += 1,
+        None => r.push((why, 1)),
     }
 }
 
@@ -1070,8 +1076,9 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
+    let dropped_reasons = take_drop_reasons();
     let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, ?dropped_reasons, "native draws so far");
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
         let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
