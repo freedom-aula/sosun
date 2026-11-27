@@ -80,6 +80,9 @@ exercises those states directly, with a bounded failure guard and worker cleanup
 This preserves Windows' [shared-reader/exclusive-writer ownership semantics](https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks);
 it does not add a fairness guarantee.
 
+Thread-pool timer workers wake when a deadline is replaced, disarmed, or closed.
+`WaitForThreadpoolTimerCallbacks` waits for queued and running callbacks. Its
+cancel flag drops queued callbacks and leaves future deadlines armed.
 
 ## Function pointers we hand to title code, and title pointers we call
 
