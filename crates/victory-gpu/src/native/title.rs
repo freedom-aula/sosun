@@ -200,8 +200,8 @@ pub struct Title<B: PresentBackend> {
     pub thread_pipes: HashMap<usize, Pipe<B>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
-    /// How long a new compute pipeline may hold the frame while Metal compiles it (the frame's
-    /// budget, `glue::pipe`); past it the pipeline is put off (`ShaderStats::put_off`).
+    /// How long a new pipeline may hold the frame while Metal compiles it (`glue::compile_wait`);
+    /// past it the pipeline is put off (`ShaderStats::put_off`).
     pub compile_wait: std::time::Duration,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,

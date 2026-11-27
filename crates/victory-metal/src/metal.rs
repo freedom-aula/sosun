@@ -30,7 +30,9 @@ pub struct Metal {
     pub(crate) archive: std::cell::OnceCell<Option<std::sync::Arc<crate::archive::Archive>>>,
     /// Compute pipelines being made on threads of their own (`create_compute_pipeline_within`),
     /// by their DXIL and layout.
-    compiling: std::cell::RefCell<std::collections::HashMap<[u8; 32], std::sync::mpsc::Receiver<Compiled>>>,
+    compiling: Compiling<Result<ComputeState, String>>,
+    /// As `compiling`, the render and mesh pipelines (`create_render_pipeline_within`).
+    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
     /// Pipeline state pointer to name, kept only when tracing.
@@ -48,7 +50,9 @@ pub struct Metal {
 }
 
 type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-type Compiled = crate::archive::Sendable<Result<ComputeState, String>>;
+/// Pipelines a `pipeline-compile` thread is making or has made, by what they are made of.
+pub(crate) type Compiling<T> =
+    std::cell::RefCell<std::collections::HashMap<[u8; 32], std::sync::mpsc::Receiver<crate::archive::Sendable<T>>>>;
 
 /// Seconds since the first `Metal::new` (about process start), for the failure trace.
 pub(crate) fn since_start() -> f64 {
@@ -207,8 +211,8 @@ impl Metal {
                 "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
             );
         });
-        // Pipelines put off past a frame's budget compile side by side
-        // (`create_compute_pipeline_within`); Metal's default is two at a time. macOS 13.3.
+        // Pipelines put off past a frame's budget compile side by side (`within`); Metal's
+        // default is two at a time. macOS 13.3.
         if dev.respondsToSelector(objc2::sel!(setShouldMaximizeConcurrentCompilation:)) {
             dev.setShouldMaximizeConcurrentCompilation(true);
         }
@@ -221,6 +225,7 @@ impl Metal {
             counts: Default::default(),
             archive: Default::default(),
             compiling: Default::default(),
+            compiling_render: Default::default(),
             trace_fails: {
                 since_start();
                 std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
@@ -237,7 +242,7 @@ impl Metal {
     }
 
     /// What makes compute pipeline states: all of it may go to another thread.
-    fn compiler(&self) -> Result<Compiler, String> {
+    pub(crate) fn compiler(&self) -> Result<Compiler, String> {
         Ok(Compiler { dev: self.dev.clone(), msc: self.msc.clone()?, archive: self.archive().cloned() })
     }
 
@@ -266,19 +271,12 @@ impl Metal {
     pub fn recommended_working_set(&self) -> u64 {
         self.dev.recommendedMaxWorkingSetSize()
     }
-
-    /// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
-    /// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
-    /// is a dependency.
-    pub(crate) fn load_library(
-        &self,
-        lib: &[u8],
-    ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
-        load_library(&self.dev, lib)
-    }
 }
 
-fn load_library(dev: &Dev, lib: &[u8]) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+/// A metallib image to a library. shortcut: it goes through a file (no dispatch_data here); one
+/// name per library, because Metal keeps libraries by URL. Use `newLibraryWithData` once dispatch2
+/// is a dependency.
+pub(crate) fn load_library(dev: &Dev, lib: &[u8]) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
     {
         let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
         let file =
@@ -291,18 +289,76 @@ fn load_library(dev: &Dev, lib: &[u8]) -> Result<Retained<ProtocolObject<dyn MTL
     }
 }
 
-/// How long a frame waits for any compute pipeline it first asks for, its budget spent or not:
-/// enough for one the disk cache and the archive hold (a few ms), so a warm run puts none off.
-const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Pipelines waiting for a `pipeline-compile` thread. The one asked for last goes first: it is
+/// the one a frame may be waiting for, behind those earlier frames put off.
+static JOBS: (std::sync::Mutex<Vec<Job>>, std::sync::Condvar) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Runs `job` on one of the `pipeline-compile` threads (as many as cores, started at the first).
+fn compile_later(job: Job) {
+    static THREADS: std::sync::Once = std::sync::Once::new();
+    THREADS.call_once(|| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            let _ = std::thread::Builder::new().name("pipeline-compile".into()).spawn(|| {
+                loop {
+                    let mut jobs = JOBS.0.lock().unwrap_or_else(|e| e.into_inner());
+                    let job = loop {
+                        match jobs.pop() {
+                            Some(job) => break job,
+                            None => jobs = JOBS.1.wait(jobs).unwrap_or_else(|e| e.into_inner()),
+                        }
+                    };
+                    drop(jobs);
+                    objc2::rc::autoreleasepool(|_| job());
+                }
+            });
+        }
+    });
+    JOBS.0.lock().unwrap_or_else(|e| e.into_inner()).push(job);
+    JOBS.1.notify_one();
+}
+
+/// What the job `start` gives makes, on a `pipeline-compile` thread, if it comes within `wait`.
+/// `None` while it is still being made: the same `key` later picks it up, without waiting again
+/// (its draws come many times a frame, and frames after the first would stall on it in turn).
+pub(crate) fn within<T: 'static, J: FnOnce() -> T + Send + 'static>(
+    compiling: &Compiling<T>,
+    key: [u8; 32],
+    wait: std::time::Duration,
+    start: impl FnOnce() -> Result<J, String>,
+) -> Result<Option<T>, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let started = compiling.borrow_mut().remove(&key);
+    let (rx, wait) = match started {
+        Some(rx) => (rx, std::time::Duration::ZERO),
+        None => {
+            let job = start()?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            compile_later(Box::new(move || {
+                let _ = tx.send(crate::archive::Sendable(job()));
+            }));
+            (rx, wait)
+        }
+    };
+    match rx.recv_timeout(wait) {
+        Ok(made) => Ok(Some(made.0)),
+        Err(RecvTimeoutError::Timeout) => {
+            compiling.borrow_mut().insert(key, rx);
+            Ok(None)
+        }
+        Err(RecvTimeoutError::Disconnected) => Err("the pipeline's compile thread ended without a result".into()),
+    }
+}
 
 fn compile_key(dxil: &[u8], layout: Option<&RootLayout>) -> [u8; 32] {
     *blake3::Hasher::new().update(dxil).update(format!("{layout:?}").as_bytes()).finalize().as_bytes()
 }
 
-struct Compiler {
-    dev: Dev,
-    msc: std::sync::Arc<Msc>,
-    archive: Option<std::sync::Arc<crate::archive::Archive>>,
+pub(crate) struct Compiler {
+    pub(crate) dev: Dev,
+    pub(crate) msc: std::sync::Arc<Msc>,
+    pub(crate) archive: Option<std::sync::Arc<crate::archive::Archive>>,
 }
 
 // SAFETY: Metal's devices may be used from any thread; the converter and the archive are `Sync`.
@@ -443,42 +499,19 @@ impl ComputeBackend for Metal {
         Ok(Pipeline(self.compiler()?.compute(dxil, Some(layout))?, self.static_samplers(Some(layout))?))
     }
 
-    /// Converted and compiled on a thread of its own, so pipelines put off past `wait` are made
-    /// side by side while the frame goes on. shortcut: a thread a pipeline, as many at once as
-    /// are put off (about 200 at the first frame of the world); a pool if that ever costs.
+    /// Converted and compiled on a `pipeline-compile` thread, so pipelines put off past `wait`
+    /// are made side by side while the frame goes on.
     fn create_compute_pipeline_within(
         &self,
         dxil: &[u8],
         layout: Option<&RootLayout>,
         wait: std::time::Duration,
     ) -> Result<Option<Pipeline>, String> {
-        use std::sync::mpsc::RecvTimeoutError;
-        let key = compile_key(dxil, layout);
-        let started = self.compiling.borrow_mut().remove(&key);
-        // One already put off is only picked up, not waited for again: its dispatches come many
-        // times a frame, and frames after the first would stall on it in turn.
-        let (rx, wait) = match started {
-            Some(rx) => (rx, std::time::Duration::ZERO),
-            None => {
-                let (compiler, dxil, layout) = (self.compiler()?, dxil.to_vec(), layout.cloned());
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("pipeline-compile".into())
-                    .spawn(move || {
-                        let _ = tx.send(crate::archive::Sendable(compiler.compute(&dxil, layout.as_ref())));
-                    })
-                    .map_err(|e| e.to_string())?;
-                (rx, wait.max(ARCHIVED))
-            }
-        };
-        match rx.recv_timeout(wait) {
-            Ok(made) => Ok(Some(Pipeline(made.0?, self.static_samplers(layout)?))),
-            Err(RecvTimeoutError::Timeout) => {
-                self.compiling.borrow_mut().insert(key, rx);
-                Ok(None)
-            }
-            Err(RecvTimeoutError::Disconnected) => Err("the pipeline's compile thread ended without a result".into()),
-        }
+        let made = within(&self.compiling, compile_key(dxil, layout), wait, || {
+            let (compiler, dxil, layout) = (self.compiler()?, dxil.to_vec(), layout.cloned());
+            Ok(move || compiler.compute(&dxil, layout.as_ref()))
+        })?;
+        made.map(|state| Ok(Pipeline(state?, self.static_samplers(layout)?))).transpose()
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {

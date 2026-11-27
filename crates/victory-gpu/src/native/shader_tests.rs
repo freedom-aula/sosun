@@ -168,8 +168,22 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
         // SAFETY: whole subobjects over live elements and names.
         unsafe { g.read(kind, s.as_ptr()) };
     }
-    let pipe = t.render_pipe(&vs, Some(&ps), &g, "tri");
-    assert!(matches!(pipe, Pipe::Render(..)), "{:?}", t.shaders);
+    // With no time to wait it is put off while Metal compiles it, not refused: nothing is cached
+    // and a later use picks it up.
+    t.compile_wait = std::time::Duration::ZERO;
+    let mut asks = 0;
+    let pipe = loop {
+        let pipe = t.render_pipe(&vs, Some(&ps), &g, "tri");
+        if matches!(pipe, Pipe::Render(..)) {
+            break pipe;
+        }
+        asks += 1;
+        assert!(asks < 3000, "never made: {:?}", t.shaders);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(asks > 0);
+    assert_eq!((t.shaders.put_off, t.shaders.refusals()), (asks, 0));
+    t.compile_wait = std::time::Duration::MAX;
     assert!(matches!(t.render_pipe(&vs, Some(&ps), &g, "tri again"), Pipe::Render(..)));
     assert_eq!((t.shaders.pipelines, t.shaders.cached), (1, 1));
 

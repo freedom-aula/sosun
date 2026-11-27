@@ -819,8 +819,8 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
         }
         return Pipe::Refused;
     }
-    // A compute pipeline Metal is still compiling when the budget ends is put off the same way.
-    t.compile_wait = left;
+    // A pipeline Metal is still compiling when the budget ends is put off the same way.
+    t.compile_wait = compile_wait();
     let put_off = t.shaders.put_off;
     let (made, console) = make_pipe(t, key, targets);
     if t.shaders.put_off != put_off {
@@ -837,6 +837,25 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 /// What the current frame has left of its budget for new pipelines (zero: spent).
 fn frame_left() -> std::time::Duration {
     BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
+}
+
+/// How long a new pipeline may hold the current frame while Metal makes it: what the frame has
+/// left of its budget; then, for `ARCHIVED_FOR` more, the few ms a pipeline the disk cache and
+/// the archive hold takes (so a warm frame that outlasts its budget still puts none off); then
+/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s.
+fn compile_wait() -> std::time::Duration {
+    const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
+    const ARCHIVED_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+    let left = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(
+        crate::frame::current(),
+        std::time::Instant::now(),
+        crate::prewarm::FIRST_BIND_BUDGET + ARCHIVED_FOR,
+    );
+    match left.checked_sub(ARCHIVED_FOR) {
+        Some(budget) if !budget.is_zero() => budget,
+        _ if left.is_zero() => left,
+        _ => ARCHIVED,
+    }
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -973,7 +992,7 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     }
     let (hash, shader) = crate::pipeline::native_threads(key as This);
     let name = format!("compute {hash} by thread counts");
-    t.compile_wait = frame_left();
+    t.compile_wait = compile_wait();
     let put_off = t.shaders.put_off;
     let made = match shader {
         Ok(cs) => t.compute_pipe(&cs, &name),
@@ -1251,8 +1270,12 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     if tracing_targets() {
         tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
     }
+    t.compile_wait = compile_wait();
+    let put_off = t.shaders.put_off;
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
-    g.made.borrow_mut().insert(key, made.clone());
+    if t.shaders.put_off == put_off {
+        g.made.borrow_mut().insert(key, made.clone());
+    }
     made
 }
 
