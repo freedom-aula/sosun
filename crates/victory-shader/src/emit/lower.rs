@@ -10926,19 +10926,39 @@ impl<'a> Lower<'a> {
             if taken != not_taken
                 && st.bools.support(when).iter().any(|a| !matches!(a, Atom::Uniform(_))));
         let on_n = self.lane_edge(preds[n], b);
-        per_lane && args.iter().enumerate().any(|(k, arg)| {
-            // A back edge's block (one the join dominates) runs after the lanes of edge `n`
-            // have gone on. An arm inside a loop's body is no back edge.
-            k != n
-                && !self.dominates(b, preds[k])
-                && st.masks.get(arg).is_some_and(|&m| {
-                    [true, false].into_iter().any(|set| {
-                        let mut lanes = on_n.clone();
-                        lanes.extend([(m, set), (x, !set)]);
-                        st.bools.meet(&lanes)
+        // Whether a lane of edge `n` that `part` holds for, brought `x` (`None`: a value not
+        // known, which differs wherever there is such a lane), differs from another edge's mask.
+        let differs = |part: &[(Bool, bool)], x: Option<Bool>| {
+            let on_n = [on_n.as_slice(), part].concat();
+            let Some(x) = x else { return st.bools.meet(&on_n) };
+            args.iter().enumerate().any(|(k, arg)| {
+                // A back edge's block (one the join dominates) runs after the lanes of edge
+                // `n` have gone on. An arm inside a loop's body is no back edge.
+                k != n
+                    && !self.dominates(b, preds[k])
+                    && st.masks.get(arg).is_some_and(|&m| {
+                        [true, false].into_iter().any(|set| {
+                            let mut lanes = on_n.clone();
+                            lanes.extend([(m, set), (x, !set)]);
+                            st.bools.meet(&lanes)
+                        })
                     })
-                })
-        })
+            })
+        };
+        // Where what the edge brings is a join made in its own block (an if's then part writes
+        // the register, and this edge skips the else part), `x` is an atom nothing is known
+        // of: each edge into that block is weighed too, for its own lanes and what it brought.
+        let p = self.x.p;
+        per_lane
+            && differs(&[], Some(x))
+            && self.phi_at.get(&args[n]).is_none_or(|&(q, i)| {
+                q != preds[n]
+                    || self.on_cycle(q)
+                    || p.blocks[q].phis[i].args.iter().zip(&p.blocks[q].preds).any(|(a, &from)| {
+                        let known = st.masks.get(a).or_else(|| st.other.get(a)).copied();
+                        differs(&self.lane_edge(from, q), known)
+                    })
+            })
     }
 
     /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.
@@ -15325,6 +15345,50 @@ mod tests {
             };
             assert!(what.contains("lane-mask join"), "{what}");
         }
+    }
+
+    #[test]
+    fn a_then_parts_constant_on_the_else_skip_edge_is_weighed_for_its_own_lanes() {
+        // An if's then part (lanes below 8) writes s6, and the else part writes a mask there.
+        // The edge that skips the else part brings a join of the then part's value and what s6
+        // held before, of which the then lanes hold the first. With -1, and an else part that
+        // sets the bits of the lanes outside it (`s_orn2` by EXEC), they read 1 either way. With
+        // 5, and the saved EXEC in the else part, they read 1 on the console and their bit of 5
+        // from the join: refused.
+        let program = |then: u32, other: [u32; 3]| {
+            [
+                0x7E10_0280, // v_mov_b32 v8, 0
+                0x7E12_0280, // v_mov_b32 v9, 0
+                0xBE86_0385, // s_mov_b32 s6, 5
+                0xBE89_037E, // s_mov_b32 s9, exec_lo
+                0x7DA8_0088, // v_cmpx_gt_u32 8, v0
+                0xBF88_0001, // s_cbranch_execz else
+                then,        // s_mov_b32 s6, -1 (or 5)
+                0x8A7E_7E09, // else: s_andn2_b32 exec_lo, s9, exec_lo
+                0xBF88_0003, // s_cbranch_execz end
+                other[0],
+                other[1],
+                other[2],
+                0xBEFE_0309, // end: s_mov_b32 exec_lo, s9
+                0xD501_0003,
+                0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+                0xDC70_8000,
+                0x007D_0308, // global_store_dword v[8:9], v3
+                S_ENDPGM,
+            ]
+        };
+        // v_cmp_gt_u32 s6, 12, v0; s_orn2_b32 s6, s6, exec_lo
+        const OTHERS_SET: [u32; 3] = [0xD4C4_0006, 0x0002_008C, 0x8B06_7E06];
+        // s_mov_b32 s6, s9; s_nop 0; s_nop 0
+        const SAVED: [u32; 3] = [0xBE86_0309, 0xBF80_0000, 0xBF80_0000];
+        lowers(&program(0xBE86_03C1, OTHERS_SET), 1 << 7)
+            .unwrap_or_else(|e| panic!("-1 for lanes whose bits the else part sets: {e}"));
+        let Err(crate::ShaderError::Unsupported { what, .. }) =
+            lowers(&program(0xBE86_0385, SAVED), 1 << 7)
+        else {
+            panic!("5 joined with the saved EXEC translated");
+        };
+        assert!(what.contains("lane-mask join"), "{what}");
     }
 
     #[test]
