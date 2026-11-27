@@ -32,6 +32,22 @@ fn refusal(words: &[u32]) -> Option<String> {
     try_translate_wave(words, 5, 0, 128, true, shaders::options()).err().map(|e| e.to_string())
 }
 
+/// [`refusal`] of a program of 32-lane waves, one a group.
+fn refusal32(words: &[u32]) -> Option<String> {
+    try_translate_wave(words, 5, 0, 32, false, shaders::options()).err().map(|e| e.to_string())
+}
+
+/// [`run`] of a program of 32-lane waves, one a group.
+fn run32(words: &[u32], flag: u32) -> Vec<u32> {
+    let Some(mut t) = title() else { return Vec::new() };
+    let f = Fixture::new(&t);
+    let cs = translate_wave(words, 5, 0, 32, false, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, flag], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.get(DST, 32)
+}
+
 fn run(words: &[u32], lds: u32, flag: u32) -> Vec<u32> {
     run_io(words, lds << 15, 64, flag)
 }
@@ -1035,4 +1051,121 @@ fn whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep() {
     let want: Vec<u32> = (0..50).map(|i| if i % 16 == 0 { 32 } else { i - 1 + 32 }).collect();
     assert_eq!(got[..50], want);
     assert_eq!(got[50..], [CANARY; 14]);
+}
+
+#[test]
+fn a_mask_a_32_lane_wave_starts_as_a_pairs_constant_holds_the_lanes_ored_in() {
+    // The loop above in 32-lane waves, its mask made 0 by `s_mov_b64 s[8:9], 0` or
+    // `s_bfm_b64 s[8:9], 32, 32` (as the G-buffer's 32-lane compute programs do): lanes leave
+    // as `v0` plus 8 a time reaches 32, and the wave when `s14` reaches `s4` (2), so the mask
+    // holds the lanes from 16 (was refused as data at a lane-mask join).
+    // s_mov_b64 s[8:9], 0; s_bfm_b64 s[8:9], 32, 32
+    for zero in [0xBE88_0480, 0x9288_A0A0] {
+        let w = [
+            zero,
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0xBE8E_0380, // s_mov_b32 s14, 0
+            0x7E06_0300, // v_mov_b32 v3, v0
+            // loop:
+            0xBE8C_037E, // s_mov_b32 s12, exec_lo
+            0xBF06_040E, // s_cmp_eq_u32 s14, s4
+            0xBF85_0006, // s_cbranch_scc1 out
+            0x800E_810E, // s_add_u32 s14, s14, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA6_06A0, // v_cmpx_le_u32 32, v3
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBE8C_470C, // s_andn2_wrexec_b32 s12, s12
+            0xBF85_FFF7, // s_cbranch_scc1 loop
+            // out:
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal32(&w), None, "{zero:#x}");
+        let got = run32(&w, 2);
+        if got.is_empty() {
+            return;
+        }
+        assert_eq!(got[..16], [0; 16]);
+        assert_eq!(got[16..], [1; 16]);
+    }
+}
+
+#[test]
+fn a_mask_a_divergent_loop_copies_away_and_back_is_the_mask_it_entered_with() {
+    // VCC holds the lanes below 20 into a loop the lanes leave as `v0` plus 8 a time reaches 32;
+    // inside, the lanes of VCC count their passes and copy VCC to `s20` and back (the G-buffer's
+    // 32-lane compute programs spill so). Every edge brings VCC or a copy of it, so it is the
+    // mask it entered with (was refused as data at a lane-mask join).
+    let w = [
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_037E, // s_mov_b32 s10, exec_lo
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        // loop:
+        0xBE90_3C6A, // s_and_saveexec_b32 s16, vcc_lo
+        0xBF88_0003, // s_cbranch_execz skip
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xBEEA_0314, // s_mov_b32 vcc_lo, s20
+        // skip:
+        0xBEFE_0310, // s_mov_b32 exec_lo, s16
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+        0xBF89_FFF7, // s_cbranch_execnz loop
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal32(&w), None);
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [4; 8]);
+    assert_eq!(got[8..16], [3; 8]);
+    assert_eq!(got[16..20], [2; 4]);
+    assert_eq!(got[20..], [0; 12]);
+}
+
+#[test]
+fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
+    // As the copy case, but the copy back is of another mask (the lanes below 10): after the
+    // first pass VCC holds those, so lanes 10 to 19 count one pass. Refused, or that.
+    let w = [
+        0xD4C4_0015, 0x0002_008A, // v_cmp_gt_u32 s21, 10, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_037E, // s_mov_b32 s10, exec_lo
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        // loop:
+        0xBE90_3C6A, // s_and_saveexec_b32 s16, vcc_lo
+        0xBF88_0003, // s_cbranch_execz skip
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xBEEA_0315, // s_mov_b32 vcc_lo, s21
+        // skip:
+        0xBEFE_0310, // s_mov_b32 exec_lo, s16
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+        0xBF89_FFF7, // s_cbranch_execnz loop
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    if refusal32(&w).is_some() {
+        return;
+    }
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [4; 8]);
+    assert_eq!(got[8..10], [3; 2]);
+    assert_eq!(got[10..20], [1; 10]);
+    assert_eq!(got[20..], [0; 12]);
 }
