@@ -33,9 +33,10 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
+use crate::structure::{Map, Set};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
@@ -473,13 +474,14 @@ pub(crate) fn raise_graphics(
 /// for pixel interpolation (`v_interp_*`), following scalar copies, `v_writelane`/`v_readlane`
 /// spills, and phis.
 fn ps_prim_mask(p: &Program, user: u32, guessed: bool) -> Option<u8> {
+    let uses = PrimMaskUses::new(p);
     let mut found = None;
     for &(reg, init_v) in &p.inputs {
         let Reg::S(pm) = reg else { continue };
         if pm > 104 || u32::from(pm) < user {
             continue;
         }
-        if is_prim_mask_only(p, init_v, guessed) {
+        if uses.is_prim_mask_only(init_v, guessed) {
             if found.is_some() {
                 return None;
             }
@@ -489,28 +491,72 @@ fn ps_prim_mask(p: &Program, user: u32, guessed: bool) -> Option<u8> {
     found
 }
 
-/// Whether `init_v` (a live-in SGPR) flows only through copies / `v_writelane`+`v_readlane`
-/// spills into `m0`, and every consumer of those `m0` values is `v_interp_*` (or the benign
-/// `MSG_ORDERED_PS_DONE` sendmsg, which ignores `m0` in hardware).
-// shortcut: guessed shaders may also mask, shift or extract bits on the way to M0, extend the
-// recognised scalar operations if a new compiler pattern still uses the value only for M0.
-pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bool {
-    use std::collections::HashSet;
-    let m0 = crate::ir::M0;
-    let mut scalar_vals = HashSet::from([init_v]);
-    let mut scalar_q = vec![init_v];
-    let mut spilled: HashSet<(Value, u32)> = HashSet::new();
-    let mut spill_q: Vec<(Value, u32)> = Vec::new();
-    let mut m0_vals: HashSet<Value> = HashSet::new();
-    let mut m0_q: Vec<Value> = Vec::new();
+/// Indexed SSA phi and instruction readers of a [`Program`], built once and shared across entry
+/// SGPR queries ([`PrimMaskUses::is_prim_mask_only`]): scanning every block and instruction per
+/// popped value was quadratic across spilled SGPRs in large pixel shaders.
+pub(crate) struct PrimMaskUses<'a> {
+    phis: Map<Value, Vec<&'a Phi>>,
+    insts: Map<Value, Vec<&'a Inst>>,
+    #[cfg(test)]
+    visits: std::cell::Cell<usize>,
+}
 
-    while !scalar_q.is_empty() || !spill_q.is_empty() {
-        while let Some(v) = scalar_q.pop() {
-            for block in &p.blocks {
-                for phi in &block.phis {
-                    if !phi.args.contains(&v) {
-                        continue;
+impl<'a> PrimMaskUses<'a> {
+    pub(crate) fn new(p: &'a Program) -> Self {
+        let mut phis: Map<Value, Vec<&'a Phi>> = Map::default();
+        let mut insts: Map<Value, Vec<&'a Inst>> = Map::default();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for (i, &arg) in phi.args.iter().enumerate() {
+                    if !phi.args[..i].contains(&arg) {
+                        phis.entry(arg).or_default().push(phi);
                     }
+                }
+            }
+            for inst in &block.insts {
+                for (i, &(_, val)) in inst.reads.iter().enumerate() {
+                    if !inst.reads[..i].iter().any(|r| r.1 == val) {
+                        insts.entry(val).or_default().push(inst);
+                    }
+                }
+            }
+        }
+        Self {
+            phis,
+            insts,
+            #[cfg(test)]
+            visits: Default::default(),
+        }
+    }
+
+    fn phis_of(&self, v: Value) -> &[&'a Phi] {
+        self.phis.get(&v).map_or(&[], Vec::as_slice)
+    }
+
+    fn insts_of(&self, v: Value) -> &[&'a Inst] {
+        self.insts.get(&v).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `init_v` (a live-in SGPR) flows only through copies / `v_writelane`+`v_readlane`
+    /// spills into `m0`, and every consumer of those `m0` values is `v_interp_*` (or the benign
+    /// `MSG_ORDERED_PS_DONE` sendmsg, which ignores `m0` in hardware).
+    // shortcut: guessed shaders may also mask, shift or extract bits on the way to M0, extend the
+    // recognised scalar operations if a new compiler pattern still uses the value only for M0.
+    pub(crate) fn is_prim_mask_only(&self, init_v: Value, guessed: bool) -> bool {
+        let m0 = crate::ir::M0;
+        let mut scalar_vals = Set::default();
+        scalar_vals.insert(init_v);
+        let mut scalar_q = vec![init_v];
+        let mut spilled: Set<(Value, u32)> = Set::default();
+        let mut spill_q: Vec<(Value, u32)> = Vec::new();
+        let mut m0_vals: Set<Value> = Set::default();
+        let mut m0_q: Vec<Value> = Vec::new();
+
+        while !scalar_q.is_empty() || !spill_q.is_empty() {
+            while let Some(v) = scalar_q.pop() {
+                for &phi in self.phis_of(v) {
+                    #[cfg(test)]
+                    self.visits.set(self.visits.get() + 1);
                     match phi.reg {
                         Reg::S(d) if d < 106 => {
                             if scalar_vals.insert(phi.value) {
@@ -520,10 +566,9 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                         _ => return false,
                     }
                 }
-                for inst in &block.insts {
-                    if !inst.reads.iter().any(|r| r.1 == v) {
-                        continue;
-                    }
+                for &inst in self.insts_of(v) {
+                    #[cfg(test)]
+                    self.visits.set(self.visits.get() + 1);
                     match (inst.name(), &inst.fields) {
                         (
                             name,
@@ -538,10 +583,8 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                         {
                             // The mask bits have no host use, including through SCC.
                             if let Some(scc) = inst.write(Reg::Scc)
-                                && p.blocks.iter().any(|b| {
-                                    b.phis.iter().any(|phi| phi.args.contains(&scc))
-                                        || b.insts.iter().any(|inst| inst.read(Reg::Scc) == Some(scc))
-                                })
+                                && (!self.phis_of(scc).is_empty()
+                                    || self.insts_of(scc).iter().any(|u| u.read(Reg::Scc) == Some(scc)))
                             {
                                 return false;
                             }
@@ -586,14 +629,11 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                     }
                 }
             }
-        }
 
-        while let Some((vv, lane)) = spill_q.pop() {
-            for block in &p.blocks {
-                for phi in &block.phis {
-                    if !phi.args.contains(&vv) {
-                        continue;
-                    }
+            while let Some((vv, lane)) = spill_q.pop() {
+                for &phi in self.phis_of(vv) {
+                    #[cfg(test)]
+                    self.visits.set(self.visits.get() + 1);
                     match phi.reg {
                         Reg::V(_) => {
                             if spilled.insert((phi.value, lane)) {
@@ -603,10 +643,9 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                         _ => return false,
                     }
                 }
-                for inst in &block.insts {
-                    if !inst.reads.iter().any(|r| r.1 == vv) {
-                        continue;
-                    }
+                for &inst in self.insts_of(vv) {
+                    #[cfg(test)]
+                    self.visits.set(self.visits.get() + 1);
                     match (inst.name(), &inst.fields) {
                         ("v_readlane_b32", Fields::Valu(f))
                             if matches!(
@@ -681,48 +720,45 @@ pub(crate) fn is_prim_mask_only(p: &Program, init_v: Value, guessed: bool) -> bo
                 }
             }
         }
-    }
 
-    if m0_vals.is_empty() {
-        return false;
-    }
-    while let Some(mv) = m0_q.pop() {
-        for block in &p.blocks {
-            for phi in &block.phis {
-                if phi.args.contains(&mv) {
-                    if phi.reg == Reg::S(m0) {
-                        if m0_vals.insert(phi.value) {
-                            m0_q.push(phi.value);
-                        }
-                    } else {
-                        return false;
+        if m0_vals.is_empty() {
+            return false;
+        }
+        while let Some(mv) = m0_q.pop() {
+            for &phi in self.phis_of(mv) {
+                #[cfg(test)]
+                self.visits.set(self.visits.get() + 1);
+                if phi.reg == Reg::S(m0) {
+                    if m0_vals.insert(phi.value) {
+                        m0_q.push(phi.value);
                     }
+                } else {
+                    return false;
                 }
             }
         }
-    }
-    let mut saw_interp = false;
-    for block in &p.blocks {
-        for inst in &block.insts {
-            if !inst.reads.iter().any(|r| m0_vals.contains(&r.1)) {
-                continue;
-            }
-            if matches!(inst.fields, Fields::Vintrp { .. }) || inst.name().starts_with("v_interp_")
-            {
-                saw_interp = true;
-            } else if matches!(
-                inst.fields,
-                Fields::Sopp { imm }
-                    if matches!(inst.name(), "s_sendmsg" | "s_sendmsghalt") && imm & 0xF == 7
-            ) {
-                // `MSG_ORDERED_PS_DONE` ignores `m0` in hardware (`ir.rs` adds `m0` read for all
-                // `s_sendmsg`).
-            } else {
-                return false;
+        let mut saw_interp = false;
+        for &mv in &m0_vals {
+            for &inst in self.insts_of(mv) {
+                #[cfg(test)]
+                self.visits.set(self.visits.get() + 1);
+                if matches!(inst.fields, Fields::Vintrp { .. }) || inst.name().starts_with("v_interp_")
+                {
+                    saw_interp = true;
+                } else if matches!(
+                    inst.fields,
+                    Fields::Sopp { imm }
+                        if matches!(inst.name(), "s_sendmsg" | "s_sendmsghalt") && imm & 0xF == 7
+                ) {
+                    // `MSG_ORDERED_PS_DONE` ignores `m0` in hardware (`ir.rs` adds `m0` read for
+                    // all `s_sendmsg`).
+                } else {
+                    return false;
+                }
             }
         }
+        saw_interp
     }
-    saw_interp
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -1116,5 +1152,48 @@ mod tests {
             raise(&movrel, &pixel(vec![], 0)).unwrap().initialized_sgprs,
             Some(10)
         );
+    }
+
+    #[test]
+    fn prim_mask_uses_visits_spills_and_phis_linearly() {
+        let chain = |diamonds: usize| {
+            let mut w = vec![
+                0xD761_0005u32,
+                0x0001_0002, // v_writelane_b32 v5, s2, 0 (non-prim-mask SGPR spilled)
+                0xD761_0005,
+                0x0001_0203, // v_writelane_b32 v5, s3, 1 (prim-mask SGPR spilled)
+            ];
+            for _ in 0..diamonds {
+                w.push(0x7D88_0084); // v_cmp_gt_u32 vcc_lo, 4, v0
+                w.push(0xBE88_3C6A); // s_and_saveexec_b32 s8, vcc_lo
+                w.push(0xBF88_0002); // s_cbranch_execz +2
+                w.extend([0xD761_0005, 0x0001_0481]); // v_writelane_b32 v5, 1, 2
+                w.push(0xBEFE_0308); // s_mov_b32 exec_lo, s8
+            }
+            w.extend([
+                0xD760_000Au32,
+                0x0001_0105, // v_readlane_b32 s10, v5, 0
+                0x800A_810A, // s_add_u32 s10, s10, 1 (rejects s2)
+                0xD760_000B,
+                0x0001_0305, // v_readlane_b32 s11, v5, 1
+                0xBEFC_030B, // s_mov_b32 m0, s11
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 16).unwrap();
+            let uses = super::PrimMaskUses::new(&p);
+            let s2 = p.inputs.iter().find(|(r, _)| *r == Reg::S(2)).unwrap().1;
+            let s3 = p.inputs.iter().find(|(r, _)| *r == Reg::S(3)).unwrap().1;
+            assert!(!uses.is_prim_mask_only(s2, true));
+            uses.visits.set(0);
+            assert!(uses.is_prim_mask_only(s3, true));
+            uses.visits.get()
+        };
+        let v64 = chain(64);
+        let v128 = chain(128);
+        // Doubling the diamond count must only double the visited sites (linear, not quadratic).
+        assert!(v128 <= 2 * v64 + 8, "v64={v64}, v128={v128}");
     }
 }
