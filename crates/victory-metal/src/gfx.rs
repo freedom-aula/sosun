@@ -167,7 +167,9 @@ impl StaticSamplers {
     }
 }
 
-fn pixel_format(f: Format) -> MTLPixelFormat {
+/// The Metal pixel format each `Format` is made as (also read by the present's ambient tests, so
+/// the formats the backend creates stay tied to what it will bind).
+pub(crate) fn pixel_format(f: Format) -> MTLPixelFormat {
     match f {
         Format::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,

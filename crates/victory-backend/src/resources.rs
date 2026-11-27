@@ -722,3 +722,88 @@ pub trait PresentBackend: GraphicsBackend {
         Ok(())
     }
 }
+
+/// The host pixel format of a depth target, as far as [`PresentBackend::set_ambient_fallback`]
+/// needs to know it: the depth and stencil formats Metal defines, and everything else as
+/// [`HostDepthFormat::Other`]. The Metal backend maps its `MTLPixelFormat` into this before
+/// deciding what to bind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostDepthFormat {
+    /// `Depth16Unorm`.
+    D16Unorm,
+    /// `Depth32Float`.
+    D32Float,
+    /// `Depth32Float_Stencil8`.
+    D32FloatStencil8,
+    /// `Depth24Unorm_Stencil8`: never made by the backend (Apple GPUs do not have it; the
+    /// console's 24-bit depth formats become [`HostDepthFormat::D32FloatStencil8`]).
+    D24UnormStencil8,
+    /// `Stencil8`: stencil only, no depth to shade by.
+    Stencil8,
+    /// Any other format: colour, compressed, or a depth format the backend never creates.
+    Other,
+}
+
+/// Whether the ambient present may shade by a depth target of this format. The depth texture is
+/// bound to the present fragment's `texture2d<float>` slot **as itself, never as a colour view**:
+/// a colour view of a packed depth-stencil texture aborts Metal's validation on the texel-size
+/// mismatch (`_mtlValidateArgumentsForTextureViewOnDevice`: `Depth32Float_Stencil8` is eight
+/// bytes a texel, the requested colour format four), and the backend's own views of depth
+/// textures keep their format for exactly that reason (`create_texture_view`). Only the three
+/// formats the backend makes depth targets of are known to read their depth that way (the
+/// shader's `.r`); anything else — a stencil-only texture, a format the backend never creates,
+/// a colour format — skips the shading for that present rather than risk Metal's validation.
+pub fn depth_shades_ambient(f: HostDepthFormat) -> bool {
+    matches!(
+        f,
+        HostDepthFormat::D16Unorm | HostDepthFormat::D32Float | HostDepthFormat::D32FloatStencil8
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_depth_formats_the_backend_makes_shade_the_ambient_present() {
+        // Bound as themselves: the shader reads `.r` as the depth (the backend's own rule for
+        // depth textures in shader slots, `create_texture_view`).
+        assert!(depth_shades_ambient(HostDepthFormat::D16Unorm));
+        assert!(depth_shades_ambient(HostDepthFormat::D32Float));
+        assert!(depth_shades_ambient(HostDepthFormat::D32FloatStencil8));
+    }
+
+    #[test]
+    fn every_other_format_skips_the_shading_instead_of_risking_a_view() {
+        // Stencil-only has no depth to shade by; Depth24Unorm_Stencil8 is never made (Apple GPUs
+        // do not have it); anything else is not a depth target the backend created.
+        assert!(!depth_shades_ambient(HostDepthFormat::Stencil8));
+        assert!(!depth_shades_ambient(HostDepthFormat::D24UnormStencil8));
+        assert!(!depth_shades_ambient(HostDepthFormat::Other));
+    }
+
+    #[test]
+    fn a_packed_depth_stencil_texture_is_never_viewed_as_a_colour_format() {
+        // The regression this table exists for (Native-Victory-macOS tester report, macOS 27):
+        // `Depth32Float_Stencil8` was viewed as `R32Float`, eight bytes a texel read as four,
+        // and Metal's `_mtlValidateArgumentsForTextureViewOnDevice` aborted the process. The
+        // decision must be made from the source format, and the three bindable formats are
+        // bound as the depth textures they are — no colour view of a depth texture is ever
+        // requested, for any input.
+        for f in [
+            HostDepthFormat::D16Unorm,
+            HostDepthFormat::D32Float,
+            HostDepthFormat::D32FloatStencil8,
+            HostDepthFormat::D24UnormStencil8,
+            HostDepthFormat::Stencil8,
+            HostDepthFormat::Other,
+        ] {
+            // The only two answers are "bind the texture itself" and "skip"; there is no
+            // third answer that would create a view.
+            assert_eq!(depth_shades_ambient(f), matches!(
+                f,
+                HostDepthFormat::D16Unorm | HostDepthFormat::D32Float | HostDepthFormat::D32FloatStencil8
+            ));
+        }
+    }
+}

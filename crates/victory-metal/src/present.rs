@@ -8,7 +8,7 @@
 
 use crate::metal::{Metal, Queue};
 use crate::gfx::Texture;
-use crate::resources::PresentBackend;
+use crate::resources::{depth_shades_ambient, HostDepthFormat, PresentBackend};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::msg_send;
@@ -312,20 +312,25 @@ impl PresentBackend for Metal {
         depth: Option<&Texture>,
         level: f32,
     ) -> Result<(), String> {
-        // A packed depth-stencil texture is read through its float depth view, as the backend's
-        // own views of depth textures do (`create_texture_view`).
+        // The depth texture is bound as itself, never as a colour view. A colour view of a
+        // packed depth-stencil texture aborts Metal's validation on the texel-size mismatch
+        // (`_mtlValidateArgumentsForTextureViewOnDevice`: `Depth32Float_Stencil8` is eight
+        // bytes a texel, `R32Float` four), and the backend's own views of depth textures
+        // keep their format for that reason (`create_texture_view`): shaders read the depth
+        // as the float the texture holds, so the present fragment's `.r` is the depth. Only
+        // the three depth formats the backend makes are bound, single-sampled (a multisampled
+        // texture cannot go into a `texture2d` slot); anything else skips the shading for
+        // this present — logged once per format — rather than risk Metal's validation.
         let depth = depth
-            .map(|t| {
-                if t.tex.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 {
-                    t.tex
-                        .newTextureViewWithPixelFormat(MTLPixelFormat::R32Float)
-                        .map(|v| Texture { tex: v, format: t.format })
-                        .unwrap_or_else(|| t.clone())
-                } else {
-                    t.clone()
+            .filter(|t| {
+                let ok = depth_shades_ambient(host_depth_format(t.tex.pixelFormat()))
+                    && t.tex.sampleCount() == 1;
+                if !ok {
+                    warn_skipped_ambient_depth(t.tex.pixelFormat(), t.tex.sampleCount());
                 }
+                ok
             })
-            .map(|t| (t, level));
+            .map(|t| (t.clone(), level));
         *_surface.shade.borrow_mut() = depth;
         Ok(())
     }
@@ -452,10 +457,40 @@ fn probe_pixels(
     Some((buf, bgra))
 }
 
+/// A depth target's format for the ambient present's binding decision
+/// ([`victory_backend::resources::depth_shades_ambient`]): the depth and stencil formats Metal
+/// defines, everything else as [`HostDepthFormat::Other`].
+fn host_depth_format(f: MTLPixelFormat) -> HostDepthFormat {
+    match f {
+        MTLPixelFormat::Depth16Unorm => HostDepthFormat::D16Unorm,
+        MTLPixelFormat::Depth32Float => HostDepthFormat::D32Float,
+        MTLPixelFormat::Depth32Float_Stencil8 => HostDepthFormat::D32FloatStencil8,
+        MTLPixelFormat::Depth24Unorm_Stencil8 => HostDepthFormat::D24UnormStencil8,
+        MTLPixelFormat::Stencil8 => HostDepthFormat::Stencil8,
+        _ => HostDepthFormat::Other,
+    }
+}
+
+/// A depth target the ambient present refused, logged once per format (and sample count), so a
+/// run log says which formats were skipped without repeating it every frame.
+fn warn_skipped_ambient_depth(f: MTLPixelFormat, samples: usize) {
+    static SEEN: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(f.0, samples)) {
+        seen.push((f.0, samples));
+        tracing::warn!(
+            pixel_format = f.0,
+            samples,
+            "VICTORY_AMBIENT: this depth target's format cannot shade the present; shading skipped for it"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::ComputeBackend;
+    use crate::gfx::pixel_format;
     use crate::resources::{Format, ResourceBackend, TextureDesc};
 
     #[test]
@@ -492,5 +527,28 @@ mod tests {
         assert_eq!(metal.present(&queue, &surface, &source).unwrap_err(), "timed out waiting for a drawable");
         assert!(started.elapsed() >= std::time::Duration::from_secs(2));
         assert_eq!(surface.frames(), 0);
+    }
+
+    /// Every depth and stencil format Metal defines maps, and only the three the backend makes
+    /// depth targets of come out bindable — the packed depth-stencil formats never do, so no
+    /// colour view of them is ever requested (that aborts Metal's validation).
+    #[test]
+    fn metal_depth_formats_map_to_the_binding_decision() {
+        for (mtl, host) in [
+            (MTLPixelFormat::Depth16Unorm, HostDepthFormat::D16Unorm),
+            (MTLPixelFormat::Depth32Float, HostDepthFormat::D32Float),
+            (MTLPixelFormat::Depth32Float_Stencil8, HostDepthFormat::D32FloatStencil8),
+            (MTLPixelFormat::Depth24Unorm_Stencil8, HostDepthFormat::D24UnormStencil8),
+            (MTLPixelFormat::Stencil8, HostDepthFormat::Stencil8),
+            (MTLPixelFormat::R32Float, HostDepthFormat::Other),
+            (MTLPixelFormat::BGRA8Unorm, HostDepthFormat::Other),
+        ] {
+            assert_eq!(host_depth_format(mtl), host);
+        }
+        // Exactly the formats `pixel_format` makes of `Format::D16Unorm`, `D32Float` and
+        // `D32FloatS8`: bound as themselves, `.r` read as the depth.
+        assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D16Unorm))));
+        assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D32Float))));
+        assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D32FloatS8))));
     }
 }
