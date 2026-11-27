@@ -159,9 +159,13 @@ pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_k
     r
 }
 
+fn is_compiler_crash(error: &str) -> bool {
+    error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
+}
+
 fn remember_crash<T>(r: &Result<T, String>, key: &str) {
     if let Err(e) = r
-        && e.contains("XPC_ERROR_CONNECTION_INTERRUPTED")
+        && is_compiler_crash(e)
     {
         crate::disk::remember_crash(key.as_bytes());
     }
@@ -220,5 +224,16 @@ mod tests {
         );
         assert_eq!(slow, None);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(2));
+    }
+
+    #[test]
+    fn recognizes_reported_metal_compiler_failures() {
+        assert!(is_compiler_crash("Compiler encountered an internal error"));
+        assert!(is_compiler_crash("Compilation failed: Compiler encountered an internal error."));
+        assert!(is_compiler_crash(
+            "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED"
+        ));
+        assert!(!is_compiler_crash("Fragment input mismatching vertex shader output type"));
+        assert!(!is_compiler_crash("not enough memory to create pipeline"));
     }
 }
