@@ -480,8 +480,8 @@ extern "win64" fn commit_changes(_this: *mut Engine, _operation_set: u32) -> HRE
 
 extern "win64" fn get_performance_data(_this: *mut Engine, data: *mut u8) {
     if !data.is_null() {
-        // SAFETY: an XAUDIO2_PERFORMANCE_DATA (72 bytes).
-        unsafe { std::ptr::write_bytes(data, 0, 72) };
+        // SAFETY: XAUDIO2_PERFORMANCE_DATA contains two UINT64s and twelve UINT32s.
+        unsafe { std::ptr::write_bytes(data, 0, 64) };
     }
 }
 
@@ -534,11 +534,11 @@ fn first_send(inner: &Inner, sends: *const u8) -> Option<VoiceId> {
         if count == 0 {
             return None;
         }
-        let descriptors = sends.add(8).cast::<*const u8>().read_unaligned();
+        let descriptors = sends.add(4).cast::<*const u8>().read_unaligned();
         if descriptors.is_null() {
             return None;
         }
-        let voice = descriptors.add(8).cast::<*const Voice>().read_unaligned();
+        let voice = descriptors.add(4).cast::<*const Voice>().read_unaligned();
         (!voice.is_null()).then(|| (*voice).id)
     }
 }
@@ -696,10 +696,7 @@ extern "win64" fn get_voice_details(this: *mut Voice, details: *mut u32) {
         } else {
             (v.format.channels as u32, v.format.rate)
         };
-        details.write(0);
-        details.add(1).write(0);
-        details.add(2).write(channels);
-        details.add(3).write(rate);
+        details.cast::<[u32; 4]>().write_unaligned([0, 0, channels, rate]);
     }
 }
 
@@ -919,7 +916,7 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
                 r(24) as usize,
                 r(28) as usize,
                 r(32),
-                buffer.add(40).cast::<usize>().read_unaligned(),
+                buffer.add(36).cast::<usize>().read_unaligned(),
             ),
         )
     };
@@ -992,7 +989,7 @@ extern "win64" fn source_get_state(this: *mut Voice, state: *mut u8, _flags: u32
     unsafe {
         state.cast::<usize>().write_unaligned(context);
         state.add(8).cast::<u32>().write_unaligned(queued);
-        state.add(16).cast::<u64>().write_unaligned(played);
+        state.add(12).cast::<u64>().write_unaligned(played);
     }
 }
 
@@ -1220,6 +1217,13 @@ mod tests {
         assert_eq!(call!(master.cast::<c_void>(), 19, fn(*mut u32) -> HRESULT, &mut mask), S_OK);
         assert_eq!(mask, 3);
 
+        // Route the source through an explicit packed send to the mastering voice.
+        let mut descriptor = [0u8; 12];
+        descriptor[4..12].copy_from_slice(&(master as usize).to_le_bytes());
+        let mut sends = [0u8; 12];
+        sends[..4].copy_from_slice(&1u32.to_le_bytes());
+        sends[4..12].copy_from_slice(&(descriptor.as_ptr() as usize).to_le_bytes());
+
         // CreateSourceVoice: mono, 16-bit, 24 kHz, with a callback object.
         let w = wave(1, 24_000, 16, 1);
         let log = Mutex::new(Vec::new());
@@ -1228,9 +1232,18 @@ mod tests {
         let mut voice: *mut Voice = std::ptr::null_mut();
         assert_eq!(
             call!(engine, 5, fn(*mut *mut Voice, *const u8, u32, f32, *mut c_void, *const u8, *const c_void) -> HRESULT,
-                &mut voice, w.as_ptr(), 0, 2.0, callback.ptr(), std::ptr::null(), std::ptr::null()),
+                &mut voice, w.as_ptr(), 0, 2.0, callback.ptr(), sends.as_ptr(), std::ptr::null()),
             S_OK
         );
+        // A packed XAUDIO2_VOICE_DETAILS can start on an odd address.
+        #[repr(align(4))]
+        struct Details([u8; 17]);
+        let mut details = Details([0xA5; 17]);
+        call!(voice, 0, fn(*mut u32) -> (), details.0[1..].as_mut_ptr().cast());
+        assert_eq!(details.0[0], 0xA5);
+        assert_eq!(&details.0[1..9], &[0; 8]);
+        assert_eq!(&details.0[9..13], &1u32.to_le_bytes());
+        assert_eq!(&details.0[13..], &24_000u32.to_le_bytes());
         // ADPCM is not ours.
         let adpcm = wave(1, 24_000, 4, 2);
         let mut none: *mut Voice = std::ptr::null_mut();
@@ -1247,16 +1260,18 @@ mod tests {
                 ((x * 16000.0) as i16).to_le_bytes()
             })
             .collect();
-        let mut buffer = [0u8; 48];
+        const CONTEXT: usize = 0x0000_1234_5678_C0DE;
+        let mut buffer = [0u8; 44];
         buffer[0..4].copy_from_slice(&XAUDIO2_END_OF_STREAM.to_le_bytes());
         buffer[4..8].copy_from_slice(&(pcm.len() as u32).to_le_bytes());
         buffer[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
-        buffer[40..48].copy_from_slice(&0xC0DEusize.to_le_bytes());
+        buffer[36..44].copy_from_slice(&CONTEXT.to_le_bytes());
         let voice_ptr = voice.cast::<c_void>();
         assert_eq!(call!(voice_ptr, 21, fn(*const u8, *const c_void) -> HRESULT, buffer.as_ptr(), std::ptr::null()), S_OK);
         // Not started: silent, one buffer queued.
-        let mut state = [0u8; 24];
+        let mut state = [0xA5u8; 20 + 4];
         call!(voice_ptr, 25, fn(*mut u8, u32) -> (), state.as_mut_ptr(), 0);
+        assert_eq!(usize::from_le_bytes(state[..8].try_into().unwrap()), CONTEXT);
         assert_eq!(u32::from_le_bytes(state[8..12].try_into().unwrap()), 1);
         assert!(pull(480, 2).iter().all(|&x| x == 0.0));
         // Start, half volume, and the device pulls the 50 ms (2400 output frames).
@@ -1287,15 +1302,16 @@ mod tests {
         assert_eq!(
             got,
             [
-                &Observed::Notice(Notice::BufferStart, 0xC0DE),
-                &Observed::Notice(Notice::BufferEnd, 0xC0DE),
+                &Observed::Notice(Notice::BufferStart, CONTEXT),
+                &Observed::Notice(Notice::BufferEnd, CONTEXT),
                 &Observed::Notice(Notice::StreamEnd, 0)
             ]
         );
         drop(notices);
         call!(voice_ptr, 25, fn(*mut u8, u32) -> (), state.as_mut_ptr(), 0);
         assert_eq!(u32::from_le_bytes(state[8..12].try_into().unwrap()), 0);
-        assert_eq!(u64::from_le_bytes(state[16..24].try_into().unwrap()), 1200);
+        assert_eq!(&state[20..], &[0xA5; 4]);
+        assert_eq!(u64::from_le_bytes(state[12..20].try_into().unwrap()), 1200);
 
         // Voices and the engine go; the output stops with the master.
         call!(voice_ptr, 18, fn() -> (),);
@@ -1358,7 +1374,7 @@ mod tests {
         let fed_voice = source(&fed);
         fed.voice.store(fed_voice, Ordering::Relaxed);
         let pcm = [16_384i16; 480]; // Two output passes at a 2:1 resampling ratio.
-        let mut buffer = [0; 48];
+        let mut buffer = [0; 44];
         buffer[4..8].copy_from_slice(&(size_of_val(&pcm) as u32).to_le_bytes());
         buffer[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
         assert_eq!(
@@ -1459,7 +1475,7 @@ mod tests {
         let (resume, wait) = channel();
         *lock(&BLOCK) = Some((entered, wait));
         assert_eq!(
-            source_submit(voice, [0; 48].as_ptr(), std::ptr::null()),
+            source_submit(voice, [0; 44].as_ptr(), std::ptr::null()),
             S_OK
         );
         assert_eq!(source_flush(voice), S_OK);
@@ -1487,6 +1503,10 @@ mod tests {
         let mut engine: *mut Engine = std::ptr::null_mut();
         assert_eq!(create_with(&mut engine, open_held), S_OK);
         let e = engine.cast::<c_void>();
+        let mut performance = [0xA5; 64 + 8];
+        call!(e, 11, fn(*mut u8) -> (), performance.as_mut_ptr());
+        assert_eq!(&performance[..64], &[0; 64]);
+        assert_eq!(&performance[64..], &[0xA5; 8]);
         assert_eq!(call!(e, 1, fn() -> u32,), 2);
         let mut same: *mut c_void = std::ptr::null_mut();
         assert_eq!(call!(e, 0, fn(*const c_void, *mut *mut c_void) -> HRESULT, std::ptr::null(), &mut same), S_OK);
@@ -1505,7 +1525,7 @@ mod tests {
         let engine = new_engine(open_held);
         let w = wave(1, 48_000, 16, 1);
         // XAUDIO2_VOICE_SENDS with SendCount=1 and pSends=NULL must not dereference NULL.
-        let mut bad_sends = [0u8; 16];
+        let mut bad_sends = [0u8; 12];
         bad_sends[0..4].copy_from_slice(&1u32.to_le_bytes());
         let mut voice = std::ptr::null_mut();
         assert_eq!(
@@ -1533,7 +1553,7 @@ mod tests {
 
         // Loop regions outside [play_begin, play_end] are refused.
         let pcm = [0i16; 100];
-        let mut buf = [0u8; 48];
+        let mut buf = [0u8; 44];
         buf[4..8].copy_from_slice(&(size_of_val(&pcm) as u32).to_le_bytes());
         buf[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
         buf[16..20].copy_from_slice(&50u32.to_le_bytes()); // PlayBegin = 50
