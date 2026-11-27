@@ -434,21 +434,38 @@ pub(crate) fn irreducible_edge(
 ) -> Option<(usize, usize)> {
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
+    let (tin, tout) = dominator_intervals(&idom, order, entry);
     for &b in order {
         for s in blocks[b].exit.successors() {
-            if index[s] > index[b] {
-                continue;
-            }
-            let mut d = b;
-            while d != s && d != entry {
-                d = idom[d];
-            }
-            if d != s {
+            if index[s] <= index[b] && !(tin[s] <= tin[b] && tout[b] <= tout[s]) {
                 return Some((b, s));
             }
         }
     }
     None
+}
+
+/// DFS intervals nest exactly when one block dominates another.
+fn dominator_intervals(idom: &[usize], order: &[usize], entry: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut children = vec![Vec::new(); idom.len()];
+    for &b in &order[1..] {
+        children[idom[b]].push(b);
+    }
+    let mut tin = vec![0; idom.len()];
+    let mut tout = vec![0; idom.len()];
+    let mut stack = vec![(entry, false)];
+    let mut time = 0;
+    while let Some((b, exiting)) = stack.pop() {
+        if exiting {
+            tout[b] = time;
+        } else {
+            tin[b] = time;
+            stack.push((b, true));
+            stack.extend(children[b].iter().map(|&child| (child, false)));
+        }
+        time += 1;
+    }
+    (tin, tout)
 }
 
 /// Each block's immediate dominator (the entry's is itself, unreachable
@@ -482,6 +499,10 @@ pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<u
                 } else {
                     intersect(&idom, q, new)
                 };
+                // No remaining predecessor can move the common dominator above entry.
+                if new == entry {
+                    break;
+                }
             }
             if idom[b] != new {
                 idom[b] = new;
@@ -1629,6 +1650,81 @@ mod tests {
             .collect();
         link(&mut blocks);
         blocks
+    }
+
+    fn rpo_and_index(blocks: &[Block]) -> (Vec<usize>, Vec<usize>) {
+        let order = reverse_postorder(blocks);
+        let mut index = vec![usize::MAX; blocks.len()];
+        for (i, &b) in order.iter().enumerate() {
+            index[b] = i;
+        }
+        (order, index)
+    }
+
+    #[test]
+    fn reducible_chain_with_256_latches() {
+        let mut exits = vec![Exit::Jump(1), Exit::Jump(2)];
+        for latch in 2..258 {
+            exits.push(Exit::Branch {
+                taken: 1,
+                not_taken: latch + 1,
+            });
+        }
+        exits.push(Exit::End);
+        let blocks = graph(&exits);
+        let (order, index) = rpo_and_index(&blocks);
+        assert_eq!(irreducible_edge(&blocks, &order, &index), None);
+    }
+
+    #[test]
+    fn two_entry_cycle_reports_the_first_offending_edge() {
+        for (taken, not_taken) in [(1, 2), (2, 1)] {
+            let blocks = graph(&[
+                Exit::Branch { taken, not_taken },
+                Exit::Jump(2),
+                Exit::Jump(1),
+                Exit::Jump(1), // Unreachable predecessor.
+            ]);
+            let (order, index) = rpo_and_index(&blocks);
+            assert_eq!(
+                irreducible_edge(&blocks, &order, &index),
+                Some((not_taken, taken))
+            );
+        }
+    }
+
+    #[test]
+    fn irreducible_edge_matches_parent_walk_on_three_block_graphs() {
+        let mut exits = vec![Exit::End];
+        for taken in 0..3 {
+            exits.push(Exit::Jump(taken));
+            for not_taken in 0..3 {
+                exits.push(Exit::Branch { taken, not_taken });
+            }
+        }
+        for &a in &exits {
+            for &b in &exits {
+                for &c in &exits {
+                    let blocks = graph(&[a, b, c]);
+                    let (order, index) = rpo_and_index(&blocks);
+                    let idom = idoms(&blocks, &order, &index);
+                    let expected = order.iter().find_map(|&from| {
+                        blocks[from].exit.successors().into_iter().find_map(|to| {
+                            let mut d = from;
+                            while d != to && d != order[0] {
+                                d = idom[d];
+                            }
+                            (index[to] <= index[from] && d != to).then_some((from, to))
+                        })
+                    });
+                    assert_eq!(
+                        irreducible_edge(&blocks, &order, &index),
+                        expected,
+                        "{a:?}, {b:?}, {c:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
