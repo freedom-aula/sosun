@@ -341,6 +341,11 @@ impl<B: PresentBackend> Title<B> {
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
         self.sync_dirty();
+        self.submit_synced(queue, segments);
+    }
+
+    /// [`Self::submit`] once the textures are in step with title memory ([`Self::sync_dirty`]).
+    pub fn submit_synced(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
         for (list, waits) in segments {
             self.stats.segments += 1;
             let waits: Vec<ValueWait> = waits.into_iter().map(Into::into).collect();

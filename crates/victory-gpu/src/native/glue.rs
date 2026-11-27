@@ -166,6 +166,22 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     if env_set!("VICTORY_TRACE_WRITES") {
         tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
     }
+    // One submission at a time, in the order they came: the lock below is let go while the
+    // textures are read, and the next submission must not overtake this one meanwhile.
+    static ORDER: Mutex<()> = Mutex::new(());
+    let _order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    // Tests share one title and count the uploads of their own `sync_dirty` calls, which another
+    // test's submission with textures read but not yet uploaded would upset: there the lock is
+    // kept from the probes to the uploads (`Title::submit`).
+    let unlocked = !cfg!(test);
+    if unlocked {
+        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        for batch in super::textures::batches(jobs) {
+            // Without the lock: the title's other threads go on recording.
+            let prepared = super::textures::prepare(&batch);
+            with_title(|t| t.sync_apply(prepared));
+        }
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -175,7 +191,11 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             let list = crate::list::native(l);
             segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
-        t.submit(queue as usize, segments);
+        if unlocked {
+            t.submit_synced(queue as usize, segments);
+        } else {
+            t.submit(queue as usize, segments);
+        }
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {

@@ -12,6 +12,11 @@
 //! a thread hashes the memory of every sampled texture round after round (see `Watch`); a compute detile that reads the
 //! pool buffer directly and a per-page change test (what `watch.rs` gives the D3D12 host) are the
 //! next step. A change detiles the whole texture.
+//!
+//! A submission's textures are read, hashed and detiled on a few threads without the host's lock
+//! ([`prepare`]); only the probes that pick them ([`Title::sync_jobs`]) and the uploads
+//! ([`Title::sync_apply`]) hold it. Under the lock that work stopped every thread of a title that
+//! streams (hundreds of MiB of textures a second), for most of each second.
 
 use super::descriptors::format;
 use super::host::NativeHost;
@@ -79,13 +84,27 @@ impl TextureInfo {
 
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
-    const CHUNK: usize = 1 << 20;
     let mut out = vec![0u8; len];
+    let _ = read_into(at as usize, &mut out);
+    out
+}
+
+/// Fills `out` from title memory at `at`, with zeros where it cannot be read; whether some of it
+/// could not.
+///
+/// shortcut: a megabyte with one page that cannot be read is all zeros; read page by page if a
+/// title's textures turn out to be mapped in pieces (`VICTORY_TRACE_TEXTURE_SYNC=1` counts them).
+fn read_into(at: usize, out: &mut [u8]) -> bool {
+    const CHUNK: usize = 1 << 20;
+    let mut unreadable = false;
     for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
         // Only an address, checked by the kernel when read.
-        let _ = super::safe_read(at.wrapping_add(i * CHUNK), chunk);
+        if !super::safe_read((at + i * CHUNK) as *const u8, chunk) {
+            chunk.fill(0);
+            unreadable = true;
+        }
     }
-    out
+    unreadable
 }
 
 /// Host texels as title memory holds them: the reverse of [`to_host`].
@@ -108,6 +127,44 @@ pub fn to_host(format: u32, texels: &mut [u8]) {
     }
 }
 
+/// One mip of one slice, detiled: what `ResourceBackend::upload_texture` takes.
+struct Level {
+    mip: usize,
+    slice: usize,
+    texels: Vec<u8>,
+    row: usize,
+    slice_pitch: usize,
+}
+
+/// Detiles every mip of every slice of `tiled` (a texture's whole memory): the levels detiled,
+/// and the error that stopped it short if one did.
+fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (Vec<Level>, Result<(), String>) {
+    let slices = if dimension == Dimension::Tex3d { 1 } else { layout.slices };
+    let n = layout.desc.element_bytes as usize;
+    let mut levels = Vec::new();
+    for mip in 0..layout.mips.len() as u32 {
+        let m = &layout.mips[mip as usize];
+        let row = m.width as usize * n;
+        let slice_pitch = row * m.height as usize;
+        let depth = layout.subresource_depth(mip).max(1) as usize;
+        for slice in 0..slices {
+            let mut texels = vec![0u8; slice_pitch * depth];
+            if let Err(e) = layout.detile(tiled, mip, slice, &mut texels, row, slice_pitch) {
+                return (levels, Err(format!("detile mip {mip} slice {slice}: {e:?}")));
+            }
+            to_host(format, &mut texels);
+            levels.push(Level { mip: mip as usize, slice: slice as usize, texels, row, slice_pitch });
+        }
+    }
+    (levels, Ok(()))
+}
+
+fn upload_levels<B: ResourceBackend>(backend: &B, tex: &B::Texture, levels: &[Level]) {
+    for l in levels {
+        backend.upload_texture(tex, l.mip, l.slice, &l.texels, l.row, l.slice_pitch);
+    }
+}
+
 /// Detiles every mip of every slice of `tiled` (the texture's whole memory) into `tex`.
 pub fn upload<B: ResourceBackend>(
     backend: &B,
@@ -115,28 +172,9 @@ pub fn upload<B: ResourceBackend>(
     info: &TextureInfo,
     tiled: &[u8],
 ) -> Result<(), String> {
-    let layout = &info.layout;
-    let slices = if info.dimension == Dimension::Tex3d {
-        1
-    } else {
-        layout.slices
-    };
-    let n = layout.desc.element_bytes as usize;
-    for mip in 0..layout.mips.len() as u32 {
-        let m = &layout.mips[mip as usize];
-        let row = m.width as usize * n;
-        let slice_pitch = row * m.height as usize;
-        let depth = layout.subresource_depth(mip).max(1) as usize;
-        let mut linear = vec![0u8; slice_pitch * depth];
-        for slice in 0..slices {
-            layout
-                .detile(tiled, mip, slice, &mut linear, row, slice_pitch)
-                .map_err(|e| format!("detile mip {mip} slice {slice}: {e:?}"))?;
-            to_host(info.format, &mut linear);
-            backend.upload_texture(tex, mip as usize, slice as usize, &linear, row, slice_pitch);
-        }
-    }
-    Ok(())
+    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled);
+    upload_levels(backend, tex, &levels);
+    result
 }
 
 /// The reverse of [`upload`]: every mip of every slice of `tex`, retiled into `tiled` (the
@@ -245,9 +283,14 @@ impl<B: PresentBackend> Back<B> {
 #[derive(Default)]
 struct Watch {
     /// Title texture key to (address, bytes, whether it is a render target: its first sight is
-    /// its baseline, not a change).
-    entries: HashMap<usize, (usize, usize, bool)>,
+    /// its baseline, not a change; which texture of that key: [`Tracked::serial`]).
+    entries: HashMap<usize, (usize, usize, bool, u64)>,
     dirty: std::collections::HashSet<usize>,
+    /// The hash of each texture's memory as last read whole, by the scanner or by a submission.
+    /// What a submission read, the host texture holds: the scanner does not report it again (it
+    /// used to report every new texture and every write a probe had caught already, and each
+    /// report is the whole texture read once more).
+    seen: HashMap<usize, blake3::Hash>,
 }
 
 static WATCH: std::sync::Mutex<Option<Watch>> = std::sync::Mutex::new(None);
@@ -260,13 +303,15 @@ fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
-            let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                let list: Vec<(usize, (usize, usize, bool))> =
+                let list: Vec<(usize, (usize, usize, bool, u64))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
-                seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for &(key, (at, size, target)) in &list {
+                for &(key, entry) in &list {
+                    let (at, size, target, _) = entry;
+                    // What it is compared with; `None` (skipped) if it was released since the list.
+                    let known = |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
+                    let Some(before) = watch(|w| known(w)) else { continue };
                     let mut h = blake3::Hasher::new();
                     for off in (0..size).step_by(buf.len()) {
                         let n = buf.len().min(size - off);
@@ -275,10 +320,17 @@ fn start_scanner() {
                         h.update(&buf[..n]);
                     }
                     let h = h.finalize();
-                    let before = seen.insert(key, h);
-                    if before != Some(h) && !(target && before.is_none()) {
-                        watch(|w| w.dirty.insert(key));
-                    }
+                    watch(|w| {
+                        // Released, or read by a submission while it was hashed here: this reading
+                        // is the older one, and the next round compares with the submission's.
+                        if known(w) != Some(before) {
+                            return;
+                        }
+                        w.seen.insert(key, h);
+                        if before != Some(h) && !(target && before.is_none()) {
+                            w.dirty.insert(key);
+                        }
+                    });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -290,17 +342,20 @@ fn start_scanner() {
 pub struct Tracked<B: ResourceBackend> {
     pub texture: Rc<B::Texture>,
     info: TextureInfo,
+    /// Which texture this is: its key (an object's address, a placement) names another one later.
+    serial: u64,
     /// The hash of the memory last uploaded; `None` for targets and before the first upload.
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
     pub uploads: u64,
     /// Submissions left in which its memory is probed at submission rather than left to the
-    /// scanner (0: cold), and the hash of what the last probe read.
+    /// scanner (0: cold), and the hash of its samples when it was last read whole (a probe that
+    /// reads others reports a write).
     hot: u32,
     probe: Option<blake3::Hash>,
-    /// Whether its writes show in the sampled probe (a movie's planes, rewritten whole): then it is
-    /// read whole only every `WHOLE_EVERY` probes, and probes skipped since. A change the samples
-    /// missed clears it.
+    /// Whether its last write showed in the sampled probe (a movie's planes, a streamed texture:
+    /// written whole): then it is read whole only every `WHOLE_EVERY` probes, and probes skipped
+    /// since. Set at each upload (`sync_apply`), whoever found the write.
     sampled_sees_writes: bool,
     skipped: u32,
     /// Its last upload was all zeros: it is probed (`Title::blank_keys`) until written, however
@@ -340,9 +395,15 @@ const MIN_SYNC_HOT: usize = 32;
 const PROBE_PAGES: usize = 8;
 /// Bytes sampled per page when probing a large hot texture.
 const PROBE_SAMPLE: usize = 256;
-/// Hot textures up to this size that changed more than once are probed whole (a glyph cache gets
-/// a few glyphs at a time). Textures written once after a blank upload (streaming) are sampled:
-/// probing all of them whole looked about 15% slower in one run.
+/// Hot textures up to this size whose last write its samples missed are read whole at every probe
+/// (a glyph cache gets a few glyphs at a time). Those written so that the samples showed it (a
+/// streamed texture, written whole after its blank upload) are read whole now and then
+/// (`WHOLE_EVERY`): in the world they are thousands, and read whole at every probe they were 2,000
+/// textures and 500 MiB a second, most of what a submission read.
+///
+/// shortcut: an atlas whose first glyphs reach a sampled page gets its next ones up to
+/// `WHOLE_EVERY` probes late, once (then its samples have missed a write); per-sample hashes
+/// would tell a partial write from a whole one.
 const PROBE_WHOLE: usize = 4 << 20;
 
 /// A hot texture whose writes show in its samples is read whole once in this many probes, to
@@ -350,6 +411,14 @@ const PROBE_WHOLE: usize = 4 << 20;
 /// Reading the movie's chroma planes whole at every submission cost 15 ms a submission, halving
 /// the movie's frame rate.
 pub(super) const WHOLE_EVERY: u32 = 8;
+/// Bytes of hot textures one submission reads whole to check them, once `MIN_SYNC_HOT` were
+/// probed: the reading is off the host's lock but not free (a guess at what a submission can
+/// spare: about 5 ms of one thread under Rosetta).
+const WHOLE_BUDGET: usize = 8 << 20;
+/// Of those, bytes of the ones read whole only now and then (`WHOLE_EVERY`: their samples showed
+/// their last write). In the world they are nearly all of the hot textures and the title submits
+/// some 30 times a frame; one that is due and not read stays due (a guess, as above: 1 ms).
+const WHOLE_SPARE: usize = 1 << 20;
 
 /// Hash of the bytes a probe of `size` bytes at `at` reads ([`probe_read`]).
 fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> blake3::Hash {
@@ -410,9 +479,16 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     }
 }
 
+/// For the trace: hot textures a probe read whole, and their bytes.
+static WHOLE_PROBES: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// For the trace: placements that took the place of another at their address, and those of them
+/// that had been at that address before.
+static REPLACED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// Probes `keys` round-robin from `cursor`, each at most once, until `until` once
-/// `MIN_SYNC_HOT` were probed; those whose memory changed go to `dirty`. Hot textures that stay
-/// unchanged cool down and leave; blank ones (`blank`) stay until they are written.
+/// `MIN_SYNC_HOT` were probed; those whose memory changed, and the hot ones to be read whole to
+/// tell, go to `dirty`. Hot textures that stay unchanged cool down and leave; blank ones (`blank`)
+/// stay until they are written.
 fn probe_round<B: ResourceBackend>(
     textures: &mut Textures<B>,
     keys: &mut Vec<usize>,
@@ -424,8 +500,11 @@ fn probe_round<B: ResourceBackend>(
 ) {
     let mut left = keys.len();
     let mut probed = 0;
+    // Bytes of the textures to be read whole, and of those among them read so only now and then.
+    let mut whole = 0;
+    let mut spare = 0;
     while left > 0 && !keys.is_empty() {
-        if probed >= MIN_SYNC_HOT && std::time::Instant::now() >= until {
+        if probed >= MIN_SYNC_HOT && (std::time::Instant::now() >= until || whole >= WHOLE_BUDGET) {
             break;
         }
         left -= 1;
@@ -447,31 +526,30 @@ fn probe_round<B: ResourceBackend>(
             written
         } else {
             let sampled = probe_hash(at, t.info.size, false, scratch);
-            let before = t.probe.replace(sampled);
-            let mut changed = before != Some(sampled);
-            if changed && before.is_some() {
-                // Its writes reach the samples (a movie's planes): no need to read it whole.
-                t.sampled_sees_writes = true;
-            }
+            // Its samples at the last upload (`sync_apply` moves them on).
+            let before = t.probe;
+            let changed = before != Some(sampled);
             if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
-                t.skipped = if t.sampled_sees_writes { t.skipped + 1 } else { WHOLE_EVERY };
-                if t.skipped >= WHOLE_EVERY {
+                t.skipped = if t.sampled_sees_writes { t.skipped.saturating_add(1) } else { WHOLE_EVERY };
+                if t.skipped >= WHOLE_EVERY && !(t.sampled_sees_writes && spare >= WHOLE_SPARE) {
                     t.skipped = 0;
-                    // The same hash as the upload's (`last`): what the GPU has.
-                    changed = t.last != Some(probe_hash(at, t.info.size, true, scratch));
-                    if changed {
-                        // A write the samples missed (a glyph): read it whole every time again.
-                        t.sampled_sees_writes = false;
+                    if t.sampled_sees_writes {
+                        spare += t.info.size;
                     }
+                    // Read whole with the textures the submission reads anyway, without the host's
+                    // lock ([`prepare`]), and uploaded if that is not what the host texture holds
+                    // (a write the samples missed: `sync_apply`). Hashed here, the hot textures
+                    // of a title that streams were hundreds of MiB a second under the lock.
+                    dirty.insert(key);
+                    whole += t.info.size;
+                    WHOLE_PROBES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    WHOLE_PROBES[1].fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if changed {
                 dirty.insert(key);
             } else {
                 t.hot -= 1;
-            }
-            if t.hot == 0 {
-                t.probe = None;
             }
             t.hot == 0
         };
@@ -599,7 +677,9 @@ impl<B: PresentBackend> Title<B> {
         self.host.register_texture(key, &tex);
         // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
         // it changes, as it is not otherwise seen (a GPU write never changes title memory).
-        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target(), serial)));
         start_scanner();
         // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
         // was never drawn into, and a black one was drawn black.
@@ -619,6 +699,7 @@ impl<B: PresentBackend> Title<B> {
             Tracked {
                 texture: tex,
                 info,
+                serial,
                 last: None,
                 uploads: 0,
                 hot: 0,
@@ -686,6 +767,7 @@ impl<B: PresentBackend> Title<B> {
         watch(|w| {
             w.entries.remove(&key);
             w.dirty.remove(&key);
+            w.seen.remove(&key);
         });
     }
 
@@ -697,6 +779,15 @@ impl<B: PresentBackend> Title<B> {
         if let Some((old, _)) = self.placed.insert(address, (key, pool))
             && old != key
         {
+            if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
+                // Whether two descriptions keep taking one address from each other.
+                static WERE: std::sync::Mutex<Option<std::collections::HashSet<(u64, usize)>>> = std::sync::Mutex::new(None);
+                let mut were = WERE.lock().unwrap_or_else(|e| e.into_inner());
+                let were = were.get_or_insert_default();
+                were.insert((address, old));
+                REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                REPLACED[1].fetch_add(u64::from(were.contains(&(address, key))), std::sync::atomic::Ordering::Relaxed);
+            }
             self.host.forget_resource(old);
             self.texture_released(old);
         }
@@ -730,42 +821,72 @@ impl<B: PresentBackend> Title<B> {
             .filter(|(_, t)| !t.info.render_target())
             .map(|(&k, _)| k)
             .collect();
-        self.sync_keys(keys);
+        let jobs = self.jobs(keys);
+        self.sync(jobs);
     }
 
     /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
-    /// found changed since.
+    /// found changed since. (`glue::submit` takes the same steps, the middle one without the
+    /// host's lock.)
     pub fn sync_dirty(&mut self) {
+        let jobs = self.sync_jobs();
+        self.sync(jobs);
+    }
+
+    /// Reads `jobs` and uploads what changed.
+    pub(super) fn sync(&mut self, jobs: Vec<Job>) {
+        for batch in batches(jobs) {
+            let prepared = prepare(&batch);
+            self.sync_apply(prepared);
+        }
+    }
+
+    /// The textures a submission must read: those not uploaded yet, and those the scanner or
+    /// the probes of hot and blank textures found changed.
+    pub(super) fn sync_jobs(&mut self) -> Vec<Job> {
         self.release_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
-        for key in &dirty {
-            // Missed by the sampled probe, so read it whole while it stays hot.
-            if let Some(t) = self.textures.get_mut(key) {
-                t.sampled_sees_writes = false;
-            }
-        }
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
         // the ones that changed lately first, then the blank ones.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let started = std::time::Instant::now();
+        let until = started + PROBE_BUDGET;
         probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
         // The blank ones get a budget of their own: a busy movie must not starve its next planes.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let hot = std::time::Instant::now();
+        let until = hot + PROBE_BUDGET;
         probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
-        let unloaded = std::mem::take(&mut self.unloaded);
-        if unloaded.is_empty() && dirty.is_empty() {
-            return;
+        if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
+            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
-        let mut todo: Vec<usize> = unloaded.into_iter().collect();
+        let mut todo: Vec<usize> = std::mem::take(&mut self.unloaded).into_iter().collect();
         for key in dirty {
             if !todo.contains(&key) {
                 todo.push(key);
             }
         }
-        self.sync_keys(todo);
+        self.jobs(todo)
     }
 
-    fn sync_keys(&mut self, keys: Vec<usize>) {
+    fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
+        let job = |key| {
+            let t = self.textures.get(&key)?;
+            Some(Job {
+                key,
+                serial: t.serial,
+                memory: t.info.memory as usize,
+                size: t.info.size,
+                format: t.info.format,
+                dimension: t.info.dimension,
+                layout: t.info.layout.clone(),
+                last: t.last,
+            })
+        };
+        keys.into_iter().filter_map(job).collect()
+    }
+
+    /// Uploads what [`prepare`] detiled, into the textures that are still the ones it read.
+    pub(super) fn sync_apply(&mut self, prepared: Prepared) {
         let Title {
             host,
             textures,
@@ -774,40 +895,248 @@ impl<B: PresentBackend> Title<B> {
             stats,
             ..
         } = self;
-        for key in keys {
-            let Some(t) = textures.get_mut(&key) else {
+        let started = std::time::Instant::now();
+        let mut cost = SyncCost { batches: 1, prepare: prepared.took, ..Default::default() };
+        let mut read = Vec::new();
+        for r in prepared.ready {
+            cost.textures += 1;
+            cost.bytes += r.bytes as u64;
+            cost.read += r.cost[0];
+            cost.hash += r.cost[1];
+            cost.detile += r.cost[2];
+            cost.unreadable += u64::from(r.unreadable);
+            // Released while it was read (its key may name another texture by now).
+            let Some(t) = textures.get_mut(&r.key).filter(|t| t.serial == r.serial) else {
                 continue;
             };
-            let tiled = read_memory(t.info.memory, t.info.size);
-            let hash = blake3::hash(&tiled);
-            if t.last == Some(hash) {
+            let key = r.key;
+            read.push((key, t.serial, r.hash));
+            cost.first += u64::from(t.last.is_none());
+            // What a probe of this memory reads: the next one reports a write since, not this
+            // content again (a texture's first probe used to, and that was a whole read wasted).
+            let sampled = t.probe.replace(r.probe);
+            // `last` again: a copy back into title memory may have moved it meanwhile.
+            let Some((levels, detiled)) = r.levels.filter(|_| t.last != Some(r.hash)) else {
+                cost.unchanged += 1;
                 continue;
+            };
+            if let Some(sampled) = sampled {
+                // Whoever found this write: one its samples do not show has it read whole at
+                // every probe while it is hot, one they show only now and then.
+                t.sampled_sees_writes = sampled != r.probe;
             }
-            let blank = tiled.iter().all(|&b| b == 0);
+            cost.blank += u64::from(r.blank);
             if !t.info.render_target() {
-                if blank && !t.blank {
+                if r.blank && !t.blank {
                     blank_keys.push(key);
-                } else if !blank && t.uploads > 0 {
+                } else if !r.blank && t.uploads > 0 {
                     // Written again after its first upload: hot.
                     if t.hot == 0 {
                         hot_keys.push(key);
                     }
                     t.hot = HOT;
                 }
-                t.blank = blank;
+                t.blank = r.blank;
             }
-            match upload(&host.backend, &t.texture, &t.info, &tiled) {
+            upload_levels(&host.backend, &t.texture, &levels);
+            t.last = Some(r.hash);
+            match detiled {
                 Ok(()) => {
-                    t.last = Some(hash);
                     t.uploads += 1;
                     stats.detiles += 1;
                 }
                 Err(e) => {
-                    t.last = Some(hash);
                     stats.undetilable += 1;
                     tracing::warn!(texture = key, error = %e, "a title texture was not detiled");
                 }
             }
+        }
+        watch(|w| {
+            for (key, serial, hash) in read {
+                if w.entries.get(&key).is_some_and(|e| e.3 == serial) {
+                    // What the scanner reported while this was read is this same content.
+                    if w.seen.insert(key, hash) == Some(hash) {
+                        w.dirty.remove(&key);
+                    }
+                }
+            }
+        });
+        if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
+            cost.upload = started.elapsed();
+            cost.log();
+        }
+    }
+}
+
+/// A texture whose memory a submission reads: what the reading needs, taken under the host's lock
+/// so that [`prepare`] runs without it.
+pub(super) struct Job {
+    pub(super) key: usize,
+    serial: u64,
+    memory: usize,
+    size: usize,
+    format: u32,
+    dimension: Dimension,
+    layout: Layout,
+    /// The hash of what the host texture holds: memory that still hashes to it is not detiled.
+    last: Option<blake3::Hash>,
+}
+
+/// What a [`Job`]'s memory held when [`prepare`] read it.
+struct Ready {
+    key: usize,
+    serial: u64,
+    bytes: usize,
+    hash: blake3::Hash,
+    /// What a sampled probe of that memory hashes to ([`probe_hash`]).
+    probe: blake3::Hash,
+    /// Some of it could not be read (and counts as zeros).
+    unreadable: bool,
+    /// All zeros.
+    blank: bool,
+    /// Detiled, and how that went; `None` when the host texture holds this content already.
+    levels: Option<(Vec<Level>, Result<(), String>)>,
+    /// Time reading, hashing and detiling.
+    cost: [std::time::Duration; 3],
+}
+
+/// What [`prepare`] made of a batch of jobs, and how long it took.
+pub(super) struct Prepared {
+    ready: Vec<Ready>,
+    took: std::time::Duration,
+}
+
+/// Threads a submission's textures are read on (the submitting thread is one of them).
+const SYNC_THREADS: usize = 6;
+/// Texture memory read at a time: its detiled copy is held until it is uploaded.
+const SYNC_BATCH: usize = 256 << 20;
+
+/// `jobs` in runs of at most `SYNC_BATCH` bytes of texture memory (a larger texture alone).
+pub(super) fn batches(jobs: Vec<Job>) -> Vec<Vec<Job>> {
+    let mut out: Vec<Vec<Job>> = Vec::new();
+    let mut bytes = 0;
+    for job in jobs {
+        if out.is_empty() || bytes + job.size > SYNC_BATCH {
+            out.push(Vec::new());
+            bytes = 0;
+        }
+        bytes += job.size;
+        out.last_mut().expect("pushed above").push(job);
+    }
+    out
+}
+
+impl Job {
+    /// Reads its memory into `tiled` (kept from job to job: a fresh buffer each time maps and
+    /// faults in new pages) and detiles it unless it is what the host texture holds.
+    fn read(&self, tiled: &mut Vec<u8>) -> Ready {
+        let started = std::time::Instant::now();
+        // Sampled as the probes sample it (a page that can be read in a megabyte that cannot
+        // counts there and not in the whole read), and before the whole read: a write between
+        // the two is then a change to the next probe, not part of what it compares with.
+        let probe = probe_hash(self.memory, self.size, false, tiled);
+        if tiled.len() < self.size {
+            tiled.resize(self.size, 0);
+        }
+        let tiled = &mut tiled[..self.size];
+        let unreadable = read_into(self.memory, tiled);
+        let read = started.elapsed();
+        let hash = blake3::hash(tiled);
+        let hashed = started.elapsed();
+        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled));
+        Ready {
+            key: self.key,
+            serial: self.serial,
+            bytes: self.size,
+            hash,
+            probe,
+            unreadable,
+            blank: levels.is_some() && tiled.iter().all(|&b| b == 0),
+            levels,
+            cost: [read, hashed - read, started.elapsed() - hashed],
+        }
+    }
+}
+
+/// Reads, hashes and detiles the textures of `jobs`, in their order. This is the bulk of a texture
+/// sync and needs nothing of the host, so it runs without the host's lock, on a few threads.
+pub(super) fn prepare(jobs: &[Job]) -> Prepared {
+    let started = std::time::Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::with_capacity(jobs.len()));
+    let work = || {
+        let mut tiled = Vec::new();
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(job) = jobs.get(i) else { break };
+            let ready = job.read(&mut tiled);
+            done.lock().unwrap_or_else(|e| e.into_inner()).push((i, ready));
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 1..SYNC_THREADS.min(jobs.len()) {
+            // Without the thread, the others (this one at least) read its share.
+            let _ = std::thread::Builder::new().name("victory texture read".into()).spawn_scoped(s, work);
+        }
+        work();
+    });
+    let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
+    done.sort_by_key(|&(i, _)| i);
+    Prepared { ready: done.into_iter().map(|(_, r)| r).collect(), took: started.elapsed() }
+}
+
+/// What syncing textures cost: logged with `VICTORY_TRACE_TEXTURE_SYNC=1`, summed over each second.
+#[derive(Default)]
+struct SyncCost {
+    batches: u64,
+    textures: u64,
+    /// Never uploaded before (a new texture, or a render target's memory written for the first time).
+    first: u64,
+    /// Read and hashed, and what the host texture holds already.
+    unchanged: u64,
+    /// All zeros (detiled and uploaded all the same).
+    blank: u64,
+    /// With memory that could not be read.
+    unreadable: u64,
+    bytes: u64,
+    /// Hot textures at a submission (the last of the second is logged).
+    hot: u64,
+    /// Under the host's lock: probing hot textures and blank ones, and uploading.
+    probe: [std::time::Duration; 2],
+    upload: std::time::Duration,
+    /// What the reading took the submission, without the host's lock.
+    prepare: std::time::Duration,
+    /// On the reading threads, summed: reading title memory, hashing it, detiling it.
+    read: std::time::Duration,
+    hash: std::time::Duration,
+    detile: std::time::Duration,
+}
+
+impl SyncCost {
+    fn log(self) {
+        static SUM: std::sync::Mutex<Option<(std::time::Instant, [u64; 14])>> = std::sync::Mutex::new(None);
+        let mut sum = SUM.lock().unwrap_or_else(|e| e.into_inner());
+        let (since, s) = sum.get_or_insert_with(|| (std::time::Instant::now(), [0; 14]));
+        let us = |d: std::time::Duration| d.as_micros() as u64;
+        let add = [
+            self.batches, self.textures, self.first, self.unchanged, self.blank, self.unreadable, self.bytes,
+            us(self.probe[0]), us(self.probe[1]), us(self.upload), us(self.prepare), us(self.read), us(self.hash), us(self.detile),
+        ];
+        s.iter_mut().zip(add).for_each(|(s, a)| *s += a);
+        static HOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if self.hot > 0 {
+            HOT.store(self.hot, std::sync::atomic::Ordering::Relaxed);
+        }
+        if since.elapsed().as_secs() >= 1 {
+            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before)",
+                since.elapsed().as_secs_f32(), s[0], s[1], s[2], s[3], s[4], s[5], s[6] >> 20,
+                take(&HOT), s[7] / 1000, take(&WHOLE_PROBES[0]), take(&WHOLE_PROBES[1]) >> 20, s[8] / 1000, s[9] / 1000,
+                s[10] / 1000, s[11] / 1000, s[12] / 1000, s[13] / 1000,
+                take(&REPLACED[0]), take(&REPLACED[1])
+            );
+            *sum = None;
         }
     }
 }

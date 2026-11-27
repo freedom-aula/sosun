@@ -134,11 +134,33 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
         t.sync_dirty();
         assert_eq!(t.uploads_of(key), 2, "uploaded again at the next submission");
     });
+    // Its samples showed that write, as they show a streamed texture's: it is not read whole at
+    // every submission after it (thousands of those were most of what a world submission read).
+    with_title(|t| {
+        let reads = (0..crate::native::textures::WHOLE_EVERY)
+            .filter(|_| {
+                let jobs = t.sync_jobs();
+                let read = jobs.iter().any(|j| j.key == key);
+                t.sync(jobs);
+                read
+            })
+            .count();
+        assert!(reads <= 1, "read whole {reads} times in a whole-read period");
+    });
     // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
     pool.write(3 * 4096 + 100, &[1u8; 16]);
+    // (Twice the period: other tests' textures share what a submission spares for these reads.)
+    with_title(|t| {
+        let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| {
+            t.sync_dirty();
+            t.uploads_of(key) == 3
+        });
+        assert!(n.is_some(), "a small write is seen within a whole-read period or two");
+    });
+    pool.write(5 * 4096 + 100, &[1u8; 16]);
     with_title(|t| {
         t.sync_dirty();
-        assert_eq!(t.uploads_of(key), 3, "a small write is seen at the next submission too");
+        assert_eq!(t.uploads_of(key), 4, "and, its samples having missed one, the next at the next submission");
     });
 }
 
@@ -190,8 +212,9 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
     }
     // A glyph's worth of bytes in page 3 (a page the samples skip).
     pool.write(3 * 4096 + 100, &[9u8; 16]);
-    let n = (1..=crate::native::textures::WHOLE_EVERY + 1).find(|_| sync() == 5);
-    assert!(n.is_some(), "a write the samples miss is seen within a whole-read period");
+    // (Twice the period: other tests' textures share what a submission spares for these reads.)
+    let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| sync() == 5);
+    assert!(n.is_some(), "a write the samples miss is seen within a whole-read period or two");
     pool.write(5 * 4096 + 100, &[9u8; 16]);
     assert_eq!(sync(), 6, "and the next one at the next submission");
 }
@@ -224,6 +247,98 @@ fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
         let seen = keys.iter().filter(|&&k| t.uploads_of(k) == 2).count();
         assert_eq!(seen, N, "all {N} hot textures written, seen at the next submission");
     });
+}
+
+/// A submission's textures are read and detiled on several threads: each host texture gets its
+/// own memory's texels, once.
+#[test]
+fn textures_read_on_several_threads_get_their_own_texels() {
+    const N: usize = 48;
+    const STRIDE: usize = 64 << 10;
+    let Some(pool) = pool(9125, N * STRIDE / page_size() + 1) else { return };
+    let keys: Vec<usize> = (0..N)
+        .map(|i| {
+            let res = crate::resource::test_texture_at(pool.va(i * STRIDE), (64, 64), 1, 28, Swizzle::SW_4KB_S.0, 0);
+            let layout = crate::resource::texture_info(res).unwrap().layout;
+            let mut bytes = vec![0u8; layout.size as usize];
+            let texels = vec![i as u8 + 1; 64 * 64 * 4];
+            layout.tile(&mut bytes, 0, 0, &texels, 64 * 4, texels.len()).unwrap();
+            pool.write(i * STRIDE, &bytes);
+            res as usize
+        })
+        .collect();
+    with_title(|t| {
+        for &k in &keys {
+            assert!(t.realize(k));
+        }
+        t.sync_dirty();
+        assert!(keys.iter().all(|&k| t.uploads_of(k) == 1), "each uploaded once");
+    });
+    for (i, &k) in keys.iter().enumerate() {
+        assert!(read_mip(k, 0, 64, 64).iter().all(|&b| b == i as u8 + 1), "texture {i} holds its own texels");
+    }
+}
+
+/// A texture released while a submission read its memory (without the host's lock): what was read
+/// is not uploaded into the texture that has its key by then.
+#[test]
+fn memory_read_for_a_texture_released_meanwhile_is_dropped() {
+    let Some(pool) = pool(9126, 8) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    pool.write(0, &vec![7u8; info.size]);
+    with_title(|t| {
+        assert!(t.realize(key));
+        let jobs = t.sync_jobs();
+        assert!(jobs.iter().any(|j| j.key == key));
+        let prepared = crate::native::textures::prepare(&jobs);
+        // Released, and another made at its key, while the memory was read.
+        t.texture_released(key);
+        t.texture_created(key, info.clone());
+        assert!(t.realize(key));
+        t.sync_apply(prepared);
+        assert_eq!(t.uploads_of(key), 0, "the new texture gets nothing read for the old one");
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 1, "and is filled at the next submission");
+    });
+}
+
+/// A texture just uploaded is not read whole again until its memory changes: neither its first
+/// probe as a hot texture nor the scanner's next round reports what the submission read.
+#[test]
+fn a_texture_just_uploaded_is_not_read_again_until_it_changes() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    // 8 MiB: more than a probe reads whole.
+    let Some(pool) = pool(9127, (8 << 20) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (2048, 1024), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    // A submission: whether it reads the texture, and the texture's uploads after it.
+    let submit = || {
+        with_title(|t| {
+            let jobs = t.sync_jobs();
+            let read = jobs.iter().any(|j| j.key == key);
+            t.sync(jobs);
+            (read, t.uploads_of(key))
+        })
+        .unwrap()
+    };
+    // Written under the lock, so that no other test's submission reads half of it.
+    let write = |bytes: &[u8]| with_title(|_| pool.write(0, bytes)).unwrap();
+    with_title(|t| assert!(t.realize(key)));
+    assert_eq!(submit().1, 1, "the blank first upload");
+    write(&vec![0xABu8; info.size]);
+    // Within a few submissions (other tests' blank textures share the probe's time budget), this
+    // test's or another's.
+    assert!((1..=4).any(|_| submit().1 == 2), "written, so uploaded again");
+    for _ in 0..20 {
+        // Time for a round of the scanner.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(submit(), (false, 2), "read again though nothing was written");
+    }
+    write(&[1u8; 16]);
+    assert!((1..=4).any(|_| submit().1 == 3), "a write is seen");
 }
 
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
