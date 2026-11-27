@@ -235,8 +235,30 @@ impl Layer {
 
 impl Metal {
     /// A layer drawing to this device: `width` by `height` drawables in BGRA, readable (not
-    /// frame-buffer only), vsync off.
+    /// frame-buffer only), vsync off. `VICTORY_RENDER_SCALE=<f>` (a fraction in (0, 1]) scales
+    /// the drawables down — the present pass draws the title's texture over whatever the layer
+    /// gives it, so the picture is only softer — which on a memory-pressured Mac saves the
+    /// drawable's bytes (three of them alive at once) and the compositor's. A layer the app
+    /// itself sized (create_surface) is left alone: its size is the app's own.
     pub fn create_layer(&self, width: usize, height: usize) -> Layer {
+        static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let scale = *SCALE.get_or_init(|| {
+            std::env::var("VICTORY_RENDER_SCALE")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|&k| k > 0.0 && k <= 1.0)
+                .unwrap_or(1.0)
+        });
+        let (width, height) = if scale < 1.0 {
+            let (w, h) = (
+                ((width as f32 * scale) as usize).max(1),
+                ((height as f32 * scale) as usize).max(1),
+            );
+            tracing::info!(scale, from = ?[width, height], to = ?[w, h], "VICTORY_RENDER_SCALE: drawables scaled down");
+            (w, h)
+        } else {
+            (width, height)
+        };
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(&self.dev));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);

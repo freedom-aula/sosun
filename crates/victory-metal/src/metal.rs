@@ -296,10 +296,23 @@ type Job = Box<dyn FnOnce() + Send>;
 static JOBS: (std::sync::Mutex<Vec<Job>>, std::sync::Condvar) = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
 /// Runs `job` on one of the `pipeline-compile` threads (as many as cores, started at the first).
+/// `VICTORY_COMPILE_THREADS=<n>` (at least 1) caps them instead: every concurrent conversion
+/// and Metal compile holds its own working memory (the converter's IR, Metal's compiler state),
+/// and on a memory-pressured Mac (a 16 GB Air running a world load) fewer of them is a smaller
+/// peak at the cost of compiles taking longer — a cold frame's 800 pipelines still get made,
+/// just less at once.
 fn compile_later(job: Job) {
     static THREADS: std::sync::Once = std::sync::Once::new();
     THREADS.call_once(|| {
-        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+        let asked = std::env::var("VICTORY_COMPILE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        let threads = asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        if let Some(n) = asked {
+            tracing::info!(threads = n, "metal: pipeline compiles capped by VICTORY_COMPILE_THREADS");
+        }
+        for _ in 0..threads {
             let _ = std::thread::Builder::new().name("pipeline-compile".into()).spawn(|| {
                 loop {
                     let mut jobs = JOBS.0.lock().unwrap_or_else(|e| e.into_inner());

@@ -1758,6 +1758,23 @@ impl Metal {
             };
             (slice_bytes % align == 0).then_some((buf_off, slice_bytes))
         };
+        // The staging pool of this encoder: every format-converting copy below goes through a
+        // private buffer of its own rows, and one buffer that grows to the largest of them
+        // serves the lot instead of one allocation per copy — a world load's thousands of
+        // copies then cost the largest single copy's bytes, not their sum. The encoder runs
+        // its operations in the order they were encoded (the copy-out/copy-in pair below
+        // already relies on that), and Metal keeps a buffer alive past the operations that
+        // use it, so replacing the pool's handle when it grows is safe.
+        let mut staging: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)> = None;
+        let mut take_staging = |this: &Self, need: usize| -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+            if let Some((buffer, _)) = staging.as_ref().filter(|&(_, len)| *len >= need) {
+                return Some(buffer.clone());
+            }
+            let grown = need.max(staging.as_ref().map_or(16, |(_, len)| len * 2));
+            let buffer = this.dev.newBufferWithLength_options(grown, MTLResourceOptions::StorageModePrivate)?;
+            staging = Some((buffer.clone(), grown));
+            Some(buffer)
+        };
         for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
@@ -1808,7 +1825,7 @@ impl Metal {
                         if !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, d) {
                             continue;
                         }
-                        let Some(scratch) = self.dev.newBufferWithLength_options((row * rows * sz[2]).max(16), MTLResourceOptions::StorageModePrivate) else {
+                        let Some(scratch) = take_staging(self, row * rows * sz[2]) else {
                             continue;
                         };
                         let pitch = if sz[2] > 1 { row * rows } else { 0 };
