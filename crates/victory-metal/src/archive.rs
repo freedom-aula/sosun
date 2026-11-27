@@ -114,14 +114,14 @@ impl Archive {
 
     /// As [`Self::render`], for a mesh pipeline. Without this each run compiled every mesh pipeline
     /// again on the frame that first draws with it: seconds each at the first frame of the world.
-    pub(crate) fn mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
+    pub(crate) fn mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
         let started = Instant::now();
         if let Some(p) = self.archived_mesh(dev, d) {
             note(started, "mesh pipeline from the archive");
             return Ok(p);
         }
         d.setBinaryArchives(None);
-        let p = compile_mesh(dev, d)?;
+        let p = compile_mesh(dev, d, crash_key)?;
         self.add("mesh pipeline added to the archive", || {
             self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok()
         });
@@ -143,15 +143,14 @@ impl Archive {
     pub(crate) fn compute(
         &self,
         dev: &Dev,
-        f: &ProtocolObject<dyn MTLFunction>,
+        d: &MTLComputePipelineDescriptor,
+        crash_key: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
         let started = Instant::now();
-        let d = MTLComputePipelineDescriptor::new();
-        d.setComputeFunction(Some(f));
         d.setBinaryArchives(Some(&self.list));
         let reading = self.read();
         if let Ok(p) = dev.newComputePipelineStateWithDescriptor_options_reflection_error(
-            &d,
+            d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
             None,
         ) {
@@ -160,13 +159,9 @@ impl Archive {
         }
         drop(reading);
         d.setBinaryArchives(None);
-        let p = dev
-            .newComputePipelineStateWithDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)
-            .map_err(|e| e.localizedDescription().to_string());
-        note(started, "compute pipeline compiled");
-        let p = p?;
+        let p = compile_compute(dev, d, crash_key)?;
         self.add("compute pipeline added to the archive", || {
-            self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok()
+            self.archive.addComputePipelineFunctionsWithDescriptor_error(d).is_ok()
         });
         Ok(p)
     }
@@ -200,9 +195,13 @@ impl Drop for Archive {
 /// pipeline on macOS 15 (0.7 s on macOS 27), on the frame. A normal compile takes well under this.
 /// shortcut: a pipeline that compiles slower than this is refused for the run, and the compile it
 /// finishes is dropped (not archived); keep it in the archive if a real one ever needs longer.
-const COMPILE_DEADLINE: Duration = Duration::from_secs(10);
+/// It was 10 s while the frame's thread waited for it. Compiles now run side by side on the
+/// `pipeline-compile` threads, where a cold world frame's took up to 15 s each, and the frame
+/// waits for them only inside its own budget (`metal::within`).
+const COMPILE_DEADLINE: Duration = Duration::from_secs(60);
 
 type RenderPso = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+type ComputePso = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// Metal objects handed to the compile thread: Metal's devices, descriptors and pipeline states
 /// may be used from any thread.
@@ -210,21 +209,16 @@ pub(crate) struct Sendable<T>(pub(crate) T);
 // SAFETY: as above; only the compile thread uses them once moved.
 unsafe impl<T> Send for Sendable<T> {}
 
-/// Compiles the render pipeline `d` on a thread of its own, waiting at most `COMPILE_DEADLINE`.
-/// A compile that ends in a compiler crash, in time or after, is remembered under `crash_key`
-/// ([`crate::disk::remember_crash`]), so later runs refuse it at once.
-pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
-    use objc2_foundation::NSCopying;
-    let job = Sendable((dev.clone(), d.copy()));
-    let compile = move || {
-        let job = job;
-        let (dev, d) = &job.0;
-        Sendable(dev.newRenderPipelineStateWithDescriptor_error(d).map_err(|e| e.localizedDescription().to_string()))
-    };
+fn compile_with_deadline<P: 'static>(
+    what: &str,
+    crash_key: &str,
+    compile: impl FnOnce() -> Result<P, String> + Send + 'static,
+) -> Result<P, String> {
+    let job = move || Sendable(compile());
     let late_key = crash_key.to_owned();
     let started = Instant::now();
-    let made = with_deadline(COMPILE_DEADLINE, compile, move |r| remember_crash(&r.0, &late_key));
-    note(started, "render pipeline compiled");
+    let made = with_deadline(COMPILE_DEADLINE, job, move |r| remember_crash(&r.0, &late_key));
+    note(started, what);
     let Some(Sendable(r)) = made else {
         return Err(format!(
             "Metal's compiler took over {} s (refused for this run; a crash is remembered when it ends)",
@@ -235,19 +229,46 @@ pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_k
     r
 }
 
-fn is_compiler_crash(error: &str) -> bool {
-    error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
+/// Compiles the render pipeline `d` on a thread of its own, waiting at most `COMPILE_DEADLINE`.
+/// A compile that ends in a compiler crash, in time or after, is remembered under `crash_key`
+/// ([`crate::disk::remember_crash`]), so later runs refuse it at once.
+pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
+    use objc2_foundation::NSCopying;
+    let job = Sendable((dev.clone(), d.copy()));
+    compile_with_deadline("render pipeline compiled", crash_key, move || {
+        let job = job;
+        let (dev, d) = &job.0;
+        dev.newRenderPipelineStateWithDescriptor_error(d)
+            .map_err(|e| e.localizedDescription().to_string())
+    })
 }
 
-/// Compiles the mesh pipeline `d`. shortcut: no deadline and no crash memory as
-/// [`compile_render`] has; add them if Metal's compiler ever crashes on a mesh pipeline.
-pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
-    let started = Instant::now();
-    let p = dev
-        .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
-        .map_err(|e| e.localizedDescription().to_string());
-    note(started, "mesh pipeline compiled");
-    p
+/// As [`compile_render`], for a mesh render pipeline descriptor.
+pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
+    use objc2_foundation::NSCopying;
+    let job = Sendable((dev.clone(), d.copy()));
+    compile_with_deadline("mesh pipeline compiled", crash_key, move || {
+        let job = job;
+        let (dev, d) = &job.0;
+        dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
+            .map_err(|e| e.localizedDescription().to_string())
+    })
+}
+
+/// As [`compile_render`], for a compute pipeline descriptor.
+pub(crate) fn compile_compute(dev: &Dev, d: &MTLComputePipelineDescriptor, crash_key: &str) -> Result<ComputePso, String> {
+    use objc2_foundation::NSCopying;
+    let job = Sendable((dev.clone(), d.copy()));
+    compile_with_deadline("compute pipeline compiled", crash_key, move || {
+        let job = job;
+        let (dev, d) = &job.0;
+        dev.newComputePipelineStateWithDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
+            .map_err(|e| e.localizedDescription().to_string())
+    })
+}
+
+fn is_compiler_crash(error: &str) -> bool {
+    error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
 }
 
 /// Logs slow pipeline work, as `msc` does a slow conversion: the frame's thread waits for it.
@@ -367,11 +388,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = Archive::open_in(&dev, dir.path()).unwrap();
         assert!(first.archived_mesh(&dev, &mesh_descriptor(&dev)).is_none());
-        first.mesh(&dev, &mesh_descriptor(&dev)).unwrap();
+        first.mesh(&dev, &mesh_descriptor(&dev), "mesh").unwrap();
         // Written here, not left to the drop: the writing thread may hold the archive just then.
         first.save();
         drop(first);
         let second = Archive::open_in(&dev, dir.path()).unwrap();
         assert!(second.archived_mesh(&dev, &mesh_descriptor(&dev)).is_some());
+    }
+
+    #[test]
+    fn compute_archive_hits_after_flush_across_reloaded_libraries() {
+        let Some(m) = crate::metal::Metal::new().ok() else { return };
+        let Some(msc) = m.msc().ok() else { return };
+        let affine = include_bytes!("../tests/affine.dxil");
+        let (_, lib) = msc.convert(affine, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let l1 = crate::metal::load_library(&m.dev, &lib).unwrap();
+        let name1 = l1.functionNames().iter().next().unwrap();
+        let f1 = l1.newFunctionWithName(&name1).unwrap();
+        let d1 = MTLComputePipelineDescriptor::new();
+        d1.setComputeFunction(Some(&f1));
+
+        let a1 = Archive::open_in(&m.dev, dir.path()).unwrap();
+        a1.compute(&m.dev, &d1, "affine").unwrap();
+        // What the `pipeline-archive` thread does every `SAVE_EVERY`, with no drop (`Title` is in a static).
+        a1.save();
+        assert_eq!(a1.added.load(Ordering::Relaxed), 0);
+        assert!(a1.path.exists());
+
+        // Reload the converted metallib from a fresh temporary URL (as a second run does)
+        // and verify FailOnBinaryArchiveMiss hits on the reopened archive.
+        let l2 = crate::metal::load_library(&m.dev, &lib).unwrap();
+        let name2 = l2.functionNames().iter().next().unwrap();
+        let f2 = l2.newFunctionWithName(&name2).unwrap();
+        let d2 = MTLComputePipelineDescriptor::new();
+        d2.setComputeFunction(Some(&f2));
+        let a2 = Archive::open_in(&m.dev, dir.path()).unwrap();
+        d2.setBinaryArchives(Some(&a2.list));
+        m.dev
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &d2,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+                None,
+            )
+            .expect("reopened archive should hit FailOnBinaryArchiveMiss");
     }
 }

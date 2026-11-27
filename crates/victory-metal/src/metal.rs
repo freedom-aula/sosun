@@ -367,6 +367,11 @@ unsafe impl Send for Compiler {}
 impl Compiler {
     /// DXIL to a compute pipeline state: converted, loaded, then from the archive or compiled.
     fn compute(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<ComputeState, String> {
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        let crash_key = crate::disk::key(&[dxil]);
+        if crate::disk::crashed(crash_key.as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
         let (_, lib) = self.msc.convert_with(dxil, None, layout, false).map_err(|e| e.to_string())?;
         let l = load_library(&self.dev, &lib)?;
         let name = l
@@ -375,12 +380,11 @@ impl Compiler {
             .next()
             .ok_or("converted library is empty")?;
         let f = l.newFunctionWithName(&name).ok_or("no function")?;
+        let d = MTLComputePipelineDescriptor::new();
+        d.setComputeFunction(Some(&f));
         match &self.archive {
-            Some(a) => a.compute(&self.dev, &f),
-            None => self
-                .dev
-                .newComputePipelineStateWithFunction_error(&f)
-                .map_err(|e| e.localizedDescription().to_string()),
+            Some(a) => a.compute(&self.dev, &d, &crash_key),
+            None => crate::archive::compile_compute(&self.dev, &d, &crash_key),
         }
     }
 }

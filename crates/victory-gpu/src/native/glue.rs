@@ -991,6 +991,13 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     if let Some(p) = t.thread_pipes.get(&key) {
         return p.clone();
     }
+    if frame_left().is_zero()
+        && let Some(s) = crate::pipeline::compute_shader(key as This)
+        && !s.threads_ready()
+    {
+        put_off(format!("{} threads", s.hash), move || drop(s.native_threads_shader()));
+        return Pipe::Refused;
+    }
     let (hash, shader) = crate::pipeline::native_threads(key as This);
     let name = format!("compute {hash} by thread counts");
     t.compile_wait = compile_wait(t);
