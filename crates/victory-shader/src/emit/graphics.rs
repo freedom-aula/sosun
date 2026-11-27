@@ -200,18 +200,22 @@ fn infer(
         }
     }
     // Guess: root constants that are a pixel program's last user data take the SGPRs after them
-    // that it reads on entry (the metadata names only their first), as compute's reach its user
-    // SGPR count (`constants_to_the_end`); observed: the upscale program's b500 in s9 to s12. The
-    // primitive mask, which follows the user SGPRs and only reaches M0, ends them.
+    // (the metadata names only their first), as compute's reach its user SGPR count
+    // (`constants_to_the_end`): up to the primitive mask, which follows the user SGPRs and only
+    // reaches M0, when the program reads one (observed: b500 in s10 to s14, the mask in s15, s13
+    // read on entry); else as far as it reads them on entry (the upscale program's b500 in s9 to
+    // s12, with no interpolation).
     if stage == HwStage::Ps
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
     {
         let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
-        let mut end = u32::from(last.user_data) + last.sgprs;
-        while end < 32 && live(end).is_some_and(|v| !crate::io::is_prim_mask_only(&p, v, true)) {
-            end += 1;
-        }
+        let mask = |s: u32| live(s).is_some_and(|v| crate::io::is_prim_mask_only(&p, v, true));
+        let start = u32::from(last.user_data) + last.sgprs;
+        let end = match (start..32).find(|&s| mask(s)) {
+            Some(m) => m,
+            None => (start..32).find(|&s| live(s).is_none()).unwrap_or(32),
+        };
         last.sgprs = end - u32::from(last.user_data);
     }
     // A vertex shader's own vertex fetch: usually s0/s1 address the table of vertex buffer
@@ -1450,6 +1454,21 @@ mod tests {
         ];
         let (p, _) = infer(HwStage::Ps, &words(&interp), &meta).unwrap();
         assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 1), "{:?}", p.layout);
+        // Constants the program reads past SGPRs it writes first (s10, s11) reach up to its
+        // primitive mask (s13): s12 is theirs (two of the title's G-buffer pixel programs).
+        let gap = [
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E06_020C, // v_mov_b32 v3, s12
+            0xBEFC_030D, // s_mov_b32 m0, s13
+            0xC808_0000, 0xC809_0001, // v_interp_p1_f32 v2, v0, attr0.x; v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_0803, 0x0000_0203, // exp mrt0 v3, v2 done
+            ENDPGM,
+        ];
+        let (p, _) = infer(HwStage::Ps, &words(&gap), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 4), "{:?}", p.layout);
+        let c = container(HwStage::Ps, &words(&gap), &meta).unwrap();
+        super::super::translate_with(&c, super::super::Options::default()).unwrap();
     }
 
     /// `s_sext_i32_i16` and `s_sext_i32_i8` (some of the title's mesh programs) translate.

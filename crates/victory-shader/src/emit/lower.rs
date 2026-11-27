@@ -1702,6 +1702,12 @@ impl<'a> Lower<'a> {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // Guess (docs/native-host.md, "LDS instructions addressed by M0"): M0 a
+                    // compute program reads before writing holds LDS address 0 (observed: a
+                    // `ds_append` counter at 0 + offset that the program zeroes and reads there).
+                    None if n == crate::ir::M0 && self.x.native.stage == HwStage::Cs => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch

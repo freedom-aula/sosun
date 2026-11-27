@@ -941,6 +941,27 @@ fn lds_instructions_addressed_by_m0_translate() {
     );
 }
 
+/// Some of the title's compute programs append to a counter in LDS without setting M0 (the counter
+/// at 0 + offset, zeroed and read there by address): M0 read before it is written is LDS address 0,
+/// not "a hardware SGPR input".
+#[test]
+fn an_append_with_m0_never_set_addresses_lds_from_0() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xD8F8_0004, 0x0100_0000, // ds_append v1 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 1 << 15 | 5 << 1, [32, 1, 1], true, &resources);
+    translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
+}
+
 /// A loaded buffer descriptor whose stride the program clears (`s_and_b32` of dword 1 with
 /// 0xc000ffff, a title's form) is the loaded view read raw, the index adding nothing (RDNA2 ISA
 /// 8.1.5): its dword loads translate, by index or by offset. A mask that clears only part of the
