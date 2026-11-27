@@ -1,0 +1,30 @@
+name: Bug or setup problem
+description: Something in the code, the build or the scripts is wrong.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What went wrong
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. tools/macos/native-setup.sh
+        2. ...
+  - type: input
+    id: env
+    attributes:
+      label: Mac, macOS version and commit
+      placeholder: "M1, 16 GB, macOS 15.5, commit abc1234"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or log
+      render: text

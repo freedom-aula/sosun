@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560" role="img" aria-label="The layers between the game and the Mac: the game's own code, VIctory, Wine, D3DMetal and Rosetta 2, then Metal and the Apple Silicon GPU and CPU">
+  <style>
+    .t { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; fill: #ffffff; }
+    .s { font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; fill: #e6e4f5; font-size: 15px; }
+    .h { font-size: 21px; font-weight: 700; }
+  </style>
+  <rect width="900" height="560" rx="20" fill="#14122b"/>
+  <rect x="40" y="30" width="820" height="80" rx="14" fill="#5b5d73"/>
+  <text class="t h" x="64" y="64">The game (your own copy)</text>
+  <text class="s" x="64" y="90">The Xbox Series build's x86-64 code runs unchanged</text>
+  <rect x="40" y="130" width="820" height="100" rx="14" fill="#7d3c98"/>
+  <text class="t h" x="64" y="164">VIctory</text>
+  <text class="s" x="64" y="190">Loads the game and stands in for the console: memory, files, input, audio,</text>
+  <text class="s" x="64" y="212">and Direct3D 12.X turned into desktop Direct3D 12, with shaders recompiled</text>
+  <rect x="40" y="250" width="400" height="110" rx="14" fill="#2e6f9e"/>
+  <text class="t h" x="64" y="284">CrossOver Wine</text>
+  <text class="s" x="64" y="310">Windows system calls on macOS,</text>
+  <text class="s" x="64" y="332">built from CodeWeavers' source</text>
+  <rect x="460" y="250" width="400" height="110" rx="14" fill="#c0396b"/>
+  <text class="t h" x="484" y="284">D3DMetal</text>
+  <text class="s" x="484" y="310">Direct3D 12 to Metal, from Apple's</text>
+  <text class="s" x="484" y="332">Game Porting Toolkit</text>
+  <rect x="40" y="380" width="400" height="80" rx="14" fill="#2b8a6e"/>
+  <text class="t h" x="64" y="414">Rosetta 2</text>
+  <text class="s" x="64" y="440">x86-64 and AVX2 on Apple Silicon</text>
+  <rect x="460" y="380" width="400" height="80" rx="14" fill="#b8742a"/>
+  <text class="t h" x="484" y="414">Metal</text>
+  <text class="s" x="484" y="440">Apple's graphics API</text>
+  <rect x="40" y="480" width="820" height="56" rx="14" fill="#d8d5ec"/>
+  <text class="h" x="450" y="515" text-anchor="middle" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" fill="#14122b">Apple Silicon Mac (M1 or newer)</text>
+</svg>

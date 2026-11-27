@@ -1,0 +1,16 @@
+LIBRARY victory-probe-dll.dll
+EXPORTS
+DllProbeState
+DllProbeAdd
+DllProbeTls
+DllProbeThreadAttaches
+DllProbeTlsThreadAttaches
+DllProbeThrow
+DllProbeFinallyRuns
+DllProbeCatchInside
+DllProbeCall
+SetError=KERNEL32.SetLastError
+AddAlias=victory-probe-dll.DllProbeAdd
+Loop=victory-probe-dll.Loop
+Missing=KERNEL32.NoSuchVictoryFunction
+Initialize=xgameruntime.XGameRuntimeInitialize
