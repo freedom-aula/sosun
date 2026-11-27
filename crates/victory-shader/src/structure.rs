@@ -1592,7 +1592,9 @@ impl<'a> Lanes<'a> {
                     }
                     _ => None,
                 },
-                _ => None,
+                _ => xored_back(inst, half, |x| {
+                    self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i])
+                }),
             }
         };
         let phi_args = |k: Key| -> Option<Vec<Key>> {
@@ -1605,7 +1607,10 @@ impl<'a> Lanes<'a> {
         let (mut seen, mut todo, mut leaf) = (Set::default(), args.to_vec(), None);
         seen.insert(k);
         while let Some(mut a) = todo.pop() {
-            while let (Some(lo), Some(hi)) = (copy(a.0), copy(a.1)) {
+            // Each half on its own: a pair's copy can be two `s_mov_b32`s, or one half's.
+            while let next @ (lo, hi) = (copy(a.0).unwrap_or(a.0), copy(a.1).unwrap_or(a.1))
+                && next != a
+            {
                 a = (lo, hi);
             }
             if !seen.insert(a) {
@@ -2166,6 +2171,35 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
         }),
         None => Ok(()),
     }
+}
+
+/// The value dword `half` of `s_xor` `inst` equals when one operand is itself an XOR (of the
+/// same width) of the other and that value: the last XOR of a swap by three, as the console
+/// compiler swaps two SGPRs. `def` gives a value's instruction.
+pub(crate) fn xored_back<'a>(
+    inst: &Inst,
+    half: u8,
+    def: impl Fn(Value) -> Option<&'a Inst>,
+) -> Option<Value> {
+    let name = inst.name();
+    if !matches!(name, "s_xor_b32" | "s_xor_b64") {
+        return None;
+    }
+    let pair = |i: &Inst, k: u8| -> Option<(Value, Value)> {
+        let Fields::Sop { src, .. } = &i.fields else { return None };
+        let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src[..] else {
+            return None;
+        };
+        Some((i.read(Reg::S(a + k))?, i.read(Reg::S(b + k))?))
+    };
+    let (x, y) = pair(inst, half)?;
+    let other = |v: Value, u: Value| {
+        let i = def(v).filter(|i| i.name() == name)?;
+        let k = i.writes.iter().position(|w| w.1 == v)? as u8;
+        let (a, b) = pair(i, k)?;
+        (b == u).then_some(a).or((a == u).then_some(b))
+    };
+    other(x, y).or_else(|| other(y, x))
 }
 
 #[cfg(test)]

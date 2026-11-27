@@ -1169,3 +1169,45 @@ fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
     assert_eq!(got[10..20], [1; 10]);
     assert_eq!(got[20..], [0; 12]);
 }
+
+#[test]
+fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_with() {
+    // As the copy case, but VCC is swapped with data (`s4`) by three XORs and back by three
+    // more (the NGG vertex programs swap SGPRs so): the swap's last XOR is a copy, so VCC at
+    // the loop head is still the mask it entered with.
+    let w = [
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_037E, // s_mov_b32 s10, exec_lo
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        // loop:
+        0xBE90_3C6A, // s_and_saveexec_b32 s16, vcc_lo
+        0xBF88_0008, // s_cbranch_execz skip
+        0xBE94_0304, // s_mov_b32 s20, s4
+        0x8914_6A14, // s_xor_b32 s20, s20, vcc_lo
+        0x896A_6A14, // s_xor_b32 vcc_lo, s20, vcc_lo
+        0x8914_6A14, // s_xor_b32 s20, s20, vcc_lo
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x896A_146A, // s_xor_b32 vcc_lo, vcc_lo, s20
+        0x8914_146A, // s_xor_b32 s20, vcc_lo, s20
+        0x896A_146A, // s_xor_b32 vcc_lo, vcc_lo, s20
+        // skip:
+        0xBEFE_0310, // s_mov_b32 exec_lo, s16
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+        0xBF89_FFF2, // s_cbranch_execnz loop
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal32(&w), None);
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [4; 8]);
+    assert_eq!(got[8..16], [3; 8]);
+    assert_eq!(got[16..20], [2; 4]);
+    assert_eq!(got[20..], [0; 12]);
+}

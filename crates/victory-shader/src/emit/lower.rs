@@ -281,6 +281,10 @@ struct Lower<'a> {
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     data_phis: Vec<(V, usize, usize)>,
+    /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
+    /// incoming values are still to fill (block, phi index, lane).
+    spill_phis: Map<(Value, u32), V>,
+    pending_spills: Vec<(V, usize, usize, u32)>,
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
@@ -833,6 +837,8 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
+            spill_phis: Map::default(),
+            pending_spills: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -2170,6 +2176,67 @@ impl<'a> Lower<'a> {
     /// The vertex id input (debugging).
     fn get_input_vertex_id(&mut self) -> Result<Val, Why> {
         Ok(self.input(Input::VertexId))
+    }
+
+    /// What lane `lane` of VGPR value `v` holds when every path to it fills that lane with
+    /// `v_writelane_b32` of an SGPR or constant (an SGPR spill): the value written, or a phi
+    /// of them at a VGPR join. With `make` unset only checks (`seen`: joins on the way).
+    fn spill_slot(
+        &mut self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+        make: bool,
+    ) -> Result<V, Why> {
+        const NOT: Why = "a VGPR lane no SGPR spill fills";
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            if let Some(&x) = self.spill_phis.get(&(v, lane)) {
+                return Ok(x);
+            }
+            if !make {
+                if seen.contains(&v) {
+                    return Ok(self.s.m.i32(0));
+                }
+                seen.push(v);
+                for &a in &p.blocks[b].phis[i].args {
+                    self.spill_slot(a, lane, seen, false)?;
+                }
+                return Ok(self.s.m.i32(0));
+            }
+            let at = self.block[b].ok_or(NOT)?;
+            let x = self.s.m.phi(at, self.s.t.i32);
+            self.spill_phis.insert((v, lane), x);
+            self.pending_spills.push((x, b, i, lane));
+            return Ok(x);
+        }
+        let inst = self.def_inst(v).ok_or(NOT)?;
+        let Fields::Valu(w) = &inst.fields else { return Err(NOT) };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(NOT);
+        };
+        if inst.name() != "v_writelane_b32" || w.sdwa.is_some() || w.dpp.is_some() {
+            return Err(NOT);
+        }
+        if crate::resource::lane_of(*at).ok_or(NOT)? != lane {
+            return self.spill_slot(inst.read(Reg::V(reg)).ok_or(NOT)?, lane, seen, make);
+        }
+        let c = match *value {
+            Operand::Scalar { code: NULL, .. } => 0,
+            Operand::Scalar { code, .. } => {
+                let x = inst.read(Reg::S(code)).ok_or(NOT)?;
+                // Values made by now (on a back edge, by the time phis are filled).
+                return match self.vals.get(&x) {
+                    Some(&Val::I32(x)) => Ok(x),
+                    None if !make => Ok(self.s.m.i32(0)),
+                    _ => Err(NOT),
+                };
+            }
+            Operand::Const(c) => crate::resource::inline(c).ok_or(NOT)?,
+            Operand::Literal(x) => x,
+            _ => return Err(NOT),
+        };
+        Ok(self.s.m.i32(c))
     }
 
     /// The DXIL form of an IR value.
@@ -4927,6 +4994,29 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Each result dword of a swap's last XOR ([`crate::structure::xored_back`]) and the value
+    /// it equals.
+    fn xor_copies(&self, inst: &Inst) -> Option<Vec<(Value, Value)>> {
+        let Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), .. } = &inst.fields else {
+            return None;
+        };
+        let halves = if inst.name() == "s_xor_b64" { 2 } else { 1 };
+        (0..halves)
+            .map(|k| {
+                let a = crate::structure::xored_back(inst, k, |v| self.def_inst(v))?;
+                Some((inst.write(Reg::S(d + k))?, a))
+            })
+            .collect()
+    }
+
+    /// `v` as a 32-bit number, when it has one.
+    fn i32_data(&mut self, v: Value) -> Result<V, Why> {
+        match self.vals.get(&v) {
+            Some(&Val::I32(x)) => Ok(x),
+            _ => Err("not data"),
+        }
+    }
+
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
     }
@@ -4942,6 +5032,28 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // The last XOR of a swap by three (the console compiler's swap of two SGPRs, a mask's
+        // and data's say) is a copy of the data: what it XORs back out.
+        if let Some(copies) = self.xor_copies(inst)
+            && copies.iter().all(|&(_, a)| !self.is_mask(Some(a)))
+            && let Ok(vals) =
+                copies.iter().map(|&(_, a)| self.i32_data(a)).collect::<Result<Vec<_>, _>>()
+        {
+            let mut any = None;
+            for (&(w, _), x) in copies.iter().zip(vals) {
+                self.vals.insert(w, Val::I32(x));
+                any = Some(match any {
+                    None => x,
+                    Some(y) => self.s.m.bin(self.cur, Bin::Or, y, x),
+                });
+            }
+            if let (Some(scc), Some(any)) = (scc, any) {
+                let z = self.s.m.i32(0);
+                let b = self.s.m.cmp(self.cur, pred::NE, any, z);
+                self.vals.insert(scc, Val::Bit(b));
+            }
+            return Ok(());
+        }
         if inst.write(Reg::S(EXEC)).is_some()
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
@@ -8736,6 +8848,17 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // A constant lane of a VGPR only `v_writelane_b32` fills on every path: the SGPR (or
+            // constant) last written there, a phi where paths wrote different ones.
+            "v_readlane_b32"
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::V(reg))
+                    && self.spill_slot(x, lane, &mut Vec::new(), false).is_ok() =>
+            {
+                let a = self.spill_slot(x, lane, &mut Vec::new(), true)?;
+                int(self, a)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -13688,6 +13811,19 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        while let Some((x, b, i, lane)) = self.pending_spills.pop() {
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let a = p.blocks[b].phis[i].args[n];
+                let y = self
+                    .spill_slot(a, lane, &mut Vec::new(), true)
+                    .map_err(|w| unsupported(p.blocks[b].offset, w))?;
+                incoming.push((y, qb));
+            }
+            self.s.m.set_phi(x, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);

@@ -1562,4 +1562,50 @@ mod tests {
         let e = mesh(&program([0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
         assert!(e.to_string().contains("lane mask"), "{e}");
     }
+
+    /// The NGG vertex programs ahead of the G-buffer spill SGPRs to VGPR lanes on two paths
+    /// into a join and read the lane back after it (was refused: "a cross-lane operation in a
+    /// mesh shader"): the read is a phi of the SGPRs written.
+    #[test]
+    fn a_mesh_program_reads_back_an_sgpr_spilled_on_two_paths() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE94_03F2, // s_mov_b32 s20, 1.0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xBF0D_9F08, // s_bitcmp1_b32 s8, 31
+            0xBF85_0003, // s_cbranch_scc1 3
+            0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+            0xBF82_0002, // s_branch 2
+            0xD761_000E, 0x0001_0615, // v_writelane_b32 v14, s21, 3
+            0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
+    }
+
+    /// They also swap a mask and data between two SGPRs by three XORs (was refused: "a lane
+    /// mask read as data"): the last XOR gives back the data.
+    #[test]
+    fn a_mesh_program_swaps_a_mask_and_data_by_three_xors() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE96_0308, // s_mov_b32 s22, s8
+            0xBE98_047E, // s_mov_b64 s[24:25], exec
+            0x8918_1618, // s_xor_b32 s24, s24, s22
+            0x8916_1618, // s_xor_b32 s22, s24, s22
+            0x8918_1618, // s_xor_b32 s24, s24, s22
+            0x7E00_0218, // v_mov_b32 v0, s24
+            0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
+    }
 }
