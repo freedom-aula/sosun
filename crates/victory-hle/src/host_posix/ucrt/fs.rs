@@ -6,13 +6,13 @@
 
 use std::ffi::CString;
 use std::fs::Metadata;
-use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::runtime::bad_param;
 use super::stdio::win_errno;
-use super::{Ch, EACCES, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units};
+use super::{Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units};
 use crate::host_posix::files;
 
 const S_IFDIR: u16 = 0x4000;
@@ -232,11 +232,12 @@ pub extern "system" fn _wremove(path: *const u16) -> i32 {
 }
 
 fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
-    let (Some(from), Some(to)) = (from, to) else {
+    let (Some(from_path), Some(to_path)) = (from, to) else {
         set_errno(ENOENT);
         return -1;
     };
-    let [Ok(from), Ok(to)] = [from, to].map(|p| CString::new(p.into_os_string().into_vec())) else {
+    let [Ok(from), Ok(to)] = [&from_path, &to_path].map(|p| CString::new(p.as_os_str().as_bytes()))
+    else {
         set_errno(EINVAL);
         return -1;
     };
@@ -244,9 +245,21 @@ fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
     if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
         0
     } else {
-        set_errno(win_errno(&std::io::Error::last_os_error()));
-        -1
+        rename_error(&from_path, &to_path, std::io::Error::last_os_error())
     }
+}
+
+fn rename_error(from_path: &Path, to_path: &Path, err: std::io::Error) -> i32 {
+    if err.raw_os_error() == Some(libc::ENOTSUP) {
+        // This filesystem has no RENAME_EXCL: check, then rename (not atomic).
+        if std::fs::symlink_metadata(to_path).is_ok() {
+            set_errno(EEXIST);
+            return -1;
+        }
+        return done(std::fs::rename(from_path, to_path));
+    }
+    set_errno(win_errno(&err));
+    -1
 }
 
 pub extern "system" fn rename(from: *const u8, to: *const u8) -> i32 {
@@ -859,7 +872,6 @@ exports!(pub(super) fn lookup;
 
 #[cfg(test)]
 mod tests {
-    use super::super::EEXIST;
     use super::*;
 
     #[test]
@@ -966,6 +978,35 @@ mod tests {
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(remove(gp.as_ptr()), -1);
         assert_eq!(_rmdir(dp.as_ptr()), 0);
+    }
+
+    #[test]
+    fn rename_falls_back_when_exclusive_rename_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let fallback =
+            || rename_error(&from, &to, std::io::Error::from_raw_os_error(libc::ENOTSUP));
+
+        std::fs::write(&from, b"first").unwrap();
+        assert_eq!(fallback(), 0);
+        assert!(!from.try_exists().unwrap());
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::write(&from, b"second").unwrap();
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::remove_file(&to).unwrap();
+        let target = Path::new("missing");
+        std::os::unix::fs::symlink(target, &to).unwrap();
+        set_errno(0);
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
     }
 
     #[test]
