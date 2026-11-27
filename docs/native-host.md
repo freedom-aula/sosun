@@ -428,6 +428,11 @@ ISA clamps append and consume by M0's size). The `ds_gws` group (GDS) stays refu
 `addr_tests::lds_append_consume_and_addtid_follow_m0_on_the_gpu` (`victory-gpu`) runs them on
 Metal, wave32 and wave64.
 
+Guess: M0 that a compute program reads before writing it is LDS address 0. Three of the title's
+compute programs append to a counter with `ds_append` at offset 0 or 4 and never set M0; one zeroes
+LDS bytes 0 to 7 at address 0 and reads the counter back at 0 + 4, so the base must be 0. These
+were refused as "a hardware SGPR input".
+
 ## Scalar absolute difference
 
 `s_absdiff_i32` was decoded but refused ("s_absdiff_i32 is not supported", one compute program in
@@ -1060,7 +1065,9 @@ are fixed here:
   (the primitive mask, which follows the user SGPRs). Observed: the upscale program (pixel
   `41e09588771fe7a0`, which writes the 1920x1080 DXGI 10 target that tonemapping and present read)
   reads b500 as s9 to s12 and interpolates nothing; s10 to s12 were refused as "a hardware SGPR
-  input".
+  input". When the program reads a primitive mask, the constants reach up to it, also past
+  SGPRs the program writes before reading (two G-buffer programs read b500 as s10 to s14, the mask in
+  s15, s13 read on entry).
 - **Descriptor dwords swapped by XORs.** The title's compiler swaps SGPRs in three XORs (`a ^= b;
   b ^= a; a ^= b`, in 32 and 64 bits, `vcc` as the other register too), descriptor dwords included.
   The tracer follows a value through `s_xor_b32/b64 d, x, y` when `x` is an XOR of `a` and `b` and
