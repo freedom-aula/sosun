@@ -9,7 +9,14 @@
 //! detile pass (see docs/metal-backend.md, "What is left").
 
 use crate::descriptor::View;
+use std::collections::HashMap;
 use victory_backend::resources::{Address, BorderColor, Filter, Format, SamplerDesc};
+
+/// A registered resource: title address and size for buffers, the native texture for images.
+pub(super) enum Res<T> {
+    Buffer(u64, u64),
+    Texture(T),
+}
 
 /// What a heap entry holds, in backend terms.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +28,7 @@ pub enum Decoded {
     },
     /// A texture SRV or UAV of a registered resource: the first mip and count of its view.
     /// A count of `u32::MAX` includes every remaining mip; the backend clips it to the texture.
+    /// With no mip or format override, bind the original texture, including every mip and slice.
     Image {
         resource: usize,
         mips: Option<(u32, u32)>,
@@ -115,11 +123,11 @@ pub fn format(dxgi: u32) -> Option<Format> {
     })
 }
 
-/// `buffer_of` gives the title address and size of a buffer resource object.
-pub(crate) fn decode(
-    view: &View,
-    buffer_of: &dyn Fn(usize) -> Option<(u64, u64)>,
-) -> Option<Decoded> {
+pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Option<Decoded> {
+    let buffer_base = |r: &usize| match resources.get(r)? {
+        Res::Buffer(addr, _) => Some(*addr),
+        Res::Texture(_) => None,
+    };
     match view {
         View::Constant(addr, size) => Some(Decoded::Buffer {
             addr: *addr,
@@ -128,7 +136,7 @@ pub(crate) fn decode(
         // SRV words: format, dimension, mapping, pad, then the union (buffer: first element (8
         // bytes), count, stride, flags; 2D: first mip, mip count).
         View::Shader(r, Some(d)) if d[1] == BUFFER => {
-            let (base, _) = buffer_of(*r)?;
+            let base = buffer_base(r)?;
             let first = u64::from(d[4]) | u64::from(d[5]) << 32;
             let (addr, size) = buffer_view(base, d[0], d[7], d[8], first, d[6])?;
             Some(Decoded::Buffer { addr, size })
@@ -136,7 +144,7 @@ pub(crate) fn decode(
         // UAV words: format, dimension, then the union (buffer: first element (8 bytes), count,
         // stride, counter offset (8 bytes), flags; 2D: mip slice, plane).
         View::Unordered(r, _, Some(d)) if d[1] == BUFFER => {
-            let (base, _) = buffer_of(*r)?;
+            let base = buffer_base(r)?;
             let first = u64::from(d[2]) | u64::from(d[3]) << 32;
             let (addr, size) = buffer_view(base, d[0], d[5], d[8], first, d[4])?;
             Some(Decoded::Buffer { addr, size })
@@ -167,14 +175,18 @@ pub(crate) fn decode(
                 format: format(d[0]),
             })
         }
-        // A whole buffer (no description): raw.
-        View::Shader(r, None) | View::Unordered(r, _, None) => {
-            let (addr, size) = buffer_of(*r)?;
-            Some(Decoded::Buffer {
+        View::Shader(r, None) | View::Unordered(r, _, None) => match *resources.get(r)? {
+            Res::Buffer(addr, size) => Some(Decoded::Buffer {
                 addr,
                 size: size.min(u64::from(u32::MAX)) as u32,
-            })
-        }
+            }),
+            Res::Texture(_) if matches!(view, View::Shader(..)) => Some(Decoded::Image {
+                resource: *r,
+                mips: None,
+                format: None,
+            }),
+            Res::Texture(_) => None,
+        },
         View::Shader(r, Some(d)) if d[1] == TEXTURE_2D => Some(Decoded::Image {
             resource: *r,
             mips: Some((d[4], d[5])),
@@ -305,6 +317,8 @@ mod tests {
 
     use super::*;
 
+    type Resources = HashMap<usize, Res<()>>;
+
     #[test]
     fn texture_srvs_keep_all_remaining_mips_from_the_first_requested() {
         let mut srv = [0; 10];
@@ -315,7 +329,7 @@ mod tests {
         resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
 
         for view in [View::Shader(7, Some(srv)), View::Placed(false, resource, placed)] {
-            let Some(Decoded::Image { mips, .. }) = decode(&view, &|_| None) else {
+            let Some(Decoded::Image { mips, .. }) = decode(&view, &Resources::new()) else {
                 panic!("expected a texture view");
             };
             assert_eq!(mips, Some((2, u32::MAX)));
@@ -323,8 +337,69 @@ mod tests {
     }
 
     #[test]
+    fn default_srv_uses_the_whole_registered_resource() {
+        let resources = Resources::from([(7, Res::Texture(())), (8, Res::Buffer(0x1000, 256))]);
+        assert_eq!(
+            decode(&View::Shader(7, None), &resources),
+            Some(Decoded::Image { resource: 7, mips: None, format: None })
+        );
+        assert_eq!(
+            decode(&View::Shader(8, None), &resources),
+            Some(Decoded::Buffer { addr: 0x1000, size: 256 })
+        );
+        assert_eq!(decode(&View::Shader(9, None), &resources), None);
+        assert_eq!(decode(&View::Unordered(7, 0, None), &resources), None);
+    }
+
+    #[test]
+    fn default_texture_srv_replaces_the_texture_in_the_backend_slot() {
+        use crate::native::{host::NativeHost, vertex_tests::Capture};
+        use victory_backend::resources::{HeapKind, TexDim, TextureDesc};
+
+        let host = NativeHost::new(Capture::default());
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+        let a = host.texture(&TextureDesc {
+            dim: TexDim::D3,
+            depth_or_layers: 2,
+            ..TextureDesc::d2(Format::R8Unorm, 4, 4)
+        }).unwrap();
+        let key_a = std::rc::Rc::as_ptr(&a) as usize;
+        host.register_texture(key_a, &a);
+
+        let mut srv = [0u32; 10];
+        srv[0] = 61; // R8_UNORM
+        srv[1] = 8; // TEXTURE3D
+        srv[2] = 5768; // default component mapping
+        srv[5] = 1;
+        crate::descriptor::create_srv(std::ptr::null_mut(), key_a as _, &srv, handle);
+        assert!(host.mirror(handle).unwrap());
+        assert_eq!(heap.heap.borrow()[0].unwrap().format, Format::R8Unorm);
+
+        for format in [Format::Rgba8UnormSrgb, Format::D32Float] {
+            let b = host.texture(&TextureDesc {
+                dim: TexDim::D2Array,
+                mips: 4,
+                depth_or_layers: 3,
+                render_target: format.is_depth(),
+                ..TextureDesc::d2(format, 8, 8)
+            }).unwrap();
+            let key_b = std::rc::Rc::as_ptr(&b) as usize;
+            host.register_texture(key_b, &b);
+            crate::descriptor::create_srv(std::ptr::null_mut(), key_b as _, std::ptr::null(), handle);
+            assert!(host.mirror(handle).unwrap());
+            let bound = heap.heap.borrow()[0].unwrap();
+            assert_eq!(bound.format, format);
+            assert_eq!((bound.dim, bound.mips, bound.depth_or_layers), (TexDim::D2Array, 4, 3));
+            crate::descriptor::forget(key_b);
+        }
+        crate::descriptor::forget(key_a);
+    }
+
+    #[test]
     fn buffer_views_decode_to_raw_ranges() {
-        let base = |r: usize| (r == 7).then_some((0x1000_0000u64, 0x1_0000u64));
+        let base = Resources::from([(7, Res::Buffer(0x1000_0000, 0x1_0000))]);
         // A raw SRV: 16 elements of 4 bytes from element 4.
         let mut srv = [0u32; 10];
         srv[1] = BUFFER;
@@ -377,7 +452,7 @@ mod tests {
             let mut words = [0; 27];
             words[6..9].copy_from_slice(&[mode, 3, 3]);
             words[17..21].copy_from_slice(&rgba.map(f32::to_bits));
-            let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(words), &|_| None) else {
+            let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(words), &Resources::new()) else {
                 panic!("expected a sampler");
             };
             desc
@@ -406,7 +481,7 @@ mod tests {
         w[1] = 1; // bilinear magnification
         w[3] = 2; // linear mips
         w[6..9].copy_from_slice(&[1, 2, 3]);
-        let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(w), &|_| None)
+        let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(w), &Resources::new())
         else {
             panic!("not a sampler");
         };
