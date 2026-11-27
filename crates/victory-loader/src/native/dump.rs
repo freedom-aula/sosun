@@ -122,6 +122,18 @@ fn report() {
             "clzero emulations so far: {}",
             super::seh::signal::EMULATED.load(std::sync::atomic::Ordering::Relaxed)
         );
+        // The title watchdog's crash writes the signal handler declined (`watchdog`): the
+        // sites as image offsets, most taken first.
+        let declined = crate::watchdog::DECLINED.load(std::sync::atomic::Ordering::Relaxed);
+        if declined > 0 {
+            tracing::warn!("watchdog crash writes declined so far: {declined}");
+            for (rip, magic, n) in crate::watchdog::sites() {
+                let at = unwind::image_base_of(rip as usize)
+                    .map(|base| format!("image+{:#x}", rip as usize - base))
+                    .unwrap_or_else(|| format!("{rip:#x}"));
+                tracing::warn!("  at {at}: signature {magic:#x}, {n} time(s)");
+            }
+        }
         if let Some((at, n)) = std::env::var("VICTORY_DUMP_MEM").ok().and_then(|v| {
             let (a, n) = v.split_once(',')?;
             Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse::<usize>().ok()?))

@@ -42,6 +42,9 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 mod windows;
+/// The title's deliberate crash writes (`mov dword [0], <signature>`), declined by the
+/// signal handler; compiled on every host so its pattern is tested everywhere.
+pub mod watchdog;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;

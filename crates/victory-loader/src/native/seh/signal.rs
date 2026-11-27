@@ -292,6 +292,42 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
     }
     ctx.set_from_thread_state(&thread_state);
     let rip = word(T_RIP);
+    // The title's deliberate crash write: a store whose address is *in the instruction*,
+    // absolute zero (`mov dword [0], <signature>`, `watchdog::crash_write`). A genuine
+    // null-pointer write addresses through a register, so this names a deliberate crash:
+    // the title's watchdog fires it when its init takes longer than it allows (a first
+    // world frame with a cold shader cache, slow storage). The host declines the store —
+    // the saved rip moves past it, as the emulated instructions above are stepped over —
+    // and the watchdog's thread returns to its caller instead of ending the run in the
+    // crash handler. Recorded lock-free for the thread dump (`watchdog`).
+    if signal == SIGSEGV {
+        // SAFETY: fields of the signal's own records.
+        let (err, fault, si_addr) = unsafe {
+            (
+                mc.add(MC_ERR).cast::<u32>().read(),
+                mc.add(MC_FAULT_ADDR).cast::<u64>().read(),
+                info.add(INFO_ADDR).cast::<usize>().read(),
+            )
+        };
+        let at = if fault != 0 { fault as usize } else { si_addr };
+        // A write (bit 1 of the page-fault error code) to address zero.
+        if err & 2 != 0 && at == 0 {
+            // SAFETY: rip is in the code that just faulted; 15 bytes is the
+            // longest instruction and the page after is mapped or the read
+            // faults like the instruction would have.
+            let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
+            if let Some((len, magic)) = crate::watchdog::crash_write(code) {
+                crate::watchdog::record(rip, magic);
+                // SAFETY: the saved rip, past the declined store.
+                unsafe {
+                    mc.add(MC_THREAD + T_RIP * 8)
+                        .cast::<u64>()
+                        .write(rip + len as u64)
+                };
+                return;
+            }
+        }
+    }
     if signal == SIGILL {
         // SAFETY: rip is in the code that just trapped; 15 bytes is the
         // longest instruction and the page after is mapped or the read faults
