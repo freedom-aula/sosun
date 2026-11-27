@@ -226,6 +226,7 @@ mod lockstep;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
+pub use lower::mesh_clamped;
 #[cfg(test)]
 mod gfx_refusal_tests;
 #[cfg(test)]
@@ -1472,11 +1473,13 @@ mod tests {
     }
 
     /// A mesh program whose declared output exceeds the host's 32 KiB a threadgroup (16 rows of
-    /// 16 bytes for 256 vertices is 64 KiB before the primitives' indices) is refused before any
-    /// DXIL is made, so it never reaches Metal's compiler, which crashes on such a mesh instead
-    /// of refusing it (issue #181).
+    /// 16 bytes for 256 vertices is 64 KiB before the primitives' indices) is clamped to what
+    /// fits before any DXIL is made — the maxima shrink, the shader runs with fewer vertices
+    /// and primitives a threadgroup — so it never reaches Metal's compiler, which crashes on
+    /// such a mesh instead of refusing it (issue #181). A signature so wide that one vertex
+    /// and one primitive do not fit is still refused: no count can run it.
     #[test]
-    fn a_mesh_shader_past_the_32_kib_output_limit_is_refused() {
+    fn a_mesh_shader_past_the_32_kib_output_limit_is_clamped_to_fit() {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1520,17 +1523,44 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
+        // Sixteen rows for 256 vertices and 256 primitives is 16 * 16 * 256 + 12 * 256 bytes,
+        // past the 32 KiB: the maxima clamp to what fits (16 * 16 + 12 a piece, 122) instead
+        // of the shader being refused, and the clamped shader translates.
+        let before = mesh_clamped();
+        assert!(emit(&c, &native, &p, &st, &io, &res).is_ok(), "the clamped shader translates");
+        assert!(mesh_clamped() > before, "the clamp is counted");
+        // One row of 16 bytes for those 256 vertices, with the 256 primitives' indices, fits
+        // as it is: 16 * 256 + 12 * 256 bytes, no clamp.
+        let before = mesh_clamped();
+        let small = container::signature(&rows[..1], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &small)]);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(emit(&c, &native, &p, &st, &io, &res).is_ok(), "one row fits");
+        assert_eq!(mesh_clamped(), before, "what fits is not clamped");
+        // A signature so wide that one vertex and one primitive do not fit is still refused:
+        // no count can run it.
+        let wide: Vec<_> = (0..2100u32)
+            .map(|n| SigElement {
+                name: if n == 0 { "SV_Position".into() } else { "TEXCOORD".into() },
+                index: n,
+                kind: u8::from(n == 0) * 3,
+                comp: 9,
+                interp: 0,
+                row: Some(n),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            })
+            .collect();
+        let wide = container::signature(&wide, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &wide)]);
+        let c = Container::parse(&bytes).unwrap();
         let err = emit(&c, &native, &p, &st, &io, &res).unwrap_err();
         assert!(
             matches!(&err, ShaderError::Unsupported { what, .. } if *what == "a mesh shader whose output exceeds the host's 32 KiB a threadgroup"),
             "{err}"
         );
-        // One row of 16 bytes for those 256 vertices, with the 256 primitives' indices, fits:
-        // 16 * 256 + 12 * 256 bytes.
-        let small = container::signature(&rows[..1], false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &small)]);
-        let c = Container::parse(&bytes).unwrap();
-        assert!(emit(&c, &native, &p, &st, &io, &res).is_ok(), "one row fits");
     }
 
     /// A primitive export's corners are 9-bit indices: the edge flag above

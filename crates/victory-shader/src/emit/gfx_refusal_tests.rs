@@ -1650,6 +1650,7 @@ fn tbuffer_fetch_vs(fmt: u8, count: u32) -> [u32; 10] {
 #[test]
 fn refusal6_all_42_vertex_fetch_formats_and_partial_loads_lower() {
     // (GFX10 unified format number, load count, expected semantic name, expected comp, expected cols)
+    // The scaled formats beside them: the integer's stage-in kind, the conversion in the body.
     let cases: &[(u8, u32, &str, u8, u8)] = &[
         // 8-bit 1/2/4 channels
         (1, 1, "VBN1", 9, 1),
@@ -1701,6 +1702,16 @@ fn refusal6_all_42_vertex_fetch_formats_and_partial_loads_lower() {
         (71, 3, "VBH4", 9, 4), // xyz of [16,16,16,16] Float
         (50, 3, "VBP4", 9, 4), // xyz of [10,10,10,2] Unorm
         (56, 3, "VBN4", 9, 4), // xyz of [8,8,8,8] Unorm
+        // Scaled formats: the stage-in reads the integer (the uint/sint kind), and the
+        // conversion to the float the console's load gave follows it in the body.
+        (58, 4, "VBB4", 5, 4), // 8_8_8_8 Uscaled
+        (59, 4, "VBC4", 4, 4), // 8_8_8_8 Sscaled
+        (67, 4, "VBW4", 5, 4), // 16_16_16_16 Uscaled
+        (68, 4, "VBK4", 4, 4), // 16_16_16_16 Sscaled
+        (9, 1, "VBW1", 5, 1),  // 16 Uscaled
+        (10, 1, "VBK1", 4, 1), // 16 Sscaled
+        (16, 2, "VBB2", 5, 2), // 8_8 Uscaled
+        (17, 2, "VBC2", 4, 2), // 8_8 Sscaled
     ];
     for &(fmt, count, expect_name, expect_comp, expect_cols) in cases {
         let code = tbuffer_fetch_vs(fmt, count);
@@ -1723,13 +1734,15 @@ fn refusal6_all_42_vertex_fetch_formats_and_partial_loads_lower() {
 #[test]
 fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
     let bad_tbuffer: &[(u8, u32, &str)] = &[
-        (58, 4, "8_8_8_8 Uscaled"),
-        (59, 4, "8_8_8_8 Sscaled"),
         (44, 4, "2_10_10_10 Unorm (low 2-bit)"),
         (43, 3, "10_11_11 Float (reversed)"),
         (54, 4, "10_10_10_2 Uint"),
         (55, 4, "10_10_10_2 Sint"),
         (29, 4, "xyzw load from 2-channel 16_16 Float (count > w.len())"),
+        // The packed widths' scaled forms stay refused: no host vertex format reads a
+        // packed scaled, and the plain widths above cover the scaled fetches seen.
+        (52, 4, "10_10_10_2 Uscaled"),
+        (53, 4, "10_10_10_2 Sscaled"),
     ];
     for &(fmt, count, label) in bad_tbuffer {
         let code = tbuffer_fetch_vs(fmt, count);

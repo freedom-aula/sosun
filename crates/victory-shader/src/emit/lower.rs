@@ -498,6 +498,17 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 
+/// Mesh shaders whose declared output passed the host's 32 KiB a threadgroup and was clamped
+/// to fit ([`Lower::mesh_prologue`]) instead of being refused: the shader runs with fewer
+/// vertices and primitives a threadgroup than the console's. Read by the native host's frame
+/// log, so a run says how much of the world came through clamped.
+static CLAMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mesh shaders clamped so far ([`CLAMPED`]).
+pub fn mesh_clamped() -> u64 {
+    CLAMPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -4470,10 +4481,27 @@ impl<'a> Lower<'a> {
         let rows = |sig: &[SigElement]| {
             sig.iter().filter_map(|o| o.row).collect::<std::collections::BTreeSet<u32>>().len() as u64
         };
-        let payload = 16 * rows(&self.s.outputs) * u64::from(mesh.max_vertices)
-            + (16 * rows(&self.s.prims) + 12) * u64::from(mesh.max_primitives);
+        let (row_v, row_p) = (rows(&self.s.outputs), rows(&self.s.prims));
+        let payload =
+            16 * row_v * u64::from(mesh.max_vertices) + (16 * row_p + 12) * u64::from(mesh.max_primitives);
+        let mut mesh = mesh;
         if payload > 32 * 1024 {
-            return Err("a mesh shader whose output exceeds the host's 32 KiB a threadgroup");
+            // Clamp both maxima to the largest count that fits instead of refusing the shader
+            // outright: what the console drew with more comes out with fewer vertices and
+            // primitives a threadgroup — visible, torn geometry — rather than the whole pass
+            // drawing nothing. The two maxima clamp to the same count because the store guard
+            // below is `flat < max_primitives` and the vertex stores go by that same flat id,
+            // so equal maxima keep every store inside its array. A signature so wide that one
+            // vertex and one primitive do not fit is still refused: no count can run it.
+            let per = 16 * row_v + 16 * row_p + 12;
+            let fit = (32 * 1024 / per).min(u64::from(mesh.max_vertices.min(mesh.max_primitives)));
+            if fit == 0 {
+                return Err("a mesh shader whose output exceeds the host's 32 KiB a threadgroup");
+            }
+            mesh.max_vertices = fit as u32;
+            mesh.max_primitives = fit as u32;
+            CLAMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;
         let void = self.s.t.void;
@@ -12222,39 +12250,67 @@ impl<'a> Lower<'a> {
         if !by_index || offset >= 0x1000 {
             return Err("a vertex fetch that is not indexed or has a large offset");
         }
+        // A scaled tbuffer format (USCALED, SSCALED) reads the integer and converts it to a
+        // float in the load; the host's stage-in reads the raw integer (the `B`/`C`/`W`/`K`
+        // kinds), so the conversion follows the load. `None`: the format's values are what the
+        // stage-in already gives.
+        let scaled: Option<bool>;
         let (kind, comp, channels) = match (typed, format.and_then(buffer_format)) {
-            (false, _) if inst.name() == "buffer_load_ubyte" => ('B', 5, 1),
-            (false, _) if inst.name() == "buffer_load_sbyte" => ('C', 4, 1),
-            (false, _) if inst.name() == "buffer_load_ushort" => ('W', 5, 1),
-            (false, _) if inst.name() == "buffer_load_sshort" => ('K', 4, 1),
-            (false, _) if (1..=4).contains(&count) => (
-                if count == 1 { 'U' } else { 'F' },
-                if count == 1 { 5 } else { 9 },
-                count,
-            ),
+            (false, _) if inst.name() == "buffer_load_ubyte" => {
+                scaled = None;
+                ('B', 5, 1)
+            }
+            (false, _) if inst.name() == "buffer_load_sbyte" => {
+                scaled = None;
+                ('C', 4, 1)
+            }
+            (false, _) if inst.name() == "buffer_load_ushort" => {
+                scaled = None;
+                ('W', 5, 1)
+            }
+            (false, _) if inst.name() == "buffer_load_sshort" => {
+                scaled = None;
+                ('K', 4, 1)
+            }
+            (false, _) if (1..=4).contains(&count) => {
+                scaled = None;
+                (
+                    if count == 1 { 'U' } else { 'F' },
+                    if count == 1 { 5 } else { 9 },
+                    count,
+                )
+            }
             (true, Some((w, num)))
                 if !inst.name().contains("_format_d16_") && w.len() >= count as usize =>
             {
-                let (k, c) = match (w, num) {
+                let (k, c, s): (_, _, Option<bool>) = match (w, num) {
                     ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Float) => {
-                        ('F', 9)
+                        ('F', 9, None)
                     }
-                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Uint) => ('U', 5),
-                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Sint) => ('I', 4),
-                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Float) => ('H', 9),
-                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Unorm) => ('M', 9),
-                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Snorm) => ('S', 9),
-                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Uint) => ('W', 5),
-                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Sint) => ('K', 4),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Unorm) => ('N', 9),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Snorm) => ('Q', 9),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint) => ('B', 5),
-                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint) => ('C', 4),
-                    ([10, 10, 10, 2], Numeric::Unorm) => ('P', 9),
-                    ([10, 10, 10, 2], Numeric::Snorm) => ('T', 9),
-                    ([11, 11, 10], Numeric::Float) => ('G', 9),
+                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Uint) => ('U', 5, None),
+                    ([32] | [32, 32] | [32, 32, 32] | [32, 32, 32, 32], Numeric::Sint) => ('I', 4, None),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Float) => ('H', 9, None),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Unorm) => ('M', 9, None),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Snorm) => ('S', 9, None),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Uint) => ('W', 5, None),
+                    ([16] | [16, 16] | [16, 16, 16, 16], Numeric::Sint) => ('K', 4, None),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Unorm) => ('N', 9, None),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Snorm) => ('Q', 9, None),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Uint) => ('B', 5, None),
+                    ([8] | [8, 8] | [8, 8, 8, 8], Numeric::Sint) => ('C', 4, None),
+                    ([10, 10, 10, 2], Numeric::Unorm) => ('P', 9, None),
+                    ([10, 10, 10, 2], Numeric::Snorm) => ('T', 9, None),
+                    ([11, 11, 10], Numeric::Float) => ('G', 9, None),
+                    // Scaled: the stage-in kind is the integer's, the conversion follows.
+                    ([8] | [8, 8] | [8, 8, 8, 8] | [16] | [16, 16] | [16, 16, 16, 16], Numeric::Uscaled) => {
+                        (if w == [8] || w == [8, 8] || w == [8, 8, 8, 8] { 'B' } else { 'W' }, 5, Some(false))
+                    }
+                    ([8] | [8, 8] | [8, 8, 8, 8] | [16] | [16, 16] | [16, 16, 16, 16], Numeric::Sscaled) => {
+                        (if w == [8] || w == [8, 8] || w == [8, 8, 8, 8] { 'C' } else { 'K' }, 4, Some(true))
+                    }
                     _ => return Err("a vertex fetch format the host's vertex layout lacks"),
                 };
+                scaled = s;
                 (k, c, w.len() as u32)
             }
             _ => return Err("a vertex fetch format the host's vertex layout lacks"),
@@ -12294,11 +12350,25 @@ impl<'a> Lower<'a> {
                 let Val::I32(v) = self.load_any_input(id, k as u8) else {
                     return Err("a vertex input");
                 };
+                // A scaled format's integer becomes a float here (the console's load did it).
+                let v = match scaled {
+                    None => v,
+                    Some(signed) => {
+                        let c = self.cur;
+                        let f = self.s.m.cast(
+                            c,
+                            if signed { Cast::SiToFp } else { Cast::UiToFp },
+                            v,
+                            self.s.t.f32,
+                        );
+                        self.as_int(f)
+                    }
+                };
                 x[corner] = Some(v);
             }
             loaded.push(x);
         }
-        let float = !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        let float = scaled.is_some() || !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
         if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
             (&loaded[..], float, self.rect_corner)
         {
