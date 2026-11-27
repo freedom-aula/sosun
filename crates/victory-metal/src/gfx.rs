@@ -2274,6 +2274,8 @@ impl Metal {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
         }
         let mut named = Vec::new();
+        let mut depth_set = false;
+        let mut default_depth = None;
         for (k, d) in rp.draws.iter().enumerate() {
             // The stage that reads the draw's buffers before the pixel shader.
             let first = match (d.pipeline.mesh, d.call) {
@@ -2310,8 +2312,20 @@ impl Metal {
                 MTLDepthClipMode::Clamp
             });
             e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            // Passing nil restores Metal's default depth and stencil state for this draw.
-            e.setDepthStencilState(d.pipeline.depth.as_deref());
+            // Metal validation forbids passing nil to `setDepthStencilState:`: bind a default
+            // state object when returning from a depth/stencil pipeline to one without.
+            if let Some(depth) = d.pipeline.depth.as_deref() {
+                e.setDepthStencilState(Some(depth));
+                depth_set = true;
+            } else if depth_set {
+                let depth = default_depth.get_or_insert_with(|| {
+                    self.dev
+                        .newDepthStencilStateWithDescriptor(&MTLDepthStencilDescriptor::new())
+                        .expect("default depth state")
+                });
+                e.setDepthStencilState(Some(depth));
+                depth_set = false;
+            }
             if d.pipeline.stencil {
                 e.setStencilReferenceValue(d.state.stencil_ref);
             }
