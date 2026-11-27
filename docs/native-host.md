@@ -976,6 +976,33 @@ Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D text
 
 A world run on an M5 Pro (Series S, windowed, reported on [#151](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/151)) named 22 textures as copied back (15 2D, 4 3D, 3 1D; the largest 256x256x16, 4 MiB), none too large, with no frame rate change beyond run-to-run noise up to the first world frame. The run then crashed (image+0x55e56f8, also without the switch), so whether boats float is still unknown. That count may be low: a texture skipped on its first completion was not logged then (fixed since).
 
+#### Size queries of writable images read 0 (fixed)
+
+A program that asks a writable image (a UAV) for its size got 0x0. The translator wrote the level of
+the query as DXIL's undefined value for a UAV, as DXC does (an `RWTexture` query has no level), and
+Metal through the Shader Converter answers that with 0. Sizes the host rebuilds into an image
+descriptor's own dwords, when a program reads its width or height from the descriptor's bits instead
+of querying them (`Lower::descriptor_data`), came from the same query and read 0 too (height - 1
+read as 16383).
+
+Under Wine the same answer from D3DMetal gave the title's sun-shadow min/max program
+(`cascadeshadows_processing:CS_ComputeMinMax`, `07f451a14b13fecb`) a 0x0 image, so its tile
+classifier lit or shadowed whole 16x16 tiles ([halfwave50/VIctory-macOS-halfwave50
+0f3ed38](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/0f3ed38), opt-in per program
+there).
+
+* **`image_get_resinfo`** now queries the level in the program's first address for every image, as
+  for shader resource views. Level 0 is the view's own size.
+* **guess:** a level past a writable view's single one reads 0 on the console, as it does here.
+  Forcing level 0 in every program under Wine changed the TAA disocclusion mask and put speckles on
+  skin, which suggests some programs ask about another level. Those keep reading 0, as before.
+* **Descriptor fields** of an image come from level 0, writable or not. A buffer's record count
+  keeps the undefined level, which a buffer ignores.
+* **Tested** (`heap_tests::a_size_query_of_a_writable_image_reads_its_size`, M1 Pro, macOS 27.2,
+  MSC 4.0.3): a 16x8 texture UAV declared in a table. Upstream read `[0, 0, 16383]` for the width,
+  height and descriptor height - 1, the query fix alone `[16, 8, 16383]`, and both fixes
+  `[16, 8, 7]`. **Not tested:** a game run; the shadow edges themselves.
+
 #### Texture formats the host lacked
 
 The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
