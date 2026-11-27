@@ -3221,6 +3221,38 @@ fn else_lanes_keep_their_registers() {
     })]));
 }
 
+/// Swap lanes 0 and 1 in each quad, with only lane 1 disabled. Each
+/// destination starts at 99 and lane 1's source VGPR still holds 7.
+#[test]
+fn dpp_fetch_inactive_and_bounds_choose_the_value_written() {
+    let body = [
+        sop1(0x03, 20, EXEC_LO),
+        vopc(0xD5, int(1), 1), // v_cmpx_ne_u32 exec_lo, 1, v1
+        vop1(1, 5, 0xE9), 0xDE_54_C1_02, // DPP8 [1,0,3,2,5,4,7,6], fi:0
+        vop1(1, 6, 0xEA), 0xDE_54_C1_02, // DPP8, fi:1
+        vop1(1, 7, 0xFA), 0xFF00_B102, // quad_perm [1,0,3,2], BC clear
+        vop1(1, 8, 0xFA), 0xFF08_B102, // quad_perm [1,0,3,2], BC set
+        sop1(0x03, 126, s(20)),
+    ];
+    let shader = lower_program(&program(&body, false)).expect("lower DPP probe");
+    let inputs: Vec<_> = (0..64).map(|lane| [lane % 4, lane + 6, 0, 99]).collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware adapter for a wave of 32; skipped");
+        return;
+    };
+    let out = run(&host, &shader, &inputs, false).expect("dispatch DPP probe");
+    for (lane, result) in out.into_iter().enumerate() {
+        let neighbour = (lane as u32 ^ 1) + 6;
+        let want = match lane % 4 {
+            0 => [0, neighbour, 99, 0],
+            1 => [99; 4],
+            _ => [neighbour; 4],
+        };
+        assert_eq!(result, want, "lane {lane}");
+    }
+}
+
 /// DS `op` at `addr + offset`: data from `data`, result to `vdst`.
 fn ds(op: u32, vdst: u8, addr: u8, data: u8, offset: u8) -> [u32; 2] {
     [
