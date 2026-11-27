@@ -895,6 +895,15 @@ impl CopyLocation {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl CopyLocation {
+    /// Subresource `index` of `resource` (the index shares the footprint's first dword).
+    pub(crate) fn sub(resource: This, index: u32) -> Self {
+        let footprint = crate::resource::PlacedFootprint { offset: index.into(), format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
+        Self { resource, kind: 0, footprint }
+    }
+}
+
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1079,18 +1088,14 @@ extern "system" fn resolve(
         }
     }
     #[cfg(target_os = "macos")]
-    crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    if !crate::native::glue::resolve(this, dst, dst_sub, src, src_sub) {
+        crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
-#[repr(C)]
-pub(crate) struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
+pub(crate) use victory_backend::resources::ClearRect as Rect;
 
 extern "system" fn clear_rtv(
     this: This,
@@ -1136,10 +1141,15 @@ extern "system" fn clear_rtv(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (count, rects);
         // SAFETY: the title passes four floats (null is tolerated).
         if let Some(&color) = unsafe { color.as_ref() } {
-            crate::native::glue::clear_rtv(this, handle, color);
+            let rects = if count == 0 || rects.is_null() {
+                &[]
+            } else {
+                // SAFETY: the title passes an array of `count` D3D12_RECTs.
+                unsafe { std::slice::from_raw_parts(rects, count as usize) }
+            };
+            crate::native::glue::clear_rtv(this, handle, color, rects);
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]

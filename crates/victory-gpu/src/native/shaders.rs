@@ -193,7 +193,7 @@ impl<B: PresentBackend> Title<B> {
         };
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
-        let binding = Binding::of(shader);
+        let binding = Binding { name: name.into(), ..Binding::of(shader) };
         let made = match binding.layout() {
             Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
             None => self.host.backend.create_compute_pipeline(&shader.dxil),
@@ -285,9 +285,9 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding::of(vs);
+        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
         let ps_binding = ps
-            .map(Binding::of)
+            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
             .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
