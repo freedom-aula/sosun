@@ -1184,7 +1184,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             // encoder for a pass without attachments, and that refused the whole piece.
             let no_target = match c {
                 Cmd::Draw { targets, .. } => targets.color.is_empty() && targets.depth.is_none(),
-                Cmd::Clear { color, depth } => color.is_none() && depth.is_none(),
+                Cmd::Clear { color, depth, .. } => color.is_none() && depth.is_none(),
                 _ => false,
             };
             if no_target {
@@ -1416,11 +1416,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         })
                         .collect(),
                 ),
-                Group::Clear(k) => {
-                    let Cmd::Clear { color, depth } = cmds[*k] else {
-                        unreachable!()
-                    };
-                    Pass::Render(RenderPass {
+                Group::Clear(k) => match cmds[*k] {
+                    Cmd::Clear {
+                        color: Some((target, color)),
+                        rects: Some(rects),
+                        ..
+                    } => Pass::ClearColorRects {
+                        target,
+                        color: *color,
+                        rects,
+                    },
+                    Cmd::Clear { color, depth, .. } => Pass::Render(RenderPass {
                         color: color
                             .iter()
                             .map(|(t, c)| ColorTarget {
@@ -1434,8 +1440,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             clear_stencil: *s,
                         }),
                         draws: vec![],
-                    })
-                }
+                    }),
+                    _ => unreachable!(),
+                },
                 Group::Render(a, b) => {
                     let Cmd::Draw {
                         targets: Targets { color, depth },

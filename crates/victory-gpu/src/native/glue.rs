@@ -613,14 +613,18 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     });
 }
 
-/// `ClearRenderTargetView`. shortcut: the selected attachment, regardless of rectangle arguments.
-pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
+/// `ClearRenderTargetView` against the attachment named by the descriptor.
+pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4], rects: &[crate::list::Rect]) {
     with_list(this, |t, l| {
         if let Some(record) = crate::descriptor::rtv_record(handle)
             && let Some((texture, _)) = t.target_of(record)
         {
             trace_bump(record.resource as usize, 1);
-            l.list.clear_render_target(&texture, color);
+            if rects.is_empty() {
+                l.list.clear_render_target(&texture, color);
+            } else {
+                l.list.clear_render_target_rects(&texture, color, rects);
+            }
         }
     });
 }

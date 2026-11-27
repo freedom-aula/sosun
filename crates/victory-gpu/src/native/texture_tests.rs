@@ -1002,3 +1002,98 @@ fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
         }
     }
 }
+
+#[test]
+fn a_rectangular_color_clear_preserves_texels_outside_the_selected_regions() {
+    for (storage_format, view_format, color, pixel) in [
+        (28, 28, [1.0, 0.0, 0.0, 1.0], [255, 0, 0, 255]),
+        (28, 29, [0.5, 0.5, 0.5, 1.0], [188, 188, 188, 255]),
+        (30, 30, [17.0, 65.0, 201.0, 255.0], [17, 65, 201, 255]),
+    ] {
+        check_rectangular_color_clear(storage_format, view_format, color, pixel);
+    }
+}
+
+fn check_rectangular_color_clear(
+    storage_format: u32,
+    view_format: u32,
+    color: [f32; 4],
+    cleared_pixel: [u8; 4],
+) {
+    use crate::list::Rect;
+    use victory_backend::backend::ComputeBackend;
+
+    let pool = pool(9139, 16).expect("Metal device and generated texture pool");
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let resource = crate::resource::test_texture_array_at(
+        pool.va(0), (8, 6), 2, 2, storage_format, Swizzle::LINEAR.0, 1,
+    );
+    let key = resource as usize;
+    let desc = [view_format, 5, 1, 1, 1, 0];
+    crate::descriptor::create_rtv(std::ptr::null(), resource, &desc, handle);
+
+    let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
+    let queue = crate::queue::test_queue(false);
+    let mut fence = std::ptr::null();
+    assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), 0);
+    let cases: [(&str, &[[i32; 4]], &[usize]); 6] = [
+        ("interior", &[[1, 1, 3, 2]], &[5, 6]),
+        ("bounded", &[[-2, 1, 2, 2]], &[4, 5]),
+        ("empty and inverted", &[[1, 1, 1, 2], [3, 1, 1, 2]], &[]),
+        ("wholly outside", &[[4, 0, 5, 3]], &[]),
+        ("overlapping and disjoint", &[[0, 0, 2, 1], [1, 0, 3, 1], [2, 2, 8, 3]], &[0, 1, 2, 10, 11]),
+        ("zero count", &[], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+    ];
+
+    for (case_index, (name, rects, required)) in cases.into_iter().enumerate() {
+        with_title(|title| {
+            let texture = title.texture_of(key).expect("realized texture");
+            for slice in 0..2 {
+                for mip in 0..2 {
+                    let (w, h) = (8 >> mip, 6 >> mip);
+                    let pixel = sentinel(mip, slice);
+                    title.host.backend.upload_texture(&texture, mip, slice, &pixel.repeat(w * h), w * 4, 0);
+                }
+            }
+        }).expect("Metal title");
+
+        let list = crate::list::test_list(false, std::ptr::null());
+        let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const Rect)>(list, 0x1a0);
+        let unused = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut caller_rects: Vec<_> = rects.iter().map(|&[left, top, right, bottom]| {
+            Rect { left, top, right, bottom }
+        }).collect();
+        let ptr = if caller_rects.is_empty() { &unused as *const _ } else { caller_rects.as_ptr() };
+        clear(list, handle, &color, caller_rects.len() as u32, ptr);
+        // The list must own the original coordinates at record time.
+        caller_rects.fill(unused);
+        std::hint::black_box(&caller_rects);
+
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        let value = case_index as u64 + 1;
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(slot::<extern "system" fn(This, This, u64) -> i32>(queue, 0x70)(queue, fence, value), 0);
+        with_title(|title| {
+            let fence = title.fence(fence as usize, 0).expect("native fence");
+            assert!(title.host.backend.wait(&fence, value, 2000), "native clear did not finish");
+            let texture = title.texture_of(key).expect("realized texture");
+            for slice in 0..2 {
+                for mip in 0..2 {
+                    let (w, h) = (8 >> mip, 6 >> mip);
+                    let mut data = vec![0; w * h * 4];
+                    title.host.backend.read_texture(&texture, mip, slice, &mut data, w * 4, 0);
+                    for (index, pixel) in data.as_chunks::<4>().0.iter().enumerate() {
+                        let expected = if (mip, slice) == (1, 1) && required.contains(&index) {
+                            cleared_pixel
+                        } else {
+                            sentinel(mip, slice)
+                        };
+                        assert_eq!(*pixel, expected, "DXGI {view_format}, {name}, mip {mip}, slice {slice}, pixel {index}");
+                    }
+                }
+            }
+        }).expect("Metal title");
+        println!("DXGI {view_format}, {name}: {} changed / {} preserved in view, adjacent subresources unchanged", required.len(), 12 - required.len());
+    }
+}
