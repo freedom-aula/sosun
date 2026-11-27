@@ -748,8 +748,13 @@ fn infer_wave64(list: &[Instruction]) -> bool {
             let is_32 = name.ends_with("_b32") || name.ends_with("_u32") || name.ends_with("_i32");
             for op in dst.iter().chain(src) {
                 if let Operand::Scalar { code, .. } = *op {
-                    if is_64 && matches!(code, 106 | 126) {
+                    if is_64 && code == 126 {
                         strong_w64 = true;
+                    }
+                    // A wave32 program may use the VCC pair as a spare 64-bit SGPR pair
+                    // (`s_mov_b64 vcc, s[82:83]` beside `s_and_saveexec_b32`), so only weak.
+                    if is_64 && code == 106 {
+                        weak_w64 = true;
                     }
                     if is_32 && code == 126 {
                         weak_w32 = true;
@@ -1104,6 +1109,13 @@ mod tests {
         // Wave32 saveexec_b32 with vcc_hi used as a scratch SGPR: strong wave32 wins.
         let w32_with_vcc_hi = words(&[0xBE80_3C01, 0xBEEB_0302, ENDPGM]);
         assert!(!infer(HwStage::Ps, &w32_with_vcc_hi, &meta).unwrap().0.wave64);
+
+        // s_mov_b64 vcc, s[2:3] alone: wave64 (the default holds).
+        let vcc_pair = words(&[0xBEEA_0402, ENDPGM]);
+        assert!(infer(HwStage::Ps, &vcc_pair, &meta).unwrap().0.wave64);
+        // Beside s_and_saveexec_b32 the VCC pair is a spare SGPR pair: wave32.
+        let w32_vcc_pair = words(&[0xBE80_3C01, 0xBEEA_0402, ENDPGM]);
+        assert!(!infer(HwStage::Ps, &w32_vcc_pair, &meta).unwrap().0.wave64);
     }
 
     #[test]
