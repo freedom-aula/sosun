@@ -10938,6 +10938,51 @@ impl<'a> Lower<'a> {
         some
     }
 
+    /// Whether, at a per-lane join `b` that edge `n` reaches by a per-lane branch, another edge
+    /// brings a mask that may differ from the lane function `x` in a lane taking edge `n`. The
+    /// console wave runs every path some lane takes, so where that edge's block ran, the
+    /// register holds its mask for the lanes of edge `n` too: their bit of it, which `x`, what
+    /// edge `n` brings, then does not tell.
+    fn mask_differs_on_edge(&self, b: usize, args: &[Value], n: usize, x: Bool) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        // Where the whole wave leaves by edge `n`, no other path runs before the join.
+        let per_lane = matches!(st.exits[preds[n]], LaneExit::Branch { when, taken, not_taken }
+            if taken != not_taken
+                && st.bools.support(when).iter().any(|a| !matches!(a, Atom::Uniform(_))));
+        let on_n = self.lane_edge(preds[n], b);
+        per_lane && args.iter().enumerate().any(|(k, arg)| {
+            // A back edge's block (one the join dominates) runs after the lanes of edge `n`
+            // have gone on. An arm inside a loop's body is no back edge.
+            k != n
+                && !self.dominates(b, preds[k])
+                && st.masks.get(arg).is_some_and(|&m| {
+                    [true, false].into_iter().any(|set| {
+                        let mut lanes = on_n.clone();
+                        lanes.extend([(m, set), (x, !set)]);
+                        st.bools.meet(&lanes)
+                    })
+                })
+        })
+    }
+
+    /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.
+    fn dominates(&self, b: usize, q: usize) -> bool {
+        let blocks = &self.x.p.blocks;
+        let mut seen = vec![false; blocks.len()];
+        seen[b] = true;
+        let mut stack = vec![0];
+        while let Some(x) = stack.pop() {
+            if !std::mem::replace(&mut seen[x], true) {
+                if x == q {
+                    return false;
+                }
+                stack.extend(blocks[x].exit.successors());
+            }
+        }
+        true
+    }
+
     /// Whether IR block `b` can reach itself.
     fn on_cycle(&self, b: usize) -> bool {
         let blocks = &self.x.p.blocks;
@@ -14159,9 +14204,11 @@ impl<'a> Lower<'a> {
                         self.s.m.bool(false)
                     }
                     // A lane function the structure knows though no mask tracks it (a constant,
-                    // SCC, a join that resolved): each lane's bit of it.
+                    // SCC, a join that resolved): each lane's bit of it, unless another edge's
+                    // mask may differ from it in the lanes of this one (`mask_differs_on_edge`).
                     (None, _)
                         if let Some(&m) = self.x.st.other.get(&arg)
+                            && (uniform || !self.mask_differs_on_edge(b, &phi.args, n, m))
                             && !self.x.st.bools.support(m).iter().any(|a| {
                                 matches!(a, Atom::Opaque(_) | Atom::Quad(_))
                             }) =>
@@ -15262,6 +15309,70 @@ mod tests {
         words[6] = 0xBF80_0000; // s_nop 0
         words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
         lowers(&words, 1 << 7).expect("a uniform loop's mask join");
+    }
+
+    /// s6 holds a constant where lanes 16 and up skip the arm, which is `arm`; in a uniform
+    /// loop's body if `looped`.
+    fn skip_edge_constant(constant: u32, arm: [u32; 2], looped: bool) -> Vec<u32> {
+        let mut words = vec![
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0x7E12_0280, // v_mov_b32 v9, 0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            constant,    // loop: s_mov_b32 s6, 5 (or 0)
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2
+            arm[0],
+            arm[1],
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xD501_0003,
+            0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        ];
+        if looped {
+            words.extend([
+                0x8007_8107, // s_add_u32 s7, s7, 1
+                0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+                0xBF85_FFF4, // s_cbranch_scc1 loop
+            ]);
+        }
+        words.extend([
+            0xDC70_8000,
+            0x007D_0308, // global_store_dword v[8:9], v3
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// `s_mov_b32 s6, s8; s_nop 0`: the saved EXEC, which holds the skipping lanes.
+    const SAVED_EXEC: [u32; 2] = [0xBE86_0308, 0xBF80_0000];
+
+    #[test]
+    fn a_skip_edge_constant_is_not_the_bit_where_the_arm_keeps_the_skipping_lanes() {
+        // With a compare in the arm the skipping lanes read 0, their bit of it. With the saved
+        // EXEC there the console's register holds their bit set, which the constant 5 does not
+        // say: refused, in a uniform loop's body too.
+        const COMPARE: [u32; 2] = [0xD4C4_0006, 0x0002_0088]; // v_cmp_gt_u32 s6, 8, v0
+        for looped in [false, true] {
+            lowers(&skip_edge_constant(0xBE86_0385, COMPARE, looped), 1 << 7)
+                .unwrap_or_else(|e| panic!("a compare the skipping lanes are not in: {e}"));
+            let Err(crate::ShaderError::Unsupported { what, .. }) =
+                lowers(&skip_edge_constant(0xBE86_0385, SAVED_EXEC, looped), 1 << 7)
+            else {
+                panic!("5 joined with the saved EXEC translated (loop: {looped})");
+            };
+            assert!(what.contains("lane-mask join"), "{what}");
+        }
+    }
+
+    #[test]
+    #[ignore = "known gap: on the host's lanes a constant 0 or -1 is taken as every lane's bit unchecked"]
+    fn a_skip_edge_constant_of_no_lane_is_not_the_bit_either() {
+        let Err(crate::ShaderError::Unsupported { what, .. }) =
+            lowers(&skip_edge_constant(0xBE86_0380, SAVED_EXEC, false), 1 << 7)
+        else {
+            panic!("0 joined with the saved EXEC translated");
+        };
+        assert!(what.contains("lane-mask join"), "{what}");
     }
 
     #[test]
