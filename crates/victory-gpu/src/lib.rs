@@ -61,7 +61,8 @@ pub mod resource;
 pub mod root;
 mod rootser;
 mod sampler;
-#[cfg(any(windows, target_os = "macos"))]
+// Plain std and `victory-pipeline`; its Windows and non-Windows branches are inside, so the
+// native host (which builds on every target) can reach it everywhere.
 pub mod shader_cache;
 #[cfg(target_os = "macos")]
 mod prewarm;

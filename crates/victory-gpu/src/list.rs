@@ -1924,8 +1924,10 @@ mod state {
     pub(super) use super::dispatch;
     pub(super) use super::draw;
     pub(super) use super::draw as draw_indexed;
-    pub(super) use super::dropped_mesh as dispatch_mesh;
-    pub(super) use super::dropped_mesh_x as dispatch_mesh_x;
+    // As on macOS: a mesh dispatch counts as a draw and is dropped (there is no backend to
+    // run it; the per-kind drop counters are the macOS glue's).
+    pub(super) use super::draw as dispatch_mesh;
+    pub(super) use super::draw as dispatch_mesh_x;
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;

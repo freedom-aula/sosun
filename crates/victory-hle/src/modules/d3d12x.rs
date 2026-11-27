@@ -17,7 +17,11 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
+    // The title's allocator exists on the hosts with an xmem (Windows, macOS); a host with
+    // none keeps the default, as it runs no title memory anyway.
+    #[cfg(any(windows, target_os = "macos"))]
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
+    #[cfg(any(windows, target_os = "macos"))]
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
