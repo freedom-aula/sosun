@@ -71,6 +71,10 @@ pub fn choose() -> Option<(usize, u32)> {
 mod tests {
     use super::*;
 
+    /// These tests own the process-wide frame, so only one runs at a time (as `valu_tests`
+    /// does for the host it shares).
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_level_must_be_a_fraction_above_zero() {
         // The parsing itself, not the cached switch: same shape, other values.
@@ -85,6 +89,7 @@ mod tests {
 
     #[test]
     fn the_most_drawn_depth_wins_and_ties_go_to_the_latest() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         // These use the process-wide frame, so this test owns it: nothing else notes draws.
         assert_eq!(choose(), None, "nothing was drawn yet");
         note(None);
@@ -102,6 +107,7 @@ mod tests {
 
     #[test]
     fn equally_drawn_depths_go_to_the_most_recently_drawn() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..2 {
             note(Some(0xa));
             note(Some(0xb));
