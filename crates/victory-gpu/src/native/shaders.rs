@@ -261,6 +261,10 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let color_state = g.color_state();
+        // A pixel shader with one output more than there are targets feeds target 0's second
+        // blend source; the converter must be told, or Metal refuses the pipeline.
+        let targets = ps.map_or_else(Vec::new, |p| state::pixel_targets(&p.dxil));
+        let dual_source = state::dual_source(color.len(), &targets, &color_state);
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
@@ -285,6 +289,7 @@ impl<B: PresentBackend> Title<B> {
             depth_test: depth.and(g.depth_test()),
             cull: g.cull(),
             color_state: &color_state,
+            dual_source,
             stencil: depth.and(g.stencil()),
             raster: g.raster(),
         };

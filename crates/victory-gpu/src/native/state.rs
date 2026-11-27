@@ -756,6 +756,37 @@ pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
     mask
 }
 
+/// The render targets a pixel shader writes (`SV_Target` index and write mask), from its DXIL
+/// container's `OSG1` part.
+pub fn pixel_targets(dxil: &[u8]) -> Vec<(u32, u8)> {
+    use victory_shader::{Container, FourCC};
+    let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(FourCC::OSG1).map(|p| p.data.to_vec())) else {
+        return Vec::new();
+    };
+    let word = |at: usize| part.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+    (0..word(0) as usize)
+        .filter_map(|i| {
+            let at = 8 + 32 * i;
+            // System value 64 is a render target.
+            (word(at + 12) == 64).then(|| (word(at + 8), part.get(at + 24).copied().unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Whether a pipeline's colour comes through dual-source blending: target 0's blend reads a second
+/// source (`SRC1_*`), which the pixel shader supplies as one more output than there are targets
+/// (`SV_Target1` for the one target, not a second attachment). The console does this for particles
+/// and decals; Metal expresses it as `[[color(0) index(1)]]`, which its converter only emits when
+/// told the pipeline is dual-source.
+pub fn dual_source(colors: usize, targets: &[(u32, u8)], states: &[ColorState]) -> bool {
+    targets.len() == colors + 1
+        && targets.iter().enumerate().all(|(i, (index, _))| *index as usize == i)
+        && states
+            .first()
+            .and_then(|s| s.blend)
+            .is_some_and(|b| b.second_source())
+}
+
 /// The positions of the system values in a vertex shader's input signature that come before its
 /// last attribute. The converter numbers the stage-in attributes by signature position, system
 /// values included, so these positions are attribute slots no element fills.
@@ -775,6 +806,68 @@ pub fn system_gaps(dxil: &[u8]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dual-source blending: the shader gives target 0 one more output than there are targets, and
+    /// target 0's blend reads it as its second source. Metal refuses the pipeline otherwise.
+    #[test]
+    fn a_target_blended_with_its_second_source_is_dual_source() {
+        let blend = |src, dst, src_alpha, dst_alpha| ColorState {
+            blend: Some(Blend { src, dst, op: BlendOp::Add, src_alpha, dst_alpha, op_alpha: BlendOp::Add }),
+            write_mask: 0xf,
+        };
+        let second = blend(
+            BlendFactor::Src1Color,
+            BlendFactor::InvSrc1Color,
+            BlendFactor::Src1Alpha,
+            BlendFactor::InvSrc1Alpha,
+        );
+        let alpha = blend(
+            BlendFactor::SrcAlpha,
+            BlendFactor::InvSrcAlpha,
+            BlendFactor::One,
+            BlendFactor::InvSrcAlpha,
+        );
+        let two = [(0, 0xf), (1, 0xf)];
+        let one = [(0, 0xf)];
+        // The console's particle pass: two shader outputs, one target.
+        assert!(dual_source(1, &two, &[second]));
+        // Two outputs into two targets: a second attachment, not a second source.
+        assert!(!dual_source(2, &two, &[second]));
+        // One output cannot feed both of the target's sources.
+        assert!(!dual_source(1, &one, &[second]));
+        // The extra output must be the one after the targets, not a gap.
+        assert!(!dual_source(1, &[(0, 0xf), (2, 0xf)], &[second]));
+        // Ordinary alpha blending reads no second source.
+        assert!(!dual_source(1, &two, &[alpha]));
+    }
+
+    /// Any of the four factors reading source 1 makes a blend dual-source.
+    #[test]
+    fn any_second_source_factor_needs_dual_source() {
+        let base = Blend {
+            src: BlendFactor::One,
+            dst: BlendFactor::One,
+            op: BlendOp::Add,
+            src_alpha: BlendFactor::One,
+            dst_alpha: BlendFactor::One,
+            op_alpha: BlendOp::Add,
+        };
+        assert!(!base.second_source());
+        for f in [
+            BlendFactor::Src1Color,
+            BlendFactor::InvSrc1Color,
+            BlendFactor::Src1Alpha,
+            BlendFactor::InvSrc1Alpha,
+        ] {
+            let picks = [
+                Blend { src: f, ..base },
+                Blend { dst: f, ..base },
+                Blend { src_alpha: f, ..base },
+                Blend { dst_alpha: f, ..base },
+            ];
+            assert!(picks.iter().all(Blend::second_source), "{f:?} in one place must count");
+        }
+    }
 
     /// A stream's subobject bytes: the type, then the data at +4.
     fn sub(kind: u32, data: &[u32]) -> Vec<u8> {
