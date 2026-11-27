@@ -1095,13 +1095,7 @@ extern "system" fn resolve(
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
-#[repr(C)]
-pub(crate) struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
+pub(crate) use victory_backend::resources::ClearRect as Rect;
 
 extern "system" fn clear_rtv(
     this: This,
@@ -1147,10 +1141,15 @@ extern "system" fn clear_rtv(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (count, rects);
         // SAFETY: the title passes four floats (null is tolerated).
         if let Some(&color) = unsafe { color.as_ref() } {
-            crate::native::glue::clear_rtv(this, handle, color);
+            let rects = if count == 0 || rects.is_null() {
+                &[]
+            } else {
+                // SAFETY: the title passes an array of `count` D3D12_RECTs.
+                unsafe { std::slice::from_raw_parts(rects, count as usize) }
+            };
+            crate::native::glue::clear_rtv(this, handle, color, rects);
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]

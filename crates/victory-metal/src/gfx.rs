@@ -1176,6 +1176,9 @@ impl GraphicsBackend for Metal {
                     self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
                 }
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+                Pass::ClearColorRects { target, color, rects } => {
+                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
+                }
             };
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
@@ -2031,6 +2034,86 @@ impl Metal {
         }
         e.endEncoding();
         Ok(())
+    }
+
+    fn encode_color_clear_rects(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &Texture,
+        color: [f32; 4],
+        rects: &[ClearRect],
+        set_on_queue: bool,
+        order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
+    ) -> Result<(), String> {
+        let clip = |p, limit| usize::try_from(p).unwrap_or_default().min(limit);
+        let (width, height) = (target.tex.width(), target.tex.height());
+        let regions: Vec<_> = rects
+            .iter()
+            .filter_map(|r| {
+                let (left, right) = (clip(r.left, width), clip(r.right, width));
+                let (top, bottom) = (clip(r.top, height), clip(r.bottom, height));
+                (left < right && top < bottom).then(|| ([left, top, 0], [right - left, bottom - top, 1]))
+            })
+            .collect();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        if !matches!(target.tex.textureType(), MTLTextureType::Type2D | MTLTextureType::Type2DArray)
+            || target.tex.sampleCount() != 1
+        {
+            return Err("rectangular color clear requires a single-sampled 2D color target".into());
+        }
+        if target.format.is_depth()
+            || !target.tex.usage().contains(MTLTextureUsage::RenderTarget)
+        {
+            return Err("rectangular color clear requires a renderable color format".into());
+        }
+
+        // Use Metal's clear conversion in the view format, including sRGB and integer targets.
+        // A retained command buffer keeps this private scratch alive until the blits finish.
+        let (max_width, max_height) = regions.iter().fold((0, 0), |(w, h), (_, size)| {
+            (w.max(size[0]), h.max(size[1]))
+        });
+        let td = MTLTextureDescriptor::new();
+        td.setPixelFormat(target.tex.pixelFormat());
+        td.setStorageMode(MTLStorageMode::Private);
+        td.setUsage(MTLTextureUsage::RenderTarget);
+        // SAFETY: these nonzero dimensions fit the selected view.
+        unsafe {
+            td.setWidth(max_width);
+            td.setHeight(max_height);
+        }
+        let scratch = Texture {
+            tex: self.dev.newTextureWithDescriptor(&td).ok_or("no rectangular clear texture")?,
+            format: target.format,
+        };
+        self.encode_render(
+            cb,
+            &RenderPass {
+                color: vec![ColorTarget { texture: &scratch, clear: Some(color) }],
+                depth: None,
+                draws: vec![],
+            },
+            set_on_queue,
+            order,
+            attached_heaps,
+        )?;
+        let copies: Vec<_> = regions
+            .into_iter()
+            .map(|(dst_origin, size)| BlitOp::CopyTexture {
+                src: &scratch,
+                src_mip: 0,
+                src_slice: 0,
+                src_origin: [0, 0, 0],
+                size,
+                dst: target,
+                dst_mip: 0,
+                dst_slice: 0,
+                dst_origin,
+            })
+            .collect();
+        self.encode_blit(cb, &copies, order)
     }
 
     fn encode_render(

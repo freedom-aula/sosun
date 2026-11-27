@@ -138,7 +138,8 @@
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
 //!   give 0, writes are dropped. In such a program (and one with root
-//!   parameters past its user SGPRs) root SRVs and UAVs are title memory
+//!   parameters past its user SGPRs, and a vertex or pixel program with
+//!   [`Options::zero_copy_memory`]) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
