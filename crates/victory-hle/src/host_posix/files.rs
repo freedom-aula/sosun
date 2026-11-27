@@ -704,15 +704,97 @@ pub(crate) struct Find {
     next: usize,
 }
 
-/// Whether `name` matches a `*` and `?` pattern, ignoring case.
-fn wildcard(pattern: &[char], name: &[char]) -> bool {
-    match pattern.split_first() {
-        None => name.is_empty(),
-        Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),
-        Some((p, rest)) => name.split_first().is_some_and(|(n, tail)| {
-            (*p == '?' || p.to_lowercase().eq(n.to_lowercase())) && wildcard(rest, tail)
-        }),
+/// One element of a search mask, after Windows' DOS rewrite of `*`, `?` and `.`.
+#[derive(Clone, Copy, PartialEq)]
+enum Mask {
+    Char(char),
+    /// `*`: any run of characters.
+    Star,
+    /// `<`: any run of characters that ends at or before the name's last `.` (`*` before a
+    /// final `.`).
+    DosStar,
+    /// `>`: one character, or none at a `.` or the end of the name (every `?`).
+    DosQm,
+    /// `"`: a `.`, or nothing at the end of the name (a `.` before `*` or `?`).
+    DosDot,
+}
+
+/// The mask `FindFirstFile` hands the file system for `pattern`: trailing dots and spaces
+/// are dropped, a `.` before `*` or `?` may match the end of the name, `?` may match nothing
+/// at a `.` or the end, and a `*` that ended in dropped dots stops at the last `.`. The
+/// three DOS wildcards may also be written as `<`, `>` and `"`.
+fn dos_mask(pattern: &[char]) -> Vec<Mask> {
+    let no_ext = pattern.last() == Some(&'.');
+    let len = pattern.len()
+        - pattern
+            .iter()
+            .rev()
+            .take_while(|&&c| c == '.' || c == ' ')
+            .count();
+    let p = &pattern[..len];
+    let mut mask: Vec<Mask> = p
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| match c {
+            '.' if matches!(p.get(i + 1), Some('*' | '?')) => Mask::DosDot,
+            '?' | '>' => Mask::DosQm,
+            '*' => Mask::Star,
+            '<' => Mask::DosStar,
+            '"' => Mask::DosDot,
+            c => Mask::Char(c),
+        })
+        .collect();
+    if no_ext && mask.last() == Some(&Mask::Star) {
+        *mask.last_mut().unwrap() = Mask::DosStar;
     }
+    mask
+}
+
+/// Whether `name` matches a mask from `dos_mask`, ignoring case.
+fn mask_matches(mask: &[Mask], name: &[char]) -> bool {
+    let Some((&m, rest)) = mask.split_first() else {
+        return name.is_empty();
+    };
+    match m {
+        Mask::Char(c) => name.split_first().is_some_and(|(n, tail)| {
+            c.to_lowercase().eq(n.to_lowercase()) && mask_matches(rest, tail)
+        }),
+        Mask::Star => (0..=name.len()).any(|i| mask_matches(rest, &name[i..])),
+        Mask::DosStar => {
+            // It may take the last `.` but nothing of the extension after it.
+            let end = name
+                .iter()
+                .rposition(|&c| c == '.')
+                .map_or(name.len(), |d| d + 1);
+            (0..=end).any(|i| mask_matches(rest, &name[i..]))
+        }
+        Mask::DosQm => match name.first() {
+            None => mask_matches(rest, name),
+            Some('.') => {
+                // Nothing at a `.`, unless the run of `?` ends the mask: then it takes the `.`.
+                let after = &rest[rest.iter().take_while(|&&m| m == Mask::DosQm).count()..];
+                if after.is_empty() {
+                    mask_matches(after, &name[1..])
+                } else {
+                    mask_matches(after, name)
+                }
+            }
+            Some(_) => mask_matches(rest, &name[1..]),
+        },
+        Mask::DosDot => match name.split_first() {
+            None => mask_matches(rest, name),
+            Some(('.', tail)) => mask_matches(rest, tail),
+            Some(_) => false,
+        },
+    }
+}
+
+/// Whether `name` matches a `FindFirstFile` pattern as Windows matches long names, ignoring
+/// case: `*.*` matches every name, `a.*` also `a`, `*.` only names without an extension.
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
+    // The file system matches `..` as `.`.
+    let name = if name == ['.', '.'] { &name[..1] } else { name };
+    mask_matches(&dos_mask(pattern), name)
 }
 
 /// Dot entries come first and have no host `DirEntry`.
@@ -984,6 +1066,42 @@ mod tests {
         assert!(m("a?c", "abc"));
         assert!(!m("a?c", "ac"));
         assert!(!m("*.bin", "a.txt"));
+    }
+
+    #[test]
+    fn wildcards_follow_the_dos_rules_for_dots() {
+        // What FindFirstFile on Windows gives for these long names (short 8.3 names, which
+        // the host has none of, can add more matches there).
+        let names = [
+            ".", "..", "a", "aa", "a.a", "a..a", "a.a.a", ".a", "readme", "x.txt",
+        ];
+        let matches = |p: &str| -> Vec<&str> {
+            let p: Vec<char> = p.chars().collect();
+            names
+                .iter()
+                .copied()
+                .filter(|n| wildcard(&p, &n.chars().collect::<Vec<_>>()))
+                .collect()
+        };
+        // `*.*` is every name, with or without a dot.
+        assert_eq!(matches("*.*"), names);
+        // `name.*` also matches the name without an extension.
+        assert_eq!(matches("aa.*"), ["aa"]);
+        assert_eq!(matches("README.*"), ["readme"]);
+        // A final `.` asks for names without an extension.
+        assert_eq!(matches("*."), [".", "..", "a", "aa", "readme"]);
+        assert_eq!(matches("a*."), ["a", "aa"]);
+        // `?` matches one character, or none at a dot or the end.
+        assert_eq!(matches("?"), [".", "..", "a"]);
+        assert_eq!(matches("??."), [".", "..", "a", "aa"]);
+        assert_eq!(matches("?.??."), [".", "..", "a", "a.a", ".a"]);
+        // Literal dots and `*` elsewhere are unchanged.
+        assert_eq!(matches("*.a"), ["a.a", "a..a", "a.a.a", ".a"]);
+        assert_eq!(matches("*..*"), [".", "..", "a..a"]);
+        assert_eq!(matches("*.TXT"), ["x.txt"]);
+        // The DOS wildcards may be written directly.
+        assert_eq!(matches("<.a"), ["a.a", "a..a", "a.a.a", ".a"]);
+        assert_eq!(matches(r#"a"*"a"#), ["a..a", "a.a.a"]);
     }
 
     #[test]
