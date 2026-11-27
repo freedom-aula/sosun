@@ -680,19 +680,15 @@ fn list(path: Option<PathBuf>) -> Option<Vec<Entry>> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let mut entries: Vec<Entry> = vec![(".".into(), None), ("..".into(), None)];
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        entries.push((
-            e.file_name().to_string_lossy().into_owned(),
-            e.metadata().ok(),
-        ));
-    }
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut entries: Vec<Entry> = files::matching_entries(read, &pattern)
+        .map(|(name, entry)| (name, entry.and_then(|e| files::find_metadata(e.metadata()))))
+        .collect();
     for (name, meta) in entries.iter_mut() {
         if meta.is_none() {
-            *meta = std::fs::metadata(dir.join(&*name)).ok();
+            *meta = files::find_metadata(std::fs::metadata(dir.join(&*name)));
         }
     }
-    entries.retain(|(n, _)| files::wildcard(&pattern, &n.chars().collect::<Vec<_>>()));
     Some(entries)
 }
 
@@ -959,6 +955,27 @@ mod tests {
     }
 
     #[test]
+    fn find_first_only_reads_metadata_for_matching_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..999 {
+            std::fs::File::create(dir.path().join(format!("{i}.bin"))).unwrap();
+        }
+        std::fs::write(dir.path().join("slot.sav"), b"saved").unwrap();
+
+        let pattern = c(dir.path().join("*.sav").to_str().unwrap());
+        let mut data = [0u8; 304];
+        files::FIND_METADATA_LOOKUPS.set(0);
+        let handle = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(handle > 0);
+        assert_eq!(files::FIND_METADATA_LOOKUPS.get(), 1);
+        assert_eq!(text(&data[36..]), "slot.sav");
+        assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 5);
+        assert_eq!(_findnext64i32(handle, data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
+        assert_eq!(_findclose(handle), 0);
+    }
+
+    #[test]
     fn findfirst_lists_by_wildcard() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"12").unwrap();
@@ -988,6 +1005,7 @@ mod tests {
         assert_eq!(_findclose(h), -1);
         let none = c(&format!("{}/*.zzz", dir.path().to_str().unwrap()));
         assert_eq!(_findfirst64i32(none.as_ptr(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
         // `.` and `..` match `*`; the wide, 64-bit-size form has its name at 40.
         let all: Vec<u16> = format!("{}/*", dir.path().to_str().unwrap())
             .encode_utf16()

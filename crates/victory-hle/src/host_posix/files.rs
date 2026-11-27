@@ -21,7 +21,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
-use std::fs::{File, OpenOptions};
+use std::fs::{DirEntry, File, OpenOptions, ReadDir};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -687,6 +687,17 @@ pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
 
 // Directory searches.
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FIND_METADATA_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn find_metadata(result: io::Result<std::fs::Metadata>) -> Option<std::fs::Metadata> {
+    #[cfg(test)]
+    FIND_METADATA_LOOKUPS.set(FIND_METADATA_LOOKUPS.get() + 1);
+    result.ok()
+}
+
 /// What `FindFirstFile` found: its entries, and the next to give out.
 pub(crate) struct Find {
     entries: Vec<(String, Option<std::fs::Metadata>)>,
@@ -694,7 +705,7 @@ pub(crate) struct Find {
 }
 
 /// Whether `name` matches a `*` and `?` pattern, ignoring case.
-pub(super) fn wildcard(pattern: &[char], name: &[char]) -> bool {
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
     match pattern.split_first() {
         None => name.is_empty(),
         Some(('*', rest)) => (0..=name.len()).any(|i| wildcard(rest, &name[i..])),
@@ -702,6 +713,20 @@ pub(super) fn wildcard(pattern: &[char], name: &[char]) -> bool {
             (*p == '?' || p.to_lowercase().eq(n.to_lowercase())) && wildcard(rest, tail)
         }),
     }
+}
+
+/// Dot entries come first and have no host `DirEntry`.
+pub(super) fn matching_entries(
+    read: ReadDir,
+    pattern: &[char],
+) -> impl Iterator<Item = (String, Option<DirEntry>)> + '_ {
+    let dots = [".", ".."].into_iter().map(|name| (name.to_owned(), None));
+    let children = read.flatten().map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        (name, Some(entry))
+    });
+    dots.chain(children)
+        .filter(|(name, _)| wildcard(pattern, &name.chars().collect::<Vec<_>>()))
 }
 
 fn fill_find_data(entry: &(String, Option<std::fs::Metadata>), data: *mut u8) {
@@ -759,17 +784,16 @@ fn find_first(path: Option<PathBuf>, data: *mut u8) -> *mut c_void {
             return invalid_handle();
         }
     };
-    let mut entries: Vec<(String, Option<std::fs::Metadata>)> = vec![
-        (".".to_owned(), std::fs::metadata(&dir).ok()),
-        ("..".to_owned(), std::fs::metadata(dir.join("..")).ok()),
-    ];
-    entries.extend(read.flatten().map(|e| {
-        (
-            e.file_name().to_string_lossy().into_owned(),
-            e.metadata().ok(),
-        )
-    }));
-    entries.retain(|(name, _)| wildcard(&pattern, &name.chars().collect::<Vec<_>>()));
+    let entries: Vec<_> = matching_entries(read, &pattern)
+        .map(|(name, entry)| {
+            let meta = match entry {
+                Some(entry) => entry.metadata(),
+                None if name == "." => std::fs::metadata(&dir),
+                None => std::fs::metadata(dir.join("..")),
+            };
+            (name, find_metadata(meta))
+        })
+        .collect();
     if entries.is_empty() {
         set_error(ERROR_FILE_NOT_FOUND);
         return invalid_handle();
@@ -909,6 +933,42 @@ mod tests {
         );
         let size = u32::from_le_bytes(attributes[32..36].try_into().unwrap());
         assert_eq!(size, 100);
+    }
+
+    #[test]
+    fn find_first_only_reads_metadata_for_matching_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..999 {
+            File::create(dir.path().join(format!("{i}.bin"))).unwrap();
+        }
+        std::fs::write(dir.path().join("slot.sav"), b"saved").unwrap();
+
+        let pattern = wide(dir.path().join("*.sav").to_str().unwrap());
+        let mut data = [0u8; 592];
+        FIND_METADATA_LOOKUPS.set(0);
+        let handle = FindFirstFileW(pattern.as_ptr(), data.as_mut_ptr());
+        assert_ne!(handle, invalid_handle());
+        assert_eq!(FIND_METADATA_LOOKUPS.get(), 1);
+        let name: Vec<u16> = data[44..]
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        assert_eq!(String::from_utf16(&name).unwrap(), "slot.sav");
+        assert_eq!(u32::from_le_bytes(data[28..32].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 5);
+        assert_eq!(FindNextFileW(handle, data.as_mut_ptr()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_NO_MORE_FILES);
+        assert_eq!(FindClose(handle), 1);
+
+        let none = wide(dir.path().join("*.zzz").to_str().unwrap());
+        FIND_METADATA_LOOKUPS.set(0);
+        assert_eq!(
+            FindFirstFileW(none.as_ptr(), data.as_mut_ptr()),
+            invalid_handle()
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_FILE_NOT_FOUND);
+        assert_eq!(FIND_METADATA_LOOKUPS.get(), 0);
     }
 
     #[test]
