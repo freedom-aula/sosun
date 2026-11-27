@@ -556,8 +556,13 @@ impl Metal {
         }
     }
 
-    /// Residency for one command buffer: the heap's set, committed if entries changed.
-    fn use_heap_cb(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>, heap: &Heap) {
+    /// A set covers all passes in the command buffer. Later uses can still commit new entries.
+    fn use_heap_cb(
+        &self,
+        heap: &Heap,
+        attached_heaps: &mut Vec<*const Heap>,
+        attach: impl FnOnce(&ProtocolObject<dyn MTLResidencySet>),
+    ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
                 set.commit();
@@ -567,7 +572,10 @@ impl Metal {
                     c.heap_set_bytes = c.heap_set_bytes.max(set.allocatedSize());
                 });
             }
-            cb.useResidencySet(set);
+            if !attached_heaps.contains(&std::ptr::from_ref(heap)) {
+                attached_heaps.push(heap);
+                attach(set);
+            }
         }
     }
 
@@ -1158,11 +1166,19 @@ impl GraphicsBackend for Metal {
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
         // is dropped, the command buffer still commits, and the caller is told.
         let mut refused: Option<String> = None;
+        let mut attached_heaps = Vec::new();
         for pass in work.passes {
             let encoded = match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order),
-                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order),
+                Pass::Compute(dispatches) => {
+                    self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
+                }
+                Pass::Render(rp) => {
+                    self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
+                }
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+                Pass::ClearColorRects { target, color, rects } => {
+                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
+                }
             };
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
@@ -1596,14 +1612,21 @@ impl Metal {
             (0..3).all(|i| at[i].saturating_add(sz[i]) <= dims[i])
         };
         let fits_buffer_transfer = |what: &str, buf: (&Buffer, *const u8), t: &Texture, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize| -> Option<(usize, usize)> {
-            let align = t.format.block().1;
+            // A depth and stencil texture's rows are its 4-byte depth plane (`DepthFromDepthStencil`).
+            let plane = t.format == Format::D32FloatS8;
+            let align = if plane { 4 } else { t.format.block().1 };
             let buf_off = off(buf.0, buf.1);
-            if is_depth(t.tex.pixelFormat())
+            let rows_fit = if plane {
+                (sz[2] - 1) * slice_pitch + (sz[1] - 1) * row_pitch + sz[0] * 4 <= len && row_pitch >= sz[0] * 4
+            } else {
+                transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+            };
+            if (is_depth(t.tex.pixelFormat()) && !matches!(t.format, Format::D32FloatS8 | Format::D32Float | Format::D16Unorm))
                 || !fits_region(&t.tex, mip, slice, at, sz)
                 || buf_off % align != 0
                 || row_pitch % align != 0
                 || buf_off.saturating_add(len) > buf.0.buf.length()
-                || !transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+                || !rows_fit
             {
                 return None;
             }
@@ -1643,6 +1666,43 @@ impl Metal {
                     dst_slice,
                     dst_origin,
                 } => {
+                    if !direct_copy(src.format, dst.format) {
+                        // Block-compressed against plain texels of the block's size, or a depth
+                        // plane against a plain 4-byte format: no view joins them, so rows go
+                        // through a buffer of our own (the command buffer keeps it alive). `sz` is
+                        // in source texels.
+                        let ((sw, sb), (dw, db)) = (src.format.block(), dst.format.block());
+                        let bytes = |f: Format, b: usize| if f == Format::D32FloatS8 { 4 } else { b };
+                        if bytes(src.format, sb) != bytes(dst.format, db) || !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz) {
+                            continue;
+                        }
+                        let (row, rows) = (sz[0].div_ceil(sw) * bytes(src.format, sb), sz[1].div_ceil(sw));
+                        let dims = tex_dims(&dst.tex, *dst_mip);
+                        let d: [usize; 3] = std::array::from_fn(|i| match i {
+                            2 => sz[2],
+                            _ if dw > sw => (sz[i] * dw).min(dims[i].saturating_sub(dst_origin[i])),
+                            _ if sw > dw => sz[i].div_ceil(sw),
+                            _ => sz[i],
+                        });
+                        if !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, d) {
+                            continue;
+                        }
+                        let Some(scratch) = self.dev.newBufferWithLength_options((row * rows * sz[2]).max(16), MTLResourceOptions::StorageModePrivate) else {
+                            continue;
+                        };
+                        let pitch = if sz[2] > 1 { row * rows } else { 0 };
+                        // SAFETY: the regions lie inside both subresources (checked above) and the
+                        // buffer holds their rows.
+                        unsafe {
+                            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                                &src.tex, *src_slice, *src_mip, origin(*src_origin), size(*sz), &scratch, 0, row, pitch, depth_plane(src),
+                            );
+                            e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                                &scratch, 0, row, pitch, size(d), &dst.tex, *dst_slice, *dst_mip, origin(*dst_origin), depth_plane(dst),
+                            );
+                        }
+                        continue;
+                    }
                     if !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz)
                         || !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, *sz)
                     {
@@ -1713,7 +1773,7 @@ impl Metal {
                     };
                     // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
                     unsafe {
-                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
                             &src.0.buf,
                             src_off,
                             *row_pitch,
@@ -1723,6 +1783,7 @@ impl Metal {
                             *dst_slice,
                             *dst_mip,
                             origin(*dst_origin),
+                            depth_plane(dst),
                         )
                     };
                 }
@@ -1753,7 +1814,7 @@ impl Metal {
                     };
                     // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
                     unsafe {
-                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
                             &src.tex,
                             *src_slice,
                             *src_mip,
@@ -1763,6 +1824,7 @@ impl Metal {
                             dst_off,
                             *row_pitch,
                             slice_bytes,
+                            depth_plane(src),
                         )
                     };
                 }
@@ -1779,6 +1841,19 @@ impl Metal {
         e.endEncoding();
         Ok(())
     }
+}
+
+/// The blit option a copy between `t` and buffer rows takes: a depth and stencil texture's rows
+/// are its depth plane.
+fn depth_plane(t: &Texture) -> MTLBlitOption {
+    if t.format == Format::D32FloatS8 { MTLBlitOption::DepthFromDepthStencil } else { MTLBlitOption::None }
+}
+
+/// Whether a texture copies into another with one texture-to-texture blit: the same format, or
+/// two plain formats of one texel size (through a view).
+pub fn direct_copy(a: Format, b: Format) -> bool {
+    let plain = |f: Format| f.block().0 == 1 && !f.is_depth();
+    a == b || (plain(a) && plain(b) && a.block() == b.block())
 }
 
 /// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
@@ -1884,6 +1959,7 @@ impl Metal {
         dispatches: &[crate::backend::Dispatch<'_, Metal>],
         set_on_queue: bool,
         order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
     ) -> Result<(), String> {
         let runs = |d: &crate::backend::Dispatch<'_, Metal>| {
             d.indirect.is_some() || !d.groups.contains(&0)
@@ -1908,7 +1984,7 @@ impl Metal {
             };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
-                self.use_heap_cb(cb, h);
+                self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
             self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
@@ -1960,12 +2036,93 @@ impl Metal {
         Ok(())
     }
 
+    fn encode_color_clear_rects(
+        &self,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &Texture,
+        color: [f32; 4],
+        rects: &[ClearRect],
+        set_on_queue: bool,
+        order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
+    ) -> Result<(), String> {
+        let clip = |p, limit| usize::try_from(p).unwrap_or_default().min(limit);
+        let (width, height) = (target.tex.width(), target.tex.height());
+        let regions: Vec<_> = rects
+            .iter()
+            .filter_map(|r| {
+                let (left, right) = (clip(r.left, width), clip(r.right, width));
+                let (top, bottom) = (clip(r.top, height), clip(r.bottom, height));
+                (left < right && top < bottom).then(|| ([left, top, 0], [right - left, bottom - top, 1]))
+            })
+            .collect();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        if !matches!(target.tex.textureType(), MTLTextureType::Type2D | MTLTextureType::Type2DArray)
+            || target.tex.sampleCount() != 1
+        {
+            return Err("rectangular color clear requires a single-sampled 2D color target".into());
+        }
+        if target.format.is_depth()
+            || !target.tex.usage().contains(MTLTextureUsage::RenderTarget)
+        {
+            return Err("rectangular color clear requires a renderable color format".into());
+        }
+
+        // Use Metal's clear conversion in the view format, including sRGB and integer targets.
+        // A retained command buffer keeps this private scratch alive until the blits finish.
+        let (max_width, max_height) = regions.iter().fold((0, 0), |(w, h), (_, size)| {
+            (w.max(size[0]), h.max(size[1]))
+        });
+        let td = MTLTextureDescriptor::new();
+        td.setPixelFormat(target.tex.pixelFormat());
+        td.setStorageMode(MTLStorageMode::Private);
+        td.setUsage(MTLTextureUsage::RenderTarget);
+        // SAFETY: these nonzero dimensions fit the selected view.
+        unsafe {
+            td.setWidth(max_width);
+            td.setHeight(max_height);
+        }
+        let scratch = Texture {
+            tex: self.dev.newTextureWithDescriptor(&td).ok_or("no rectangular clear texture")?,
+            format: target.format,
+        };
+        self.encode_render(
+            cb,
+            &RenderPass {
+                color: vec![ColorTarget { texture: &scratch, clear: Some(color) }],
+                depth: None,
+                draws: vec![],
+            },
+            set_on_queue,
+            order,
+            attached_heaps,
+        )?;
+        let copies: Vec<_> = regions
+            .into_iter()
+            .map(|(dst_origin, size)| BlitOp::CopyTexture {
+                src: &scratch,
+                src_mip: 0,
+                src_slice: 0,
+                src_origin: [0, 0, 0],
+                size,
+                dst: target,
+                dst_mip: 0,
+                dst_slice: 0,
+                dst_origin,
+            })
+            .collect();
+        self.encode_blit(cb, &copies, order)
+    }
+
     fn encode_render(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         rp: &RenderPass<'_, Metal>,
         set_on_queue: bool,
         order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
     ) -> Result<(), String> {
         // Attachments must agree in sample count. Their sizes may differ (a 1920x1080 colour
         // target over a 3840x2160 depth target in GTA VI's story load): the console draws into
@@ -2113,7 +2270,7 @@ impl Metal {
                 continue;
             }
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
-                self.use_heap_cb(cb, h);
+                self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
             e.setRenderPipelineState(&d.pipeline.pso);
             e.setCullMode(d.pipeline.cull);
@@ -2800,6 +2957,38 @@ mod sampler_tests {
 #[cfg(test)]
 mod heap_set_tests {
     use super::*;
+
+    #[test]
+    fn each_command_buffer_attaches_each_heap_once_and_commits_later_changes() {
+        let m = Metal::new().unwrap().with_heap_sets();
+        let a = m.create_heap(HeapKind::Resource, 1).unwrap();
+        let b = m.create_heap(HeapKind::Sampler, 1).unwrap();
+        let Some(set_a) = &a.set else {
+            eprintln!("skipped: no residency sets on this system");
+            return;
+        };
+        let attaches = |heap: &Heap, attached_heaps: &mut Vec<*const Heap>| {
+            let mut called = false;
+            m.use_heap_cb(heap, attached_heaps, |_| called = true);
+            called
+        };
+        let mut first = Vec::new();
+        assert!(attaches(&a, &mut first));
+        assert!(attaches(&b, &mut first));
+
+        // Metal reports allocatedSize at the last commit.
+        let before = set_a.allocatedSize();
+        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 128, 128)).unwrap();
+        m.write_texture(&a, 0, &texture, 0.0);
+        assert!(a.dirty.get());
+        assert!(!attaches(&a, &mut first));
+        assert!(!a.dirty.get());
+        assert!(set_a.allocatedSize() > before);
+
+        let mut second = Vec::new();
+        assert!(attaches(&a, &mut second));
+        assert!(!attaches(&a, &mut second));
+    }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,
     /// and lets an allocation go when the last entry naming it is overwritten: the set is what a
