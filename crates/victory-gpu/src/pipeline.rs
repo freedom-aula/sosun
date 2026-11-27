@@ -227,6 +227,17 @@ impl Shader {
         self.native.get().is_some()
     }
 
+    /// Whether the rectangle-list translation is made (or refused) already.
+    pub(crate) fn rect_ready(&self) -> bool {
+        self.rect.get().is_some()
+    }
+
+    /// Whether [`Self::translate_extra`] would find its translation on disk.
+    pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32]) -> bool {
+        let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+        crate::native::shaders::extra_cached(&container, rect, extra, copy)
+    }
+
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
     pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());

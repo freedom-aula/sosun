@@ -160,6 +160,15 @@ fn native_key(settings: &str) -> [u8; 32] {
     *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes()
 }
 
+/// Whether the native host's cache holds the translation of `container` with `settings` (as
+/// [`native_shader`] would key it), without reading or translating it.
+pub fn native_present(container: &[u8], settings: &str) -> bool {
+    let Some(cache) = NATIVE.get() else { return false };
+    let converter = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+    let input = [&native_key(settings)[..], container].concat();
+    cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input)).is_file()
+}
+
 /// Shaders found in the cache and translated since the start (both hosts). The slow-translation
 /// log line shows only translations of 20 ms or more, which a hit never is.
 pub fn counts() -> (u64, u64) {
@@ -737,7 +746,13 @@ mod tests {
             Ok(shader())
         };
         let first = Cache::open(dir.path()).unwrap();
+        let input = [&native_key(&settings())[..], b"container"].concat();
+        let probe = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+        let path = first.path_for(&victory_pipeline::CacheKey::new(&probe, &input));
+        assert!(!path.is_file());
         assert_eq!(cached(&first, &native_key(&settings()), b"container", translate).1, false);
+        // Where `native_present` looks: the entry `cached` wrote.
+        assert!(path.is_file());
         drop(first);
         let second = Cache::open(dir.path()).unwrap();
         assert_eq!(cached(&second, &native_key(&settings()), b"container", translate).1, true);

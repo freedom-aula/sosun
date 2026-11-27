@@ -832,6 +832,26 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 static BUDGET: Mutex<crate::prewarm::FrameBudget> = Mutex::new(crate::prewarm::FrameBudget::new());
 static PUT_OFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Runs a translation `what` names on a thread of its own, once at a time per name, for a
+/// pipeline put off past the frame's budget ([`guess`]).
+fn put_off(what: String, translate: impl FnOnce() + Send + 'static) {
+    static RUNNING: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    if !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(what.clone()) {
+        return;
+    }
+    let n = PUT_OFF.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(put_off = n, "pipelines put off for their translations so far");
+    }
+    let _ = std::thread::Builder::new().name("shader-put-off".into()).spawn(move || {
+        crate::prewarm::lower_priority();
+        translate();
+        if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            r.remove(&what);
+        }
+    });
+}
+
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1160,6 +1180,15 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     if let Some(p) = g.made.borrow().get(&key) {
         return p.clone();
     }
+    // As in `pipe`: past the frame's budget, a translation not made yet goes to a worker and the
+    // draw is dropped this time (nothing is cached; the worker's result is, on disk or in the
+    // shader).
+    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    if spent && rect && !g.vs_source.rect_ready() {
+        let s = g.vs_source.clone();
+        put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));
+        return Pipe::Refused;
+    }
     let rect_vs = if rect {
         match g.vs_source.native_rect() {
             Ok(h) => Some(h.clone()),
@@ -1184,6 +1213,11 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
             if orig < 32 && new < 32 {
                 copy[new as usize] = orig as u8 + 1;
             }
+        }
+        if spent && !g.vs_source.extra_cached(rect, extra, copy) {
+            let s = g.vs_source.clone();
+            put_off(format!("{} {rect} {extra} {copy:?}", s.hash), move || drop(s.translate_extra(rect, extra, copy)));
+            return Pipe::Refused;
         }
         match g.vs_source.translate_extra(rect, extra, copy) {
             Ok(h) => Some(h),
