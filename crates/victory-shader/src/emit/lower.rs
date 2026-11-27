@@ -113,6 +113,12 @@ pub(crate) struct Lowered {
     /// The lane reads, with their constant arguments.
     #[cfg(test)]
     pub wave_read_lane_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// The wave reduction calls, with their constant arguments.
+    #[cfg(test)]
+    pub wave_active_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// Live f32 multiplies, including the inclusive and cross-wave prefix steps.
+    #[cfg(test)]
+    pub float_multiplies: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1429,24 +1435,40 @@ impl<'a> Lower<'a> {
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
+        let mut half_prefix = None;
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+            (_, Some(inclusive)) => {
+                let (kind, bin) = match op {
+                    Op::AddU | Op::AddF => (0, Bin::Add),
+                    Op::MulF => (1, Bin::Mul),
+                    _ => return Err("a wave prefix of an operation other than a sum or product"),
+                };
+                let args = [arg, self.s.m.i8(kind), self.s.m.i8(u8::from(!float))];
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
                     Attr::NoUnwind,
                     ty,
                     121,
-                    &[arg, k0, unsigned],
+                    &args,
                 );
+                if self.halves {
+                    let total = self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &args,
+                    );
+                    half_prefix = Some((bin, total));
+                }
                 if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
+                    self.s.m.bin(c, bin, r, arg)
                 } else {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -1478,7 +1500,7 @@ impl<'a> Lower<'a> {
             }
         };
         let r = if self.halves {
-            self.halves_reduce(op, prefix.is_some(), arg, r)?
+            self.halves_reduce(op, r, half_prefix)?
         } else {
             r
         };
@@ -1658,6 +1680,10 @@ impl<'a> Lower<'a> {
             wave_prefix_calls: self.s.m.written_call_args("dx.op.wavePrefixOp"),
             #[cfg(test)]
             wave_read_lane_calls: self.s.m.written_call_args("dx.op.waveReadLaneAt"),
+            #[cfg(test)]
+            wave_active_calls: self.s.m.written_call_args("dx.op.waveActiveOp"),
+            #[cfg(test)]
+            float_multiplies: self.s.m.written_bin_ops(self.s.t.f32, Bin::Mul),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
