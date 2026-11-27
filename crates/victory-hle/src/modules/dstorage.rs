@@ -585,8 +585,28 @@ impl Scheduler {
     }
 }
 
-/// A worker: runs the next read of the most deserving queue.
+/// Puts the calling thread below the title's own: `QOS_CLASS_DEFAULT` with the lowest relative
+/// priority it allows, as the shader prewarm pool does. The dstorage workers are many (one a
+/// core) and busy through a load; the title's threads are few and latency-sensitive.
+#[cfg(target_os = "macos")]
+fn lower_priority() {
+    const QOS_CLASS_DEFAULT: u32 = 0x15;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    }
+    // SAFETY: libSystem's documented call, for the calling thread only.
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, -15) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn lower_priority() {}
+
+/// A worker: runs the next read of the most deserving queue. Runs below the title's own
+/// threads' priority, so a load's BCPack and zlib work never starves the title's render thread
+/// or its status-array polls (its `Sleep(1)` loop sees a finished request within a millisecond
+/// of the worker's condvar-woken finish, not whenever the workers happen to yield).
 fn work(scheduler: &'static Scheduler) {
+    lower_priority();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {

@@ -70,9 +70,10 @@ log="$run_dir/victory.log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
 # Shade near-black presents by the frame's depth target so the world shows while the
-# lighting compute passes are still refused (native/ambient.rs). 0.35 keeps the overlay
-# and movie readable while unlit geometry is clearly visible.
-export VICTORY_AMBIENT="${VICTORY_AMBIENT:-0.35}"
+# lighting compute passes are still refused (native/ambient.rs). 0.45 — also the code's
+# own default — keeps the overlay and movie readable while unlit geometry is clearly
+# visible, and a depth-less UI pass keeps the scene pass's depth for its presents.
+export VICTORY_AMBIENT="${VICTORY_AMBIENT:-0.45}"
 # Per-encoder residency naming on small Macs: the world's heap residency set holds
 # 17-18 GB, which a 16 GB Mac cannot keep resident (metal.rs logs the choice).
 if (( ram_gb <= 16 )); then

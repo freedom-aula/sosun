@@ -243,9 +243,15 @@ fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (
     (levels, Ok(()))
 }
 
-fn upload_levels<B: ResourceBackend>(backend: &B, tex: &B::Texture, levels: &[Level]) {
+fn upload_levels<B: ResourceBackend>(backend: &B, tex: &B::Texture, levels: &mut [Level]) {
     for l in levels {
         backend.upload_texture(tex, l.mip, l.slice, &l.texels, l.row, l.slice_pitch);
+        // The detiled copy has done its work: `upload_texture` has taken the bytes before it
+        // returns, so the level's `Vec` is freed now instead of holding every level of the
+        // batch detiled in memory until the whole `Prepared` goes.
+        l.texels = Vec::new();
+        l.row = 0;
+        l.slice_pitch = 0;
     }
 }
 
@@ -256,8 +262,8 @@ pub fn upload<B: ResourceBackend>(
     info: &TextureInfo,
     tiled: &[u8],
 ) -> Result<(), String> {
-    let (levels, result) = detile(&info.layout, info.dimension, info.format, tiled);
-    upload_levels(backend, tex, &levels);
+    let (mut levels, result) = detile(&info.layout, info.dimension, info.format, tiled);
+    upload_levels(backend, tex, &mut levels);
     result
 }
 
@@ -449,6 +455,12 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
 fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        if !scanner_on() {
+            // The probes of hot and blank textures and the first upload of every texture do not
+            // need the scanner; only a texture whose memory the title rewrites while it is not
+            // hot is seen a few submissions later without it.
+            return;
+        }
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
             let mut buf = vec![0u8; 1 << 20];
             loop {
@@ -459,12 +471,31 @@ fn start_scanner() {
     });
 }
 
+/// Whether the background scanner runs. Its rounds read every watched texture's memory over
+/// and over, and on a memory-pressured Mac (16 GB: the title's heap, the host's mirrors and the
+/// compiler's state already at the limit) that bandwidth is what the title's own streaming
+/// starves for — the very thing the scanner was meant to keep up. So it is off by default on
+/// 16 GB-and-less hosts; `VICTORY_TEXTURE_SCAN=1` turns it back on, and bigger hosts keep it.
+fn scanner_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if let Some(v) = std::env::var_os("VICTORY_TEXTURE_SCAN") {
+            return v != "0";
+        }
+        crate::console::host_memory().is_none_or(|m| m > 16 << 30)
+    })
+}
+
 /// A texture the host keeps for a title texture.
 pub struct Tracked<B: ResourceBackend> {
     pub texture: Rc<B::Texture>,
     info: TextureInfo,
     /// Which texture this is: its key (an object's address, a placement) names another one later.
     serial: u64,
+    /// The present (see [`Title::evict_idle_textures`]) this texture was last used in: fetching
+    /// it for a bind, a target or the present itself. The least recently used mirrors are what
+    /// the host drops when its cache grows past its cap.
+    used: u64,
     /// The hash of the memory last uploaded; `None` for targets and before the first upload.
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
@@ -794,6 +825,72 @@ impl<B: PresentBackend> Title<B> {
         self.pending.insert(key, info);
     }
 
+    /// `VICTORY_MAX_GPU_CACHE_MB` (2560 by default; `0` for no cap): the most title texture
+    /// memory the host's mirrors may hold at once. The title's own heap is what it is; the
+    /// mirrors are the host's addition, and a title that streams for an hour grows them past
+    /// any bound unless the least recently used are dropped.
+    fn gpu_cache_cap() -> Option<u64> {
+        static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *CAP.get_or_init(|| {
+            match std::env::var("VICTORY_MAX_GPU_CACHE_MB") {
+                Ok(v) => v.trim().parse::<u64>().ok().filter(|&mb| mb > 0).map(|mb| mb << 20),
+                Err(_) => Some(2560 << 20),
+            }
+        })
+    }
+
+    /// How many presents a mirror must go unused before the cap may drop it: what the frame is
+    /// drawing into, what it samples and what the present itself reads are all fetched within
+    /// the frame, so a handful of presents covers the ambient fallback's kept targets too.
+    const EVICT_AFTER_PRESENTS: u64 = 4;
+
+    /// A present happened: age the host's texture mirrors by it. While they hold more title
+    /// memory than [`Self::gpu_cache_cap`] allows, the least recently used mirrors that no
+    /// present has fetched for [`Self::EVICT_AFTER_PRESENTS`] are dropped — their host textures
+    /// and views go, their descriptions stay so the next use makes them again (a re-made
+    /// mirror takes its next upload from title memory like a fresh one). Nothing the current
+    /// frames are using is touched. Called at each present (macOS).
+    pub fn evict_idle_textures(&mut self) {
+        self.use_serial += 1;
+        let Some(cap) = Self::gpu_cache_cap() else {
+            return;
+        };
+        let serial = self.use_serial;
+        let mirrors: Vec<(usize, u64, u64)> = self
+            .textures
+            .iter()
+            .map(|(&k, t)| (k, t.info.size as u64, t.used))
+            .collect();
+        let mut evicted = 0u64;
+        let mut freed = 0u64;
+        for victim in evict_order(&mirrors, serial, cap, Self::EVICT_AFTER_PRESENTS) {
+            let Some(t) = self.textures.remove(&victim) else { continue };
+            evicted += 1;
+            freed += t.info.size as u64;
+            // As a release, minus the forgetfulness: the description goes back so the next use
+            // makes the mirror again (`realize`), and the heap entries that showed it are
+            // cleared so they do not keep its texture resident.
+            self.host.release_resource(victim);
+            let info = t.info;
+            self.texture_released(victim);
+            self.pending.insert(victim, info);
+        }
+        if evicted > 0 {
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LAST.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed) + evicted;
+            if n.is_power_of_two() {
+                let held: u64 = self.textures.values().map(|t| t.info.size as u64).sum();
+                tracing::info!(
+                    evicted_total = n,
+                    freed_mib = freed >> 20,
+                    held_mib = held >> 20,
+                    cap_mib = cap >> 20,
+                    "texture mirrors evicted past the GPU cache cap"
+                );
+            }
+        }
+    }
+
     /// Makes the host texture of title texture `key` if it has none yet and registers it for
     /// views. `false` when there is none (not a title texture, or one the host cannot represent).
     pub fn realize(&mut self, key: usize) -> bool {
@@ -851,6 +948,7 @@ impl<B: PresentBackend> Title<B> {
                 texture: tex,
                 info,
                 serial,
+                used: self.use_serial,
                 last: None,
                 uploads: 0,
                 hot: 0,
@@ -876,7 +974,10 @@ impl<B: PresentBackend> Title<B> {
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
-        self.textures.get(&key).map(|t| t.texture.clone())
+        self.textures.get_mut(&key).map(|t| {
+            t.used = self.use_serial;
+            t.texture.clone()
+        })
     }
 
     /// Resolves a render-target view to its attachment and its effective format. The base
@@ -923,6 +1024,7 @@ impl<B: PresentBackend> Title<B> {
         let key = record.resource as usize;
         self.realize(key);
         let t = self.textures.get_mut(&key)?;
+        t.used = self.use_serial;
         let desc = t.info.desc()?;
         let (mip, slice) = record.native_rtv_subresource(
             t.info.dimension,
@@ -1185,7 +1287,7 @@ impl<B: PresentBackend> Title<B> {
             // content again (a texture's first probe used to, and that was a whole read wasted).
             let sampled = t.probe.replace(r.probe);
             // `last` again: a copy back into title memory may have moved it meanwhile.
-            let Some((levels, detiled)) = r.levels.filter(|_| t.last != Some(r.hash)) else {
+            let Some((mut levels, detiled)) = r.levels.filter(|_| t.last != Some(r.hash)) else {
                 // Nothing changed since the last upload: if its previous write missed the samples,
                 // this follow-up whole read has checked for an immediate next write, and further
                 // checks return to `WHOLE_EVERY` within `WHOLE_SPARE` with backoff.
@@ -1213,7 +1315,7 @@ impl<B: PresentBackend> Title<B> {
                 }
                 t.blank = r.blank;
             }
-            upload_levels(&host.backend, &t.texture, &levels);
+            upload_levels(&host.backend, &t.texture, &mut levels);
             t.last = Some(r.hash);
             match detiled {
                 Ok(()) => {
@@ -1290,8 +1392,11 @@ pub(super) struct Prepared {
 
 /// Threads a submission's textures are read on (the submitting thread is one of them).
 const SYNC_THREADS: usize = 6;
-/// Texture memory read at a time: its detiled copy is held until it is uploaded.
-const SYNC_BATCH: usize = 256 << 20;
+/// Texture memory read at a time: its detiled copy is held until it is uploaded. The smaller the
+/// batch, the less detiled data is in flight at once — the 256 MiB it was held a world load's
+/// copies at their peak alongside the title's own heap on a 16 GB Mac — while a batch still
+/// amortizes the per-batch work over many textures.
+const SYNC_BATCH: usize = 64 << 20;
 
 /// `jobs` in runs of at most `SYNC_BATCH` bytes of texture memory (a larger texture alone).
 pub(super) fn batches(jobs: Vec<Job>) -> Vec<Vec<Job>> {
@@ -1421,6 +1526,33 @@ impl SyncCost {
             *sum = None;
         }
     }
+}
+
+/// [`Title::evict_idle_textures`]'s decision as a pure function of the mirrors it would age:
+/// each is `(key, bytes, the present it was last used in)`. The keys to drop, least recently
+/// used first, that bring the total under `cap` — never one of the last `after` presents' own.
+/// Empty when the total already fits, or when everything past the cap is that fresh (the cap
+/// waits for the next presents rather than drop what the frames are using).
+fn evict_order(mirrors: &[(usize, u64, u64)], serial: u64, cap: u64, after: u64) -> Vec<usize> {
+    let mut held: u64 = mirrors.iter().map(|&(_, bytes, _)| bytes).sum();
+    if held <= cap {
+        return Vec::new();
+    }
+    let mut eligible: Vec<(usize, u64, u64)> = mirrors
+        .iter()
+        .filter(|&&(_, _, used)| serial.saturating_sub(used) > after)
+        .copied()
+        .collect();
+    eligible.sort_unstable_by_key(|&(key, _, used)| (used, key));
+    let mut drop = Vec::new();
+    for &(key, bytes, _) in &eligible {
+        if held <= cap {
+            break;
+        }
+        held -= bytes;
+        drop.push(key);
+    }
+    drop
 }
 
 fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize> {
@@ -1910,5 +2042,58 @@ mod tests {
         assert_eq!((reads, queries), (1, 1));
         assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
         assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
+    }
+}
+
+/// The eviction decision ([`evict_order`]): the checklist's "LRU GPU texture cache eviction
+/// triggers when exceeding the memory cap".
+#[cfg(test)]
+mod evict_tests {
+    use super::*;
+
+    /// `after` as `Title::EVICT_AFTER_PRESENTS`: a few presents of grace.
+    const AFTER: u64 = 4;
+
+    #[test]
+    fn nothing_is_evicted_under_the_cap() {
+        let mirrors = [(1, 100, 0), (2, 200, 3), (3, 300, 10)];
+        assert!(evict_order(&mirrors, 20, 600, AFTER).is_empty());
+        // Exactly at it.
+        assert!(evict_order(&mirrors, 20, 600, AFTER).is_empty());
+    }
+
+    #[test]
+    fn the_least_recently_used_go_first_until_it_fits() {
+        let mirrors = [(1, 100, 0), (2, 200, 8), (3, 300, 20)];
+        // The oldest mirror alone brings 600 down to the cap of 500.
+        assert_eq!(evict_order(&mirrors, 20, 500, AFTER), [1]);
+        // A tighter cap takes the next oldest as well.
+        assert_eq!(evict_order(&mirrors, 20, 450, AFTER), [1, 2]);
+        // Deeper over: everything eligible, freshest kept.
+        assert_eq!(evict_order(&mirrors, 20, 50, AFTER), [1, 2]);
+    }
+
+    #[test]
+    fn what_the_last_presents_used_is_never_evicted() {
+        // Key 3 is the biggest but was used this very present; keys 1 and 2
+        // are stale, so they go even though key 3 alone would fit the bill.
+        let mirrors = [(1, 100, 0), (2, 200, 2), (3, 700, 20)];
+        assert_eq!(evict_order(&mirrors, 20, 500, AFTER), [1, 2]);
+        // The grace window: used four presents back is still protected.
+        let mirrors = [(1, 100, 16)];
+        assert!(evict_order(&mirrors, 20, 50, AFTER).is_empty(), "within the window");
+        // Five back is not.
+        let mirrors = [(1, 100, 15)];
+        assert_eq!(evict_order(&mirrors, 20, 50, AFTER), [1], "past the window");
+    }
+
+    #[test]
+    fn a_cache_of_nothing_but_fresh_mirrors_waits() {
+        // Everything was used in the last few presents: nothing to drop, even
+        // far past the cap, until they age.
+        let mirrors = [(1, 900, 17), (2, 900, 18), (3, 900, 20)];
+        assert!(evict_order(&mirrors, 20, 100, AFTER).is_empty());
+        // A few presents later the oldest two go.
+        assert_eq!(evict_order(&mirrors, 24, 100, AFTER), [1, 2]);
     }
 }

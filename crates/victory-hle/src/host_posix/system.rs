@@ -816,7 +816,7 @@ pub extern "system" fn GetSystemInfo(out: *mut u8) {
 }
 
 pub extern "system" fn GlobalMemoryStatusEx(out: *mut u8) -> i32 {
-    let (fast, standard) = victory_gpu::console::current().title_memory();
+    let (fast, standard) = victory_gpu::console::title_memory_budget();
     let total = (fast + standard) as u64;
     // MEMORYSTATUSEX, 64 bytes.
     // SAFETY: the title's structure.

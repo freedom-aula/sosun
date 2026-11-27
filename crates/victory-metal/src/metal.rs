@@ -300,7 +300,8 @@ static JOBS: (std::sync::Mutex<Vec<Job>>, std::sync::Condvar) = (std::sync::Mute
 /// and Metal compile holds its own working memory (the converter's IR, Metal's compiler state),
 /// and on a memory-pressured Mac (a 16 GB Air running a world load) fewer of them is a smaller
 /// peak at the cost of compiles taking longer — a cold frame's 800 pipelines still get made,
-/// just less at once.
+/// just less at once. A 16 GB-or-less host is capped at [`COMPILE_THREADS_CAP`] of them unless
+/// the variable names another count.
 fn compile_later(job: Job) {
     static THREADS: std::sync::Once = std::sync::Once::new();
     THREADS.call_once(|| {
@@ -308,7 +309,17 @@ fn compile_later(job: Job) {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0);
-        let threads = asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let threads = asked.unwrap_or_else(|| {
+            let all = std::thread::available_parallelism().map_or(4, |n| n.get());
+            // 0 is "cannot be read", not a small host.
+            let memory = physical_memory();
+            if memory != 0 && memory <= 16 << 30 && all > COMPILE_THREADS_CAP {
+                tracing::info!(threads = COMPILE_THREADS_CAP, all, "metal: pipeline compiles capped on a small host");
+                COMPILE_THREADS_CAP
+            } else {
+                all
+            }
+        });
         if let Some(n) = asked {
             tracing::info!(threads = n, "metal: pipeline compiles capped by VICTORY_COMPILE_THREADS");
         }
@@ -332,9 +343,30 @@ fn compile_later(job: Job) {
     JOBS.1.notify_one();
 }
 
+/// Compile threads a 16 GB-or-less host runs: the converter's and Metal compiler's working
+/// memory, times the threads, is what a small Mac cannot hold alongside the title.
+const COMPILE_THREADS_CAP: usize = 2;
+
+/// How many jobs wait for a `pipeline-compile` thread: while the queue is this deep, a frame
+/// that asks for one more pipeline is not blocked on its compile — it is put off (`within`
+/// caps its wait) and picks the finished pipeline up at a later draw, so the title's thread
+/// keeps recording the frame while the backlog drains.
+const SATURATED: usize = 4;
+
+/// The backlog of [`compile_later`]: jobs waiting for a thread.
+pub(crate) fn compile_backlog() -> usize {
+    JOBS.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
 /// What the job `start` gives makes, on a `pipeline-compile` thread, if it comes within `wait`.
 /// `None` while it is still being made: the same `key` later picks it up, without waiting again
 /// (its draws come many times a frame, and frames after the first would stall on it in turn).
+///
+/// When the compile threads are saturated ([`SATURATED`] jobs or more already waiting), a *new*
+/// pipeline's wait is capped at a small slice whatever the frame's budget asked for: the title's
+/// thread puts the pipeline off (the draw is dropped and retried once the compile has landed)
+/// instead of standing in a queue of hundreds, which is what stretched a cold world load's frames
+/// — and with them the title's own loading screen — into minutes.
 pub(crate) fn within<T: 'static, J: FnOnce() -> T + Send + 'static>(
     compiling: &Compiling<T>,
     key: [u8; 32],
@@ -351,6 +383,13 @@ pub(crate) fn within<T: 'static, J: FnOnce() -> T + Send + 'static>(
             compile_later(Box::new(move || {
                 let _ = tx.send(crate::archive::Sendable(job()));
             }));
+            // One already queued for this pipeline goes to its front (the last pushed is the
+            // first run); behind a backlog this deep, waiting for it is waiting for the queue.
+            let wait = if compile_backlog() >= SATURATED {
+                wait.min(std::time::Duration::from_millis(20))
+            } else {
+                wait
+            };
             (rx, wait)
         }
     };

@@ -315,6 +315,32 @@ pub fn footprint() -> usize {
     }
 }
 
+/// The Mac's physical memory (`hw.memsize`), `None` if it cannot be read.
+pub fn physical_memory() -> Option<u64> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let mut bytes = 0u64;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a 64-bit value, written into `bytes`.
+    let read = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    (read == 0).then_some(bytes)
+}
+
 /// The first mapped region that ends above `addr`: the one containing it, or
 /// the next one up. `None` if nothing is mapped from there on.
 pub fn next_region(addr: usize) -> Option<Region> {

@@ -15,7 +15,9 @@ use windows_sys::Win32::System::Memory::{
     SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
     VirtualProtect, VirtualQuery,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+use windows_sys::Win32::System::SystemInformation::{
+    GlobalMemoryStatusEx, GetSystemInfo, MEMORYSTATUSEX, SYSTEM_INFO,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Page protection, as the raw `PAGE_*` value (so a value the host returns,
@@ -456,4 +458,14 @@ pub unsafe fn unmap(addr: *mut u8, _len: usize) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// The machine's physical memory, `None` if it cannot be read.
+pub fn physical_memory() -> Option<u64> {
+    // SAFETY: a plain structure of zeroes, its `dwLength` set before the call.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: the structure's `dwLength` names its size; our own process.
+    let read = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (read != 0).then_some(status.ullTotalPhys)
 }

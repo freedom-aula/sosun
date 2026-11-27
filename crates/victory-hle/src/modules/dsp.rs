@@ -12,15 +12,17 @@
 //! The transforms themselves are not computed from the title's own impulse
 //! response: the hardware takes it already in its own partitioned
 //! frequency-domain layout, which is not known, so `StreamDesc::ir` is not
-//! read. With `VICTORY_GUESS_DSP=1`, a convolution stream instead gets a
-//! short synthetic decaying-noise tail (see `synthetic_ir`), carried across
-//! blocks so it does not reset at every block boundary; this is a CPU
-//! fallback approximation of reverb coloration, not the title's actual
-//! effect, and without the variable set the output is silence as before.
-//! Other block transforms stay silent either way: their shape is unknown.
+//! read. A transform the host cannot compute is *bypassed, not muted*: the
+//! command's input passes through to its output scaled by the command's
+//! gains, so the dry signal of anything routed through the DSP — the
+//! dialogue of a wet/dry mix — is heard while the effect itself is missing.
+//! With `VICTORY_GUESS_DSP=1`, a convolution stream instead gets a short
+//! synthetic decaying-noise tail (see `synthetic_ir`) *on top of* its dry
+//! signal (the tail's impulse response begins with the direct sound),
+//! carried across blocks so it does not reset at every block boundary.
 // shortcut: convolution streams get one fixed synthetic decay instead of the
 // title's impulse response, behind VICTORY_GUESS_DSP=1 since it is unverified
-// against a real run; other transform kinds stay silent regardless. Upgrade
+// against a real run; other transform kinds pass their input through. Upgrade
 // once the hardware's partitioned IR layout is documented.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -89,15 +91,17 @@ const TAPS: usize = 4800;
 
 fn synthetic_ir(len: usize) -> Vec<f32> {
     let mut seed = 0x9E37_79B9_u32;
-    (0..len)
-        .map(|k| {
+    // The direct sound first: the tail is added to the dry signal, not heard
+    // instead of it (a wet/dry mix the title builds around its reverb).
+    std::iter::once(1.0)
+        .chain((0..len).map(|k| {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
             let noise = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
             let decay = (-(k as f32) / (len as f32 / 5.0)).exp();
             noise * decay
-        })
+        }))
         .collect()
 }
 
@@ -301,9 +305,11 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: a convolution stream with an input gets
-/// the synthetic reverb tail (see module docs); everything else stays
-/// silence.
+/// Completes the command at once. A convolution stream with the synthetic
+/// tail on (`VICTORY_GUESS_DSP=1`) gets dry plus tail; every other transform
+/// — and a convolution without the guess — is *bypassed*: its input passes
+/// through to its output scaled by the command's gains, never zeroed, so a
+/// title's wet/dry graph keeps its dry signal while the effect is missing.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -341,7 +347,21 @@ pub extern "system" fn XDspSubmitCommand(
             stream
                 .history
                 .copy_from_slice(&stream.scratch[tail_start..]);
+        } else if !command.input.is_null() {
+            // Bypass: the dry signal at the command's own gains.
+            // SAFETY: the title's input and output buffers each hold one
+            // block of the stream; the gain of each channel is read once so
+            // the loop below cannot read through the output pointer.
+            let input = unsafe { std::slice::from_raw_parts(command.input, samples) };
+            let gains = command.gains;
+            let channels = stream.channels as usize;
+            // SAFETY: the title's output buffer, as above.
+            let out = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+            for (i, (s, o)) in input.iter().zip(out).enumerate() {
+                *o = s * gains[(i % channels.max(1)).min(1)];
+            }
         } else {
+            // No input at all: a block of silence, as the console's would be.
             // SAFETY: the title's output buffer holds one block of the stream.
             unsafe { std::ptr::write_bytes(command.output, 0, samples) };
         }
@@ -379,9 +399,13 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
 
+    /// These tests set and clear `VICTORY_GUESS_DSP`, so only one of them runs at a time.
+    static GUESS_ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
     #[test]
     fn convolution_stream_as_the_title_drives_it() {
-        // SAFETY: no other test reads VICTORY_GUESS_DSP.
+        let _one = GUESS_ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: held alone: no other test reads VICTORY_GUESS_DSP.
         unsafe { std::env::set_var("VICTORY_GUESS_DSP", "1") };
         let mut base = vec![0u8; 0x10_0000];
         let mut dsp = std::ptr::null_mut();
@@ -518,10 +542,110 @@ mod tests {
         let a = synthetic_ir(16);
         let b = synthetic_ir(16);
         assert_eq!(a, b);
-        assert_eq!(a.len(), 16);
+        assert_eq!(a.len(), 17);
+        // The direct sound is a unit impulse: the tail adds to the dry signal.
+        assert_eq!(a[0], 1.0);
         // The tail dies out: the back half carries much less energy than the front half.
-        let front: f32 = a[..8].iter().map(|s| s * s).sum();
-        let back: f32 = a[8..].iter().map(|s| s * s).sum();
+        let front: f32 = a[1..9].iter().map(|s| s * s).sum();
+        let back: f32 = a[9..].iter().map(|s| s * s).sum();
         assert!(back < front);
+    }
+
+    #[test]
+    fn a_stream_without_a_transform_passes_its_dry_input_through() {
+        // The console's other block transforms (an EQ, a compressor) have an
+        // unknown shape, and the synthetic reverb is off by default: what the
+        // title routed through them must still be heard, so the command is
+        // bypassed — input to output at the command's gains — never muted.
+        let _one = GUESS_ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: held alone; it is off for this whole test.
+        unsafe { std::env::remove_var("VICTORY_GUESS_DSP") };
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                0x80,
+                1,
+                &mut dsp
+            ),
+            S_OK
+        );
+        // A mono block transform, as the console allows.
+        let desc = StreamDesc {
+            kind: 2,
+            options: 0,
+            frames: 0x200,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let mut output = vec![0f32; 0x200];
+        let input: Vec<f32> = (0..0x200).map(|i| (i % 17) as f32 / 17.0).collect();
+        let command = Command {
+            gains: [0.25, 0.5],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        // Dry at the command's gain, not zeros and not the raw input.
+        for (&i, &o) in input.iter().zip(&output) {
+            assert_eq!(o, i * 0.25);
+        }
+        assert_eq!(XDspDeactivate(stream), S_OK);
+
+        // A convolution stream with the guess off is bypassed the same way
+        // (the title's reverb stays silent, its dry signal does not).
+        let reverb = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x200,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        assert_eq!(XDspActivate(dsp, &reverb, &mut status, &mut stream), S_OK);
+        output.fill(0.0);
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        assert_eq!(output, input, "dry at unity while the reverb is silent");
+        assert_eq!(XDspDeactivate(stream), S_OK);
+
+        // A stereo bypass applies each channel its own gain (a convolution
+        // stream with the guess still off: those may be stereo).
+        let stereo = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x200,
+            channels: 2,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        assert_eq!(XDspActivate(dsp, &stereo, &mut status, &mut stream), S_OK);
+        let mut stereo_out = vec![0f32; 0x400];
+        let stereo_in = vec![0.5f32; 0x400];
+        let command = Command {
+            gains: [1.0, 0.0],
+            input: stereo_in.as_ptr(),
+            output: stereo_out.as_mut_ptr(),
+            reserved: 0,
+        };
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        for (i, &o) in stereo_out.iter().enumerate() {
+            assert_eq!(o, if i % 2 == 0 { 0.5 } else { 0.0 }, "left passes, right is gated");
+        }
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
     }
 }

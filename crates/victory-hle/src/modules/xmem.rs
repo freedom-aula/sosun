@@ -466,7 +466,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     #[cfg(not(windows))]
     let used = victory_platform::mem::footprint();
-    let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let (gpu_optimal, standard) = victory_gpu::console::title_memory_budget();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: used,
@@ -489,7 +489,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     let Some(size) = size.checked_next_multiple_of(2 * MIB) else {
         return 0;
     };
-    let standard = victory_gpu::console::current().title_memory().1;
+    let standard = victory_gpu::console::title_memory_budget().1;
     let moved = kind == TITLE_TO_SYSTEM
         && TRANSFERRED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {

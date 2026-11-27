@@ -13,10 +13,33 @@ const LIMIT: usize = 16_384;
 /// New first binds between two writes of the list: a run the watchdog ends loses at most these.
 const WRITE_EVERY: usize = 64;
 
-/// Workers in the pool: all cores but two (the title's render thread and one more).
+/// Workers in the pool: all cores but two (the title's render thread and one more), but no more
+/// than [`POOL_CAP`] of them on a memory-pressured host: every prewarm worker holds a translated
+/// shader's DXIL (and its converter state) while it works, and on a 16 GB Mac that working set
+/// is what the title's own heap competes with. `VICTORY_PREWARM_THREADS=<n>` overrides.
 pub(crate) fn pool_size(cores: usize) -> usize {
-    cores.saturating_sub(2).max(1)
+    pool_size_for(cores, crate::console::host_memory())
 }
+
+/// [`pool_size`] with the host's memory named, so the cap is testable whatever runs the tests.
+fn pool_size_for(cores: usize, host: Option<u64>) -> usize {
+    static ASKED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(n) = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_PREWARM_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    }) {
+        return n;
+    }
+    let full = cores.saturating_sub(2).max(1);
+    if host.is_some_and(|m| m <= SMALL_POOL_HOST) { full.min(POOL_CAP) } else { full }
+}
+
+/// A host whose memory caps the prewarm pool: 16 GB and less.
+const SMALL_POOL_HOST: u64 = 16 << 30;
+/// The cap itself: two workers, translating side by side without piling up.
+const POOL_CAP: usize = 2;
 
 /// How long a frame may run, from its first new host pipeline, before pipelines whose shaders
 /// are not translated yet are put off ([`FrameBudget`]): well under the title's 30 s watchdog.
@@ -178,11 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_leaves_two_cores() {
-        assert_eq!(pool_size(18), 16);
-        assert_eq!(pool_size(8), 6);
-        assert_eq!(pool_size(2), 1);
-        assert_eq!(pool_size(1), 1);
+    fn the_pool_leaves_two_cores_and_a_small_host_caps_it() {
+        assert_eq!(pool_size_for(18, None), 16);
+        assert_eq!(pool_size_for(8, None), 6);
+        assert_eq!(pool_size_for(2, None), 1);
+        assert_eq!(pool_size_for(1, None), 1);
+        // A 16 GB host caps the pool at two workers however many cores it has.
+        assert_eq!(pool_size_for(18, Some(16 << 30)), 2);
+        assert_eq!(pool_size_for(4, Some(8 << 30)), 2);
+        // A bigger host keeps them all.
+        assert_eq!(pool_size_for(18, Some(64 << 30)), 16);
     }
 
     #[test]

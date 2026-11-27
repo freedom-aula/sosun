@@ -77,7 +77,7 @@ About a thousand functions of the Xbox and Windows surface, implemented in Rust:
 
 - **Memory** — the `VirtualAlloc` and `XMem` families, physical pages, and the console's quotas (7.6 GiB of title memory as Series S, 13.5 GiB as Series X).
 - **Files** — the console's fixed drives, synchronous and async IO, and **DirectStorage**: a story load streams about 9,500 reads at about 79 MB/s.
-- **Audio** — XAudio2 onto CoreAudio; the title's Windows Spatial Audio stream is mixed to stereo; Opus and XMA voices are decoded. (Reverb is still silent.)
+- **Audio** — XAudio2 onto CoreAudio; the title's Windows Spatial Audio stream is mixed to stereo; Opus and XMA voices are decoded. (The reverb effect itself is still synthetic, but the DSP paths pass the dry signal through, and 5.1/7.1 dialogue reaches the stereo mix.)
 - **Input** — GameInput, fed by the keyboard and by `GCController` pads.
 - **Networking** — winsock and winhttp.
 - **The rest of the console surface** — `xgameui`, `xgamesave`, `xuser`, `xpackage`, lifecycle, and so on.
@@ -203,7 +203,7 @@ Off by default, read once at startup. The ones you will actually reach for:
 
 | Switch | What it does |
 | --- | --- |
-| `VICTORY_AMBIENT=<level>` | Shade the unlit world's near-black pixels by the frame's depth target (`level` a fraction in (0, 1]; geometry shows while lighting is refused) |
+| `VICTORY_AMBIENT=<level>` | Shade the unlit world's near-black pixels by the frame's depth target (`level` a fraction in (0, 1], 0.45 by default, `0` off; geometry shows while lighting is refused, and a depth-less UI pass keeps the scene's depth) |
 | `VICTORY_CAPTURE=<dir>` | Save presented frames as PNGs (every frame whose number is a power of two) |
 | `VICTORY_CAPTURE_FRAMES=<n>,<n>,...` | Save these frames too |
 | `VICTORY_CAPTURE_WORLD=<n>,...` | Count frames from the world's first frame |

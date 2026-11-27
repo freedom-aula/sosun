@@ -1045,35 +1045,11 @@ fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
     crate::disk::key(&[d.vs, d.ps.unwrap_or_default()])
 }
 
-impl GraphicsBackend for Metal {
-    type RenderPipeline = RenderPipeline;
-
-    fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
-        let (pso, mesh) = self.compiler()?.render(d)?;
-        self.finish_render(d, pso, mesh)
-    }
-
-    /// As `create_compute_pipeline_within`: converted and compiled on a `pipeline-compile`
-    /// thread, and picked up by the same call later when `wait` was not enough.
-    fn create_render_pipeline_within(
-        &self,
-        d: &RenderPipelineDesc<'_>,
-        wait: std::time::Duration,
-    ) -> Result<Option<RenderPipeline>, String> {
-        let state = format!(
-            "{} {:?}",
-            d.vs.len(),
-            (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
-        );
-        let key = *blake3::Hasher::new().update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes()).finalize().as_bytes();
-        let made = crate::metal::within(&self.compiling_render, key, wait, || {
-            let (compiler, owned) = (self.compiler()?, OwnedDesc::of(d));
-            Ok(move || compiler.render(&owned.desc()))
-        })?;
-        made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
-    }
-
-    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+/// [`Metal`]'s submission body, apart from the trait so the pool wrapper stays a one-liner:
+/// run inside its own autorelease pool by `submit_passes`.
+impl Metal {
+    /// [`Self::submit_passes`]: the body, run inside its own autorelease pool.
+    fn submit_passes_pooled(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
@@ -1202,6 +1178,49 @@ impl GraphicsBackend for Metal {
             None => Ok(()),
         }
     }
+}
+
+impl GraphicsBackend for Metal {
+    type RenderPipeline = RenderPipeline;
+
+    fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
+        let (pso, mesh) = self.compiler()?.render(d)?;
+        self.finish_render(d, pso, mesh)
+    }
+
+    /// As `create_compute_pipeline_within`: converted and compiled on a `pipeline-compile`
+    /// thread, and picked up by the same call later when `wait` was not enough.
+    fn create_render_pipeline_within(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+        wait: std::time::Duration,
+    ) -> Result<Option<RenderPipeline>, String> {
+        let state = format!(
+            "{} {:?}",
+            d.vs.len(),
+            (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
+        );
+        let key = *blake3::Hasher::new().update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes()).finalize().as_bytes();
+        let made = crate::metal::within(&self.compiling_render, key, wait, || {
+            let (compiler, owned) = (self.compiler()?, OwnedDesc::of(d));
+            Ok(move || compiler.render(&owned.desc()))
+        })?;
+        made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
+    }
+
+    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+        // Every command buffer, encoder, descriptor and error object this submission makes is
+        // autorelease-pool fodder, and the threads that submit (the title's own, the present
+        // FIFO's) are long-lived: without a pool of its own, each iteration's autoreleased
+        // objects pile up until some outer pool drains — megabytes a submission, gigabytes over
+        // a load, of nothing but garbage waiting. The pool here drains at the end of every
+        // submission, as the present's and the compile threads' already do.
+        objc2::rc::autoreleasepool(|_| {
+            self.submit_passes_pooled(queue, work)
+        })
+    }
+
+
 }
 
 impl RenderPipeline {

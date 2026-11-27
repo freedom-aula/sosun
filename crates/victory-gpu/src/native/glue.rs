@@ -70,7 +70,7 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
         match Metal::new() {
             Ok(metal) => {
                 let console = crate::console::current();
-                let (gpu_optimal, standard) = console.title_memory();
+                let (gpu_optimal, standard) = crate::console::title_memory_budget();
                 tracing::info!(
                     console = console.name(),
                     title_memory_mib = (gpu_optimal + standard) / (1 << 20),
@@ -664,14 +664,15 @@ pub(crate) fn present(queue: This, resource: This) {
     if tracing_targets() {
         trace_present(resource);
     }
-    // VICTORY_AMBIENT: the presented picture shaded by the frame's most-drawn depth target, with
-    // the most-drawn colour target blended in as the albedo, so the world shows while the
-    // lighting passes are still refused (native/ambient.rs). The choice is given to the surface
-    // before the present is queued; a frame that drew no depth clears it.
+    // VICTORY_AMBIENT (0.45 by default, `0` off): the presented picture shaded by the frame's
+    // largest depth target, with the largest colour target blended in as the albedo, so the world
+    // shows while the lighting passes are still refused (native/ambient.rs). The choice is given
+    // to the surface before the present is queued; a present whose draws named no depth (the 2D
+    // UI and subtitle pass after the scene) keeps the scene's last choice instead of clearing it.
     if let Some(k) = super::ambient::level() {
         let chosen = super::ambient::choose();
         with_title(|t| {
-            let depth = chosen.depth.and_then(|(key, draws)| {
+            let depth = chosen.depth.and_then(|(key, _, draws)| {
                 let tex = t.texture_of(key)?;
                 static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
                 let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -683,7 +684,7 @@ pub(crate) fn present(queue: This, resource: This) {
                 }
                 Some(tex)
             });
-            let albedo = chosen.color.and_then(|(key, draws)| {
+            let albedo = chosen.color.and_then(|(key, _, draws)| {
                 let tex = t.texture_of(key)?;
                 static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
                 let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -704,7 +705,13 @@ pub(crate) fn present(queue: This, resource: This) {
     }
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
-        t.present(queue as usize, resource as usize)
+        let shown = t.present(queue as usize, resource as usize);
+        // The end of the frame: the host's texture mirrors age by this present, and those past
+        // the GPU cache cap (`VICTORY_MAX_GPU_CACHE_MB`, 2.5 GiB by default) that no present
+        // has used for a few frames are dropped here, on the title's own thread, where their
+        // Metal objects go in one turn (native/textures.rs).
+        t.evict_idle_textures();
+        shown
     });
     match shown {
         Some(Err(e)) => tracing::warn!(error = %e, "a frame was not presented"),

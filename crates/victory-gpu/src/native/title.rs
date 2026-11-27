@@ -222,6 +222,9 @@ pub struct Title<B: PresentBackend> {
     pub(super) blank_cursor: usize,
     /// Reusable scratch buffer for hot-texture probes (avoids per-submission allocations).
     pub(super) probe_buf: Vec<u8>,
+    /// The present counter [`Title::evict_idle_textures`] ages mirrors by: bumped once per
+    /// present, recorded by every fetch ([`Tracked::used`]).
+    pub(super) use_serial: u64,
     /// Where `Present` shows frames, if the app gave a layer.
     pub(super) surface: Option<Rc<B::Surface>>,
     /// Title textures no view has named yet.
@@ -261,6 +264,7 @@ impl<B: PresentBackend> Title<B> {
             blank_keys: Vec::new(),
             blank_cursor: 0,
             probe_buf: Vec::new(),
+            use_serial: 0,
             surface: None,
             pending: HashMap::new(),
             placed: HashMap::new(),

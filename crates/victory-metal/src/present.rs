@@ -20,11 +20,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Draws a texture over the whole target. Compiled by Metal's own compiler at run time (this is
-/// the one shader of the backend that is not converted DXIL). With `VICTORY_AMBIENT`, a second
-/// fragment shades the near-black pixels of the source by a depth target: the lighting compute
-/// passes can still be refused, and a fully drawn G-buffer would otherwise reach the screen as
-/// pitch black after tone-mapping. Guesses: the console's reversed Z (near 1, far 0, so nearer is
-/// brighter), and that all channels under 0.005 mean unlit rather than the title's own black.
+/// the one shader of the backend that is not converted DXIL). With `VICTORY_AMBIENT` (0.45 by
+/// default), a second fragment shades the near-black pixels of the source by a depth target: the
+/// lighting compute passes can still be refused, and a fully drawn G-buffer would otherwise
+/// reach the screen as pitch black after tone-mapping. Guesses: the console's reversed Z (near 1,
+/// far 0, so nearer is brighter), and that all channels under 0.015 mean unlit rather than the
+/// title's own black.
 const SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -47,16 +48,19 @@ fragment float4 ambient_fragment(Out in [[stage_in]], texture2d<float> source [[
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 c = source.sample(s, in.uv);
     float d = z.sample(s, in.uv).r;
+    // Reversed Z: geometry sits strictly between the far clear (0) and the near plane (1), so a
+    // depth outside that range is sky or a target the frame did not fill — never shaded.
+    float drawn = step(0.0, d) * step(d, 0.9995);
     // The screen-space derivatives of the reversed-Z depth reconstruct the surface: they are
     // zero on a surface parallel to the screen and grow at slants and silhouettes, so their
     // complement is a facing term that separates surfaces from their edges.
     float2 dd = float2(dfdx(d), dfdy(d));
     float facing = 1.0 - clamp(length(dd) * 4.0, 0.0, 0.6);
-    // The G-buffer's own colour where a pass drew one (the frame's most-drawn colour
-    // target), over the depth's flat shade; without one the depth stands alone.
+    // The G-buffer's own colour where a pass drew one (the frame's largest colour target),
+    // over the depth's flat shade; without one the depth stands alone.
     float3 albedo = g.sample(s, in.uv).rgb;
     float3 lit = a.level * (0.35 + 0.65 * facing) * mix(float3(d), albedo, a.has_albedo);
-    float black = step(max(c.r, max(c.g, c.b)), 0.005);
+    float black = step(max(c.r, max(c.g, c.b)), 0.015) * drawn;
     return float4(mix(c.rgb, lit, black), c.a);
 }
 "#;
@@ -93,8 +97,9 @@ pub struct Surface {
     pipelines: RefCell<HashMap<usize, Pipeline>>,
     /// The copy pipeline of the ambient fragment for each drawable format seen.
     ambient: RefCell<HashMap<usize, Pipeline>>,
-    /// `VICTORY_AMBIENT`: the depth target presents shade near-black pixels by, the albedo
-    /// blended in, and its level.
+    /// `VICTORY_AMBIENT` (0.45 by default, `0` off): the depth target presents shade near-black
+    /// pixels by, the albedo blended in, and its level. A depth-less present keeps the last
+    /// choice (the UI pass after the scene pass: native/ambient.rs).
     shade: RefCell<Option<Ambient>>,
     /// The 1x1 black texture bound in the ambient fragment's albedo slot when the frame drew
     /// no colour target to blend in (the mix constant is zero, so it is never read; the slot

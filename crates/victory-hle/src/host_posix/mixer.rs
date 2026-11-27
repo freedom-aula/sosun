@@ -7,7 +7,11 @@
 //! interpolation to the device rate, with their loops, volume, per-channel
 //! volumes and output matrix. A voice's sends lead to the mastering voice or
 //! through submix voices, which here are gain groups: they carry a volume and
-//! an output, not their own mixing, effects or rate.
+//! an output, not their own mixing, effects or rate. A voice whose send chain
+//! does not reach the mastering voice (a reverb or DSP bus the host does not
+//! mix, an unconnected submix) is never dropped for that: it passes its dry
+//! signal straight to the mastering voice at full gain, so dialogue routed
+//! through an effect bus stays audible while the effect itself is silent.
 //!
 //! shortcut: no effect chains, no filters, no multiple sends per voice (the
 //! first send counts), and a submix has no channels or rate of its own; add
@@ -289,6 +293,10 @@ impl Mixer {
 
     /// Adds `out.len() / channels` frames of every running voice into `out`
     /// (which is cleared first), and returns what happened to the buffers.
+    ///
+    /// A voice whose send chain does not reach the mastering voice is mixed
+    /// dry at unity instead of being dropped: the reverb and DSP buses the
+    /// host cannot yet compute must not take the dialogue with them.
     pub fn render(&mut self, out: &mut [f32]) -> Vec<Event> {
         out.fill(0.0);
         let frames = out.len() / self.channels;
@@ -296,7 +304,10 @@ impl Mixer {
         let gains: HashMap<VoiceId, f32> = self
             .sources
             .iter()
-            .map(|(&id, s)| (id, self.chain_gain(s.output)))
+            .map(|(&id, s)| {
+                let chained = self.chain_gain(s.output);
+                (id, if chained == 0.0 { 1.0 } else { chained })
+            })
             .collect();
         for (id, s) in &mut self.sources {
             if s.running && !s.queue.is_empty() {
@@ -319,9 +330,32 @@ impl Mixer {
     }
 }
 
+/// The down-mix gain of source channel `c` into the left and right of a
+/// stereo mix: the Windows channel order (front left and right, front
+/// center, LFE, then back and side surrounds). The front center — where a
+/// game's dialogue lives — feeds both at 0.707, the surrounds fold into their
+/// own side, and the LFE is kept at half gain (a subwoofer channel a stereo
+/// pair cannot place, but that carries bass the mix would otherwise lose).
+fn surround_gains(c: usize) -> (f32, f32) {
+    const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    match c {
+        0 => (1.0, 0.0),         // front left
+        1 => (0.0, 1.0),         // front right
+        2 => (H, H),              // front center: dialogue
+        3 => (0.5, 0.5),          // LFE
+        4 => (H, 0.0),            // back left
+        5 => (0.0, H),            // back right
+        6 => (H, 0.0),            // side left
+        7 => (0.0, H),            // side right
+        _ => (H, H),              // height and beyond: the middle
+    }
+}
+
 /// The levels from `source` channels to `out` channels: an identity where
 /// they line up, a mono source to every output, a stereo one to a mono
-/// output halved.
+/// output halved, and a surround source (three channels or more: 5.1, 7.1)
+/// folded down with its front center — the dialogue channel — mixed into
+/// left and right rather than dropped.
 pub fn default_matrix(source: usize, out: usize) -> Vec<f32> {
     let mut m = vec![0.0; source * out];
     for o in 0..out {
@@ -329,6 +363,19 @@ pub fn default_matrix(source: usize, out: usize) -> Vec<f32> {
             m[o * source + c] = match (source, out) {
                 (1, _) => 1.0,
                 (2, 1) => 0.5,
+                (_, 1) => {
+                    // Surround to mono: the center dominates, the fronts halve
+                    // as the stereo pair does, the rest fold at half gain.
+                    match c {
+                        2 => 1.0,
+                        0 | 1 => std::f32::consts::FRAC_1_SQRT_2,
+                        _ => 0.5,
+                    }
+                }
+                _ if source > 2 => {
+                    let (l, r) = surround_gains(c);
+                    if o == 0 { l } else { r }
+                }
                 _ => f32::from(o == c),
             };
         }
@@ -654,5 +701,141 @@ mod tests {
         }
         // 100 base frames + 2 loops of 50 frames = 200 frames total.
         assert_eq!(m.source(v).unwrap().state(), (0, 0, 200));
+    }
+
+    /// The Windows 5.1 layout: front left and right, front center, LFE, back
+    /// left and right.
+    const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    #[test]
+    fn surround_downmix_carries_the_center_dialogue_channel() {
+        // The matrix of a 5.1 voice into stereo: rows are outputs, columns
+        // the source channels in Windows order (FL, FR, FC, LFE, BL, BR).
+        let m = default_matrix(6, 2);
+        let row = |o: usize| m[o * 6..o * 6 + 6].to_vec();
+        assert_eq!(
+            row(0),
+            [1.0, 0.0, H, 0.5, H, 0.0],
+            "left takes FL, the center at 0.707, LFE at 0.5, back left at 0.707"
+        );
+        assert_eq!(
+            row(1),
+            [0.0, 1.0, H, 0.5, 0.0, H],
+            "right takes FR, the center at 0.707, LFE at 0.5, back right at 0.707"
+        );
+        // 7.1 adds side left and right (channels 6 and 7) to their own sides.
+        let m = default_matrix(8, 2);
+        assert_eq!(m[6], H, "side left feeds left");
+        assert_eq!(m[7], 0.0, "side right does not");
+        assert_eq!(m[8 + 6], 0.0, "side left does not feed right");
+        assert_eq!(m[8 + 7], H, "side right feeds right");
+        assert_eq!(m[8 + 2], H, "the 7.1 center still feeds right");
+        // Stereo and mono sources keep their plain matrices.
+        assert_eq!(default_matrix(2, 2), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(default_matrix(1, 2), [1.0, 1.0]);
+        assert_eq!(default_matrix(2, 1), [0.5, 0.5]);
+        // A surround voice into mono keeps its center above everything else.
+        let m = default_matrix(6, 1);
+        assert_eq!(m[2], 1.0, "the center dominates mono");
+        assert_eq!(m[0], H, "front left folds at 0.707");
+    }
+
+    #[test]
+    fn a_51_dialogue_voice_is_audible_in_stereo() {
+        // What the title actually does: a six-channel voice (dialogue on the
+        // center, channel 2) into the stereo mastering voice. With the old
+        // identity matrix the center never reached a speaker.
+        let mut m = Mixer::new(RATE, 2);
+        let v = m.add_source(6, RATE, Some(MASTER));
+        // One frame: FL=0, FR=0, FC=1, LFE=0, BL=0, BR=0 — pure center.
+        m.source(v).unwrap().submit(buffer(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 6, 0));
+        m.source(v).unwrap().running = true;
+        let mut out = vec![0.0; 2];
+        m.render(&mut out);
+        assert!((out[0] - H).abs() < 1e-6, "left carries the center at 0.707, not {}", out[0]);
+        assert!((out[1] - H).abs() < 1e-6, "right carries the center at 0.707, not {}", out[1]);
+        // A back-left-only frame stays out of the right speaker.
+        m.source(v).unwrap().submit(buffer(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 6, 1));
+        m.source(v).unwrap().running = true;
+        let mut out = vec![0.0; 2];
+        m.render(&mut out);
+        assert!((out[0] - H).abs() < 1e-6, "back left folds into left");
+        assert_eq!(out[1], 0.0, "back left never reaches right");
+    }
+
+    #[test]
+    fn a_voice_into_a_dead_submix_passes_its_dry_signal_to_the_master() {
+        // A reverb bus the host does not mix: a submix whose own output goes
+        // nowhere (an empty send list, or a chain that never reaches the
+        // mastering voice). The voice into it must still be heard.
+        let mut m = Mixer::new(RATE, 2);
+        let dead = m.add_submix(None);
+        let v = m.add_source(1, RATE, Some(dead));
+        m.source(v).unwrap().submit(buffer(vec![0.5; 10], 1, 0));
+        m.source(v).unwrap().running = true;
+        let mut out = vec![0.0; 2 * 4];
+        m.render(&mut out);
+        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6), "dry at unity, not silence");
+
+        // A chain that runs out before the mastering voice (a submix loop)
+        // must not hang or zero the voice either.
+        let mut m = Mixer::new(RATE, 1);
+        let a = m.add_submix(None);
+        let b = m.add_submix(Some(a));
+        m.submix(a).unwrap().output = Some(b);
+        let v = m.add_source(1, RATE, Some(a));
+        m.source(v).unwrap().submit(buffer(vec![0.25; 4], 1, 0));
+        m.source(v).unwrap().running = true;
+        let mut out = vec![0.0; 4];
+        m.render(&mut out);
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6), "a looping chain falls back to dry");
+
+        // A live chain still applies its submix volume: the dry fallback is
+        // only for chains that reach nothing.
+        let mut m = Mixer::new(RATE, 1);
+        let sub = m.add_submix(Some(MASTER));
+        m.submix(sub).unwrap().volume = 0.5;
+        let v = m.add_source(1, RATE, Some(sub));
+        m.source(v).unwrap().submit(buffer(vec![1.0; 4], 1, 0));
+        m.source(v).unwrap().running = true;
+        let mut out = vec![0.0; 4];
+        m.render(&mut out);
+        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6), "the live submix still halves");
+    }
+
+    #[test]
+    fn an_infinitely_looped_buffer_plays_forever_and_announces_its_loops() {
+        // The title screen's music: one buffer, LoopCount = 255 (infinite). It
+        // must still be playing minutes later, and every pass over the loop
+        // region fires OnLoopEnd so the title can resubmit around it.
+        let mut m = Mixer::new(RATE, 2);
+        let v = m.add_source(1, RATE, Some(MASTER));
+        let mut b = buffer(vec![0.5; 100], 1, 7);
+        b.loop_begin = 10;
+        b.loop_end = 90;
+        b.loops = LOOP_INFINITE;
+        m.source(v).unwrap().submit(b);
+        m.source(v).unwrap().running = true;
+
+        let mut out = vec![0.0; 2 * 100];
+        let mut loops = 0;
+        let mut silence_after_sound = false;
+        // Far longer than the buffer: eighty passes over the loop region.
+        for _ in 0..80 {
+            out.fill(0.0);
+            let events = m.render(&mut out);
+            loops += events.iter().filter(|e| e.notice == Notice::LoopEnd).count();
+            let sounded = out.iter().any(|&x| x != 0.0);
+            if !sounded && loops > 0 {
+                silence_after_sound = true;
+            }
+            assert!(sounded, "the looped buffer is still playing");
+        }
+        assert!(loops >= 80, "every pass over the loop region announces itself: {loops}");
+        assert!(!silence_after_sound);
+        // Its state never reports the queue empty.
+        assert_eq!(m.source(v).unwrap().state().1, 1, "the buffer stays queued");
+        // An infinite loop never needs more data submitted.
+        assert_eq!(m.source(v).unwrap().frames_required(100, RATE), 0);
     }
 }
