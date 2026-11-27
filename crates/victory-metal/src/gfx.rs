@@ -1177,7 +1177,7 @@ impl GraphicsBackend for Metal {
                 }
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
                 Pass::ClearColorRects { target, color, rects } => {
-                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order)
+                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
                 }
             };
             if let Err(e) = encoded {
@@ -2044,6 +2044,7 @@ impl Metal {
         rects: &[ClearRect],
         set_on_queue: bool,
         order: Ordering<'_>,
+        attached_heaps: &mut Vec<*const Heap>,
     ) -> Result<(), String> {
         let clip = |p, limit| usize::try_from(p).unwrap_or_default().min(limit);
         let (width, height) = (target.tex.width(), target.tex.height());
@@ -2096,6 +2097,7 @@ impl Metal {
             },
             set_on_queue,
             order,
+            attached_heaps,
         )?;
         let copies: Vec<_> = regions
             .into_iter()
