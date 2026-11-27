@@ -123,6 +123,8 @@ Why the Wine path is slow here: one 64 KiB view per page (`MapViewOfFile3`) make
 | `CreateFileMappingW` on files, `NtQueryVolumeInformationFile` | `dstorage.rs`, `files.rs` | `mmap`, `fstatfs` |
 | `CreateHardLink` | blob cache (`victory-gpu`) | `link` (APFS has no 1024-link limit; see `docs/macos.md`) |
 
+The CRT's `rename` and `_wrename` use Darwin's `renamex_np` with `RENAME_EXCL` so an existing destination, including a dangling symlink, survives a rename attempt. The shim retains its existing `EEXIST` for that collision. [MSVC documents `EACCES`.](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/rename-wrename?view=msvc-170)
+
 ### Exceptions: SEH and vectored handlers
 
 | Win32 | Where | macOS |

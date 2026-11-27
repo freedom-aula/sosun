@@ -4,15 +4,15 @@
 //! `_S_IFREG`/`_S_IFDIR` and the read, write and execute bits as the CRT
 //! sets them, and the times are `time_t` seconds.
 
+use std::ffi::CString;
 use std::fs::Metadata;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use super::runtime::bad_param;
 use super::stdio::win_errno;
-use super::{
-    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units,
-};
+use super::{Ch, EACCES, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units};
 use crate::host_posix::files;
 
 const S_IFDIR: u16 = 0x4000;
@@ -236,12 +236,17 @@ fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
         set_errno(ENOENT);
         return -1;
     };
-    // Windows does not replace an existing file.
-    if to.exists() {
-        set_errno(EEXIST);
+    let [Ok(from), Ok(to)] = [from, to].map(|p| CString::new(p.into_os_string().into_vec())) else {
+        set_errno(EINVAL);
         return -1;
+    };
+    // SAFETY: both paths are live, NUL-terminated C strings.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        0
+    } else {
+        set_errno(win_errno(&std::io::Error::last_os_error()));
+        -1
     }
-    done(std::fs::rename(from, to))
 }
 
 pub extern "system" fn rename(from: *const u8, to: *const u8) -> i32 {
@@ -854,6 +859,7 @@ exports!(pub(super) fn lookup;
 
 #[cfg(test)]
 mod tests {
+    use super::super::EEXIST;
     use super::*;
 
     #[test]
@@ -951,11 +957,37 @@ mod tests {
         let gp = c(g.to_str().unwrap());
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), -1);
         assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&f).unwrap(), b"12345");
+        assert_eq!(std::fs::read(&g).unwrap(), b"x");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), 0);
+        assert!(!f.try_exists().unwrap());
+        assert_eq!(std::fs::read(&g).unwrap(), b"12345");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(remove(gp.as_ptr()), -1);
         assert_eq!(_rmdir(dp.as_ptr()), 0);
+    }
+
+    #[test]
+    fn wrename_preserves_dangling_destination_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let target = std::path::Path::new("missing");
+        std::fs::write(&from, b"source bytes").unwrap();
+        std::os::unix::fs::symlink(target, &to).unwrap();
+
+        let wide = |p: &std::path::Path| {
+            p.to_str()
+                .unwrap()
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(_wrename(wide(&from).as_ptr(), wide(&to).as_ptr()), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
     }
 
     #[test]
