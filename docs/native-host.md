@@ -946,6 +946,11 @@ logged programs use this pattern is unknown.
 Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR constants as lane
 selectors. A selector with a runtime value still produces the computed-lane-select refusal.
 
+The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
+`v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
+group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave
+reductions already have the same result in every lane and need no extra lane read.
+
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
 host waves of a console wave multiply their results (`split_wave_tests::

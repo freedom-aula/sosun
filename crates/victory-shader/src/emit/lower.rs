@@ -110,6 +110,9 @@ pub(crate) struct Lowered {
     /// The wave prefix calls, with their constant arguments.
     #[cfg(test)]
     pub wave_prefix_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// The lane reads, with their constant arguments.
+    #[cfg(test)]
+    pub wave_read_lane_calls: Vec<(String, Vec<Option<i64>>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1314,6 +1317,12 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::ReadLane(v, lane) => {
+                self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
+                let x = self.i32_of(v)?;
+                let lane = self.s.m.i32(lane);
+                return self.wide_read_lane(x, lane);
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
@@ -1647,6 +1656,8 @@ impl<'a> Lower<'a> {
             .concat(),
             #[cfg(test)]
             wave_prefix_calls: self.s.m.written_call_args("dx.op.wavePrefixOp"),
+            #[cfg(test)]
+            wave_read_lane_calls: self.s.m.written_call_args("dx.op.waveReadLaneAt"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -15141,6 +15152,41 @@ mod tests {
         w.push(S_ENDPGM);
         assert!(super::split_wave_barriers(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_none());
         assert_eq!(split_barriers(&w, 64, true), 0);
+    }
+
+    #[test]
+    fn a_whole_wave_lane_read_uses_the_original_source_lane() {
+        // v_mov_b32_dpp v2, v0 quad_perm:[1,0,3,2]
+        let swap_neighbours = [0x7E04_02FA, 0xFF00_B100];
+        for (shuffle, vsrc, lane) in [(&[][..], 0, 35), (&swap_neighbours[..], 2, 34)] {
+            let mut words = vec![
+                V_LSHLREV_V1_2_V0,
+                0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            ];
+            words.extend_from_slice(shuffle);
+            words.extend([
+                0xD760_0002, // v_readlane_b32 s2, vsrc, 35
+                0x0001_4700 | vsrc,
+                RESTORE_EXEC,
+                0x7E00_0202, // v_mov_b32 v0, s2
+            ]);
+            words.extend(DS_WRITE_V1_V0);
+            words.push(S_ENDPGM);
+
+            let normal = lowered(&words, 64, false, false);
+            assert_eq!(
+                normal.wave_read_lane_calls,
+                [(
+                    "dx.op.waveReadLaneAt.i32".into(),
+                    vec![Some(117), None, Some(lane)]
+                )]
+            );
+
+            let split = lowered(&words, 64, false, true);
+            assert!(split.exchanges);
+            assert_eq!(split.barriers, 2);
+            assert!(split.wave_read_lane_calls.is_empty());
+        }
     }
 
     #[test]
