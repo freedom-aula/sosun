@@ -169,16 +169,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 thread_local! {
     /// Lowering passes of this thread's last [`lower_graphics`].
     pub(super) static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Joins [`Lower::live_edges`] went through, with what it knew each time, in that lowering.
-    pub(super) static LIVE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     #[cfg(test)]
     PASSES.set(0);
-    #[cfg(test)]
-    LIVE_VISITS.set(0);
     // Compute programs hold masks the structurisation cannot see into
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
@@ -13736,40 +13732,30 @@ impl<'a> Lower<'a> {
     /// edge, and a contradiction (the lane that skipped an arm is not one
     /// that ran it) leaves the edge dead. A back edge forgets the branches
     /// (the loop redefines their conditions). Fewer conditions are weaker,
-    /// so keeping only the last few stays sound.
+    /// so keeping only the last few stays sound, and so does walking a phi
+    /// knowing nothing once it has been walked with `MAX_PATHS` sets.
     fn live_edges(&self) -> Set<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
+        // A branchy pixel shader of the title reached thousands of sets per
+        // phi, each compared with all before it, and never finished.
+        const MAX_PATHS: usize = 64;
         let (p, st) = (self.x.p, &self.x.st);
-        type Visit = (Value, Vec<(Bool, bool)>);
-        // Visits waiting, by how many conditions they know: those that know least go first,
-        // so that what knows more finds them done and stops (in any other order one join was
-        // gone through for tens of thousands of sets of conditions).
-        let mut work: [Vec<Visit>; MAX_KNOWN + 1] = Default::default();
-        work[0] = self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
+            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         let mut live = Set::default();
-        // By join, what was known each time it was gone through, sorted: a set, so finding
-        // an earlier visit that knew no more is 16 lookups (the subsets of at most `MAX_KNOWN`
-        // conditions), not a search of every earlier visit (thousands at one join made a
-        // pixel shader take minutes).
-        let mut seen = Map::<Value, Set<Vec<(Bool, bool)>>>::default();
-        while let Some((v, known)) = work.iter_mut().find_map(|w| w.pop()) {
+        let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
+        while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             let done = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            let mut sorted = known.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            let subset = |bits: u32| -> Vec<(Bool, bool)> {
-                (0..sorted.len()).filter(|n| bits >> n & 1 != 0).map(|n| sorted[n]).collect()
-            };
-            if (0..1u32 << sorted.len()).any(|bits| done.contains(&subset(bits))) {
+            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
                 continue;
             }
-            done.insert(sorted);
-            #[cfg(test)]
-            LIVE_VISITS.set(LIVE_VISITS.get() + 1);
+            // Knowing nothing covers every later set, so this is the phi's last walk.
+            let known = if done.len() < MAX_PATHS { known } else { Vec::new() };
+            done.push(known.clone());
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
@@ -13798,7 +13784,7 @@ impl<'a> Lower<'a> {
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
                 if self.phi_at.contains_key(&arg) {
-                    work[k.len()].push((arg, k));
+                    work.push((arg, k));
                 }
             }
         }
@@ -15319,7 +15305,7 @@ mod tests {
         // every one to the read at the end, so the deeper joins' phis were walked back once per
         // set of the last four conditions on the way, 12^4 sets each, every new one compared with
         // all the ones before it (minutes; a title pixel shader never finished). Past
-        // `live_edges` now goes through each join about once (visits kept as a set).
+        // `MAX_PATHS` sets a phi is walked knowing nothing.
         const K: u32 = 12;
         const D: u32 = 6;
         let mut words = vec![0xBE86_0380]; // s_mov_b32 s6, 0
