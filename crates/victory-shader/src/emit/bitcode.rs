@@ -623,6 +623,16 @@ impl Module {
                     _ => None,
                 },
                 V::Inst(i) => match m.insts[i as usize].op {
+                    Op::Bin(op, a, b) if matches!(m.types[m.type_of(v).0 as usize], TypeDef::Int(32)) => {
+                        let (a, b) = (constant(m, a)? as u32, constant(m, b)? as u32);
+                        let value = match op {
+                            Bin::Add => a.wrapping_add(b),
+                            Bin::LShr => a.checked_shr(b)?,
+                            Bin::And => a & b,
+                            _ => return None,
+                        };
+                        Some(i64::from(value as i32))
+                    }
                     Op::Cast(Cast::Bitcast, x) => constant(m, x),
                     _ => None,
                 },
