@@ -67,6 +67,9 @@ pub struct TitleList<B: GraphicsBackend> {
     /// its draw, and the title resources bound as targets (for the target trace).
     pub strides: Vec<u32>,
     pub target_keys: Vec<usize>,
+    /// The depth target `OMSetRenderTargets` bound last (`None` when the binding has none), which
+    /// `VICTORY_AMBIENT` shades the presented picture by.
+    pub depth_key: Option<usize>,
 }
 
 /// The formats of a draw's bound colour and depth targets.
@@ -89,6 +92,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             targets_ready: true,
             strides: Vec::new(),
             target_keys: Vec::new(),
+            depth_key: None,
         }
     }
 }

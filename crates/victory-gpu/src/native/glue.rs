@@ -15,7 +15,7 @@ use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use victory_backend::resources::HeapKind;
+use victory_backend::resources::{HeapKind, PresentBackend};
 use victory_metal::metal::Metal;
 
 pub type MetalTitle = Title<Metal>;
@@ -643,6 +643,31 @@ pub(crate) fn present(queue: This, resource: This) {
     if tracing_targets() {
         trace_present(resource);
     }
+    // VICTORY_AMBIENT: the presented picture shaded by the frame's most-drawn depth target, so
+    // the world shows while the lighting passes are still refused (native/ambient.rs). The choice
+    // is given to the surface before the present is queued; a frame that drew no depth clears it.
+    if let Some(k) = super::ambient::level() {
+        let chosen = super::ambient::choose();
+        with_title(|t| {
+            let depth = chosen.and_then(|(key, draws)| {
+                let tex = t.texture_of(key)?;
+                static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != Some((key, draws)) {
+                    *last = Some((key, draws));
+                    let i = crate::resource::texture_info(key as This)
+                        .map(|i| (i.format, i.width, i.height));
+                    tracing::info!(key, draws, info = ?i, level = k, "ambient fallback: shading presents by this depth target");
+                }
+                Some(tex)
+            });
+            if let Some(surface) = t.surface()
+                && let Err(e) = t.host.backend.set_ambient_fallback(surface, depth.as_deref(), k)
+            {
+                tracing::warn!(error = %e, "the ambient fallback cannot shade this present");
+            }
+        });
+    }
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
         t.present(queue as usize, resource as usize)
@@ -707,6 +732,7 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
         l.target_keys = views.iter().flatten().map(|r| r.resource as usize).chain(depth_key).collect();
+        l.depth_key = depth_key;
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
         let made: Option<Vec<_>> = views
@@ -1494,6 +1520,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
                     ENCODED.fetch_add(1, Ordering::Relaxed);
                     trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                    super::ambient::note(l.depth_key);
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
             }
@@ -1516,6 +1543,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
                     ENCODED.fetch_add(1, Ordering::Relaxed);
                     trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                    super::ambient::note(l.depth_key);
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
             }

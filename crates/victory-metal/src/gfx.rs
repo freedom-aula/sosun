@@ -67,9 +67,15 @@ impl Drop for Heap {
 }
 
 pub struct Texture {
-    tex: Retained<ProtocolObject<dyn MTLTexture>>,
+    pub(crate) tex: Retained<ProtocolObject<dyn MTLTexture>>,
     /// What the pixels are as Metal reads them: sizes the CPU transfers' bounds check.
-    format: Format,
+    pub(crate) format: Format,
+}
+
+impl Clone for Texture {
+    fn clone(&self) -> Self {
+        Texture { tex: self.tex.clone(), format: self.format }
+    }
 }
 
 /// What a CPU transfer of a `w` x `h` x `d` mip needs of `format`: `(row bytes, total bytes)`, or the

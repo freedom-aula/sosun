@@ -709,4 +709,16 @@ pub trait PresentBackend: GraphicsBackend {
         surface: &Self::Surface,
         source: &Self::Texture,
     ) -> Result<(), String>;
+
+    /// `VICTORY_AMBIENT`: from now on, shade the surface's near-black presented pixels by `depth`
+    /// (`level` the constant ambient), so the world is visible while the title's lighting passes
+    /// are still refused. `None` presents plainly again. A debug aid that changes no other work.
+    fn set_ambient_fallback(
+        &self,
+        _surface: &Self::Surface,
+        _depth: Option<&Self::Texture>,
+        _level: f32,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }

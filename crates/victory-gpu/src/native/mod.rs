@@ -22,6 +22,7 @@ macro_rules! env_set {
 }
 
 pub mod addr;
+pub mod ambient;
 pub mod console_state;
 pub(crate) mod descriptor_trace;
 pub mod descriptors;

@@ -20,11 +20,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Draws a texture over the whole target. Compiled by Metal's own compiler at run time (this is
-/// the one shader of the backend that is not converted DXIL).
+/// the one shader of the backend that is not converted DXIL). With `VICTORY_AMBIENT`, a second
+/// fragment shades the near-black pixels of the source by a depth target: the lighting compute
+/// passes can still be refused, and a fully drawn G-buffer would otherwise reach the screen as
+/// pitch black after tone-mapping. Guesses: the console's reversed Z (near 1, far 0, so nearer is
+/// brighter), and that all channels under 0.02 mean unlit rather than the title's own black.
 const SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 struct Out { float4 position [[position]]; float2 uv; };
+struct Ambient { float level; };
 vertex Out present_vertex(uint i [[vertex_id]]) {
     float2 p = float2((i << 1) & 2, i & 2);
     Out o;
@@ -36,9 +41,22 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     return source.sample(s, in.uv);
 }
+fragment float4 ambient_fragment(Out in [[stage_in]], texture2d<float> source [[texture(0)]],
+                                 texture2d<float> z [[texture(1)]], constant Ambient& a [[buffer(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float4 c = source.sample(s, in.uv);
+    float shade = z.sample(s, in.uv).r;
+    float3 lit = float3(a.level * shade);
+    float black = step(max(c.r, max(c.g, c.b)), 0.02);
+    return float4(mix(c.rgb, lit, black), c.a);
+}
 "#;
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+
+/// The `VICTORY_AMBIENT` state of one surface: the depth target its presents shade by, and the
+/// constant ambient level.
+type Ambient = (Texture, f32);
 
 // CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
 // worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
@@ -63,6 +81,10 @@ pub struct Surface {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// The copy pipeline for each drawable format seen.
     pipelines: RefCell<HashMap<usize, Pipeline>>,
+    /// The copy pipeline of the ambient fragment for each drawable format seen.
+    ambient: RefCell<HashMap<usize, Pipeline>>,
+    /// `VICTORY_AMBIENT`: the depth target presents shade near-black pixels by, and its level.
+    shade: RefCell<Option<Ambient>>,
     /// The texture of the last drawable presented, readable when the layer is not frame-buffer
     /// only (the tests read their pixels from it).
     last: RefCell<Option<Retained<ProtocolObject<dyn MTLTexture>>>>,
@@ -218,8 +240,10 @@ fn pipeline(
     m: &Metal,
     surface: &Surface,
     format: MTLPixelFormat,
+    fragment: &str,
+    cache: &RefCell<HashMap<usize, Pipeline>>,
 ) -> Result<Pipeline, String> {
-    if let Some(p) = surface.pipelines.borrow().get(&format.0) {
+    if let Some(p) = cache.borrow().get(&format.0) {
         return Ok(p.clone());
     }
     let d = MTLRenderPipelineDescriptor::new();
@@ -228,7 +252,7 @@ fn pipeline(
     d.setFragmentFunction(
         surface
             .library
-            .newFunctionWithName(&name("present_fragment"))
+            .newFunctionWithName(&name(fragment))
             .as_deref(),
     );
     // SAFETY: colour attachment 0 always exists.
@@ -237,7 +261,7 @@ fn pipeline(
         .dev
         .newRenderPipelineStateWithDescriptor_error(&d)
         .map_err(|e| e.localizedDescription().to_string())?;
-    surface.pipelines.borrow_mut().insert(format.0, p.clone());
+    cache.borrow_mut().insert(format.0, p.clone());
     Ok(p)
 }
 
@@ -274,10 +298,36 @@ impl PresentBackend for Metal {
             acquiring: std::cell::Cell::new(false),
             library,
             pipelines: RefCell::default(),
+            ambient: RefCell::default(),
+            shade: RefCell::default(),
             last: RefCell::default(),
             frames: Default::default(),
             green: Default::default(),
         })
+    }
+
+    fn set_ambient_fallback(
+        &self,
+        _surface: &Surface,
+        depth: Option<&Texture>,
+        level: f32,
+    ) -> Result<(), String> {
+        // A packed depth-stencil texture is read through its float depth view, as the backend's
+        // own views of depth textures do (`create_texture_view`).
+        let depth = depth
+            .map(|t| {
+                if t.tex.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 {
+                    t.tex
+                        .newTextureViewWithPixelFormat(MTLPixelFormat::R32Float)
+                        .map(|v| Texture { tex: v, format: t.format })
+                        .unwrap_or_else(|| t.clone())
+                } else {
+                    t.clone()
+                }
+            })
+            .map(|t| (t, level));
+        *_surface.shade.borrow_mut() = depth;
+        Ok(())
     }
 
     fn present(
@@ -327,7 +377,27 @@ impl PresentBackend for Metal {
             let e = cb
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or("no render encoder")?;
-            let state = pipeline(self, surface, target.pixelFormat())?;
+            // VICTORY_AMBIENT: shade near-black source pixels by the depth target the host chose,
+            // so the world is visible while the lighting passes are still refused.
+            let shade = surface.shade.borrow();
+            let state = match shade.as_ref() {
+                Some((depth, level)) => {
+                    let p = pipeline(self, surface, target.pixelFormat(), "ambient_fragment", &surface.ambient)?;
+                    // SAFETY: slot 1 of the fragment stage takes the depth texture, and the level
+                    // is four bytes set inline (setFragmentBytes copies them before returning).
+                    unsafe {
+                        e.setFragmentTexture_atIndex(Some(&depth.tex), 1);
+                        e.setFragmentBytes_length_atIndex(
+                            std::ptr::NonNull::new((&raw const level).cast_mut().cast()).unwrap(),
+                            std::mem::size_of::<f32>(),
+                            0,
+                        );
+                    }
+                    p
+                }
+                None => pipeline(self, surface, target.pixelFormat(), "present_fragment", &surface.pipelines)?,
+            };
+            drop(shade);
             e.setRenderPipelineState(&state);
             // SAFETY: slot 0 of the fragment stage takes the source texture.
             unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
