@@ -362,6 +362,9 @@ struct Lower<'a> {
     /// Mesh: SCC of a uniform compare ANDed with EXEC ([`Self::uniform_and_exec`]): the
     /// compare's result value.
     uniform_scc: Map<Value, Value>,
+    /// Mesh: SCC of EXEC ANDed with (or without) a lane function of uniform atoms
+    /// ([`Self::uniform_with_exec`]): the function, and whether SCC is its complement.
+    uniform_bits: Map<Value, UniformBit>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -502,6 +505,9 @@ enum MaskData {
     /// console's, so the first lane and the count below a lane are refused.
     None,
 }
+
+/// A mesh SCC's lane function, whether SCC is its complement, and the atoms EXEC decides.
+type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
@@ -864,6 +870,7 @@ impl<'a> Lower<'a> {
             ballots: Map::default(),
             mask_scc: Map::default(),
             uniform_scc: Map::default(),
+            uniform_bits: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -2147,6 +2154,22 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, any);
             return Ok(any);
         }
+        if let (Some(Val::Missing(_)), Some((m, not, fixed))) =
+            (found, self.uniform_bits.get(&v).cloned())
+        {
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let mut x = self.boolean_given(m, at, &fixed)?;
+            if not {
+                let t = self.s.m.bool(true);
+                x = self.s.m.bin(at, Bin::Xor, x, t);
+            }
+            self.vals.insert(v, Val::Bit(x));
+            return Ok(Val::Bit(x));
+        }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
             // Emit in the defining block so caching in `vals` dominates all uses,
@@ -3094,6 +3117,21 @@ impl<'a> Lower<'a> {
         };
         self.bools.insert((at, b), v);
         Ok(v)
+    }
+
+    /// [`Self::boolean`] with the atoms of `fixed` taken as its values.
+    // shortcut: no sharing of nodes reached twice, as these functions are of a few atoms.
+    fn boolean_given(&mut self, b: Bool, at: usize, fixed: &[(Atom, bool)]) -> Result<V, Why> {
+        let Some((atom, lo, hi)) = self.x.st.bools.node(b).filter(|_| !fixed.is_empty()) else {
+            return self.boolean(b, at);
+        };
+        if let Some(&(_, v)) = fixed.iter().find(|f| f.0 == atom) {
+            return self.boolean_given(if v { hi } else { lo }, at, fixed);
+        }
+        let a = self.atom(atom, at)?;
+        let h = self.boolean_given(hi, at, fixed)?;
+        let l = self.boolean_given(lo, at, fixed)?;
+        Ok(self.s.m.select(at, a, h, l))
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
@@ -4883,6 +4921,8 @@ impl<'a> Lower<'a> {
                 } else if let Some(u) = self.uniform_and_exec(inst) {
                     // Mesh: no ballot, but a uniform mask needs none.
                     self.uniform_scc.insert(scc, u);
+                } else if let Some(r) = self.uniform_with_exec(inst) {
+                    self.uniform_bits.insert(scc, r);
                 }
             }
             return Err(LANE_MASK);
@@ -13183,6 +13223,38 @@ impl<'a> Lower<'a> {
             .all(|r| cmp.read(Reg::S(r)).is_some() && cmp.read(Reg::S(r)) == inst.read(Reg::S(r)));
         (matches!(cmp.fields, Fields::Valu(_)) && same_exec && self.uniform_atom(Atom::Lane(u)))
             .then_some(u)
+    }
+
+    /// Mesh: SCC of `s_and` of EXEC and a mask, or `s_andn2` of EXEC by one, where the mask is
+    /// a function of atoms [`Self::uniform_atom`] takes once EXEC decides the rest (the title's
+    /// NGG vertex programs test such masks so: compares of SGPRs, which hold 0 outside the
+    /// compare's EXEC, and `s_cselect` by SCC): the same bit in every lane, so SCC is the
+    /// function's bit, or its complement for `s_andn2`, with the atoms EXEC decides.
+    // Guess: EXEC is not empty there, as for `uniform_and_exec`.
+    fn uniform_with_exec(&self, inst: &Inst) -> Option<UniformBit> {
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        let code = |k: usize| match src.get(k)? {
+            Operand::Scalar { code, .. } => Some(*code),
+            _ => None,
+        };
+        let (other, not) = match (inst.name().strip_suffix(width)?, code(0)?, code(1)?) {
+            ("s_and", EXEC, c) | ("s_and", c, EXEC) if c != EXEC => (c, false),
+            ("s_andn2", EXEC, c) if c != EXEC => (c, true),
+            _ => return None,
+        };
+        let v = inst.read(Reg::S(other))?;
+        let st = &self.x.st;
+        let &m = st.masks.get(&v).or_else(|| st.other.get(&v))?;
+        // Atoms EXEC decides (the EXEC a compare ANDs its lanes with) are those values in it.
+        let exec = inst.read(Reg::S(EXEC)).and_then(|e| st.masks.get(&e));
+        let mut fixed = Vec::new();
+        for a in st.bools.support(m) {
+            if !self.uniform_atom(a) {
+                fixed.push((a, st.bools.decides(&[(*exec?, true)], a)?));
+            }
+        }
+        Some((m, not, fixed))
     }
 
     /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a

@@ -1529,4 +1529,37 @@ mod tests {
             assert!(e.to_string().contains("lane mask"), "{e}");
         }
     }
+
+    /// The NGG vertex programs ahead of the G-buffer test EXEC without such a mask: the compare
+    /// ANDed with an `s_cselect` of -1 and 0 by SCC, then `s_andn2_b64 sN, exec, mask`, its SCC
+    /// kept and branched on (was refused: "a lane mask read as data"). On EXEC the mask is a
+    /// function of uniform atoms, so SCC (some lane of EXEC outside it) is its complement.
+    #[test]
+    fn a_mesh_program_keeps_the_scc_of_exec_without_a_uniform_lane_mask() {
+        let program = |cmp: [u32; 2]| {
+            [
+                0xBEFE_0481, // s_mov_b64 exec, 1
+                0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0x7DA8_0008, // v_cmpx_gt_u32 s8, v0
+                0xBF88_000A, // s_cbranch_execz 10
+                cmp[0], cmp[1], // v_cmp_ge_f32 vcc, <src0>, 0
+                0xBF0D_8008, // s_bitcmp1_b32 s8, 0
+                0x8598_80C1, // s_cselect_b64 s[24:25], -1, 0
+                0x8798_186A, // s_and_b64 s[24:25], vcc, s[24:25]
+                0x8A96_187E, // s_andn2_b64 s[22:23], exec, s[24:25]
+                0xBE94_03FD, // s_mov_b32 s20, src_scc
+                0xBF01_8014, // s_cmp_lg_i32 s20, 0
+                0xBF84_0001, // s_cbranch_scc0 1
+                0x7E00_02F2, // v_mov_b32 v0, 1.0
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+                0xF800_0941, 0x0000_0001, // exp prim v1 done
+                ENDPGM,
+            ]
+        };
+        mesh(&program([0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
+        let e = mesh(&program([0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
+        assert!(e.to_string().contains("lane mask"), "{e}");
+    }
 }
