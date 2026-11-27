@@ -1135,3 +1135,37 @@ validation). Previously all texture copy calls incremented `texture_copies` (`DR
 and left destination textures empty (tests: `victory-metal`
 `texture_blit_ops_copy_between_textures_and_buffers` and `victory-gpu`
 `native::texture_tests::copy_resource_and_copy_texture_region_run_on_the_gpu`).
+
+What the world needs on top of that (`fix/texture-copies-port`):
+
+* **Formats no view joins** but D3D12 copies between go through a scratch buffer of the host's
+  own, texture to buffer to texture: plain texels against compressed blocks of the same byte size
+  (one texel a 4x4 block; the world copies `R32G32B32A32_UINT` into BC3 and `R32G32_UINT` into
+  BC1, a GPU encoder's output), and a depth plane against a plain 4-byte format
+  (`victory_metal::gfx::direct_copy` decides; the region given is in source texels, the
+  destination's is scaled). The checks sit in `glue::copy_formats` and `glue::dest_size` too, so a
+  copy the host cannot do is refused at record time and counted, not skipped silently by the
+  encoder.
+* **Depth and stencil to and from buffer rows.** A `D32FloatS8` texture moves its 4-byte depth
+  plane (`MTLBlitOptionDepthFromDepthStencil`); `D32Float` and `D16Unorm` copy as they are. A
+  footprint naming both planes in one element (`D32_FLOAT_S8X24`) is still refused; the rows of
+  a depth plane come as `R32_TYPELESS` and the like. Rows and texture must have texels of one
+  size (`glue::rows_match`).
+* **`ResolveSubresource`.** Host textures have one sample, so a resolve copies what both
+  subresources hold (the console clips a larger source to the destination, as the D3D12 host
+  does).
+* **The destination is the GPU's** (`Title::gpu_written`), as a render target's is: the CPU-side
+  sync (`sync_keys`, fed by the scanner and the hot and blank probes) never fills it from title
+  memory again, which holds none of what the copy wrote. A sampled texture not uploaded yet still
+  takes its first upload at that submission, before the copy runs, so a region copy keeps the
+  rest. Guess, marked in `textures.rs`: a title does not refill a copy's destination from the CPU
+  later; if one does, that write is not seen.
+* **Counters.** "native draws so far" has `copies_recorded` next to `texture_copies` (refused);
+  with `VICTORY_TRACE_TARGETS=1` the frame line has `copies=` (since the last present) and each
+  kind is logged once ("a texture copy (first of its kind)"). A refused copy warns once per
+  operation and pair of title formats ("a texture copy refused (first of this kind)").
+
+Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resource_copies_a_texture_on_the_gpu`
+(and its destination keeps the copy when its title memory changes),
+`copy_texture_region_moves_plain_texels_into_compressed_blocks`,
+`resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.

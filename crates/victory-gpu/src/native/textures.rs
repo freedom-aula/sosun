@@ -382,7 +382,9 @@ pub struct Tracked<B: ResourceBackend> {
     blank: bool,
     /// Render-target views already made, kept so the same attachment keeps its identity.
     #[cfg(target_os = "macos")]
-    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
+    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,    /// A GPU copy wrote it: its host texture holds what title memory does not, and is never
+    /// filled from that memory again.
+    gpu_written: bool,
 }
 
 /// The other format of an sRGB pair.
@@ -705,6 +707,7 @@ impl<B: PresentBackend> Title<B> {
                 blank: false,
                 #[cfg(target_os = "macos")]
                 target_views: Vec::new(),
+                gpu_written: false,
             },
         );
         true
@@ -765,6 +768,19 @@ impl<B: PresentBackend> Title<B> {
             }
         }
         None
+    }
+
+    /// A GPU copy writes title texture `key` (made already): from now on the host texture is the
+    /// GPU's, as a render target's is, and the CPU-side sync no longer fills it from title memory.
+    /// A sampled texture not uploaded yet still takes its first upload, at the submission and so
+    /// before the copy runs (a copy of a region keeps the rest).
+    /// shortcut: what the title writes into its memory afterwards is not seen; when a title is
+    /// found to refill a copy's destination from the CPU, upload a change again.
+    pub fn gpu_written(&mut self, key: usize) {
+        if let Some(t) = self.textures.get_mut(&key) {
+            t.gpu_written = true;
+            (t.hot, t.blank) = (0, false);
+        }
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -874,6 +890,9 @@ impl<B: PresentBackend> Title<B> {
                 continue;
             };
             if t.info.desc().is_some_and(|d| d.format.is_depth()) {
+                continue;
+            }
+            if t.gpu_written && (t.uploads > 0 || t.info.render_target()) {
                 continue;
             }
             let tiled = read_memory(t.info.memory, t.info.size);

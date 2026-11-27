@@ -1002,3 +1002,106 @@ fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
         }
     }
 }
+
+/// Closes title list `list`, submits it and waits for the GPU to run it.
+fn run_title_list(list: This) {
+    let (q, f) = (crate::queue::test_queue(false), {
+        let mut f = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+        f
+    });
+    assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+    slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+    slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    assert_eq!(slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(f, 1, std::ptr::null_mut()), 0);
+}
+
+type CopyRegion = extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6]);
+
+/// `CopyResource` of two title textures is a GPU copy, and the destination stays the GPU's: a
+/// later sync does not fill it from its title memory.
+#[test]
+fn copy_resource_copies_a_texture_on_the_gpu() {
+    let Some(pool) = pool(9211, 8) else { return };
+    let src = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let dst = crate::resource::test_texture_at(pool.va(65536), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    tile(&pool, 0, &crate::resource::texture_info(src).unwrap().layout);
+    let list = crate::list::test_list(false, std::ptr::null());
+    slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, dst, src);
+    run_title_list(list);
+    let want: Vec<u8> = (0..16).flat_map(|y| (0..16).flat_map(move |x| texel(0, x, y))).collect();
+    assert!(read_mip(dst as usize, 0, 16, 16) == want, "the copy did not reach the destination");
+    // Its title memory changes (it never held the copy): the host texture keeps the copy.
+    pool.write(65536, &[0x11u8; 1024]);
+    with_title(|t| t.sync_textures());
+    assert!(read_mip(dst as usize, 0, 16, 16) == want, "the destination was filled again from title memory");
+}
+
+/// Plain texels of a compressed block's size copy into compressed blocks (a GPU encoder's
+/// output), which no view joins: through a buffer, one texel a block.
+#[test]
+fn copy_texture_region_moves_plain_texels_into_compressed_blocks() {
+    let Some(pool) = pool(9213, 8) else { return };
+    // DXGI 3 (R32G32B32A32_UINT) 2x2 into DXGI 77 (BC3) 8x8.
+    let src = crate::resource::test_texture_at(pool.va(0), (2, 2), 1, 3, Swizzle::LINEAR.0, 0);
+    let dst = crate::resource::test_texture_at(pool.va(65536), (8, 8), 1, 77, Swizzle::LINEAR.0, 0);
+    let blocks: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+    let info = crate::resource::texture_info(src).unwrap();
+    let mut tiled = vec![0u8; info.layout.size as usize];
+    info.layout.tile(&mut tiled, 0, 0, &blocks, 32, 64).unwrap();
+    pool.write(0, &tiled);
+    let list = crate::list::test_list(false, std::ptr::null());
+    slot::<CopyRegion>(list, 0x80)(list, &crate::list::CopyLocation::whole(dst), 0, 0, 0, &crate::list::CopyLocation::whole(src), std::ptr::null());
+    run_title_list(list);
+    let out = with_title(|t| {
+        let tex = t.texture_of(dst as usize).expect("a host texture");
+        let mut out = vec![0u8; 64];
+        t.host.backend.read_texture(&tex, 0, 0, &mut out, 32, 64);
+        out
+    })
+    .unwrap();
+    assert_eq!(out, blocks);
+}
+
+/// `ResolveSubresource` of single-sample textures: a copy of what both subresources hold (a
+/// larger source is clipped to the destination).
+#[test]
+fn resolve_subresource_copies_what_both_hold() {
+    let Some(pool) = pool(9214, 8) else { return };
+    let src = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let dst = crate::resource::test_texture_at(pool.va(65536), (8, 8), 1, 28, Swizzle::LINEAR.0, 0);
+    tile(&pool, 0, &crate::resource::texture_info(src).unwrap().layout);
+    let list = crate::list::test_list(false, std::ptr::null());
+    slot::<extern "system" fn(This, This, u32, This, u32, u32)>(list, 0x98)(list, dst, 0, src, 0, 28);
+    run_title_list(list);
+    let want: Vec<u8> = (0..8).flat_map(|y| (0..8).flat_map(move |x| texel(0, x, y))).collect();
+    assert!(read_mip(dst as usize, 0, 8, 8) == want, "the resolve did not reach the destination");
+}
+
+/// A depth and stencil texture to and from buffer rows moves its 4-byte depth plane: rows in, then
+/// a region of them out again into other rows.
+#[test]
+fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
+    use crate::list::CopyLocation;
+    use crate::resource::PlacedFootprint;
+    let Some(pool) = pool(9215, 8) else { return };
+    // DXGI 19 (D32_FLOAT_S8X24_UINT), a depth target; rows as DXGI 41 (R32_FLOAT).
+    let depth = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 19, Swizzle::LINEAR.0, 2);
+    let buf = crate::resource::test_buffer_at(pool.va(65536), 65536);
+    let values: Vec<f32> = (0..16 * 16).map(|i| i as f32 / 256.0).collect();
+    for y in 0..16 {
+        pool.write(65536 + y * 256, &values[y * 16..y * 16 + 16]);
+    }
+    let list = crate::list::test_list(false, std::ptr::null());
+    let copy = slot::<CopyRegion>(list, 0x80);
+    let rows = CopyLocation::placed(buf, PlacedFootprint::new(0, 41, 16, 16, 256));
+    copy(list, &CopyLocation::whole(depth), 0, 0, 0, &rows, std::ptr::null());
+    let out = CopyLocation::placed(buf, PlacedFootprint::new(8192, 41, 4, 2, 256));
+    copy(list, &out, 0, 0, 0, &CopyLocation::whole(depth), &[3, 5, 0, 7, 7, 1]);
+    run_title_list(list);
+    for r in 0..2 {
+        let got: Vec<f32> = pool.read(65536 + 8192 + r * 256, 4);
+        let at = (5 + r) * 16 + 3;
+        assert_eq!(got, values[at..at + 4], "row {r}");
+    }
+}

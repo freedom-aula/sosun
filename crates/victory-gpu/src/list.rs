@@ -895,6 +895,15 @@ impl CopyLocation {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl CopyLocation {
+    /// Subresource `index` of `resource` (the index shares the footprint's first dword).
+    pub(crate) fn sub(resource: This, index: u32) -> Self {
+        let footprint = crate::resource::PlacedFootprint { offset: index.into(), format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
+        Self { resource, kind: 0, footprint }
+    }
+}
+
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1079,7 +1088,9 @@ extern "system" fn resolve(
         }
     }
     #[cfg(target_os = "macos")]
-    crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    if !crate::native::glue::resolve(this, dst, dst_sub, src, src_sub) {
+        crate::native::glue::dropped_op("ResolveSubresource", dst, src);
+    }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
