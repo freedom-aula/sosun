@@ -325,6 +325,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 - Callbacks (`qsort`, `bsearch`, `_initterm`, `_execute_onexit_table`, `signal`/`raise`, the invalid-parameter handler) are title functions called with `call_win64`. `qsort` is a merge sort over a copy, so an inconsistent comparator cannot panic the host.
 - `strtod`, `strtof`, their wide forms and `scanf`'s floats set `ERANGE` for an underflow to zero (nonzero digits read as 0, such as `1e-400`) as for an overflow, as Microsoft documents; zero digits and subnormals do not.
 - `FILE*` is a leaked 16-byte block the title never reads; behind it is a stream shared with the descriptor `_fileno` returns, over `files::translate` paths (so `G:\` works). Reads are buffered, writes are not. Text mode drops `\r` before `\n` on reads and writes `\n` unchanged. `_filelength`, `_tell`, `_eof` and their 64-bit forms return -1 with `EBADF` for a descriptor that is not open, as Microsoft documents. `_read` of a descriptor not open for reading returns -1 with `EBADF`, as Microsoft documents, not the 0 of an end of file. A failed seek leaves the position alone and sets `errno` as Microsoft documents for `_lseek`: `EBADF` for a bad descriptor, `EINVAL` for a bad origin or a position before the start of the file (`fseek` too).
+- `_findfirst*`, `_findnext*` and `_findclose` set the `errno` Microsoft documents: `EINVAL` for a null file specification or out structure and for a `_findnext` that fails for a reason other than no more files (such as a bad handle), `ENOENT` when nothing (more) matches and for any `_findclose` failure.
 - `errno` is per thread (`_errno()`), with the Windows numbers (`EDOM` 33, `ERANGE` 34, `STRUNCATE` 80). The math functions set `EDOM` for a NaN from numbers and `ERANGE` for an infinity from finite ones. `remquo` stores the sign of `x / y` and the low three bits of the quotient's magnitude (taken from `|x| mod 8|y|`, so they hold for huge quotients too). The checked `float` wrappers (the `unary!`/`binary!` forms such as `expf`, `powf` and `fdimf`), `ldexpf`, `scalbnf`, `scalblnf` and `nextafterf` check the result after rounding it to a float, so a float overflow sets `ERANGE`; `fdim`, `ldexp`, `scalbn`, `scalbln`, `_scalb`, `nextafter` and `nexttoward` set it on overflow too. Underflow (a result rounded to zero or a subnormal) leaves `errno` alone, for all of them.
 - `rand` is the CRT's linear generator, per thread, seed 1: `srand(1)` gives 41, 18467, 6334 as on Windows.
 - `argv`, `argc`, the command line and the environment come from the host process, or from `victory_hle::posix::set_command_line` (call it before the title's start-up code runs).
@@ -396,6 +397,7 @@ run):
 - `VirtualFree(MEM_RELEASE)` of `XMemVirtualAlloc` memory, or of a range `XMemMapPhysicalPages` mapped into, gives its physical-page views back too (`xmem_posix::forget_physical`, as `XMemFreeDefault` does). It used to give back only the address space, so the freed pool stayed in the GPU's pool table and the aliases at an address the next allocation was given: two memories at one title address (issue #15).
 - `VirtualFree(MEM_DECOMMIT)` over physical-page views (`XMemVirtualAlloc`'s pool backing, `XMemMapPhysicalPages`) keeps the views and makes them no access, instead of decommitting them (`xmem_physical::decommit`); the rest of the range is decommitted as before. Decommitting put anonymous pages in place of the pool's while the views and the GPU's pool table still showed the pool, so after a recommit the title wrote one memory and the GPU and aliases read another (issue #15). Windows only promises that a recommitted page reads zeros, so a page is zeroed when it is `XMemVirtualAlloc`'s pool backing and no other address shows it: no one else can read it. Other pages keep their bytes, since a page shown at other addresses (aliases, `map_alias`) is still read there, and pages `XMemAllocatePhysicalPages` made outlive their mappings (the title may map them again). Guess: the console keeps those pages' contents too; what it does is unknown, and `VICTORY_TRACE_OWNERS` names such a decommit. Zeroing touches every page it zeroes, also those never written.
 - File calls (`CreateFileW` and the rest, `host_posix::files::win32_error`) report host errors as Windows does, from one table shared with other callers (`win32_errors::code`, the UCRT's `_dosmaperr` read backwards): `EMFILE` and `ENFILE` are `ERROR_TOO_MANY_OPEN_FILES`, `EBADF` `ERROR_INVALID_HANDLE`, `ENOMEM` `ERROR_NOT_ENOUGH_MEMORY`, `EXDEV` `ERROR_NOT_SAME_DEVICE`, `EINVAL` `ERROR_INVALID_PARAMETER`, `ENOSPC` `ERROR_DISK_FULL`, and as before `ENOENT` (`ERROR_PATH_NOT_FOUND` when the parent folder is missing too), `EACCES`, `EEXIST` and `ENOTEMPTY`. Any other host error is still `ERROR_ACCESS_DENIED`; those above used to be too.
+- `FindFirstFile*` and `_findfirst*` match a pattern as Windows matches long names: it is first rewritten as kernel32 does (trailing dots and spaces dropped; a `.` before `*` or `?` may match the end of the name; every `?` matches one character, or none at a `.` or the end; a `*` before dropped dots stops at the name's last `.`), so `*.*` lists every file, `name.*` finds `name` too, and `*.` lists names without an extension. `<`, `>` and `"` in a pattern are those DOS wildcards. Checked against the long-name results of Wine's `test_FindFirstFile_wildcards` table, which runs on Windows too: the only differences are names Windows also matches by their 8.3 short names, which the host has none of.
 - TLS images must be registered before the threads that use them; thread notices go to every registered image on every title thread.
 - A `PagePool::map` over an existing mapping replaces it silently on macOS.
 - `XMemMapPhysicalPages`, its scatter form and the GPU's `map_alias` map only over a region `VirtualAlloc` or `XMemVirtualAlloc` made, over views of ours, or over free address space (`xmem_physical::may_map`). Anything else there (the host's heap, a library, a stack) was replaced silently by the `VM_FLAGS_OVERWRITE` mapping; now the call fails, with one warning per run.
@@ -976,6 +978,33 @@ Host textures are Metal's own allocations in Apple's layout, so what a compute p
 Tested with our own shader (`tex_fill.hlsl`) on an M2 Pro: a 64x64 RGBA8 2D texture in `LINEAR`, `SW_4KB_S` and `SW_64KB_D_X`. A second test sends tiled bytes up into a host texture and back down for 1D, 2D with 5 and 9 mips, a 2D array with mips, and 3D with and without mips (element sizes 1, 4 and 8, the same three modes plus `SW_64KB_S`): every mip, array slice and depth slice comes back where it was. It shows nothing is dropped, not that the console's layout equations are right (both directions use them). Not tested: a dispatch writing those shapes.
 
 A world run on an M5 Pro (Series S, windowed, reported on [#151](https://github.com/LakshanSivakumar/Native-Victory-macOS/pull/151)) named 22 textures as copied back (15 2D, 4 3D, 3 1D; the largest 256x256x16, 4 MiB), none too large, with no frame rate change beyond run-to-run noise up to the first world frame. The run then crashed (image+0x55e56f8, also without the switch), so whether boats float is still unknown. That count may be low: a texture skipped on its first completion was not logged then (fixed since).
+
+#### Size queries of writable images read 0 (fixed)
+
+A program that asks a writable image (a UAV) for its size got 0x0. The translator wrote the level of
+the query as DXIL's undefined value for a UAV, as DXC does (an `RWTexture` query has no level), and
+Metal through the Shader Converter answers that with 0. Sizes the host rebuilds into an image
+descriptor's own dwords, when a program reads its width or height from the descriptor's bits instead
+of querying them (`Lower::descriptor_data`), came from the same query and read 0 too (height - 1
+read as 16383).
+
+Under Wine the same answer from D3DMetal gave the title's sun-shadow min/max program
+(`cascadeshadows_processing:CS_ComputeMinMax`, `07f451a14b13fecb`) a 0x0 image, so its tile
+classifier lit or shadowed whole 16x16 tiles ([halfwave50/VIctory-macOS-halfwave50
+0f3ed38](https://github.com/halfwave50/VIctory-macOS-halfwave50/commit/0f3ed38), opt-in per program
+there).
+
+* **`image_get_resinfo`** now queries the level in the program's first address for every image, as
+  for shader resource views. Level 0 is the view's own size.
+* **guess:** a level past a writable view's single one reads 0 on the console, as it does here.
+  Forcing level 0 in every program under Wine changed the TAA disocclusion mask and put speckles on
+  skin, which suggests some programs ask about another level. Those keep reading 0, as before.
+* **Descriptor fields** of an image come from level 0, writable or not. A buffer's record count
+  keeps the undefined level, which a buffer ignores.
+* **Tested** (`heap_tests::a_size_query_of_a_writable_image_reads_its_size`, M1 Pro, macOS 27.2,
+  MSC 4.0.3): a 16x8 texture UAV declared in a table. Upstream read `[0, 0, 16383]` for the width,
+  height and descriptor height - 1, the query fix alone `[16, 8, 16383]`, and both fixes
+  `[16, 8, 7]`. **Not tested:** a game run; the shadow edges themselves.
 
 #### Texture formats the host lacked
 
