@@ -335,3 +335,88 @@ fn a_compute_shader_loads_a_texture_by_heap_index() {
     super::run(&t.host, &[&l]);
     assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }
+
+/// A compute program asking a writable image for its size: a table at user data 4 holds the raw
+/// output UAV (dwords 0-3) and a texture UAV (dwords 8-15), as the title's metadata declares them.
+/// `image_get_resinfo` at level 0 (v0) returns width and height, which go to the output's dwords 0
+/// and 1, and the height the descriptor's own bits hold (less 1) goes to dword 2; the program also
+/// stores to the image, as the title's programs that query it do.
+const CS_UAV_SIZE: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0x7E12_0280, // v_mov_b32 v9, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF038_1308, 0x0004_0200, // image_get_resinfo v[2:3], v0, s[16:23] dmask:0x3 dim:2D unorm
+    0xF020_1F08, 0x0004_0600, // image_store v[6:9], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+    0xE070_0004, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0 offset:4
+    // Its height read from the descriptor's own bits (dword 2 bits 14-29: height - 1).
+    0x9018_8E12, // s_lshr_b32 s24, s18, 14
+    0x8718_FF18, 0x0000_3FFF, // s_and_b32 s24, s24, 0x3fff
+    0x7E08_0218, // v_mov_b32 v4, s24
+    0xE070_0008, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0 offset:8
+    0xBF81_0000, // s_endpgm
+];
+
+/// The size a program reads of a writable image is its own (16x8 here), not 0: a writable view has
+/// one level, so the query is of level 0. (Under Wine, D3DMetal answered the query with no level
+/// at all with 0, and the title's sun-shadow min/max program then lit or shadowed whole 16x16
+/// tiles: halfwave50/VIctory-macOS-halfwave50 0f3ed38.)
+#[test]
+fn a_size_query_of_a_writable_image_reads_its_size() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    // The texture UAV (kind 3) in the same table (root type 3), 8 dwords from its start, 8 dwords.
+    let mut image = [0u8; 32];
+    image[0] = 0x41;
+    image[4..6].copy_from_slice(&[3, 3]);
+    image[8] = 8;
+    image[16] = 1;
+    image[20..23].copy_from_slice(&[8, 4, 1]);
+    let c = crate::pipeline::test_compute_container(CS_UAV_SIZE, &[uav, image], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    // Entry 0: a raw buffer UAV of 64 dwords at `VA_A`; entry 1: a 16x8 RGBA8 texture UAV.
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 16, 8);
+    desc.unordered_access = true;
+    let tex = t.host.texture(&desc).unwrap();
+    let key = 0x4EA9_0100;
+    t.host.register_texture(key, &tex);
+    // DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_UAV_DIMENSION_TEXTURE2D, mip 0.
+    let mut uav_desc = [0u32; 10];
+    (uav_desc[0], uav_desc[1]) = (28, 4);
+    crate::descriptor::create_uav(std::ptr::null(), key as _, std::ptr::null(), &uav_desc, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "uav size") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    assert_eq!(f.get(0x2_0000, 3), [16, 8, 7], "width, height and height - 1 from the descriptor");
+    drop(records);
+}

@@ -113,6 +113,9 @@ pub struct ShaderStats {
     pub pipelines: u64,
     /// Pipelines served from the library cache.
     pub cached: u64,
+    /// Times a pipeline was not compiled within `Title::compile_wait`: its work is dropped that
+    /// time and nothing is cached, so a later use picks the pipeline up.
+    pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
 }
@@ -167,8 +170,11 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
+        let put_off = self.shaders.put_off;
         let made = self.make_compute(shader, name);
-        self.libraries.compute.insert(key, made.clone());
+        if self.shaders.put_off == put_off {
+            self.libraries.compute.insert(key, made.clone());
+        }
         made
     }
 
@@ -180,12 +186,10 @@ impl<B: PresentBackend> Title<B> {
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
         let binding = Binding { name: name.into(), ..Binding::of(shader) };
-        let made = match binding.layout() {
-            Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
-            None => self.host.backend.create_compute_pipeline(&shader.dxil),
-        };
+        let made = self.host.backend.create_compute_pipeline_within(&shader.dxil, binding.layout().as_ref(), self.compile_wait);
         match made {
-            Ok(pso) => {
+            Ok(None) => self.put_off(),
+            Ok(Some(pso)) => {
                 self.shaders.pipelines += 1;
                 self.host.backend.name_pipeline(&pso, name);
                 Pipe::Compute(Rc::new(ComputePso {
@@ -224,9 +228,21 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
+        let put_off = self.shaders.put_off;
         let made = self.make_render(vs, ps, graphics, name);
-        self.libraries.render.insert(key, made.clone());
+        if self.shaders.put_off == put_off {
+            self.libraries.render.insert(key, made.clone());
+        }
         made
+    }
+
+    /// A pipeline Metal is still compiling: no pipeline this time, and the caller caches nothing.
+    fn put_off(&mut self) -> Pipe<B> {
+        self.shaders.put_off += 1;
+        if self.shaders.put_off.is_power_of_two() {
+            tracing::info!(put_off = self.shaders.put_off, "pipelines put off for their compiles so far");
+        }
+        Pipe::Refused
     }
 
     fn make_render(
@@ -293,10 +309,11 @@ impl<B: PresentBackend> Title<B> {
             stencil: depth.and(g.stencil()),
             raster: g.raster(),
         };
-        match self.host.render_pipeline(&desc) {
-            Ok(p) => {
+        match self.host.backend.create_render_pipeline_within(&desc, self.compile_wait) {
+            Ok(None) => self.put_off(),
+            Ok(Some(p)) => {
                 self.shaders.pipelines += 1;
-                Pipe::Render(p, Some(Rc::new(Binding {
+                Pipe::Render(Rc::new(p), Some(Rc::new(Binding {
                     ps: ps_binding.map(Rc::new),
                     ..vs_binding
                 })))

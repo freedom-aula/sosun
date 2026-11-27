@@ -896,8 +896,8 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     // not translated yet is put off: its work is dropped this time (not cached, so a later draw
     // makes it), and its shaders go to the front of the prewarm pool.
     let frame = crate::frame::current();
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
-    if spent
+    let left = frame_left();
+    if left.is_zero()
         && let Some((stages, _)) = crate::pipeline::native_stages(key as This)
         && stages.iter().any(|(_, s)| !s.native_ready())
     {
@@ -910,13 +910,44 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
         }
         return Pipe::Refused;
     }
+    // A pipeline Metal is still compiling when the budget ends is put off the same way.
+    t.compile_wait = compile_wait(t);
+    let put_off = t.shaders.put_off;
     let (made, console) = make_pipe(t, key, targets);
+    if t.shaders.put_off != put_off {
+        return made;
+    }
     if console {
         t.console_pipes.insert(console_key, made.clone());
     } else {
         t.pipelines.insert(key, made.clone());
     }
     made
+}
+
+/// What the current frame has left of its budget for new pipelines (zero: spent).
+fn frame_left() -> std::time::Duration {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
+}
+
+/// How long a new pipeline may hold the current frame while Metal makes it: what the frame has
+/// left of its budget; past it, the few ms a pipeline the disk cache and the archive hold takes
+/// (so a warm frame that outlasts its budget puts none off), until one is not made in them; then
+/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s.
+fn compile_wait(t: &MetalTitle) -> std::time::Duration {
+    const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
+    /// The frame last past its budget, and the pipelines put off before that.
+    static PAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    let left = frame_left();
+    if !left.is_zero() {
+        return left;
+    }
+    let frame = crate::frame::current();
+    let mut past = PAST.lock().unwrap_or_else(|e| e.into_inner());
+    if past.0 != frame {
+        *past = (frame, t.shaders.put_off);
+    }
+    if past.1 == t.shaders.put_off { ARCHIVED } else { left }
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -1051,12 +1082,7 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     if let Some(p) = t.thread_pipes.get(&key) {
         return p.clone();
     }
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(
-        crate::frame::current(),
-        std::time::Instant::now(),
-        crate::prewarm::FIRST_BIND_BUDGET,
-    );
-    if spent
+    if frame_left().is_zero()
         && let Some(s) = crate::pipeline::compute_shader(key as This)
         && !s.threads_ready()
     {
@@ -1065,6 +1091,8 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     }
     let (hash, shader) = crate::pipeline::native_threads(key as This);
     let name = format!("compute {hash} by thread counts");
+    t.compile_wait = compile_wait(t);
+    let put_off = t.shaders.put_off;
     let made = match shader {
         Ok(cs) => t.compute_pipe(&cs, &name),
         Err(e) => {
@@ -1072,7 +1100,9 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
             Pipe::Refused
         }
     };
-    t.thread_pipes.insert(key, made.clone());
+    if t.shaders.put_off == put_off {
+        t.thread_pipes.insert(key, made.clone());
+    }
     made
 }
 
@@ -1288,7 +1318,7 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     // As in `pipe`: past the frame's budget, a translation not made yet goes to a worker and the
     // draw is dropped this time (nothing is cached; the worker's result is, on disk or in the
     // shader).
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    let spent = frame_left().is_zero();
     if spent && rect && !g.vs_source.rect_ready() {
         let s = g.vs_source.clone();
         put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));
@@ -1336,13 +1366,18 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     };
     let vs = widened.as_deref().unwrap_or(base_vs);
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
-    tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
-    if tracing_targets() {
-        tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
-    }
+    t.compile_wait = compile_wait(t);
+    let put_off = t.shaders.put_off;
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
-    g.made.borrow_mut().insert(key, made.clone());
+    // Put off, it is asked for again at every draw until Metal has made it: logged once made.
+    if t.shaders.put_off == put_off {
+        tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
+        if tracing_targets() {
+            tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
+        }
+        g.made.borrow_mut().insert(key, made.clone());
+    }
     made
 }
 

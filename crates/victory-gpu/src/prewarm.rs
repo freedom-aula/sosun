@@ -35,12 +35,13 @@ impl FrameBudget {
         FrameBudget { frame: 0, started: None }
     }
 
-    /// Whether frame `frame`, making a new pipeline at `now`, has run for `budget` since its first.
-    pub(crate) fn spent(&mut self, frame: u64, now: Instant, budget: Duration) -> bool {
+    /// What frame `frame`, making a new pipeline at `now`, has left of `budget` since its first
+    /// (zero: spent).
+    pub(crate) fn left(&mut self, frame: u64, now: Instant, budget: Duration) -> Duration {
         if frame != self.frame || self.started.is_none() {
             *self = FrameBudget { frame, started: Some(now) };
         }
-        self.started.is_some_and(|t| now.saturating_duration_since(t) >= budget)
+        self.started.map_or(budget, |t| budget.saturating_sub(now.saturating_duration_since(t)))
     }
 }
 
@@ -167,13 +168,13 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
         let budget = Duration::from_millis(100);
-        assert!(!b.spent(5, at(0), budget));
-        assert!(!b.spent(5, at(99), budget));
-        assert!(b.spent(5, at(100), budget));
+        assert_eq!(b.left(5, at(0), budget), budget);
+        assert_eq!(b.left(5, at(99), budget), Duration::from_millis(1));
+        assert!(b.left(5, at(100), budget).is_zero());
         // The next frame starts from its own first pipeline.
-        assert!(!b.spent(6, at(150), budget));
-        assert!(!b.spent(6, at(249), budget));
-        assert!(b.spent(6, at(250), budget));
+        assert_eq!(b.left(6, at(150), budget), budget);
+        assert!(!b.left(6, at(249), budget).is_zero());
+        assert!(b.left(6, at(250), budget).is_zero());
     }
 
     #[test]

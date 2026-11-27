@@ -658,26 +658,6 @@ impl Metal {
         }))
     }
 
-    /// The converted function of a stage and the converter's stage number (`IRShaderStage`).
-    fn stage_function(
-        &self,
-        dxil: &[u8],
-        layout: Option<&victory_backend::backend::RootLayout>,
-        dual_source: bool,
-    ) -> Result<(i32, Retained<ProtocolObject<dyn MTLFunction>>), String> {
-        let (stage, lib) = self
-            .msc()?
-            .convert_with(dxil, None, layout, dual_source)
-            .map_err(|e| e.to_string())?;
-        let l = self.load_library(&lib)?;
-        let name = l
-            .functionNames()
-            .iter()
-            .next()
-            .ok_or("converted library is empty")?;
-        Ok((stage, l.newFunctionWithName(&name).ok_or("no function")?))
-    }
-
     fn bind_root_compute(
         &self,
         e: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1061,70 +1041,28 @@ impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
-        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
-        if crate::disk::crashed(crash_key(d).as_bytes()) {
-            return Err("Metal's compiler crashed on it on an earlier run".into());
-        }
-        let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
-        let ff = d
-            .ps
-            .map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
-            .transpose()?
-            .map(|f| f.1);
-        let has_stencil = d.depth == Some(Format::D32FloatS8);
-        let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
-            let [x, y, z] = self.msc()?.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;
-            let md = MTLMeshRenderPipelineDescriptor::new();
-            // SAFETY: both functions are the converter's, of the stages they are set as.
-            unsafe {
-                md.setMeshFunction(Some(&vf));
-                md.setFragmentFunction(ff.as_deref());
-            }
-            color_attachments(&md.colorAttachments(), d);
-            if let Some(f) = d.depth {
-                md.setDepthAttachmentPixelFormat(pixel_format(f));
-                if has_stencil {
-                    md.setStencilAttachmentPixelFormat(pixel_format(f));
-                }
-            }
-            let crash_key = crash_key(d);
-            let pso = crate::archive::compile_mesh(&self.dev, &md, &crash_key)?;
-            (pso, Some(size([x as usize, y as usize, z as usize])))
-        } else {
-            (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
-        };
-        let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
-            let dd = MTLDepthStencilDescriptor::new();
-            let (write, cmp) = d.depth_test.unwrap_or((false, Compare::Always));
-            dd.setDepthCompareFunction(compare(cmp));
-            dd.setDepthWriteEnabled(write);
-            if let Some(s) = d.stencil.filter(|_| has_stencil) {
-                dd.setFrontFaceStencil(Some(&stencil_face(&s.front, &s)));
-                dd.setBackFaceStencil(Some(&stencil_face(&s.back, &s)));
-            }
-            self.dev
-                .newDepthStencilStateWithDescriptor(&dd)
-                .expect("depth state")
-        });
-        let cull = match d.cull {
-            Cull::None => MTLCullMode::None,
-            Cull::Front => MTLCullMode::Front,
-            Cull::Back => MTLCullMode::Back,
-        };
-        Ok(RenderPipeline {
-            pso,
-            depth,
-            cull,
-            raster: d.raster,
-            stencil: has_stencil,
-            mesh,
-            vs_static: self.static_samplers(d.vs_layout)?,
-            ps_static: if d.ps.is_some() {
-                self.static_samplers(d.ps_layout)?
-            } else {
-                None
-            },
-        })
+        let (pso, mesh) = self.compiler()?.render(d)?;
+        self.finish_render(d, pso, mesh)
+    }
+
+    /// As `create_compute_pipeline_within`: converted and compiled on a `pipeline-compile`
+    /// thread, and picked up by the same call later when `wait` was not enough.
+    fn create_render_pipeline_within(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+        wait: std::time::Duration,
+    ) -> Result<Option<RenderPipeline>, String> {
+        let state = format!(
+            "{} {:?}",
+            d.vs.len(),
+            (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
+        );
+        let key = *blake3::Hasher::new().update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes()).finalize().as_bytes();
+        let made = crate::metal::within(&self.compiling_render, key, wait, || {
+            let (compiler, owned) = (self.compiler()?, OwnedDesc::of(d));
+            Ok(move || compiler.render(&owned.desc()))
+        })?;
+        made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
@@ -1251,9 +1189,6 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
-        if let Some(a) = self.archive() {
-            a.flush_due();
-        }
         match refused {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1303,6 +1238,163 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
 }
 
 impl Metal {
+    /// The pipeline of a compiled state `pso`: what the passes set beside it.
+    fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MTLSize>) -> Result<RenderPipeline, String> {
+        let has_stencil = d.depth == Some(Format::D32FloatS8);
+        let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
+            let dd = MTLDepthStencilDescriptor::new();
+            let (write, cmp) = d.depth_test.unwrap_or((false, Compare::Always));
+            dd.setDepthCompareFunction(compare(cmp));
+            dd.setDepthWriteEnabled(write);
+            if let Some(s) = d.stencil.filter(|_| has_stencil) {
+                dd.setFrontFaceStencil(Some(&stencil_face(&s.front, &s)));
+                dd.setBackFaceStencil(Some(&stencil_face(&s.back, &s)));
+            }
+            self.dev
+                .newDepthStencilStateWithDescriptor(&dd)
+                .expect("depth state")
+        });
+        let cull = match d.cull {
+            Cull::None => MTLCullMode::None,
+            Cull::Front => MTLCullMode::Front,
+            Cull::Back => MTLCullMode::Back,
+        };
+        Ok(RenderPipeline {
+            pso,
+            depth,
+            cull,
+            raster: d.raster,
+            stencil: has_stencil,
+            mesh,
+            vs_static: self.static_samplers(d.vs_layout)?,
+            ps_static: if d.ps.is_some() {
+                self.static_samplers(d.ps_layout)?
+            } else {
+                None
+            },
+        })
+    }
+}
+
+pub(crate) type RenderState = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
+
+/// A `RenderPipelineDesc` that owns what it names, for the compile thread.
+struct OwnedDesc {
+    vs: Vec<u8>,
+    ps: Option<Vec<u8>>,
+    vs_layout: Option<victory_backend::backend::RootLayout>,
+    ps_layout: Option<victory_backend::backend::RootLayout>,
+    attributes: Vec<VertexAttr>,
+    streams: Vec<VertexStream>,
+    color: Vec<Format>,
+    color_state: Vec<ColorState>,
+    depth: Option<Format>,
+    depth_test: Option<(bool, Compare)>,
+    cull: Cull,
+    dual_source: bool,
+    stencil: Option<StencilState>,
+    raster: Raster,
+}
+
+impl OwnedDesc {
+    fn of(d: &RenderPipelineDesc<'_>) -> OwnedDesc {
+        OwnedDesc {
+            vs: d.vs.to_vec(),
+            ps: d.ps.map(<[u8]>::to_vec),
+            vs_layout: d.vs_layout.cloned(),
+            ps_layout: d.ps_layout.cloned(),
+            attributes: d.attributes.to_vec(),
+            streams: d.streams.to_vec(),
+            color: d.color.to_vec(),
+            color_state: d.color_state.to_vec(),
+            depth: d.depth,
+            depth_test: d.depth_test,
+            cull: d.cull,
+            dual_source: d.dual_source,
+            stencil: d.stencil,
+            raster: d.raster,
+        }
+    }
+
+    fn desc(&self) -> RenderPipelineDesc<'_> {
+        RenderPipelineDesc {
+            vs: &self.vs,
+            ps: self.ps.as_deref(),
+            vs_layout: self.vs_layout.as_ref(),
+            ps_layout: self.ps_layout.as_ref(),
+            attributes: &self.attributes,
+            streams: &self.streams,
+            color: &self.color,
+            color_state: &self.color_state,
+            depth: self.depth,
+            depth_test: self.depth_test,
+            cull: self.cull,
+            dual_source: self.dual_source,
+            stencil: self.stencil,
+            raster: self.raster,
+        }
+    }
+}
+
+/// The part of a render pipeline Metal compiles: all of it may run on another thread.
+impl crate::metal::Compiler {
+    /// The converted function of a stage and the converter's stage number (`IRShaderStage`).
+    fn stage_function(
+        &self,
+        dxil: &[u8],
+        layout: Option<&victory_backend::backend::RootLayout>,
+        dual_source: bool,
+    ) -> Result<(i32, Retained<ProtocolObject<dyn MTLFunction>>), String> {
+        let (stage, lib) = self.msc.convert_with(dxil, None, layout, dual_source).map_err(|e| e.to_string())?;
+        let l = crate::metal::load_library(&self.dev, &lib)?;
+        let name = l
+            .functionNames()
+            .iter()
+            .next()
+            .ok_or("converted library is empty")?;
+        Ok((stage, l.newFunctionWithName(&name).ok_or("no function")?))
+    }
+
+    /// The pipeline state of `d` and, for a mesh pipeline, its thread-group size.
+    pub(crate) fn render(&self, d: &RenderPipelineDesc<'_>) -> Result<(RenderState, Option<MTLSize>), String> {
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        if crate::disk::crashed(crash_key(d).as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
+        let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
+        let ff = d
+            .ps
+            .map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
+            .transpose()?
+            .map(|f| f.1);
+        let has_stencil = d.depth == Some(Format::D32FloatS8);
+        let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
+            let [x, y, z] = self.msc.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;
+            let md = MTLMeshRenderPipelineDescriptor::new();
+            // SAFETY: both functions are the converter's, of the stages they are set as.
+            unsafe {
+                md.setMeshFunction(Some(&vf));
+                md.setFragmentFunction(ff.as_deref());
+            }
+            color_attachments(&md.colorAttachments(), d);
+            if let Some(f) = d.depth {
+                md.setDepthAttachmentPixelFormat(pixel_format(f));
+                if has_stencil {
+                    md.setStencilAttachmentPixelFormat(pixel_format(f));
+                }
+            }
+            let crash_key = crash_key(d);
+            let pso = match &self.archive {
+                Some(a) => a.mesh(&self.dev, &md, &crash_key),
+                None => crate::archive::compile_mesh(&self.dev, &md, &crash_key),
+            }?;
+            (pso, Some(size([x as usize, y as usize, z as usize])))
+        } else {
+            (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
+        };
+        Ok((pso, mesh))
+    }
+
     /// The render pipeline state of a vertex and fragment function, with the stage-in layout.
     fn vertex_pipeline(
         &self,
@@ -1347,12 +1439,13 @@ impl Metal {
             }
         }
         let crash_key = crash_key(d);
-        match self.archive() {
+        match &self.archive {
             Some(a) => a.render(&self.dev, &pd, &crash_key),
             None => crate::archive::compile_render(&self.dev, &pd, &crash_key),
         }
     }
 }
+
 
 /// What a submission owes the title once it completes: the order event, the title's fence signals
 /// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and

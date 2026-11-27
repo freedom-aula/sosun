@@ -671,6 +671,15 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         desc: &RenderPipelineDesc<'_>,
     ) -> Result<Self::RenderPipeline, String>;
+    /// As `ComputeBackend::create_compute_pipeline_within`: `None` while the pipeline is still
+    /// being made after `wait`. The default makes it at once, however long.
+    fn create_render_pipeline_within(
+        &self,
+        desc: &RenderPipelineDesc<'_>,
+        _wait: std::time::Duration,
+    ) -> Result<Option<Self::RenderPipeline>, String> {
+        self.create_render_pipeline(desc).map(Some)
+    }
     fn submit_passes(
         &self,
         queue: &Self::Queue,

@@ -130,6 +130,20 @@ pub trait ComputeBackend {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Self::Pipeline, String>;
+    /// As the two above, waiting at most `wait` for the pipeline: `None` while it is still being
+    /// made, and the same call later picks it up. The default makes it at once, however long.
+    fn create_compute_pipeline_within(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+        _wait: std::time::Duration,
+    ) -> Result<Option<Self::Pipeline>, String> {
+        match layout {
+            Some(l) => self.create_compute_pipeline_with(dxil, l),
+            None => self.create_compute_pipeline(dxil),
+        }
+        .map(Some)
+    }
     /// Names a pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
     fn name_pipeline(&self, _p: &Self::Pipeline, _name: &str) {}
     /// Queue the work and return; never waits for the GPU.
