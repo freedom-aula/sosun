@@ -35,7 +35,7 @@ const READLANE: &[u32] = &[
     S_ENDPGM,
 ];
 
-/// Each lane reads `v0` of the lane 32 above it (modulo 64).
+/// Adding 32 to the dword index wraps back to this lane in its half.
 const BPERMUTE: &[u32] = &[
     0x4A02_00A0, // v_add_nc_u32_e32 v1, 32, v0
     0x3402_0282, // v_lshlrev_b32_e32 v1, 2, v1
@@ -173,14 +173,31 @@ fn a_ballot_of_64_lanes_is_two_host_waves_joined() {
 
 #[test]
 fn a_lane_read_across_the_halves_goes_through_group_shared_memory() {
-    for words in [READLANE, BPERMUTE] {
-        let l = host32(words, 64);
-        assert_eq!(l.wave_size, Some(32));
-        assert!(l.exchanges);
-    }
-    assert_eq!(host32(READLANE, 64).barriers, 2);
-    // The permute also ballots the lanes that run (0 from the others).
-    assert_eq!(host32(BPERMUTE, 64).barriers, 4);
+    let l = host32(READLANE, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.exchanges);
+    assert_eq!(l.barriers, 2);
+}
+
+#[test]
+fn bpermute_reads_within_each_host_wave() {
+    // Each host wave must read its own lane 0 at byte address 124 + 4.
+    // Store the result so the lane read is live in the emitted DXIL.
+    let words = [
+        0x7E02_02FF, 124, // v_mov_b32 v1, 124
+        0xDACC_0004, 0x0200_0001, // ds_bpermute_b32 v2, v1, v0 offset:4
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xD834_0000, 0x0000_0203, // ds_write_b32 v3, v2
+        S_ENDPGM,
+    ];
+    let l = lowered(&words, 64, true, true).unwrap();
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.barriers, 0);
+    assert!(!l.exchanges);
+    assert_eq!(
+        l.wave_read_lane_calls,
+        [("dx.op.waveReadLaneAt.i32".into(), vec![Some(117), None, Some(0)])]
+    );
 }
 
 #[test]

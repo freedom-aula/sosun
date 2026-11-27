@@ -14,7 +14,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use victory_gpu::clock;
 use victory_loader::native::{self, seh, teb};
@@ -1638,18 +1638,38 @@ pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
     1
 }
 
-// The thread pool: one thread per submission or timer firing (the real one
-// reuses threads; titles cannot tell). Callbacks are title code, called with
-// the Windows ABI as `(instance, context, object)`.
-
+// One worker per submission or timer arm. Callbacks use the Windows ABI
+// (instance, context, object).
 pub(crate) struct PoolObject {
     callback: usize,
     context: usize,
-    /// Callbacks queued or running, for the waits.
-    pending: Mutex<u32>,
-    idle: Condvar,
-    /// Retires the timer thread of an earlier `SetThreadpoolTimer`.
-    generation: AtomicU64,
+    state: Mutex<PoolState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Replacing the deadline retires workers still waiting for it.
+    timer_generation: u64,
+    /// Canceling queued callbacks invalidates their tickets, including after a rearm.
+    cancel_generation: u64,
+    queued: u32,
+    running: u32,
+}
+
+impl PoolState {
+    fn queue_callback(&mut self) -> u64 {
+        self.queued += 1;
+        self.cancel_generation
+    }
+
+    fn take_queued(&mut self, ticket: u64) -> bool {
+        if ticket != self.cancel_generation {
+            return false;
+        }
+        self.queued -= 1;
+        true
+    }
 }
 
 /// What a callback gets as its instance: nothing it can use, but not null.
@@ -1659,48 +1679,72 @@ fn new_pool_object(callback: usize, context: usize) -> *mut PoolObject {
     Box::into_raw(Box::new(PoolObject {
         callback,
         context,
-        pending: Mutex::new(0),
-        idle: Condvar::new(),
-        generation: AtomicU64::new(0),
+        state: Mutex::default(),
+        changed: Condvar::new(),
     }))
 }
 
-/// Runs the callback of `object` on a thread of its own after `delay`.
-fn run_callback(object: usize, delay: Duration, period: Duration, generation: Option<u64>) {
-    // SAFETY: pool objects are leaked: valid for the life of the process.
-    let o = unsafe { &*(object as *const PoolObject) };
-    *lock(&o.pending) += 1;
-    std::thread::spawn(move || {
-        // SAFETY: as above.
-        let o = unsafe { &*(object as *const PoolObject) };
-        std::thread::sleep(delay);
-        loop {
-            if generation.is_some_and(|g| o.generation.load(Ordering::Acquire) != g) {
-                break;
+impl PoolObject {
+    fn submit(&'static self, state: &mut PoolState, delay: Duration, period: Duration) {
+        let generation = state.timer_generation;
+        let armed = Instant::now();
+        // An immediately due callback is queued before the submitting call returns.
+        let mut ticket = delay.is_zero().then(|| state.queue_callback());
+        std::thread::spawn(move || {
+            let mut state = lock(&self.state);
+            let mut delay = delay.saturating_sub(armed.elapsed());
+            loop {
+                let run = if let Some(epoch) = ticket.take() {
+                    state.take_queued(epoch)
+                } else {
+                    (state, _) = self
+                        .changed
+                        .wait_timeout_while(state, delay, |s| s.timer_generation == generation)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if state.timer_generation != generation {
+                        return;
+                    }
+                    // The waiting worker starts the callback directly at expiry.
+                    true
+                };
+                if run {
+                    state.running += 1;
+                    drop(state);
+                    // SAFETY: the title's TP_WORK_CALLBACK or TP_TIMER_CALLBACK.
+                    unsafe {
+                        native::call_win64(
+                            self.callback,
+                            &[
+                                &raw const INSTANCE as u64,
+                                self.context as u64,
+                                self as *const Self as u64,
+                            ],
+                        )
+                    };
+                    state = lock(&self.state);
+                    state.running -= 1;
+                    self.changed.notify_all();
+                }
+                if period.is_zero() || state.timer_generation != generation {
+                    return;
+                }
+                delay = period;
             }
-            // SAFETY: the title's `TP_WORK_CALLBACK` or `TP_TIMER_CALLBACK`.
-            unsafe {
-                native::call_win64(
-                    o.callback,
-                    &[&raw const INSTANCE as u64, o.context as u64, object as u64],
-                )
-            };
-            if period.is_zero() {
-                break;
-            }
-            std::thread::sleep(period);
-        }
-        *lock(&o.pending) -= 1;
-        o.idle.notify_all();
-    });
-}
+        });
+    }
 
-fn wait_idle(object: *const PoolObject) {
-    // SAFETY: as above.
-    let o = unsafe { &*object };
-    let mut pending = lock(&o.pending);
-    while *pending > 0 {
-        pending = o.idle.wait(pending).unwrap_or_else(|e| e.into_inner());
+    fn wait_idle(&self, cancel: bool) {
+        let mut state = lock(&self.state);
+        if cancel && state.queued != 0 {
+            state.cancel_generation = state.cancel_generation.wrapping_add(1);
+            state.queued = 0;
+            self.changed.notify_all();
+        }
+        drop(
+            self.changed
+                .wait_while(state, |s| s.queued != 0 || s.running != 0)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
     }
 }
 
@@ -1713,15 +1757,19 @@ pub extern "system" fn CreateThreadpoolWork(
 }
 
 pub extern "system" fn SubmitThreadpoolWork(work: *mut PoolObject) {
-    run_callback(work as usize, Duration::ZERO, Duration::ZERO, None);
+    // SAFETY: pool objects live for the life of the process.
+    let o = unsafe { &*work };
+    o.submit(&mut lock(&o.state), Duration::ZERO, Duration::ZERO);
 }
 
 pub extern "system" fn WaitForThreadpoolWorkCallbacks(work: *mut PoolObject, _cancel: i32) {
-    wait_idle(work);
+    // SAFETY: as above.
+    unsafe { &*work }.wait_idle(false);
 }
 
 pub extern "system" fn CloseThreadpoolWork(work: *mut PoolObject) {
-    wait_idle(work);
+    // SAFETY: as above.
+    unsafe { &*work }.wait_idle(false);
 }
 
 pub extern "system" fn CreateThreadpoolTimer(
@@ -1740,29 +1788,27 @@ pub extern "system" fn SetThreadpoolTimer(
 ) {
     // SAFETY: as above.
     let o = unsafe { &*timer };
-    let generation = o.generation.fetch_add(1, Ordering::AcqRel) + 1;
-    if due.is_null() {
-        return;
+    let mut state = lock(&o.state);
+    state.timer_generation = state.timer_generation.wrapping_add(1);
+    o.changed.notify_all();
+    if !due.is_null() {
+        // SAFETY: the title's due time.
+        let delay = until(unsafe { due.read_unaligned() });
+        o.submit(
+            &mut state,
+            delay,
+            Duration::from_millis(u64::from(period_ms)),
+        );
     }
-    // SAFETY: the title's due time.
-    let delay = until(unsafe { due.read_unaligned() });
-    run_callback(
-        timer as usize,
-        delay,
-        Duration::from_millis(u64::from(period_ms)),
-        Some(generation),
-    );
 }
 
 pub extern "system" fn WaitForThreadpoolTimerCallbacks(timer: *mut PoolObject, cancel: i32) {
-    if cancel != 0 {
-        // SAFETY: as above.
-        unsafe { &*timer }.generation.fetch_add(1, Ordering::AcqRel);
-    }
-    wait_idle(timer);
+    // SAFETY: as above.
+    unsafe { &*timer }.wait_idle(cancel != 0);
 }
 
 pub extern "system" fn CloseThreadpoolTimer(timer: *mut PoolObject) {
+    SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
     WaitForThreadpoolTimerCallbacks(timer, 1);
 }
 
@@ -2764,6 +2810,107 @@ mod tests {
         go.0.send(again).unwrap();
         assert_eq!(other.join().unwrap(), 0);
         assert_eq!(FlsFree(again), 1);
+    }
+
+    const ONE_HOUR_DUE: i64 = -3600 * TICKS_PER_SECOND as i64;
+
+    #[test]
+    fn disarming_a_threadpool_timer_does_not_wait_for_its_deadline() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn count(_instance: usize, _context: usize, _timer: usize) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        let callback = native::host_callbacks(&[(count as *const () as usize, false)]).unwrap()[0];
+        std::thread::spawn(move || {
+            let timer = CreateThreadpoolTimer(callback, 0, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer, 0);
+            CloseThreadpoolTimer(timer);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+        assert_eq!(CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn canceling_a_queued_timer_callback_preserves_the_armed_deadline() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            extern "C" fn unused(_instance: usize, _context: usize, _timer: usize) {}
+            let callback =
+                native::host_callbacks(&[(unused as *const () as usize, false)]).unwrap()[0];
+            let timer = CreateThreadpoolTimer(callback, 0, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            WaitForThreadpoolTimerCallbacks(timer, 0);
+
+            // Hold a submission between queueing and dispatch without racing a worker thread.
+            // SAFETY: the allocated timer lives through close.
+            let o = unsafe { &*timer };
+            let (generation, ticket) = {
+                let mut state = lock(&o.state);
+                (state.timer_generation, state.queue_callback())
+            };
+            WaitForThreadpoolTimerCallbacks(timer, 1);
+            {
+                let mut state = lock(&o.state);
+                assert_eq!(state.timer_generation, generation);
+                assert!(!state.take_queued(ticket));
+            }
+            CloseThreadpoolTimer(timer);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
+    }
+
+    #[test]
+    fn a_threadpool_timer_waits_for_a_running_callback_after_rearm() {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        struct Gate {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        extern "C" fn block(_instance: usize, context: usize, _timer: usize) {
+            // SAFETY: the test keeps this gate alive through close.
+            let gate = unsafe { &*(context as *const Gate) };
+            let _ = gate.entered.send(());
+            let _ = lock(&gate.release).recv();
+        }
+
+        let callback = native::host_callbacks(&[(block as *const () as usize, false)]).unwrap()[0];
+        for cancel in [0, 1] {
+            let (entered, started) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let gate = Box::leak(Box::new(Gate {
+                entered,
+                release: Mutex::new(resume),
+            }));
+            let timer =
+                CreateThreadpoolTimer(callback, gate as *const Gate as usize, std::ptr::null());
+            SetThreadpoolTimer(timer, &ONE_HOUR_DUE, 0, 0);
+            SetThreadpoolTimer(timer, &0, 0, 0);
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            SetThreadpoolTimer(timer, std::ptr::null(), 0, 0);
+
+            let (waiting, ready) = mpsc::sync_channel(0);
+            let (done, result) = mpsc::channel();
+            let handle = timer as usize;
+            let waiter = std::thread::spawn(move || {
+                waiting.send(()).unwrap();
+                WaitForThreadpoolTimerCallbacks(handle as *mut PoolObject, cancel);
+                let _ = done.send(());
+            });
+            ready.recv().unwrap();
+            let before_release = result.recv_timeout(Duration::from_millis(50));
+            release.send(()).unwrap();
+            assert_eq!(before_release, Err(RecvTimeoutError::Timeout));
+            result.recv_timeout(Duration::from_secs(1)).unwrap();
+            waiter.join().unwrap();
+            CloseThreadpoolTimer(timer);
+        }
     }
 
     #[test]

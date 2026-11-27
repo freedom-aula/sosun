@@ -879,6 +879,19 @@ fn refusal2_pixel_system_inputs_lower_when_declared() {
     }
 }
 
+#[test]
+fn signed_flbit_i64_lowers_in_pixel_shader() {
+    let code = [
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBE84_1800, // s_flbit_i32_i64 s4, s[0:1]
+        0x7E00_0204, // v_mov_b32 v0, s4
+        0x7E02_02FD, // v_mov_b32 v1, src_scc
+        0xF800_180F, 0x0100_0100, // exp mrt0 v0, v1, v0, v1 done vm
+        0xBF81_0000,
+    ];
+    lower_ps(&code, false, vec![root_const(0, 3)], vec![], 0, 0, vec![], false).unwrap();
+}
+
 /// `s_absdiff_i32` translates (values: `victory-gpu` `addr_tests`).
 #[test]
 fn absdiff_translates() {

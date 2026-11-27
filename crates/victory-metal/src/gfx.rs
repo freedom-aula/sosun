@@ -1425,6 +1425,13 @@ struct Flight {
     owed: std::sync::Arc<Owed>,
 }
 
+/// Tests only. The list below is the process's, and a recovery with no age pays every command
+/// buffer in it, other tests' too: their fences are signalled before their work has run. So the
+/// test that recovers takes this for writing, and the tests that depend on when their own command
+/// buffers complete take it for reading.
+#[cfg(test)]
+pub(crate) static FLIGHTS_IN_TESTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Committed command buffers Metal has not reported on, oldest first, and per queue the newest
 /// serial Metal failed and when.
 static FLIGHTS: std::sync::Mutex<std::collections::VecDeque<Flight>> =
@@ -2622,6 +2629,7 @@ mod render_target_tests {
     use objc2_foundation::NSString;
 
     fn draw_green_triangles(metal: &Metal, target: &Texture, clear: Option<[f32; 4]>, viewports: &[Option<Viewport>]) {
+        let _flight = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
             #include <metal_stdlib>
             using namespace metal;
@@ -2810,6 +2818,7 @@ mod owed_tests {
     /// title's queues wait for.
     #[test]
     fn a_lost_command_buffer_pays_what_it_owes() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap();
         let region = Region::new(page_size(), None).unwrap();
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
@@ -2822,7 +2831,7 @@ mod owed_tests {
         let (long, zero) = (std::time::Duration::from_secs(3600), std::time::Duration::ZERO);
         assert_eq!(recover_lost_after(long, long), 0);
         assert_eq!(m.completed(&fence), 0);
-        // Other tests' command buffers may be in flight too (the list is the process's): at least ours.
+        // Other tests' command buffers may be in flight too (those that do not mind): at least ours.
         assert!(recover_lost_after(long, zero) >= 1);
         // SAFETY: inside the region.
         assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x5A; 8]);

@@ -709,8 +709,8 @@ and raises fence values.
 The translator can now emit wave64 compute shaders without `WaveSize(64)` (off by default; D3D12 unchanged).
 Choice: keep one thread per console lane and run a console wave as two host waves (flat ids `64n..64n+31`,
 `64n+32..64n+63`); the console lane is the group index modulo 64. What stays inside 32 lanes is native (DPP
-rows, quads, `ds_swizzle`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers,
-`v_readfirstlane` per half). What crosses the halves (ballots read as data, `v_readlane`, `ds_bpermute`, the
+rows, quads, `ds_swizzle`, `ds_bpermute`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers,
+`v_readfirstlane` per half). What crosses the halves (ballots read as data, `v_readlane`, the
 reductions and prefix sums of whole-wave sections) goes through a `xchg` group-shared array (one dword per
 thread) between two group barriers. This was preferred to two lanes per thread because the emitter lowers one
 lane per value. Cost: two barriers and a shared-memory round trip per such operation, 4 bytes per thread of

@@ -64,6 +64,30 @@ fn run_io(words: &[u32], rsrc2: u32, threads: u32, flag: u32) -> Vec<u32> {
 }
 
 #[test]
+fn bpermute_reads_an_active_source_in_the_same_half() {
+    // Only lanes 0..39 run. Byte address 124 + offset 4 wraps to local lane 0
+    // (console lanes 0 and 32). Offset 36 picks local lane 8 (8 on, 40 off).
+    for (offset, lo, hi) in [(4, 1, 33), (36, 9, 0)] {
+        let mut w = vec![
+            0x7E06_02FF, 124, // v_mov_b32 v3, 124
+            0x4A08_0081, // v_add_nc_u32 v4, 1, v0 (distinct nonzero data)
+            V_LSHLREV_V1_2_V0,
+        ];
+        w.extend(LANES_BELOW_40);
+        w.extend([0xDACC_0000 | offset, 0x0200_0403, S_WAITCNT_LGKM]); // ds_bpermute_b32 v2, v3, v4
+        w.extend(GLOBAL_STORE_V2_AT_V1);
+        w.push(S_ENDPGM);
+        let got = run(&w, 0, 0);
+        if got.is_empty() {
+            return;
+        }
+        assert_eq!(got[..32], [lo; 32]);
+        assert_eq!(got[32..40], [hi; 8]);
+        assert_eq!(got[40..], [CANARY; 24]);
+    }
+}
+
+#[test]
 fn a_ballot_across_the_halves_after_lanes_left_for_the_end() {
     // Lanes 0..39 stay; each stores the count of lanes above 5 among them (34: 26 in the
     // lower half, 8 in the upper). The lanes that left store nothing and count as off.

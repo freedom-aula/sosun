@@ -85,15 +85,24 @@ impl TextureInfo {
 /// Uploads and change probes must see the same bytes, including across holes in title memory.
 /// False if they could not be read at once (a hole: zeros there).
 fn read_texture_bytes(at: *const u8, out: &mut [u8]) -> bool {
+    read_texture_bytes_known(at, out, false)
+}
+
+/// [`read_texture_bytes`] when `known_partial` says an earlier whole read of this texture met an
+/// unmapped or protected range: skips the initial whole-range kernel read that would copy the
+/// readable prefix and then fail at the hole, and returns `true` again once every page is readable.
+fn read_texture_bytes_known(at: *const u8, out: &mut [u8], known_partial: bool) -> bool {
     #[cfg(target_os = "macos")]
     return read_texture_chunk(
         at,
         out,
+        known_partial,
         super::safe_read,
         victory_platform::mem::next_region,
     );
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = known_partial;
         let read = super::safe_read(at, out);
         if !read {
             out.fill(0);
@@ -106,25 +115,31 @@ fn read_texture_bytes(at: *const u8, out: &mut [u8]) -> bool {
 fn read_texture_chunk(
     at: *const u8,
     out: &mut [u8],
+    known_partial: bool,
     mut read: impl FnMut(*const u8, &mut [u8]) -> bool,
     mut next_region: impl FnMut(usize) -> Option<victory_platform::mem::Region>,
 ) -> bool {
     use victory_platform::mem::{Protect, page_size};
 
-    if read(at, out) {
+    if out.is_empty() {
         return true;
     }
-    // A failed read can leave partial data in a reused probe buffer.
-    out.fill(0);
     let base = at.addr();
     let page = page_size();
-    if out.len() <= page - base % page {
+    let single_page = out.len() <= page - base % page;
+    if (!known_partial || single_page) && read(at, out) {
+        return true;
+    }
+    if single_page {
+        out.fill(0);
         return false;
     }
     let Some(end) = base.checked_add(out.len()) else {
+        out.fill(0);
         return false;
     };
     let mut cur = base;
+    let mut whole = true;
     while cur < end {
         let Some(region) = next_region(cur) else {
             break;
@@ -134,9 +149,15 @@ fn read_texture_chunk(
         if start >= stop {
             break;
         }
-        if region.protect.0 & Protect::READ.0 != 0
-            && !read(start as *const u8, &mut out[start - base..stop - base])
-        {
+        if cur < start {
+            out[cur - base..start - base].fill(0);
+            whole = false;
+        }
+        if region.protect.0 & Protect::READ.0 == 0 {
+            out[start - base..stop - base].fill(0);
+            whole = false;
+        } else if !read(start as *const u8, &mut out[start - base..stop - base]) {
+            whole = false;
             // The mapping may have changed after the query. Salvage this span page by page.
             let mut pos = start;
             while pos < stop {
@@ -150,25 +171,24 @@ fn read_texture_chunk(
         }
         cur = stop;
     }
-    false
+    if cur < end {
+        out[cur - base..].fill(0);
+        whole = false;
+    }
+    whole
 }
 
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
-    let _ = read_into(at as usize, &mut out);
+    let _ = read_into(at as usize, &mut out, false);
     out
 }
 
 /// Fills `out` from title memory at `at`, with zeros where it cannot be read; whether some of it
 /// could not be read at once (`VICTORY_TRACE_TEXTURE_SYNC=1` counts those textures).
-fn read_into(at: usize, out: &mut [u8]) -> bool {
-    const CHUNK: usize = 1 << 20;
-    let mut unreadable = false;
-    for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
-        unreadable |= !read_texture_bytes((at + i * CHUNK) as *const u8, chunk);
-    }
-    unreadable
+fn read_into(at: usize, out: &mut [u8], known_partial: bool) -> bool {
+    !read_texture_bytes_known(at as *const u8, out, known_partial)
 }
 
 /// Host texels as title memory holds them: the reverse of [`to_host`].
@@ -355,6 +375,8 @@ struct Watch {
     /// used to report every new texture and every write a probe had caught already, and each
     /// report is the whole texture read once more).
     seen: HashMap<usize, blake3::Hash>,
+    /// Textures whose last whole read met an unmapped or protected range (fine mips not mapped yet).
+    partial: std::collections::HashSet<usize>,
 }
 
 impl Watch {
@@ -365,6 +387,7 @@ impl Watch {
         self.entries.remove(&key);
         self.dirty.remove(&key);
         self.seen.remove(&key);
+        self.partial.remove(&key);
     }
 }
 
@@ -384,19 +407,23 @@ fn watch_in<R>(watched: &Watched, f: impl FnOnce(&mut Watch) -> R) -> R {
 /// it, and marks those that changed since they were last read whole.
 fn scan_round(watched: &Watched, buf: &mut [u8]) {
     let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
-        let Watch { entries, seen, .. } = w;
+        let Watch { entries, seen, partial, .. } = w;
         seen.retain(|k, _| entries.contains_key(k));
+        partial.retain(|k| entries.contains_key(k));
         entries.iter().map(|(&k, &v)| (k, v)).collect()
     });
     for &(key, entry) in &list {
         let (at, size, target, _) = entry;
         // What it is compared with; `None` (skipped) if it was released since the list.
         let known = |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
-        let Some(before) = watch_in(watched, |w| known(w)) else { continue };
+        let Some((before, was_partial)) = watch_in(watched, |w| known(w).map(|b| (b, w.partial.contains(&key)))) else {
+            continue;
+        };
         let mut h = blake3::Hasher::new();
+        let mut unreadable = false;
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
-            read_texture_bytes((at + off) as *const u8, &mut buf[..n]);
+            unreadable |= !read_texture_bytes_known((at + off) as *const u8, &mut buf[..n], was_partial);
             h.update(&buf[..n]);
         }
         let h = h.finalize();
@@ -405,6 +432,11 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             // older one, and the next round compares with the submission's.
             if known(w) != Some(before) {
                 return;
+            }
+            if unreadable {
+                w.partial.insert(key);
+            } else {
+                w.partial.remove(&key);
             }
             w.seen.insert(key, h);
             if before != Some(h) && !(target && before.is_none()) {
@@ -443,10 +475,14 @@ pub struct Tracked<B: ResourceBackend> {
     hot: u32,
     probe: Option<blake3::Hash>,
     /// Whether its last write showed in the sampled probe (a movie's planes, a streamed texture:
-    /// written whole): then it is read whole only every `WHOLE_EVERY` probes, and probes skipped
-    /// since. Set at each upload (`sync_apply`), whoever found the write.
+    /// written whole): then it is read whole only every `WHOLE_EVERY` probes (backing off across
+    /// consecutive unchanged whole checks), and probes skipped since. Set at each upload
+    /// (`sync_apply`), and returned to periodic checks once a follow-up whole read finds no write.
     sampled_sees_writes: bool,
+    unchanged_whole: u8,
     skipped: u32,
+    /// Whether its last whole read met an unmapped or protected range (fine mips not mapped yet).
+    partial: bool,
     /// Its last upload was all zeros: it is probed (`Title::blank_keys`) until written, however
     /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
     /// them; once left to the scanner, their first frames showed green for a second or two).
@@ -508,11 +544,16 @@ const PROBE_SAMPLE: usize = 256;
 /// would tell a partial write from a whole one.
 const PROBE_WHOLE: usize = 4 << 20;
 
-/// A hot texture whose writes show in its samples is read whole once in this many probes, to
-/// catch the write that misses them (a glyph added to an atlas a movie-like rewrite went through).
-/// Reading the movie's chroma planes whole at every submission cost 15 ms a submission, halving
-/// the movie's frame rate.
+/// A hot texture whose writes show in its samples (or whose follow-up whole check after a missed
+/// write found nothing further) is read whole once in this many probes, doubling after each
+/// further unchanged whole check up to `WHOLE_EVERY << WHOLE_BACKOFF_MAX`, to catch a write that
+/// misses the samples (a glyph added to an atlas a movie-like rewrite went through). Reading the
+/// movie's chroma planes whole at every submission cost 15 ms a submission, halving the movie's
+/// frame rate.
 pub(super) const WHOLE_EVERY: u32 = 8;
+/// Maximum doubling steps (`WHOLE_EVERY << 5` = 256 probes) for repeated unchanged whole checks
+/// while the background scanner continues to watch every texture (a guess).
+const WHOLE_BACKOFF_MAX: u32 = 5;
 /// Bytes of hot textures one submission reads whole to check them, once `MIN_SYNC_HOT` were
 /// probed: the reading is off the host's lock but not free (a guess at what a submission can
 /// spare: about 5 ms of one thread under Rosetta).
@@ -630,8 +671,13 @@ fn probe_round<B: ResourceBackend>(
             let before = t.probe;
             let changed = before != Some(sampled);
             if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
-                t.skipped = if t.sampled_sees_writes { t.skipped.saturating_add(1) } else { WHOLE_EVERY };
-                if t.skipped >= WHOLE_EVERY && !(t.sampled_sees_writes && spare >= WHOLE_SPARE) {
+                let every = if t.sampled_sees_writes {
+                    WHOLE_EVERY << u32::from(t.unchanged_whole.saturating_sub(1)).min(WHOLE_BACKOFF_MAX)
+                } else {
+                    1
+                };
+                t.skipped = t.skipped.saturating_add(1);
+                if t.skipped >= every && !(t.sampled_sees_writes && spare >= WHOLE_SPARE) {
                     t.skipped = 0;
                     if t.sampled_sees_writes {
                         spare += t.info.size;
@@ -810,7 +856,9 @@ impl<B: PresentBackend> Title<B> {
                 hot: 0,
                 probe: None,
                 sampled_sees_writes: false,
+                unchanged_whole: 0,
                 skipped: 0,
+                partial: false,
                 blank: false,
                 #[cfg(target_os = "macos")]
                 target_views: Vec::new(),
@@ -1024,6 +1072,7 @@ impl<B: PresentBackend> Title<B> {
                 dimension: t.info.dimension,
                 layout: t.info.layout.clone(),
                 last: t.last,
+                partial: t.partial,
             })
         };
         keys.into_iter().filter_map(job).collect()
@@ -1055,16 +1104,23 @@ impl<B: PresentBackend> Title<B> {
                 continue;
             };
             let key = r.key;
-            read.push((key, t.serial, r.hash));
+            t.partial = r.unreadable;
+            read.push((key, t.serial, r.hash, r.unreadable));
             cost.first += u64::from(t.last.is_none());
             // What a probe of this memory reads: the next one reports a write since, not this
             // content again (a texture's first probe used to, and that was a whole read wasted).
             let sampled = t.probe.replace(r.probe);
             // `last` again: a copy back into title memory may have moved it meanwhile.
             let Some((levels, detiled)) = r.levels.filter(|_| t.last != Some(r.hash)) else {
+                // Nothing changed since the last upload: if its previous write missed the samples,
+                // this follow-up whole read has checked for an immediate next write, and further
+                // checks return to `WHOLE_EVERY` within `WHOLE_SPARE` with backoff.
+                t.sampled_sees_writes = true;
+                t.unchanged_whole = t.unchanged_whole.saturating_add(1);
                 cost.unchanged += 1;
                 continue;
             };
+            t.unchanged_whole = 0;
             if let Some(sampled) = sampled {
                 // Whoever found this write: one its samples do not show has it read whole at
                 // every probe while it is hot, one they show only now and then.
@@ -1097,8 +1153,13 @@ impl<B: PresentBackend> Title<B> {
             }
         }
         watch(|w| {
-            for (key, serial, hash) in read {
+            for (key, serial, hash, unreadable) in read {
                 if w.entries.get(&key).is_some_and(|e| e.3 == serial) {
+                    if unreadable {
+                        w.partial.insert(key);
+                    } else {
+                        w.partial.remove(&key);
+                    }
                     // What the scanner reported while this was read is this same content.
                     if w.seen.insert(key, hash) == Some(hash) {
                         w.dirty.remove(&key);
@@ -1125,6 +1186,8 @@ pub(super) struct Job {
     layout: Layout,
     /// The hash of what the host texture holds: memory that still hashes to it is not detiled.
     last: Option<blake3::Hash>,
+    /// Whether an earlier whole read met an unmapped or protected range.
+    partial: bool,
 }
 
 /// What a [`Job`]'s memory held when [`prepare`] read it.
@@ -1183,7 +1246,7 @@ impl Job {
             tiled.resize(self.size, 0);
         }
         let tiled = &mut tiled[..self.size];
-        let unreadable = read_into(self.memory, tiled);
+        let unreadable = read_into(self.memory, tiled, self.partial);
         let read = started.elapsed();
         let hash = blake3::hash(tiled);
         let hashed = started.elapsed();
@@ -1479,6 +1542,7 @@ mod tests {
         read_texture_chunk(
             memory.ptr,
             &mut out,
+            false,
             |at, out| {
                 reads += 1;
                 crate::native::safe_read(at, out)
@@ -1508,6 +1572,7 @@ mod tests {
         read_texture_chunk(
             memory.ptr.wrapping_add(1),
             &mut out,
+            false,
             crate::native::safe_read,
             |at| {
                 let region = next_region(at);
@@ -1569,5 +1634,85 @@ mod tests {
         mem[42] = 0;
         mem[1000] = 0xCD;
         assert_ne!(h0_whole, probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch));
+    }
+
+    #[test]
+    fn a_known_partial_chunk_skips_the_whole_read_until_every_page_is_readable() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(4 * page, None).unwrap();
+        // SAFETY: the test owns all four pages; pages 0..2 hold coarse-mip data and 2..4 are unmapped/no-access.
+        unsafe {
+            memory.ptr.write_bytes(0x5a, 2 * page);
+            protect(memory.ptr.add(2 * page), 2 * page, Protect::NO_ACCESS).unwrap();
+        }
+
+        let mut out = vec![0xff; 4 * page];
+        let (mut reads, mut queries) = (0, 0);
+        let whole = read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            false,
+            |at, buf| {
+                reads += 1;
+                crate::native::safe_read(at, buf)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(!whole);
+        assert_eq!((reads, queries), (2, 2));
+        assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
+        assert!(out[2 * page..].iter().all(|&b| b == 0));
+
+        // Once marked partial, the doomed whole-span read is skipped and only readable spans are read.
+        out.fill(0xff);
+        (reads, queries) = (0, 0);
+        let whole = read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            true,
+            |at, buf| {
+                reads += 1;
+                crate::native::safe_read(at, buf)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(!whole);
+        assert_eq!((reads, queries), (1, 2));
+        assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
+        assert!(out[2 * page..].iter().all(|&b| b == 0));
+
+        // SAFETY: restore access to pages 2..4 (fine mips mapped) and fill them.
+        unsafe {
+            protect(memory.ptr.add(2 * page), 2 * page, Protect::READ_WRITE).unwrap();
+            memory.ptr.add(2 * page).write_bytes(0xa5, 2 * page);
+        }
+        out.fill(0xff);
+        (reads, queries) = (0, 0);
+        let whole = read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            true,
+            |at, buf| {
+                reads += 1;
+                crate::native::safe_read(at, buf)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(whole, "once every page is readable again, the partial flag clears");
+        assert_eq!((reads, queries), (1, 1));
+        assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
+        assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
     }
 }

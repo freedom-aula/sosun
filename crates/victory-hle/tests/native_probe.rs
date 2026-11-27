@@ -331,6 +331,11 @@ mod run {
         assert_all(run_probe("probe_dll", 0), 0xFFF, "probe_dll");
     }
 
+    #[test]
+    fn get_proc_address_follows_title_forwarders() {
+        assert_all(run_probe("probe_forwarders", 0), 0x3F, "probe_forwarders");
+    }
+
     /// A title's start-up asks for `kernel32.dll` and an API set by name and
     /// looks functions up in them: both answer with a stable handle, a
     /// callable entry (called here through the pointer) and NULL with
