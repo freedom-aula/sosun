@@ -6,6 +6,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Entries the list keeps: far more than a world frame binds.
 const LIMIT: usize = 16_384;
@@ -17,36 +18,29 @@ pub(crate) fn pool_size(cores: usize) -> usize {
     cores.saturating_sub(2).max(1)
 }
 
-/// Time a frame may spend making host pipelines on the title's thread before pipelines whose
-/// shaders are not translated yet are put off ([`FrameBudget`]): well under the title's 30 s
-/// watchdog, which also counts the frame's other work.
-pub(crate) const FIRST_BIND_BUDGET_MS: u64 = 10_000;
+/// How long a frame may run, from its first new host pipeline, before pipelines whose shaders
+/// are not translated yet are put off ([`FrameBudget`]): well under the title's 30 s watchdog.
+pub(crate) const FIRST_BIND_BUDGET: Duration = Duration::from_secs(10);
 
-/// Time spent making pipelines in the current frame.
-#[derive(Default)]
+/// When the current frame made its first new host pipeline. Wall time, not time spent making
+/// pipelines: the frame's thread also translates inline elsewhere (rectangle lists, extra
+/// parameters, thread counts), and the watchdog counts all of it.
 pub(crate) struct FrameBudget {
     frame: u64,
-    spent_ms: u64,
+    started: Option<Instant>,
 }
 
 impl FrameBudget {
     pub(crate) const fn new() -> Self {
-        FrameBudget { frame: 0, spent_ms: 0 }
+        FrameBudget { frame: 0, started: None }
     }
 
-    /// Whether frame `frame` has spent `budget_ms` already (a new frame starts from nothing).
-    pub(crate) fn spent(&mut self, frame: u64, budget_ms: u64) -> bool {
-        if frame != self.frame {
-            *self = FrameBudget { frame, spent_ms: 0 };
+    /// Whether frame `frame`, making a new pipeline at `now`, has run for `budget` since its first.
+    pub(crate) fn spent(&mut self, frame: u64, now: Instant, budget: Duration) -> bool {
+        if frame != self.frame || self.started.is_none() {
+            *self = FrameBudget { frame, started: Some(now) };
         }
-        self.spent_ms >= budget_ms
-    }
-
-    pub(crate) fn add(&mut self, frame: u64, ms: u64) {
-        if frame != self.frame {
-            *self = FrameBudget { frame, spent_ms: 0 };
-        }
-        self.spent_ms += ms;
+        self.started.is_some_and(|t| now.saturating_duration_since(t) >= budget)
     }
 }
 
@@ -169,16 +163,17 @@ mod tests {
 
     #[test]
     fn each_frame_has_its_own_budget() {
-        let mut b = FrameBudget::default();
-        assert!(!b.spent(5, 100));
-        b.add(5, 60);
-        assert!(!b.spent(5, 100));
-        b.add(5, 40);
-        assert!(b.spent(5, 100));
-        // The next frame starts again.
-        assert!(!b.spent(6, 100));
-        b.add(7, 150);
-        assert!(b.spent(7, 100));
+        let mut b = FrameBudget::new();
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let budget = Duration::from_millis(100);
+        assert!(!b.spent(5, at(0), budget));
+        assert!(!b.spent(5, at(99), budget));
+        assert!(b.spent(5, at(100), budget));
+        // The next frame starts from its own first pipeline.
+        assert!(!b.spent(6, at(150), budget));
+        assert!(!b.spent(6, at(249), budget));
+        assert!(b.spent(6, at(250), budget));
     }
 
     #[test]
