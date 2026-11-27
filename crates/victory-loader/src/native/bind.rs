@@ -52,8 +52,14 @@ pub fn bind_imports(
 ) -> Result<BindReport> {
     let info = image.info();
     let mut report = BindReport::default();
-    let mut block = StubBlock::new(info.import_count())?;
-    let mut slots = Vec::with_capacity(info.import_count());
+    let total: usize = info
+        .imports
+        .iter()
+        .chain(&info.delay_imports)
+        .map(|m| m.entries.len())
+        .sum();
+    let mut block = StubBlock::new(total)?;
+    let mut slots = Vec::with_capacity(total);
     for module in info.imports.iter().chain(&info.delay_imports) {
         for entry in &module.entries {
             let address = match resolver.resolve(&module.dll, &entry.symbol) {
@@ -161,5 +167,89 @@ mod tests {
              api-ms-win-crt-math-l1-1-0.dll!#42"
         );
         assert_eq!(names(&[]), "");
+    }
+
+    #[test]
+    fn binds_delay_imports_past_a_full_stub_page() {
+        // 128 regular imports fill a 4 KiB Rosetta stub page exactly (128 * 32 B);
+        // delay-loaded imports must still fit in the same StubBlock.
+        let mut pe = vec![0u8; 0x3200];
+        let put16 = |d: &mut [u8], at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |d: &mut [u8], at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        pe[0..2].copy_from_slice(b"MZ");
+        put32(&mut pe, 0x3C, 0x40);
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut pe, 0x44, victory_pe::MACHINE_AMD64);
+        put16(&mut pe, 0x46, 1); // sections
+        put16(&mut pe, 0x54, 240); // optional header size
+        put16(&mut pe, 0x56, 0x2022); // DLL, large address aware
+        let opt = 0x58;
+        put16(&mut pe, opt, 0x20B);
+        put64(&mut pe, opt + 24, 0x1_8000_0000);
+        put32(&mut pe, opt + 32, 0x1000);
+        put32(&mut pe, opt + 36, 0x200);
+        put32(&mut pe, opt + 56, 0x4000); // SizeOfImage
+        put32(&mut pe, opt + 60, 0x200); // SizeOfHeaders
+        put32(&mut pe, opt + 108, 16); // NumberOfRvaAndSizes
+        // Data directory 1 (IMPORT): RVA 0x1000, size 40
+        put32(&mut pe, opt + 112 + 8, 0x1000);
+        put32(&mut pe, opt + 112 + 12, 40);
+        // Data directory 5 (BASERELOC): RVA 0x2800, size 8 (empty block so map can relocate)
+        put32(&mut pe, opt + 112 + 5 * 8, 0x2800);
+        put32(&mut pe, opt + 112 + 5 * 8 + 4, 8);
+        // Data directory 13 (DELAY_IMPORT): RVA 0x2000, size 64
+        put32(&mut pe, opt + 112 + 13 * 8, 0x2000);
+        put32(&mut pe, opt + 112 + 13 * 8 + 4, 64);
+
+        let sec = opt + 240;
+        pe[sec..sec + 6].copy_from_slice(b".rdata");
+        put32(&mut pe, sec + 8, 0x3000); // VirtualSize
+        put32(&mut pe, sec + 12, 0x1000); // VirtualAddress
+        put32(&mut pe, sec + 16, 0x3000); // SizeOfRawData
+        put32(&mut pe, sec + 20, 0x200); // PointerToRawData
+        put32(&mut pe, sec + 36, 0x4000_0000); // READ
+
+        let at = |rva: usize| 0x200 + (rva - 0x1000);
+        // Regular import descriptor: 128 ordinal entries.
+        put32(&mut pe, at(0x1000), 0x1100); // OriginalFirstThunk
+        put32(&mut pe, at(0x100C), 0x1040); // Name
+        put32(&mut pe, at(0x1010), 0x1600); // FirstThunk (IAT)
+        pe[at(0x1040)..at(0x1046)].copy_from_slice(b"a.dll\0");
+        for i in 0..128usize {
+            put64(&mut pe, at(0x1100 + i * 8), (1u64 << 63) | (i as u64 + 1));
+        }
+        // Delay import descriptor: 2 ordinal entries.
+        put32(&mut pe, at(0x2000), 1); // RVA-based
+        put32(&mut pe, at(0x2004), 0x2040); // DllNameRva
+        put32(&mut pe, at(0x2008), 0x2050); // ModuleHandleRva
+        put32(&mut pe, at(0x200C), 0x2200); // ImportAddressTableRva
+        put32(&mut pe, at(0x2010), 0x2100); // ImportNameTableRva
+        pe[at(0x2040)..at(0x2046)].copy_from_slice(b"b.dll\0");
+        for i in 0..2usize {
+            put64(&mut pe, at(0x2100 + i * 8), (1u64 << 63) | (i as u64 + 1));
+        }
+        // Minimal valid empty relocation block at 0x2800.
+        put32(&mut pe, at(0x2800), 0x1000);
+        put32(&mut pe, at(0x2804), 8);
+
+        struct NoneResolver;
+        impl ImportResolver for NoneResolver {
+            fn resolve(&self, _: &str, _: &victory_pe::ImportSymbol) -> Resolution {
+                Resolution::Missing
+            }
+        }
+
+        let image = NativeImage::map(&pe, None).unwrap();
+        let report = bind_imports(&image, &NoneResolver, UnimplementedPolicy::ReturnZero).unwrap();
+        assert_eq!(report.missing.len(), 130);
+        // Verify both delay-import IAT slots were filled with non-zero stub addresses.
+        for rva in [0x2200usize, 0x2208] {
+            // SAFETY: inside the mapped image.
+            let slot = unsafe { ((image.base() + rva) as *const u64).read_unaligned() };
+            assert_ne!(slot, 0, "delay-import slot {rva:#x} was not bound");
+        }
+        // SAFETY: no title code ran.
+        unsafe { image.unmap() };
     }
 }

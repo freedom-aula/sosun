@@ -312,6 +312,7 @@ fn address(a: Address) -> MTLSamplerAddressMode {
         Address::Wrap => MTLSamplerAddressMode::Repeat,
         Address::Mirror => MTLSamplerAddressMode::MirrorRepeat,
         Address::Clamp => MTLSamplerAddressMode::ClampToEdge,
+        Address::Border => MTLSamplerAddressMode::ClampToBorderColor,
     }
 }
 
@@ -320,6 +321,28 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
         Filter::Nearest => MTLSamplerMinMagFilter::Nearest,
         Filter::Linear => MTLSamplerMinMagFilter::Linear,
     }
+}
+
+fn dynamic_sampler_descriptor(d: &SamplerDesc) -> Retained<MTLSamplerDescriptor> {
+    let sd = MTLSamplerDescriptor::new();
+    sd.setMinFilter(filter(d.min_mag));
+    sd.setMagFilter(filter(d.min_mag));
+    sd.setMipFilter(match d.mip {
+        Filter::Nearest => MTLSamplerMipFilter::Nearest,
+        Filter::Linear => MTLSamplerMipFilter::Linear,
+    });
+    sd.setSAddressMode(address(d.address[0]));
+    sd.setTAddressMode(address(d.address[1]));
+    sd.setRAddressMode(address(d.address[2]));
+    sd.setBorderColor(match d.border_color {
+        BorderColor::TransparentBlack => MTLSamplerBorderColor::TransparentBlack,
+        BorderColor::OpaqueBlack => MTLSamplerBorderColor::OpaqueBlack,
+        BorderColor::OpaqueWhite => MTLSamplerBorderColor::OpaqueWhite,
+    });
+    sd.setMaxAnisotropy(d.max_anisotropy.max(1));
+    // Heap entries store resource IDs, which exist only for argument-buffer samplers.
+    sd.setSupportArgumentBuffers(true);
+    sd
 }
 
 /// A sampler for a static sampler's `D3D12_STATIC_SAMPLER_DESC` words up to `MaxLOD` (filter,
@@ -453,6 +476,14 @@ fn vertex_format(f: VertexFormat) -> MTLVertexFormat {
 fn resource_id(id: MTLResourceID) -> u64 {
     // SAFETY: MTLResourceID is one u64 (`Encode`d as such).
     unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }
+}
+
+fn origin(a: [usize; 3]) -> MTLOrigin {
+    MTLOrigin {
+        x: a[0],
+        y: a[1],
+        z: a[2],
+    }
 }
 
 fn size(a: [usize; 3]) -> MTLSize {
@@ -1001,19 +1032,7 @@ impl ResourceBackend for Metal {
         if let Some((_, s)) = self.samplers.borrow().iter().find(|(k, _)| k == d) {
             return Ok(Sampler(s.clone()));
         }
-        let sd = MTLSamplerDescriptor::new();
-        sd.setMinFilter(filter(d.min_mag));
-        sd.setMagFilter(filter(d.min_mag));
-        sd.setMipFilter(match d.mip {
-            Filter::Nearest => MTLSamplerMipFilter::Nearest,
-            Filter::Linear => MTLSamplerMipFilter::Linear,
-        });
-        sd.setSAddressMode(address(d.address[0]));
-        sd.setTAddressMode(address(d.address[1]));
-        sd.setRAddressMode(address(d.address[2]));
-        sd.setMaxAnisotropy(d.max_anisotropy.max(1));
-        // The heap entry stores the sampler's resource ID, which exists only for argument-buffer samplers.
-        sd.setSupportArgumentBuffers(true);
+        let sd = dynamic_sampler_descriptor(d);
         let s = self
             .dev
             .newSamplerStateWithDescriptor(&sd)
@@ -1549,6 +1568,9 @@ impl Metal {
     ) -> Result<(), String> {
         let nonzero = |op: &BlitOp<'_, Metal>| match op {
             BlitOp::Copy { len, .. } | BlitOp::Fill { len, .. } => *len > 0,
+            BlitOp::CopyTexture { size, .. } => !size.contains(&0),
+            BlitOp::CopyBufferToTexture { len, size, .. }
+            | BlitOp::CopyTextureToBuffer { len, size, .. } => *len > 0 && !size.contains(&0),
         };
         if !ops.iter().any(nonzero) {
             return Ok(());
@@ -1560,6 +1582,38 @@ impl Metal {
             e.waitForFence(f);
         }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
+        let tex_dims = |t: &ProtocolObject<dyn MTLTexture>, mip: usize| {
+            [(t.width() >> mip).max(1), (t.height() >> mip).max(1), (t.depth() >> mip).max(1)]
+        };
+        let tex_slices = |t: &ProtocolObject<dyn MTLTexture>| {
+            if t.textureType() == MTLTextureType::Type2DArray { t.arrayLength() } else { 1 }
+        };
+        let fits_region = |t: &ProtocolObject<dyn MTLTexture>, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3]| {
+            if sz.contains(&0) || mip >= t.mipmapLevelCount() || slice >= tex_slices(t) {
+                return false;
+            }
+            let dims = tex_dims(t, mip);
+            (0..3).all(|i| at[i].saturating_add(sz[i]) <= dims[i])
+        };
+        let fits_buffer_transfer = |what: &str, buf: (&Buffer, *const u8), t: &Texture, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize| -> Option<(usize, usize)> {
+            let align = t.format.block().1;
+            let buf_off = off(buf.0, buf.1);
+            if is_depth(t.tex.pixelFormat())
+                || !fits_region(&t.tex, mip, slice, at, sz)
+                || buf_off % align != 0
+                || row_pitch % align != 0
+                || buf_off.saturating_add(len) > buf.0.buf.length()
+                || !transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+            {
+                return None;
+            }
+            let slice_bytes = if sz[2] > 1 || t.tex.textureType() == MTLTextureType::Type3D {
+                slice_pitch
+            } else {
+                0
+            };
+            (slice_bytes % align == 0).then_some((buf_off, slice_bytes))
+        };
         for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
@@ -1577,6 +1631,140 @@ impl Metal {
                 BlitOp::Fill { dst, len, value } => {
                     let o = off(dst.0, dst.1);
                     e.fillBuffer_range_value(&dst.0.buf, NSRange::new(o, *len), *value);
+                }
+                BlitOp::CopyTexture {
+                    src,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size: sz,
+                    dst,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                } => {
+                    if !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz)
+                        || !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, *sz)
+                    {
+                        continue;
+                    }
+                    let view = if src.tex.pixelFormat() == dst.tex.pixelFormat() {
+                        None
+                    } else if !is_depth(src.tex.pixelFormat())
+                        && !is_depth(dst.tex.pixelFormat())
+                        && castable(src.format, dst.format)
+                        && src.tex.textureType() == dst.tex.textureType()
+                    {
+                        src.tex.newTextureViewWithPixelFormat(dst.tex.pixelFormat())
+                    } else {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| {
+                            tracing::warn!(
+                                src = ?src.format,
+                                dst = ?dst.format,
+                                "metal: skipping incompatible CopyTexture formats"
+                            );
+                        });
+                        continue;
+                    };
+                    if src.tex.pixelFormat() != dst.tex.pixelFormat() && view.is_none() {
+                        continue;
+                    }
+                    let src_tex: &ProtocolObject<dyn MTLTexture> = view.as_deref().unwrap_or(&*src.tex);
+                    // SAFETY: bounds, mip/slice ranges, and equal pixel formats are checked above.
+                    unsafe {
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            src_tex,
+                            *src_slice,
+                            *src_mip,
+                            origin(*src_origin),
+                            size(*sz),
+                            &dst.tex,
+                            *dst_slice,
+                            *dst_mip,
+                            origin(*dst_origin),
+                        )
+                    };
+                }
+                BlitOp::CopyBufferToTexture {
+                    src,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                    size: sz,
+                    dst,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                } => {
+                    let Some((src_off, slice_bytes)) = fits_buffer_transfer(
+                        "copy_buffer_to_texture",
+                        *src,
+                        dst,
+                        *dst_mip,
+                        *dst_slice,
+                        *dst_origin,
+                        *sz,
+                        *row_pitch,
+                        *slice_pitch,
+                        *len,
+                    ) else {
+                        continue;
+                    };
+                    // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
+                    unsafe {
+                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                            &src.0.buf,
+                            src_off,
+                            *row_pitch,
+                            slice_bytes,
+                            size(*sz),
+                            &dst.tex,
+                            *dst_slice,
+                            *dst_mip,
+                            origin(*dst_origin),
+                        )
+                    };
+                }
+                BlitOp::CopyTextureToBuffer {
+                    src,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size: sz,
+                    dst,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                } => {
+                    let Some((dst_off, slice_bytes)) = fits_buffer_transfer(
+                        "copy_texture_to_buffer",
+                        *dst,
+                        src,
+                        *src_mip,
+                        *src_slice,
+                        *src_origin,
+                        *sz,
+                        *row_pitch,
+                        *slice_pitch,
+                        *len,
+                    ) else {
+                        continue;
+                    };
+                    // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
+                    unsafe {
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                            &src.tex,
+                            *src_slice,
+                            *src_mip,
+                            origin(*src_origin),
+                            size(*sz),
+                            &dst.0.buf,
+                            dst_off,
+                            *row_pitch,
+                            slice_bytes,
+                        )
+                    };
                 }
             }
         }
@@ -1946,9 +2134,8 @@ impl Metal {
                 MTLDepthClipMode::Clamp
             });
             e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            if let Some(ds) = &d.pipeline.depth {
-                e.setDepthStencilState(Some(ds));
-            }
+            // Passing nil restores Metal's default depth and stencil state for this draw.
+            e.setDepthStencilState(d.pipeline.depth.as_deref());
             if d.pipeline.stencil {
                 e.setStencilReferenceValue(d.state.stencil_ref);
             }
@@ -2000,8 +2187,8 @@ impl Metal {
                     first | MTLRenderStages::Fragment,
                 );
             }
-            for (slot, (b, title)) in d.vertex_buffers.iter().enumerate() {
-                let off = *title as usize - b.base as usize;
+            for &(slot, b, title) in &d.vertex_buffers {
+                let off = title as usize - b.base as usize;
                 // SAFETY: the buffer is live and `off` is inside it.
                 unsafe {
                     e.setVertexBuffer_offset_atIndex(Some(&b.buf), off, VERTEX_BUFFERS + slot)
@@ -2459,12 +2646,146 @@ mod sampler_tests {
     use super::*;
 
     #[test]
+    fn dynamic_samplers_apply_the_metal_border_descriptor() {
+        for (color, expected) in [
+            (BorderColor::TransparentBlack, MTLSamplerBorderColor::TransparentBlack),
+            (BorderColor::OpaqueBlack, MTLSamplerBorderColor::OpaqueBlack),
+            (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
+        ] {
+            let desc = dynamic_sampler_descriptor(&SamplerDesc {
+                min_mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [Address::Border, Address::Clamp, Address::Mirror],
+                border_color: color,
+                max_anisotropy: 1,
+            });
+            assert_eq!(desc.sAddressMode(), MTLSamplerAddressMode::ClampToBorderColor);
+            assert_eq!(desc.tAddressMode(), MTLSamplerAddressMode::ClampToEdge);
+            assert_eq!(desc.rAddressMode(), MTLSamplerAddressMode::MirrorRepeat);
+            assert_eq!(desc.borderColor(), expected);
+        }
+    }
+
+    #[test]
+    fn dynamic_samplers_sample_their_border_color_and_keep_distinct_cache_keys() {
+        use objc2_foundation::NSString;
+
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        let metal = Metal::new().expect("Metal device");
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        metal.upload_texture(&source, 0, 0, &GREEN.repeat(4), 8, 0);
+        let mut output_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 1);
+        output_desc.render_target = true;
+        let output = metal.create_texture(&output_desc).unwrap();
+
+        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            vertex float4 test_vertex(uint i [[vertex_id]]) {
+                return float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
+            }
+            fragment float4 test_fragment(
+                float4 position [[position]],
+                texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]]
+            ) {
+                const float2 uv[] = {
+                    float2(-0.25, 0.25), float2(0.25, 0.25),
+                    float2(1.25, 0.25), float2(0.25, -0.25),
+                };
+                return tex.sample(s, uv[uint(position.x)]);
+            }
+        "#), None).expect("compile generated Metal shader source");
+
+        let desc = MTLRenderPipelineDescriptor::new();
+        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
+        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        desc.setVertexFunction(Some(&vertex));
+        desc.setFragmentFunction(Some(&fragment));
+        // SAFETY: color attachment 0 exists.
+        unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) }
+            .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        let pipeline = metal.dev.newRenderPipelineStateWithDescriptor_error(&desc).unwrap();
+        let queue = metal.dev.newCommandQueue().unwrap();
+
+        let sample = |sampler: &ProtocolObject<dyn MTLSamplerState>| {
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: color attachment 0 exists.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&output.tex));
+            a.setLoadAction(MTLLoadAction::Clear);
+            a.setClearColor(MTLClearColor { red: 1.0, green: 0.0, blue: 1.0, alpha: 1.0 });
+            a.setStoreAction(MTLStoreAction::Store);
+            let cb = queue.commandBuffer().unwrap();
+            let e = cb.renderCommandEncoderWithDescriptor(&pass).unwrap();
+            e.setRenderPipelineState(&pipeline);
+            // SAFETY: the generated fragment shader uses texture and sampler slot 0, and
+            // the vertex shader draws a fullscreen triangle using vertex IDs 0 through 2.
+            unsafe {
+                e.setFragmentTexture_atIndex(Some(&source.tex), 0);
+                e.setFragmentSamplerState_atIndex(Some(sampler), 0);
+                e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            e.endEncoding();
+            cb.commit();
+            cb.waitUntilCompleted();
+            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed, "{:?}", cb.error());
+
+            let mut bytes = [0; 16];
+            metal.read_texture(&output, 0, 0, &mut bytes, 16, 0);
+            *bytes.as_chunks::<4>().0.first_chunk::<4>().unwrap()
+        };
+
+        // Independently construct the edge sampler the old dynamic path used.
+        let edge_desc = MTLSamplerDescriptor::new();
+        edge_desc.setMinFilter(MTLSamplerMinMagFilter::Nearest);
+        edge_desc.setMagFilter(MTLSamplerMinMagFilter::Nearest);
+        edge_desc.setMipFilter(MTLSamplerMipFilter::Nearest);
+        edge_desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);
+        edge_desc.setSupportArgumentBuffers(true);
+        let legacy_edge = metal.dev.newSamplerStateWithDescriptor(&edge_desc).unwrap();
+        assert_eq!(sample(&legacy_edge), [GREEN; 4]);
+
+        let cases = [
+            (Address::Border, BorderColor::OpaqueWhite, [255; 4]),
+            (Address::Border, BorderColor::OpaqueBlack, [0, 0, 0, 255]),
+            (Address::Border, BorderColor::TransparentBlack, [0; 4]),
+            (Address::Clamp, BorderColor::TransparentBlack, GREEN),
+        ];
+        let cached_before = metal.samplers.borrow().len();
+        let mut ids = std::collections::HashSet::new();
+        for (mode, border_color, outside) in cases {
+            let key = SamplerDesc {
+                min_mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [mode, Address::Clamp, Address::Clamp],
+                border_color,
+                max_anisotropy: 1,
+            };
+            let sampler = metal.create_sampler(&key).unwrap();
+            let id = resource_id(sampler.0.gpuResourceID());
+            assert!(ids.insert(id), "two distinct samplers shared an ID");
+            let repeated = metal.create_sampler(&key).unwrap();
+            assert_eq!(resource_id(repeated.0.gpuResourceID()), id, "repeat lookup changed cache identity");
+
+            let pixels = sample(&sampler.0);
+            assert_eq!(pixels, [outside, GREEN, outside, GREEN], "{mode:?}, {border_color:?}");
+            println!("{mode:?} {border_color:?}: {pixels:?}");
+        }
+        assert_eq!(metal.samplers.borrow().len(), cached_before + cases.len());
+    }
+
+    #[test]
     fn a_sampler_in_a_heap_keeps_its_id() {
         let m = Metal::new().unwrap();
         let desc = |min_mag| SamplerDesc {
             min_mag,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         };
         let id = |s: &Sampler| resource_id(s.0.gpuResourceID());

@@ -86,6 +86,7 @@ impl Grid<'_> {
                 min_mag: self.filter,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
+                border_color: BorderColor::TransparentBlack,
                 max_anisotropy: 1,
             })
             .unwrap();
@@ -645,5 +646,91 @@ fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
         let signals = [(&fence, 1)];
         m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
         assert!(m.wait(&fence, 1, 5000));
+    }
+}
+
+#[test]
+fn texture_blit_ops_copy_between_textures_and_buffers() {
+    let Ok(m) = Metal::new() else { return };
+    let q = m.create_queue().unwrap();
+    let f = m.create_fence(0).unwrap();
+    let a = Arena::new(&m, 0x20000);
+
+    let (w, h) = (8usize, 8usize);
+    let pitch = 256usize;
+    let src_data: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).flat_map(move |x| [x as u8 * 17, y as u8 * 29, 99, 255]))
+        .collect();
+    let mut staged = vec![0u8; (h - 1) * pitch + w * 4];
+    for y in 0..h {
+        staged[y * pitch..y * pitch + w * 4].copy_from_slice(&src_data[y * w * 4..(y + 1) * w * 4]);
+    }
+    a.write(0, &staged);
+
+    let desc = TextureDesc {
+        dim: TexDim::D2,
+        format: Format::Rgba8Unorm,
+        width: w,
+        height: h,
+        depth_or_layers: 1,
+        mips: 1,
+        render_target: false,
+        unordered_access: false,
+    };
+    let tex_a = m.create_texture(&desc).unwrap();
+    let mut srgb_desc = desc.clone();
+    srgb_desc.format = Format::Rgba8UnormSrgb;
+    let tex_b = m.create_texture(&srgb_desc).unwrap();
+    let dst_off = 0x10000;
+
+    let passes = [Pass::Blit(vec![
+        BlitOp::CopyBufferToTexture {
+            src: (&a.buf, a.at(0) as *const u8),
+            len: staged.len(),
+            row_pitch: pitch,
+            slice_pitch: pitch * h,
+            size: [w, h, 1],
+            dst: &tex_a,
+            dst_mip: 0,
+            dst_slice: 0,
+            dst_origin: [0, 0, 0],
+        },
+        BlitOp::CopyTexture {
+            src: &tex_a,
+            src_mip: 0,
+            src_slice: 0,
+            src_origin: [2, 1, 0],
+            size: [4, 4, 1],
+            dst: &tex_b,
+            dst_mip: 0,
+            dst_slice: 0,
+            dst_origin: [1, 2, 0],
+        },
+        BlitOp::CopyTextureToBuffer {
+            src: &tex_b,
+            src_mip: 0,
+            src_slice: 0,
+            src_origin: [1, 2, 0],
+            size: [4, 4, 1],
+            dst: (&a.buf, a.at(dst_off) as *const u8),
+            len: 3 * pitch + 16,
+            row_pitch: pitch,
+            slice_pitch: pitch * 4,
+        },
+    ])];
+    m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] })
+        .unwrap();
+    assert!(m.wait(&f, 1, 5000));
+
+    let out: Vec<u8> = a.read(dst_off, 3 * pitch + 16);
+    for row in 0..4 {
+        for col in 0..4 {
+            let at = row * pitch + col * 4;
+            assert_eq!(
+                &out[at..at + 4],
+                &[(col as u8 + 2) * 17, (row as u8 + 1) * 29, 99, 255],
+                "texel ({col}, {row})"
+            );
+        }
     }
 }
