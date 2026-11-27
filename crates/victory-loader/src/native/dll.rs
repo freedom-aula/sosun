@@ -142,13 +142,13 @@ fn map_dll(
 }
 
 /// Where an export is: in the image, or forwarded to another DLL.
-enum Export {
+enum Export<'a> {
     Address(usize),
-    Forward(String),
+    Forward(&'a str),
 }
 
 impl TitleDll {
-    fn export(&self, symbol: &ImportSymbol) -> Option<Export> {
+    fn export(&self, symbol: &ImportSymbol) -> Option<Export<'_>> {
         let exports = &self.image.info().exports;
         let found: &ExportInfo = match symbol {
             ImportSymbol::Name { name, .. } => exports
@@ -158,8 +158,34 @@ impl TitleDll {
         };
         match (found.rva, &found.forward) {
             (Some(rva), _) => Some(Export::Address(self.image.base() + rva as usize)),
-            (None, Some(forward)) => Some(Export::Forward(forward.clone())),
+            (None, Some(forward)) => Some(Export::Forward(forward)),
             (None, None) => None,
+        }
+    }
+
+    /// Resolves an export of this image. Each forwarded target goes through
+    /// the runtime and host resolver before the mapped title DLLs.
+    pub fn resolve_export(&self, symbol: &ImportSymbol, inner: &dyn ImportResolver) -> Resolution {
+        let mut export = self.export(symbol);
+        let mut seen = HashSet::new();
+        while let Some(Export::Forward(forward)) = export {
+            if !seen.insert(forward) {
+                return Resolution::Missing;
+            }
+            let Some((dll, target)) = forward_target(forward) else {
+                return Resolution::Missing;
+            };
+            match inner.resolve(&dll, &target) {
+                Resolution::Missing => export = find(&dll).and_then(|d| d.export(&target)),
+                found => return found,
+            }
+        }
+        match export {
+            Some(Export::Address(address)) => Resolution::Found {
+                address,
+                provenance: Provenance::Title,
+            },
+            _ => Resolution::Missing,
         }
     }
 }
@@ -180,57 +206,16 @@ fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
     Some((format!("{dll}.dll"), symbol))
 }
 
-/// Address of an export of the title DLL at `base` (what `GetProcAddress`
-/// returns); forwards are followed among the title's DLLs.
-pub fn proc_address(base: usize, symbol: &ImportSymbol) -> Option<usize> {
-    let mut dll = find_base(base)?;
-    let mut symbol = symbol.clone();
-    for _ in 0..8 {
-        match dll.export(&symbol)? {
-            Export::Address(address) => return Some(address),
-            Export::Forward(forward) => {
-                let (next, target) = forward_target(&forward)?;
-                dll = find(&next)?;
-                symbol = target;
-            }
-        }
-    }
-    None
-}
-
 /// Resolves through `inner`, then through the exports of the title's DLLs.
 pub struct WithTitleDlls<'a> {
     pub inner: &'a dyn ImportResolver,
 }
 
-impl WithTitleDlls<'_> {
-    fn lookup_in_dlls(&self, dll: &str, symbol: &ImportSymbol, depth: u32) -> Resolution {
-        let Some(found) = find(dll).filter(|_| depth < 8) else {
-            return Resolution::Missing;
-        };
-        match found.export(symbol) {
-            Some(Export::Address(address)) => Resolution::Found {
-                address,
-                provenance: Provenance::Title,
-            },
-            Some(Export::Forward(forward)) => {
-                let Some((next, target)) = forward_target(&forward) else {
-                    return Resolution::Missing;
-                };
-                match self.inner.resolve(&next, &target) {
-                    Resolution::Missing => self.lookup_in_dlls(&next, &target, depth + 1),
-                    found => found,
-                }
-            }
-            None => Resolution::Missing,
-        }
-    }
-}
-
 impl ImportResolver for WithTitleDlls<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         match self.inner.resolve(dll, symbol) {
-            Resolution::Missing => self.lookup_in_dlls(dll, symbol, 0),
+            Resolution::Missing => find(dll)
+                .map_or(Resolution::Missing, |d| d.resolve_export(symbol, self.inner)),
             found => found,
         }
     }
