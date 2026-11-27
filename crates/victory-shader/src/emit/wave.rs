@@ -575,6 +575,12 @@ fn simulate(
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                        match uni.get(&inst.read(Reg::S(code))?) {
+                            Some(&Sym::K(x)) => Some(x),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
                 match (sel(1), sel(2)) {

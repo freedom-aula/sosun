@@ -943,6 +943,8 @@ story-load log of issue #110 (Series S) has three compute programs refused with 
 The simulator now follows a constant loaded by `s_mov_b32` inside the section. For example, a
 signed minimum can use `INT_MAX` from an SGPR as its inactive-lane identity. Whether the three
 logged programs use this pattern is unknown.
+Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR constants as lane
+selectors. A selector with a runtime value still produces the computed-lane-select refusal.
 
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
