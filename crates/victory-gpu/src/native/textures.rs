@@ -482,14 +482,14 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     }
 }
 
-/// Probes `keys` round-robin from `cursor`, each at most once, until `until` once
-/// `MIN_SYNC_HOT` were probed; those whose memory changed go to `dirty`. Hot textures that stay
+/// Probes `keys` round-robin from `cursor`, each at most once. An expired deadline stops the
+/// round after at least `MIN_SYNC_HOT` probes. Changed textures go to `dirty`. Hot textures that stay
 /// unchanged cool down and leave; blank ones (`blank`) stay until they are written.
 fn probe_round<B: ResourceBackend>(
     textures: &mut Textures<B>,
     keys: &mut Vec<usize>,
     cursor: &mut usize,
-    until: std::time::Instant,
+    until: Option<std::time::Instant>,
     blank: bool,
     scratch: &mut Vec<u8>,
     dirty: &mut std::collections::HashSet<usize>,
@@ -497,7 +497,7 @@ fn probe_round<B: ResourceBackend>(
     let mut left = keys.len();
     let mut probed = 0;
     while left > 0 && !keys.is_empty() {
-        if probed >= MIN_SYNC_HOT && std::time::Instant::now() >= until {
+        if probed >= MIN_SYNC_HOT && until.is_some_and(|until| std::time::Instant::now() >= until) {
             break;
         }
         left -= 1;
@@ -831,6 +831,15 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
     /// found changed since.
     pub fn sync_dirty(&mut self) {
+        self.sync_dirty_with_probe_budget(Some(PROBE_BUDGET));
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn sync_dirty_without_probe_deadline(&mut self) {
+        self.sync_dirty_with_probe_budget(None);
+    }
+
+    fn sync_dirty_with_probe_budget(&mut self, budget: Option<std::time::Duration>) {
         self.release_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         for key in &dirty {
@@ -842,10 +851,10 @@ impl<B: PresentBackend> Title<B> {
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
         // the ones that changed lately first, then the blank ones.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let until = budget.map(|budget| std::time::Instant::now() + budget);
         probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
         // The blank ones get a budget of their own: a busy movie must not starve its next planes.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let until = budget.map(|budget| std::time::Instant::now() + budget);
         probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
         let unloaded = std::mem::take(&mut self.unloaded);
         if unloaded.is_empty() && dirty.is_empty() {

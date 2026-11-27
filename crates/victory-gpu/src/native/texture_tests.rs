@@ -197,7 +197,8 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
 }
 
 /// A movie plane uploaded blank among hundreds of other hot textures (a title streaming) is still
-/// probed at the next submission: a count limit on the probes left its first frames green.
+/// probed at the next submission when the probe deadline allows it: a count limit on the probes
+/// left its first frames green.
 /// (Every texture is written, so which one a limited probe reaches first does not matter.)
 #[test]
 fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
@@ -215,12 +216,14 @@ fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
         }
         t.sync_dirty();
         assert!(keys.iter().all(|&k| t.uploads_of(k) == 1), "every blank upload");
-    });
-    for i in 0..N {
-        pool.write(i * STRIDE, &vec![0xABu8; size]);
-    }
-    with_title(|t| {
-        t.sync_dirty();
+        let bytes = vec![0xABu8; size];
+        for i in 0..N {
+            pool.write(i * STRIDE, &bytes);
+        }
+        t.sync_dirty_without_probe_deadline();
+        // The scanner can trigger uploads too. The probe removes written textures from blank_keys.
+        let probed = keys.iter().filter(|&k| !t.blank_keys.contains(k)).count();
+        assert_eq!(probed, N, "all {N} blank textures probed in one submission");
         let seen = keys.iter().filter(|&&k| t.uploads_of(k) == 2).count();
         assert_eq!(seen, N, "all {N} hot textures written, seen at the next submission");
     });
