@@ -1087,10 +1087,10 @@ impl GraphicsBackend for Metal {
                     md.setStencilAttachmentPixelFormat(pixel_format(f));
                 }
             }
-            let pso = self
-                .dev
-                .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&md, MTLPipelineOption::None, None)
-                .map_err(|e| e.localizedDescription().to_string())?;
+            let pso = match self.archive() {
+                Some(a) => a.mesh(&self.dev, &md),
+                None => crate::archive::compile_mesh(&self.dev, &md),
+            }?;
             (pso, Some(size([x as usize, y as usize, z as usize])))
         } else {
             (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)

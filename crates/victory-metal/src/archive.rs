@@ -27,7 +27,10 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 impl Archive {
     /// The archive for this GPU, if libraries are kept on disk.
     pub(crate) fn open(dev: &Dev) -> Option<Archive> {
-        let dir = crate::disk::dir()?;
+        Self::open_in(dev, crate::disk::dir()?)
+    }
+
+    fn open_in(dev: &Dev, dir: &std::path::Path) -> Option<Archive> {
         let gpu = blake3::hash(dev.name().to_string().as_bytes()).to_hex();
         let path = dir.join(format!("pipelines-{}.metalarchive", &gpu[..8]));
         let make = |load: bool| {
@@ -68,6 +71,29 @@ impl Archive {
             self.added_one();
         }
         Ok(p)
+    }
+
+    /// As [`Self::render`], for a mesh pipeline. Without this each run compiled every mesh pipeline
+    /// again on the frame that first draws with it: seconds each at the first frame of the world.
+    pub(crate) fn mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
+        if let Some(p) = self.archived_mesh(dev, d) {
+            return Ok(p);
+        }
+        let p = compile_mesh(dev, d)?;
+        if self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
+            self.added_one();
+        }
+        Ok(p)
+    }
+
+    fn archived_mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Option<RenderPso> {
+        d.setBinaryArchives(Some(&self.list));
+        dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+            d,
+            MTLPipelineOption::FailOnBinaryArchiveMiss,
+            None,
+        )
+        .ok()
     }
 
     /// As [`Self::render`], for a compute function.
@@ -163,6 +189,13 @@ fn is_compiler_crash(error: &str) -> bool {
     error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
 }
 
+/// Compiles the mesh pipeline `d`. shortcut: no deadline and no crash memory as
+/// [`compile_render`] has; add them if Metal's compiler ever crashes on a mesh pipeline.
+pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
+    dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
+        .map_err(|e| e.localizedDescription().to_string())
+}
+
 fn remember_crash<T>(r: &Result<T, String>, key: &str) {
     if let Err(e) = r
         && is_compiler_crash(e)
@@ -235,5 +268,46 @@ mod tests {
         ));
         assert!(!is_compiler_crash("Fragment input mismatching vertex shader output type"));
         assert!(!is_compiler_crash("not enough memory to create pipeline"));
+    }
+
+    fn mesh_descriptor(dev: &Dev) -> Retained<MTLMeshRenderPipelineDescriptor> {
+        let source = r#"
+            #include <metal_stdlib>
+            using namespace metal;
+            struct Corner { float4 position [[position]]; };
+            using Triangle = metal::mesh<Corner, void, 3, 1, metal::topology::triangle>;
+            [[mesh]] void test_mesh(Triangle out) {
+                out.set_primitive_count(1);
+                for (uint i = 0; i < 3; i++) {
+                    Corner c;
+                    c.position = float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
+                    out.set_vertex(i, c);
+                    out.set_index(i, i);
+                }
+            }
+            fragment float4 test_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
+        "#;
+        let library = dev.newLibraryWithSource_options_error(&NSString::from_str(source), None).expect("test shaders");
+        let d = MTLMeshRenderPipelineDescriptor::new();
+        // SAFETY: the functions are of the stages they are set as; the descriptor has attachment 0.
+        unsafe {
+            d.setMeshFunction(library.newFunctionWithName(&NSString::from_str("test_mesh")).as_deref());
+            d.setFragmentFunction(library.newFunctionWithName(&NSString::from_str("test_fragment")).as_deref());
+            d.colorAttachments().objectAtIndexedSubscript(0).setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        }
+        d
+    }
+
+    /// A mesh pipeline is compiled once: a later run finds it in the archive's file.
+    #[test]
+    fn a_mesh_pipeline_is_kept_in_the_archive() {
+        let Some(dev) = MTLCreateSystemDefaultDevice() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let first = Archive::open_in(&dev, dir.path()).unwrap();
+        assert!(first.archived_mesh(&dev, &mesh_descriptor(&dev)).is_none());
+        first.mesh(&dev, &mesh_descriptor(&dev)).unwrap();
+        drop(first);
+        let second = Archive::open_in(&dev, dir.path()).unwrap();
+        assert!(second.archived_mesh(&dev, &mesh_descriptor(&dev)).is_some());
     }
 }
