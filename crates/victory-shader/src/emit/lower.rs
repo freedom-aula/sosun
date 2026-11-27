@@ -1767,6 +1767,12 @@ impl<'a> Lower<'a> {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // Guess (docs/native-host.md, "LDS instructions addressed by M0"): M0 a
+                    // compute program reads before writing holds LDS address 0 (observed: a
+                    // `ds_append` counter at 0 + offset that the program zeroes and reads there).
+                    None if n == crate::ir::M0 && self.x.native.stage == HwStage::Cs => {
+                        Val::I32(self.s.m.i32(0))
+                    }
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -12841,7 +12847,9 @@ impl<'a> Lower<'a> {
             let mut copies = Vec::new();
             for &(id, col, value, half) in &stores {
                 let src = &self.s.outputs[id];
-                if src.kind != 0 || src.index >= 32 {
+                // `TEXCOORD`s only: a `HALF` of the copied index is another parameter's half,
+                // and copying it would overwrite the `HALF` of the copy's index.
+                if src.kind != 0 || src.name != "TEXCOORD" || src.index >= 32 {
                     continue;
                 }
                 for (m, &from) in self.x.copy_params.iter().enumerate() {

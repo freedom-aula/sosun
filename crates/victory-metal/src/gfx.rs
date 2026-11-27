@@ -1050,10 +1050,20 @@ impl ResourceBackend for Metal {
     }
 }
 
+/// What a compiler crash is remembered by: the two stages' DXIL (the crash is in compiling them,
+/// whatever the targets and state).
+fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
+    crate::disk::key(&[d.vs, d.ps.unwrap_or_default()])
+}
+
 impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        if crate::disk::crashed(crash_key(d).as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
         let (stage, vf) = self.stage_function(d.vs, d.vs_layout)?;
         let ff = d.ps.map(|ps| self.stage_function(ps, d.ps_layout)).transpose()?.map(|f| f.1);
         let has_stencil = d.depth == Some(Format::D32FloatS8);
@@ -1330,12 +1340,10 @@ impl Metal {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
         }
+        let crash_key = crash_key(d);
         match self.archive() {
-            Some(a) => a.render(&self.dev, &pd),
-            None => self
-                .dev
-                .newRenderPipelineStateWithDescriptor_error(&pd)
-                .map_err(|e| e.localizedDescription().to_string()),
+            Some(a) => a.render(&self.dev, &pd, &crash_key),
+            None => crate::archive::compile_render(&self.dev, &pd, &crash_key),
         }
     }
 }
