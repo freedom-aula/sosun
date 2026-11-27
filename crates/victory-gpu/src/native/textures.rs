@@ -1496,9 +1496,16 @@ mod budget_tests {
         assert!(within_budget(&mut none, 1_000).is_empty(), "no jobs at all");
         // A deferred re-queue goes first next round: the keys it returns are what
         // `sync_jobs_within` puts back into `unloaded`, which `keys_to_sync` heads with.
+        // (A hash set's order is not stable, so the two sections are sorted apart, as the
+        // macOS test of `keys_to_sync` does.)
         let unloaded: HashSet<usize> = [7, 8].into_iter().collect();
-        let dirty: HashSet<usize> = [9].into_iter().collect();
-        assert_eq!(keys_to_sync(&unloaded, &dirty), [7, 8, 9], "unloaded first");
+        let dirty: HashSet<usize> = [9, 7].into_iter().collect();
+        let mut keys = keys_to_sync(&unloaded, &dirty);
+        let (first, rest) = keys.split_at_mut(unloaded.len());
+        first.sort_unstable();
+        rest.sort_unstable();
+        assert_eq!(first, &[7, 8], "the re-queued unloaded keys first");
+        assert_eq!(rest, &[9], "then what the watch found dirty");
     }
 }
 
