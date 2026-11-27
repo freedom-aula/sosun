@@ -110,6 +110,15 @@ pub(crate) struct Lowered {
     /// The wave prefix calls, with their constant arguments.
     #[cfg(test)]
     pub wave_prefix_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// The lane reads, with their constant arguments.
+    #[cfg(test)]
+    pub wave_read_lane_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// The wave reduction calls, with their constant arguments.
+    #[cfg(test)]
+    pub wave_active_calls: Vec<(String, Vec<Option<i64>>)>,
+    /// Live f32 multiplies, including the inclusive and cross-wave prefix steps.
+    #[cfg(test)]
+    pub float_multiplies: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -714,7 +723,10 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if x.st.lockstep {
+                    split_barriers = super::lockstep::lds_barriers(p);
+                    synced = true;
+                } else if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -726,8 +738,7 @@ impl<'a> Lower<'a> {
             if host32 {
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
-                let sections = (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty());
-                halves = lanes > 32 && (console_lanes || sections);
+                halves = lanes > 32 && (console_lanes || super::wave::has_sections(p) || x.st.lockstep);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
@@ -1239,6 +1250,10 @@ impl<'a> Lower<'a> {
 
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
+        // Lockstep runs whole-wave code literally: every thread is there (`lockstep.rs`).
+        if self.x.st.lockstep {
+            return;
+        }
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
@@ -1308,6 +1323,12 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::ReadLane(v, lane) => {
+                self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
+                let x = self.i32_of(v)?;
+                let lane = self.s.m.i32(lane);
+                return self.wide_read_lane(x, lane);
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
@@ -1414,24 +1435,40 @@ impl<'a> Lower<'a> {
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
+        let mut half_prefix = None;
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+            (_, Some(inclusive)) => {
+                let (kind, bin) = match op {
+                    Op::AddU | Op::AddF => (0, Bin::Add),
+                    Op::MulF => (1, Bin::Mul),
+                    _ => return Err("a wave prefix of an operation other than a sum or product"),
+                };
+                let args = [arg, self.s.m.i8(kind), self.s.m.i8(u8::from(!float))];
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
                     Attr::NoUnwind,
                     ty,
                     121,
-                    &[arg, k0, unsigned],
+                    &args,
                 );
+                if self.halves {
+                    let total = self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &args,
+                    );
+                    half_prefix = Some((bin, total));
+                }
                 if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
+                    self.s.m.bin(c, bin, r, arg)
                 } else {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -1463,7 +1500,7 @@ impl<'a> Lower<'a> {
             }
         };
         let r = if self.halves {
-            self.halves_reduce(op, prefix.is_some(), arg, r)?
+            self.halves_reduce(op, r, half_prefix)?
         } else {
             r
         };
@@ -1641,6 +1678,12 @@ impl<'a> Lower<'a> {
             .concat(),
             #[cfg(test)]
             wave_prefix_calls: self.s.m.written_call_args("dx.op.wavePrefixOp"),
+            #[cfg(test)]
+            wave_read_lane_calls: self.s.m.written_call_args("dx.op.waveReadLaneAt"),
+            #[cfg(test)]
+            wave_active_calls: self.s.m.written_call_args("dx.op.waveActiveOp"),
+            #[cfg(test)]
+            float_multiplies: self.s.m.written_bin_ops(self.s.t.f32, Bin::Mul),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -8692,6 +8735,13 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
+            "v_readfirstlane_b32" if self.x.st.lockstep => {
+                // Lockstep: every thread runs, so the first lane is the wide EXEC's.
+                let a = s(self, 0)?;
+                let lane = self.lockstep_first_lane(inst)?;
+                let r = self.wide_read_lane(a, lane)?;
+                int(self, r)
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
@@ -15028,6 +15078,21 @@ mod tests {
     }
 
     #[test]
+    fn host32_simulates_each_whole_wave_section_once() {
+        let words = [
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            RESTORE_EXEC,
+            S_ENDPGM,
+        ];
+        let simulations = &crate::emit::wave::SIMULATIONS;
+        let before = simulations.get();
+        let shader = lowered(&words, 64, false, true);
+        assert_eq!(shader.wave_size, Some(32));
+        assert_eq!(simulations.get() - before, 1);
+    }
+
+    #[test]
     fn a_program_for_thread_counts_reads_the_count_of_each_dimension_with_lanes() {
         // `v_mov_b32 v1, 0`: nothing reads user data, but the lanes' EXEC on
         // entry comes from the dispatch's thread count in x, which the host
@@ -15113,6 +15178,41 @@ mod tests {
         w.push(S_ENDPGM);
         assert!(super::split_wave_barriers(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_none());
         assert_eq!(split_barriers(&w, 64, true), 0);
+    }
+
+    #[test]
+    fn a_whole_wave_lane_read_uses_the_original_source_lane() {
+        // v_mov_b32_dpp v2, v0 quad_perm:[1,0,3,2]
+        let swap_neighbours = [0x7E04_02FA, 0xFF00_B100];
+        for (shuffle, vsrc, lane) in [(&[][..], 0, 35), (&swap_neighbours[..], 2, 34)] {
+            let mut words = vec![
+                V_LSHLREV_V1_2_V0,
+                0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            ];
+            words.extend_from_slice(shuffle);
+            words.extend([
+                0xD760_0002, // v_readlane_b32 s2, vsrc, 35
+                0x0001_4700 | vsrc,
+                RESTORE_EXEC,
+                0x7E00_0202, // v_mov_b32 v0, s2
+            ]);
+            words.extend(DS_WRITE_V1_V0);
+            words.push(S_ENDPGM);
+
+            let normal = lowered(&words, 64, false, false);
+            assert_eq!(
+                normal.wave_read_lane_calls,
+                [(
+                    "dx.op.waveReadLaneAt.i32".into(),
+                    vec![Some(117), None, Some(lane)]
+                )]
+            );
+
+            let split = lowered(&words, 64, false, true);
+            assert!(split.exchanges);
+            assert_eq!(split.barriers, 2);
+            assert!(split.wave_read_lane_calls.is_empty());
+        }
     }
 
     #[test]

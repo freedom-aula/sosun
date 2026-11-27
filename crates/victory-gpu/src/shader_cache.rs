@@ -83,8 +83,7 @@ pub fn native_shader(
         return translate(container);
     };
     let started = std::time::Instant::now();
-    let key = *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes();
-    let (made, hit) = cached(cache, &key, container, translate);
+    let (made, hit) = cached(cache, &native_key(settings), container, translate);
     let ms = started.elapsed().as_millis();
     if ms >= 20 {
         tracing::info!(ms, hit, size = container.len(), "native shader translation");
@@ -92,7 +91,13 @@ pub fn native_shader(
     made
 }
 
-/// Shaders found in the cache and translated since the start.
+/// The native host's build key for translations made with `settings`: [`build`] and the settings.
+fn native_key(settings: &str) -> [u8; 32] {
+    *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes()
+}
+
+/// Shaders found in the cache and translated since the start (both hosts). The slow-translation
+/// log line shows only translations of 20 ms or more, which a hit never is.
 pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
@@ -653,6 +658,28 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    /// Two runs of one build: each makes the key afresh and opens the folder anew, and the second
+    /// finds what the first translated. Settings that change the output change the key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_second_run_reads_the_first_runs_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = || format!("{:?}", crate::native::shaders::options());
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let first = Cache::open(dir.path()).unwrap();
+        assert_eq!(cached(&first, &native_key(&settings()), b"container", translate).1, false);
+        drop(first);
+        let second = Cache::open(dir.path()).unwrap();
+        assert_eq!(cached(&second, &native_key(&settings()), b"container", translate).1, true);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
+        assert_ne!(native_key(&settings()), native_key(&rect));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -15,12 +15,13 @@
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
 //! of a mask read as data, `v_readlane_b32`, `ds_bpermute_b32` and the
-//! reductions and prefix sums of whole-wave sections. A ballot is each
+//! reductions and prefixes of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
-//! a reduction is each half's result, combined; a prefix sum adds the lower
-//! half's total in the upper half. Lanes the group lacks (a group whose lanes
-//! are not a multiple of 64) write no slot: their ballot bits are 0, a missing
-//! upper half adds nothing to a reduction, and a lane read of one gives 0.
+//! a reduction is each half's result, combined; a prefix combines the lower
+//! half's total with each upper lane's prefix. Lanes the group lacks (a group
+//! whose lanes are not a multiple of 64) write no slot: their ballot bits are
+//! 0, a missing upper half adds nothing to a reduction, and a lane read of
+//! one gives 0.
 //!
 //! Group barriers need every thread of the group. Such an operation is
 //! therefore lowered only in a block each thread runs exactly once
@@ -54,7 +55,8 @@ impl Lower<'_> {
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
-        if self.once[ir] {
+        // In lockstep every thread reaches every block together (`lockstep.rs`).
+        if self.once[ir] || self.x.st.lockstep {
             return Ok(());
         }
         Err(super::DIVERGENT_EXCHANGE)
@@ -155,30 +157,41 @@ impl Lower<'_> {
         })
     }
 
-    /// A reduction (`r`, one host wave's) or prefix sum (`r`, over the lanes
-    /// below in this host wave; `arg` the operand) made over the console's
-    /// 64 lanes.
-    pub(super) fn halves_reduce(&mut self, op: Op, prefix: bool, arg: V, r: V) -> Result<V, Why> {
+    /// The console lane `v_readfirstlane_b32` reads in lockstep (`lockstep.rs`): the lowest bit of
+    /// EXEC as `inst` reads it, as a number (0 when none is set).
+    pub(super) fn lockstep_first_lane(&mut self, inst: &crate::ir::Inst) -> Result<V, Why> {
+        use crate::ir::{EXEC, Reg};
+        let c = self.cur;
+        let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+            let v = inst.read(Reg::S(r)).ok_or("EXEC of a first lane read")?;
+            let was = std::mem::replace(&mut l.mask_ok, true);
+            let x = l.i32_of(v);
+            l.mask_ok = was;
+            x
+        };
+        let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+        let i32t = self.s.t.i32;
+        let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let low = self.s.m.cmp(c, pred::NE, lo, z);
+        let r = self.s.m.select(c, low, flo, fhi);
+        Ok(self.s.m.bin(c, Bin::And, r, k63))
+    }
+
+    /// Extend a host wave's result over the console's 64 lanes. A prefix
+    /// also supplies its combining operation and the whole host wave's total.
+    pub(super) fn halves_reduce(
+        &mut self,
+        op: Op,
+        r: V,
+        prefix: Option<(Bin, V)>,
+    ) -> Result<V, Why> {
         let c = self.cur;
         self.exchange_site(self.cur_ir)?;
         let float = matches!(op, Op::AddF | Op::MulF | Op::MinF | Op::MaxF);
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        // What each half sends: its result, or its total for a prefix.
-        let mine = if prefix {
-            let (k0, u) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
-            let sfx = if float { "f32" } else { "i32" };
-            let ty = if float { f32t } else { i32t };
-            self.s.op(
-                c,
-                &format!("waveActiveOp.{sfx}"),
-                Attr::NoUnwind,
-                ty,
-                119,
-                &[arg, k0, u],
-            )
-        } else {
-            r
-        };
+        let mine = prefix.map_or(r, |(_, total)| total);
         let bits = if float { self.as_int(mine) } else { mine };
         let f = self.console_flat();
         let (five, six, one) = (self.s.m.i32(5), self.s.m.i32(6), self.s.m.i32(1));
@@ -197,19 +210,13 @@ impl Lower<'_> {
         } else {
             (lo, hi)
         };
-        if prefix {
+        if let Some((bin, _)) = prefix {
             // The upper half's lanes also have every lane of the lower below.
             let upper = self.s.m.bin(c, Bin::And, half, one);
             let z = self.s.m.i32(0);
             let is_upper = self.s.m.cmp(c, pred::NE, upper, z);
-            let none = if float {
-                let z = self.s.m.i32(0);
-                self.as_float(z)
-            } else {
-                z
-            };
-            let add = self.s.m.select(c, is_upper, lo, none);
-            return Ok(self.s.m.bin(c, Bin::Add, r, add));
+            let combined = self.s.m.bin(c, bin, lo, r);
+            return Ok(self.s.m.select(c, is_upper, combined, r));
         }
         let both = match op {
             Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
