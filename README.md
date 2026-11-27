@@ -148,11 +148,11 @@ Times vary with the machine and how warm the shader cache is; the first world fr
 **1. Get the code and build it.**
 
 ```bash
-git clone https://github.com/freedom-aula/SOSUN.git
+git clone https://github.com/freedom-aula/sosun.git
 ```
 
 ```bash
-cd SOSUN && tools/macos/native-setup.sh
+cd sosun && tools/macos/native-setup.sh
 ```
 
 The setup script checks Rosetta 2, the Xcode command line tools, rustup and the Metal Shader Converter, tells you exactly what to install if anything is missing, installs the pinned Rust toolchain (1.98.1) with its x86_64 target, and builds `victory` (release, x86_64, runs under Rosetta).
