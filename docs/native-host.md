@@ -845,7 +845,7 @@ survives pressure better.
 
 A sampler heap entry holds only the sampler's resource ID. The host used to drop its `MTLSamplerState` right after writing the entry, and Metal gives a freed sampler's ID to the next sampler made, so an older entry then sampled with a newer descriptor's filter and address modes. `create_sampler` now keeps every sampler it makes, one per distinct `SamplerDesc` (few exist), and hands the same one back for the same descriptor.
 
-Dynamic `CreateSamplerX` descriptors use Metal's border mode for transparent black, opaque black, and opaque white. Other border colors retain edge clamp, since Metal offers three fixed colors.
+Dynamic `CreateSamplerX` descriptors preserve minification and magnification independently. Changing either filter selects a different cached Metal sampler. These descriptors use Metal's border mode for transparent black, opaque black, and opaque white. Other border colors retain edge clamp, since Metal offers three fixed colors.
 
 #### CPU texture transfers are bounds-checked
 

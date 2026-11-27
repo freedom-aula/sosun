@@ -225,7 +225,8 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
     };
     Decoded::Sampler {
         desc: SamplerDesc {
-            min_mag: linear(f.mag),
+            min: linear(f.min),
+            mag: linear(f.mag),
             mip: if f.mip == 2 {
                 Filter::Linear
             } else {
@@ -401,6 +402,24 @@ mod tests {
     }
 
     #[test]
+    fn console_samplers_preserve_minification_with_nearest_magnification() {
+        let sampler = |min| {
+            let mut words = [0; 27];
+            words[2] = min;
+            let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(words), &|_| None)
+            else {
+                panic!("expected a sampler");
+            };
+            desc
+        };
+        let nearest = sampler(0);
+        let linear = sampler(1);
+        assert_eq!((nearest.min, nearest.mag), (Filter::Nearest, Filter::Nearest));
+        assert_eq!((linear.min, linear.mag), (Filter::Linear, Filter::Nearest));
+        assert_ne!(nearest, linear);
+    }
+
+    #[test]
     fn console_samplers_decode() {
         let mut w = [0u32; 27];
         w[1] = 1; // bilinear magnification
@@ -410,7 +429,7 @@ mod tests {
         else {
             panic!("not a sampler");
         };
-        assert_eq!(desc.min_mag, Filter::Linear);
+        assert_eq!((desc.min, desc.mag), (Filter::Nearest, Filter::Linear));
         assert_eq!(desc.mip, Filter::Linear);
         assert_eq!(
             desc.address,

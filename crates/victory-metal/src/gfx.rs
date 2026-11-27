@@ -325,8 +325,8 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
 
 fn dynamic_sampler_descriptor(d: &SamplerDesc) -> Retained<MTLSamplerDescriptor> {
     let sd = MTLSamplerDescriptor::new();
-    sd.setMinFilter(filter(d.min_mag));
-    sd.setMagFilter(filter(d.min_mag));
+    sd.setMinFilter(filter(d.min));
+    sd.setMagFilter(filter(d.mag));
     sd.setMipFilter(match d.mip {
         Filter::Nearest => MTLSamplerMipFilter::Nearest,
         Filter::Linear => MTLSamplerMipFilter::Linear,
@@ -2874,7 +2874,8 @@ mod sampler_tests {
             (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
         ] {
             let desc = dynamic_sampler_descriptor(&SamplerDesc {
-                min_mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [Address::Border, Address::Clamp, Address::Mirror],
                 border_color: color,
@@ -2980,7 +2981,8 @@ mod sampler_tests {
         let mut ids = std::collections::HashSet::new();
         for (mode, border_color, outside) in cases {
             let key = SamplerDesc {
-                min_mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [mode, Address::Clamp, Address::Clamp],
                 border_color,
@@ -3000,21 +3002,33 @@ mod sampler_tests {
     }
 
     #[test]
-    fn a_sampler_in_a_heap_keeps_its_id() {
+    fn heap_samplers_keep_distinct_ids_for_independent_min_and_mag_filters() {
+        use MTLSamplerMinMagFilter as MetalFilter;
+
         let m = Metal::new().unwrap();
-        let desc = |min_mag| SamplerDesc {
-            min_mag,
+        let nearest = SamplerDesc {
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
             border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         };
-        let id = |s: &Sampler| resource_id(s.0.gpuResourceID());
-        // The host drops its sampler once the ID is in the heap; a later one must not take that ID.
-        let first = id(&m.create_sampler(&desc(Filter::Nearest)).unwrap());
-        let second = id(&m.create_sampler(&desc(Filter::Linear)).unwrap());
-        assert_ne!(first, second, "a freed sampler's ID was reused while a heap still names it");
-        assert_eq!(id(&m.create_sampler(&desc(Filter::Nearest)).unwrap()), first, "samplers are shared by descriptor");
+        let cases = [
+            (nearest, (MetalFilter::Nearest, MetalFilter::Nearest)),
+            (SamplerDesc { min: Filter::Linear, ..nearest }, (MetalFilter::Linear, MetalFilter::Nearest)),
+            (SamplerDesc { mag: Filter::Linear, ..nearest }, (MetalFilter::Nearest, MetalFilter::Linear)),
+        ];
+        let id = |key: &SamplerDesc| resource_id(m.create_sampler(key).unwrap().0.gpuResourceID());
+        // Like a heap entry, keep just the ID after creating each sampler.
+        let mut ids = std::collections::HashSet::new();
+        let first = id(&nearest);
+        for (key, expected) in cases {
+            let desc = dynamic_sampler_descriptor(&key);
+            assert_eq!((desc.minFilter(), desc.magFilter()), expected);
+            assert!(ids.insert(id(&key)), "distinct filter pairs shared a sampler ID");
+        }
+        assert_eq!(id(&nearest), first, "samplers are shared by descriptor");
     }
 }
 
