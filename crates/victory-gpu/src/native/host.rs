@@ -26,6 +26,8 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
     resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
+    /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
+    resources_epoch: std::cell::Cell<u64>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -140,6 +142,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             released: RefCell::default(),
             maps: RefCell::default(),
             resources: RefCell::default(),
+            resources_epoch: std::cell::Cell::new(0),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -254,17 +257,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Buffer(addr, len));
+        self.resources_epoch.set(self.resources_epoch.get() + 1);
     }
 
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
+        self.resources_epoch.set(self.resources_epoch.get() + 1);
         // The entries cleared when the texture last at this address was released are checked
         // again: the record the title writes for the new one may equal the old one's.
         for heap in self.heaps.borrow().iter() {
             for index in heap.take_gone(key) {
                 heap.mirrored.borrow_mut().remove(&index);
+                heap.pending_mirror.borrow_mut().remove(&index);
             }
         }
     }
@@ -298,6 +304,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            pending_mirror: Default::default(),
             images: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
@@ -333,7 +340,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
-        self.resources.borrow_mut().remove(&key);
+        if self.resources.borrow_mut().remove(&key).is_some() {
+            self.resources_epoch.set(self.resources_epoch.get() + 1);
+        }
     }
 
     /// The title released texture `key` for good (its object's last reference, or the pool it was
@@ -344,7 +353,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
     /// name the next object at this address, of a format the view cannot be made over.
     pub fn release_resource(&self, key: usize) {
-        let texture = matches!(self.resources.borrow_mut().remove(&key), Some(Res::Texture(_)));
+        let removed = self.resources.borrow_mut().remove(&key);
+        if removed.is_some() {
+            self.resources_epoch.set(self.resources_epoch.get() + 1);
+        }
+        let texture = matches!(removed, Some(Res::Texture(_)));
         if !texture {
             return;
         }
@@ -396,6 +409,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match decoded {
             Decoded::Buffer { addr, size } => {
+                // Read before resolving: a pool mapped by a title thread after a failed resolve
+                // must bump past these, so the entry is retried.
+                let (pool_gen, res_gen) = (self.memory.generation(), self.resources_epoch.get());
                 let (buf, ptr) = match self.resolve(addr, u64::from(size)) {
                     Ok(found) => found,
                     Err(e) => {
@@ -409,6 +425,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         );
                         // The null view has replaced whatever the cached record used to show.
                         heap.mirrored.borrow_mut().remove(&index);
+                        heap.pending_mirror.borrow_mut().insert(
+                            index,
+                            (
+                                record_at(handle),
+                                pool_gen,
+                                res_gen,
+                            ),
+                        );
                         heap.shows(index, None);
                         return Err(e);
                     }
@@ -450,6 +474,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.shows(index, None);
             }
         }
+        heap.pending_mirror.borrow_mut().remove(&index);
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
         Ok(true)
     }
@@ -506,6 +531,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
     /// so their host entries stayed empty and the shaders read zeros.
     fn remirror_tables(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        let pool_gen = self.memory.generation();
+        let res_gen = self.resources_epoch.get();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let check = table_check_count(slot, binding, Self::TABLE_CHECK);
@@ -524,14 +551,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     record_at(handle)
                 };
                 checked += 1;
-                if h.mirrored.borrow().get(&index) == Some(&record) || record == [0; 12] {
+                if record == [0; 12]
+                    || h.mirrored.borrow().get(&index) == Some(&record)
+                    || h.pending_mirror.borrow().get(&index) == Some(&(record, pool_gen, res_gen))
+                {
                     continue;
                 }
                 changed += 1;
                 // shortcut: views of resources the host has not realized yet are not made here
                 // (`glue::mirror` does that for device writes); such an entry stays as it was.
-                if let Err(e) = self.mirror(handle) {
-                    tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
+                match self.mirror(handle) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        h.pending_mirror
+                            .borrow_mut()
+                            .insert(index, (record, pool_gen, res_gen));
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
+                    }
                 }
             }
             super::descriptor_trace::record(h.start, checked, changed);
@@ -677,8 +715,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
-        let (_, maps) = self.mapping_list();
-        addr::sorted_root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
+        let mapping = self.memory.mapping_at(a);
+        addr::mapped_root_view(mapping.as_ref(), &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
     }
 
     /// The pool table in title-address order, and its generation: made again only
@@ -738,6 +776,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            pending_mirror: Default::default(),
             images: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
@@ -1654,5 +1693,24 @@ mod tests {
         h.memory().mapped(0x7001_0000, 0x1_0000, &pool, 0x1_0000);
         let (g2, c) = h.mapping_list();
         assert!(g2 != g && c.len() == 2);
+    }
+
+    #[test]
+    fn root_view_looks_up_pool_table_without_rebuilding_mapping_list() {
+        use super::super::memory::{PoolInfo, PoolObserver};
+        let h = NativeHost::new(super::super::vertex_tests::Capture::default());
+        let heap = h.heap(HeapKind::Resource, 0x1000, 8).unwrap();
+        let pool = PoolInfo { id: 1, base: 0x1000_0000, len: 0x10_0000, memory_entry: None };
+        h.memory().mapped(0x7000_0000, 0x1_0000, &pool, 0x2000);
+
+        let (view, offset) = h.root_view(&heap, 0x7000_0180);
+        assert_eq!((view, offset), (addr::pair_index(8, 1), 0x2180));
+        assert!(h.maps.borrow().is_none(), "root_view should not snapshot all mappings");
+
+        // Streaming maps another tile and bumps generation; root_view still avoids mapping_list().
+        h.memory().mapped(0x7002_0000, 0x1_0000, &pool, 0x4000);
+        assert_eq!(h.root_view(&heap, 0x7002_0040), (addr::pair_index(8, 1), 0x4040));
+        assert_eq!(h.root_view(&heap, 0x7001_5000), (addr::pair_index(8, 0), 0));
+        assert!(h.maps.borrow().is_none());
     }
 }

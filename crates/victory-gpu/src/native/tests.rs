@@ -468,6 +468,10 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
         [(0, _, _, 0)]
     ));
 
+    // While the pool table has not changed, later draws do not re-encode the null view.
+    submit();
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 1);
+
     let pool = PoolInfo {
         id: 1,
         base: 0x40000,
@@ -483,6 +487,49 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
 
     submit();
     assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
+}
+
+#[test]
+fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let res_key = 0xDEAD_BEEFusize;
+    crate::descriptor::create_srv(std::ptr::null_mut(), res_key as _, std::ptr::null(), handle);
+
+    let pool = PoolInfo {
+        id: 1,
+        base: 0x40000,
+        len: 0x4000,
+        memory_entry: None,
+    };
+    host.memory().mapped(0x80000, pool.len, &pool, 0);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    // Before the resource is registered, mirror returns Ok(false) and marks pending_mirror.
+    submit();
+    submit();
+    assert!(host.backend.buffer_writes.borrow().is_empty());
+
+    // Once registered, resources_epoch advances and the next submission mirrors the view.
+    host.register_buffer(res_key, 0x80200, 512);
+    submit();
+    assert_eq!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        &[(0, pool.base, pool.base + 0x200, 512)]
+    );
+    crate::descriptor::forget(res_key);
 }
 
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
