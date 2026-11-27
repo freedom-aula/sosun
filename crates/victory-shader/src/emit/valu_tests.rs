@@ -1013,6 +1013,46 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
 }
 
 #[test]
+fn signed_i16_add_and_sub_wrap_or_saturate_in_the_selected_half() {
+    for (op, opsel, inputs, wrapped, saturated) in [
+        // 32767 + 1, then -2 + -1: high src0, low src1, low destination.
+        (
+            0x30d,
+            0b0001,
+            [
+                [0x7fff_2222, 0x3333_0001, 0xa1b2_c3d4, 0],
+                [0xfffe_2222, 0x3333_ffff, 0xa1b2_c3d4, 0],
+            ],
+            [0xa1b2_8000, 0xa1b2_fffd],
+            [0xa1b2_7fff, 0xa1b2_fffd],
+        ),
+        // -32768 - 1, then -2 - (-1): low src0, high src1, high destination.
+        (
+            0x30e,
+            0b1010,
+            [
+                [0x2222_8000, 0x0001_3333, 0xa1b2_c3d4, 0],
+                [0x2222_fffe, 0xffff_3333, 0xa1b2_c3d4, 0],
+            ],
+            [0x7fff_c3d4, 0xffff_c3d4],
+            [0x8000_c3d4, 0xffff_c3d4],
+        ),
+    ] {
+        for (clamp, expected) in [(false, wrapped), (true, saturated)] {
+            let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            let shader = build_valu_cs(&[
+                vop1(0x001, 0, vgpr(3)),
+                w0 | opsel << 11 | u32::from(clamp) << 15,
+                w1,
+            ]);
+            run_cases(&shader, &inputs, |backend, i, _, got| {
+                assert_eq!(got, expected[i], "{backend} op={op:#x} clamp={clamp}");
+            });
+        }
+    }
+}
+
+#[test]
 fn v_cvt_u16_and_i16_f16_saturate() {
     // v_mov_b32 v0, 0; v_cvt_u16_f16 / v_cvt_i16_f16 v0, v1 (VOP1 0x052 / 0x053).
     let cases: &[(u16, u16, u16)] = &[

@@ -800,6 +800,25 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     if let Some(p) = t.console_pipes.get(&console_key) {
         return p.clone();
     }
+    // A cold first world frame binds ~1,300 pipelines; translating them all here holds the frame
+    // past the title's watchdog. Once the frame has spent its budget, a pipeline whose shaders are
+    // not translated yet is put off: its work is dropped this time (not cached, so a later draw
+    // makes it), and its shaders go to the front of the prewarm pool.
+    let frame = crate::frame::current();
+    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    if spent
+        && let Some((stages, _)) = crate::pipeline::native_stages(key as This)
+        && stages.iter().any(|(_, s)| !s.native_ready())
+    {
+        for (_, s) in stages.iter().filter(|(_, s)| !s.native_ready()) {
+            crate::pipeline::prewarm_next(s);
+        }
+        let n = PUT_OFF.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(frame, put_off = n, "pipelines put off for their translations so far");
+        }
+        return Pipe::Refused;
+    }
     let (made, console) = make_pipe(t, key, targets);
     if console {
         t.console_pipes.insert(console_key, made.clone());
@@ -807,6 +826,30 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
         t.pipelines.insert(key, made.clone());
     }
     made
+}
+
+/// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
+static BUDGET: Mutex<crate::prewarm::FrameBudget> = Mutex::new(crate::prewarm::FrameBudget::new());
+static PUT_OFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Runs a translation `what` names on a thread of its own, once at a time per name, for a
+/// pipeline put off past the frame's budget ([`guess`]).
+fn put_off(what: String, translate: impl FnOnce() + Send + 'static) {
+    static RUNNING: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    if !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(what.clone()) {
+        return;
+    }
+    let n = PUT_OFF.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(put_off = n, "pipelines put off for their translations so far");
+    }
+    let _ = std::thread::Builder::new().name("shader-put-off".into()).spawn(move || {
+        crate::prewarm::lower_priority();
+        translate();
+        if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            r.remove(&what);
+        }
+    });
 }
 
 /// Work dropped because its pipeline has no host pipeline.
@@ -1137,6 +1180,15 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     if let Some(p) = g.made.borrow().get(&key) {
         return p.clone();
     }
+    // As in `pipe`: past the frame's budget, a translation not made yet goes to a worker and the
+    // draw is dropped this time (nothing is cached; the worker's result is, on disk or in the
+    // shader).
+    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    if spent && rect && !g.vs_source.rect_ready() {
+        let s = g.vs_source.clone();
+        put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));
+        return Pipe::Refused;
+    }
     let rect_vs = if rect {
         match g.vs_source.native_rect() {
             Ok(h) => Some(h.clone()),
@@ -1161,6 +1213,11 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
             if orig < 32 && new < 32 {
                 copy[new as usize] = orig as u8 + 1;
             }
+        }
+        if spent && !g.vs_source.extra_cached(rect, extra, copy) {
+            let s = g.vs_source.clone();
+            put_off(format!("{} {rect} {extra} {copy:?}", s.hash), move || drop(s.translate_extra(rect, extra, copy)));
+            return Pipe::Refused;
         }
         match g.vs_source.translate_extra(rect, extra, copy) {
             Ok(h) => Some(h),
@@ -1540,11 +1597,9 @@ fn footprint_span(
     if fmt == victory_backend::resources::Format::D32FloatS8 {
         return None;
     }
-    let (element, block) = crate::resource::element(fp.format)?;
+    let (_, block) = crate::resource::element(fp.format)?;
     let (base, buf_size) = crate::resource::buffer_bytes(res)?;
-    let rows = fp.rows(at, size)?;
-    let start = rows.first()?.0;
-    let end = rows.last().map_or(start, |&(o, n)| o + n);
+    let (start, end) = fp.span(at, size)?;
     let byte_end = fp.offset.checked_add(end)?;
     if byte_end > buf_size {
         return None;
@@ -1553,7 +1608,6 @@ fn footprint_span(
     let len = usize::try_from(end - start).ok()?;
     let row_pitch = fp.row_pitch as usize;
     let slice_pitch = row_pitch.checked_mul((fp.height as usize).div_ceil(block as usize))?;
-    let _ = element;
     Some((addr, len, row_pitch, slice_pitch))
 }
 

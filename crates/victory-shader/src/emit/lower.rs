@@ -278,7 +278,13 @@ struct Lower<'a> {
     phi_at: Map<Value, (usize, usize)>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
+    /// [`Lower::unneeded_edges`], made at the first join that asks.
+    unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     data_phis: Vec<(V, usize, usize)>,
+    /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
+    /// incoming values are still to fill (block, phi index, lane).
+    spill_phis: Map<(Value, u32), V>,
+    pending_spills: Vec<(V, usize, usize, u32)>,
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
@@ -369,6 +375,9 @@ struct Lower<'a> {
     /// Mesh: SCC of a uniform compare ANDed with EXEC ([`Self::uniform_and_exec`]): the
     /// compare's result value.
     uniform_scc: Map<Value, Value>,
+    /// Mesh: SCC of EXEC ANDed with (or without) a lane function of uniform atoms
+    /// ([`Self::uniform_with_exec`]): the function, and whether SCC is its complement.
+    uniform_bits: Map<Value, UniformBit>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -509,6 +518,9 @@ enum MaskData {
     /// console's, so the first lane and the count below a lane are refused.
     None,
 }
+
+/// A mesh SCC's lane function, whether SCC is its complement, and the atoms EXEC decides.
+type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
@@ -823,7 +835,10 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
+            unneeded: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
+            spill_phis: Map::default(),
+            pending_spills: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -875,6 +890,7 @@ impl<'a> Lower<'a> {
             ballots: Map::default(),
             mask_scc: Map::default(),
             uniform_scc: Map::default(),
+            uniform_bits: Map::default(),
             balloting: Set::default(),
             def_block: p
                 .blocks
@@ -2168,6 +2184,67 @@ impl<'a> Lower<'a> {
         Ok(self.input(Input::VertexId))
     }
 
+    /// What lane `lane` of VGPR value `v` holds when every path to it fills that lane with
+    /// `v_writelane_b32` of an SGPR or constant (an SGPR spill): the value written, or a phi
+    /// of them at a VGPR join. With `make` unset only checks (`seen`: joins on the way).
+    fn spill_slot(
+        &mut self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+        make: bool,
+    ) -> Result<V, Why> {
+        const NOT: Why = "a VGPR lane no SGPR spill fills";
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            if let Some(&x) = self.spill_phis.get(&(v, lane)) {
+                return Ok(x);
+            }
+            if !make {
+                if seen.contains(&v) {
+                    return Ok(self.s.m.i32(0));
+                }
+                seen.push(v);
+                for &a in &p.blocks[b].phis[i].args {
+                    self.spill_slot(a, lane, seen, false)?;
+                }
+                return Ok(self.s.m.i32(0));
+            }
+            let at = self.block[b].ok_or(NOT)?;
+            let x = self.s.m.phi(at, self.s.t.i32);
+            self.spill_phis.insert((v, lane), x);
+            self.pending_spills.push((x, b, i, lane));
+            return Ok(x);
+        }
+        let inst = self.def_inst(v).ok_or(NOT)?;
+        let Fields::Valu(w) = &inst.fields else { return Err(NOT) };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(NOT);
+        };
+        if inst.name() != "v_writelane_b32" || w.sdwa.is_some() || w.dpp.is_some() {
+            return Err(NOT);
+        }
+        if crate::resource::lane_of(*at).ok_or(NOT)? != lane {
+            return self.spill_slot(inst.read(Reg::V(reg)).ok_or(NOT)?, lane, seen, make);
+        }
+        let c = match *value {
+            Operand::Scalar { code: NULL, .. } => 0,
+            Operand::Scalar { code, .. } => {
+                let x = inst.read(Reg::S(code)).ok_or(NOT)?;
+                // Values made by now (on a back edge, by the time phis are filled).
+                return match self.vals.get(&x) {
+                    Some(&Val::I32(x)) => Ok(x),
+                    None if !make => Ok(self.s.m.i32(0)),
+                    _ => Err(NOT),
+                };
+            }
+            Operand::Const(c) => crate::resource::inline(c).ok_or(NOT)?,
+            Operand::Literal(x) => x,
+            _ => return Err(NOT),
+        };
+        Ok(self.s.m.i32(c))
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -2191,6 +2268,22 @@ impl<'a> Lower<'a> {
             let any = Val::Bit(self.atom(Atom::Lane(u), at)?);
             self.vals.insert(v, any);
             return Ok(any);
+        }
+        if let (Some(Val::Missing(_)), Some((m, not, fixed))) =
+            (found, self.uniform_bits.get(&v).cloned())
+        {
+            let at = match self.def_block.get(&v) {
+                None => self.s.entry,
+                Some(&b) if b == self.cur_ir => self.cur,
+                Some(&b) => self.tail[b].ok_or("SCC written after its use")?,
+            };
+            let mut x = self.boolean_given(m, at, &fixed)?;
+            if not {
+                let t = self.s.m.bool(true);
+                x = self.s.m.bin(at, Bin::Xor, x, t);
+            }
+            self.vals.insert(v, Val::Bit(x));
+            return Ok(Val::Bit(x));
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
             // SCC of a mask operation read as data: some lane in the result.
@@ -3139,6 +3232,21 @@ impl<'a> Lower<'a> {
         };
         self.bools.insert((at, b), v);
         Ok(v)
+    }
+
+    /// [`Self::boolean`] with the atoms of `fixed` taken as its values.
+    // shortcut: no sharing of nodes reached twice, as these functions are of a few atoms.
+    fn boolean_given(&mut self, b: Bool, at: usize, fixed: &[(Atom, bool)]) -> Result<V, Why> {
+        let Some((atom, lo, hi)) = self.x.st.bools.node(b).filter(|_| !fixed.is_empty()) else {
+            return self.boolean(b, at);
+        };
+        if let Some(&(_, v)) = fixed.iter().find(|f| f.0 == atom) {
+            return self.boolean_given(if v { hi } else { lo }, at, fixed);
+        }
+        let a = self.atom(atom, at)?;
+        let h = self.boolean_given(hi, at, fixed)?;
+        let l = self.boolean_given(lo, at, fixed)?;
+        Ok(self.s.m.select(at, a, h, l))
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
@@ -4892,6 +5000,29 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Each result dword of a swap's last XOR ([`crate::structure::xored_back`]) and the value
+    /// it equals.
+    fn xor_copies(&self, inst: &Inst) -> Option<Vec<(Value, Value)>> {
+        let Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), .. } = &inst.fields else {
+            return None;
+        };
+        let halves = if inst.name() == "s_xor_b64" { 2 } else { 1 };
+        (0..halves)
+            .map(|k| {
+                let a = crate::structure::xored_back(inst, k, |v| self.def_inst(v))?;
+                Some((inst.write(Reg::S(d + k))?, a))
+            })
+            .collect()
+    }
+
+    /// `v` as a 32-bit number, when it has one.
+    fn i32_data(&mut self, v: Value) -> Result<V, Why> {
+        match self.vals.get(&v) {
+            Some(&Val::I32(x)) => Ok(x),
+            _ => Err("not data"),
+        }
+    }
+
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
     }
@@ -4907,6 +5038,28 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // The last XOR of a swap by three (the console compiler's swap of two SGPRs, a mask's
+        // and data's say) is a copy of the data: what it XORs back out.
+        if let Some(copies) = self.xor_copies(inst)
+            && copies.iter().all(|&(_, a)| !self.is_mask(Some(a)))
+            && let Ok(vals) =
+                copies.iter().map(|&(_, a)| self.i32_data(a)).collect::<Result<Vec<_>, _>>()
+        {
+            let mut any = None;
+            for (&(w, _), x) in copies.iter().zip(vals) {
+                self.vals.insert(w, Val::I32(x));
+                any = Some(match any {
+                    None => x,
+                    Some(y) => self.s.m.bin(self.cur, Bin::Or, y, x),
+                });
+            }
+            if let (Some(scc), Some(any)) = (scc, any) {
+                let z = self.s.m.i32(0);
+                let b = self.s.m.cmp(self.cur, pred::NE, any, z);
+                self.vals.insert(scc, Val::Bit(b));
+            }
+            return Ok(());
+        }
         if inst.write(Reg::S(EXEC)).is_some()
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
@@ -4928,6 +5081,8 @@ impl<'a> Lower<'a> {
                 } else if let Some(u) = self.uniform_and_exec(inst) {
                     // Mesh: no ballot, but a uniform mask needs none.
                     self.uniform_scc.insert(scc, u);
+                } else if let Some(r) = self.uniform_with_exec(inst) {
+                    self.uniform_bits.insert(scc, r);
                 }
             }
             return Err(LANE_MASK);
@@ -8700,6 +8855,17 @@ impl<'a> Lower<'a> {
             {
                 Err("a VGPR of spilled SGPRs read per lane")
             }
+            // A constant lane of a VGPR only `v_writelane_b32` fills on every path: the SGPR (or
+            // constant) last written there, a phi where paths wrote different ones.
+            "v_readlane_b32"
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::V(reg))
+                    && self.spill_slot(x, lane, &mut Vec::new(), false).is_ok() =>
+            {
+                let a = self.spill_slot(x, lane, &mut Vec::new(), true)?;
+                int(self, a)
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -9040,6 +9206,8 @@ impl<'a> Lower<'a> {
             "v_cvt_f16_i16",
         ];
         const INT: &[&str] = &[
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_add_nc_u16",
             "v_sub_nc_u16",
             "v_subrev_nc_u16",
@@ -9199,8 +9367,9 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integers: compute on the selected halves, then keep 16 bits.
+        let signed_add_sub = matches!(name, "v_add_nc_i16" | "v_sub_nc_i16");
+        if (v.clamp && !signed_add_sub) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -9235,8 +9404,8 @@ impl<'a> Lower<'a> {
                 }
                 let k15 = self.s.m.i32(15);
                 match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                    "v_add_nc_u16" | "v_add_nc_i16" => self.s.m.bin(c, Bin::Add, a, b),
+                    "v_sub_nc_u16" | "v_sub_nc_i16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -9266,6 +9435,16 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+        };
+        let r = if v.clamp {
+            let lo = self.s.m.i32(i16::MIN as u32);
+            let hi = self.s.m.i32(i16::MAX as u32);
+            let below = self.s.m.cmp(c, pred::SLT, r, lo);
+            let r = self.s.m.select(c, below, lo, r);
+            let above = self.s.m.cmp(c, pred::SGT, r, hi);
+            self.s.m.select(c, above, hi, r)
+        } else {
+            r
         };
         self.write_half(inst, r, guard)
     }
@@ -10401,127 +10580,89 @@ impl<'a> Lower<'a> {
         all
     }
 
-    /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
-    /// it and EXEC (or `s_nand` with EXEC, or `s_orn2` of it by EXEC) in `b`, with no lane of
-    /// edge `n` in that EXEC as the edge brings it: those lanes' bits of the result are 0 (1)
-    /// whatever the mask holds for them.
-    fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
-        let (p, st) = (self.x.p, self.x.st);
-        let block = &p.blocks[b];
-        let mut reads = 0;
-        for (bb, blk) in p.blocks.iter().enumerate() {
-            if blk.phis.iter().any(|phi| phi.args.contains(&value)) {
-                return false;
-            }
-            for inst in blk.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == value)) {
-                // `s_orn2 d, x, exec` sets the bits of lanes outside EXEC as `s_and` clears them.
-                let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
-                    && matches!(&inst.fields, Fields::Sop { src, .. }
-                        if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                // `s_nand` with EXEC sets those bits whatever it holds, as `s_and` clears them.
-                let and =
-                    matches!(inst.name(), "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64");
-                if bb != b || !(and || orn2_of_exec) {
-                    return false;
+    /// Every (join value, edge) whose incoming value no lane of that edge sees, as the greatest
+    /// fixpoint: each instruction reading the join is an AND or NAND with EXEC (or an `s_orn2`
+    /// by EXEC) in the join's block, with no lane of the edge in that EXEC as the edge brings it
+    /// (those lanes' bits of the result are 0, or 1, whatever the join holds for them); and each
+    /// later join that takes it is on an edge those lanes do not take from the block, or is in
+    /// the set itself (a register the console compiler reuses on a path those lanes skip, as a
+    /// nested if's else part writes it again before any read; a loop passing it round).
+    fn unneeded_edges(&self) -> &Set<(Value, usize)> {
+        self.unneeded.get_or_init(|| {
+            let (p, st) = (self.x.p, self.x.st);
+            let mut reads: Map<Value, Vec<(usize, usize)>> = Map::default();
+            let mut uses: Map<Value, Vec<(usize, usize, usize)>> = Map::default();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for (i, inst) in blk.insts.iter().enumerate() {
+                    for r in &inst.reads {
+                        reads.entry(r.1).or_default().push((b, i));
+                    }
                 }
-                let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
-                let exec = block.phis.iter().find(|phi| phi.value == exec).map_or(exec, |phi| phi.args[n]);
-                let Some(&m) = st.masks.get(&exec) else { return false };
-                let mut lanes = self.lane_edge(block.preds[n], b);
-                lanes.push((m, true));
-                if st.bools.meet(&lanes) {
-                    return false;
+                for (i, phi) in blk.phis.iter().enumerate() {
+                    for (k, &a) in phi.args.iter().enumerate() {
+                        uses.entry(a).or_default().push((b, i, k));
+                    }
                 }
-                reads += 1;
             }
-        }
-        reads > 0
-    }
-
-    /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
-    /// `depth` deep) whose edge from it needs no value ([`Self::unneeded_arg`]), so the wave can
-    /// hold any bits there.
-    fn never_seen(&self, value: Value, depth: u32) -> bool {
-        let p = self.x.p;
-        depth > 0
-            && !self.read_by_code(value)
-            && p.blocks.iter().enumerate().all(|(e, blk)| {
-                blk.phis.iter().all(|phi| {
-                    phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
-                        self.unneeded_arg(e, phi, k, depth - 1)
-                    })
-                })
-            })
-    }
-
-    /// Whether an instruction (not a join) reads `value`.
-    fn read_by_code(&self, value: Value) -> bool {
-        let reads = |i: &Inst| i.reads.iter().any(|r| r.1 == value);
-        self.x.p.blocks.iter().any(|b| b.insts.iter().any(reads))
-    }
-
-    /// Whether no lane taking edge `n` into IR block `b` sees what that edge brings to `phi`:
-    /// only an AND with an EXEC those lanes are not in reads it ([`Self::anded_off_on_edge`]),
-    /// no lane sees the join at all, or (with nothing reading the join) those lanes leave `b`
-    /// only by edges whose joins do not take it or need no value there either (a register the
-    /// console compiler reuses on a path those lanes skip, as a nested if's else part writes
-    /// it again before any read).
-    fn unneeded_arg(&self, b: usize, phi: &Phi, n: usize, depth: u32) -> bool {
-        let p = self.x.p;
-        if self.anded_off_on_edge(b, phi.value, n) || self.never_seen(phi.value, depth) {
-            return true;
-        }
-        if depth == 0 || self.read_by_code(phi.value) {
-            return false;
-        }
-        let on_n = self.lane_edge(p.blocks[b].preds[n], b);
-        p.blocks.iter().enumerate().all(|(e, blk)| {
-            blk.phis.iter().all(|next| {
-                next.args.iter().enumerate().filter(|&(_, &a)| a == phi.value).all(|(k, _)| {
-                    let taken = || [on_n.clone(), self.lane_edge(b, e)].concat();
-                    (blk.preds[k] == b && !self.x.st.bools.meet(&taken()))
-                        || self.unneeded_arg(e, next, k, depth - 1)
-                })
-            })
+            let mut set = Set::default();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
+                    let reads = reads.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    for n in 0..blk.preds.len() {
+                        let off = reads.iter().all(|&(bb, i)| {
+                            let inst = &p.blocks[bb].insts[i];
+                            let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
+                                if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                            let masked = match inst.name() {
+                                "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
+                                "s_orn2_b32" | "s_orn2_b64" => by_exec,
+                                _ => false,
+                            };
+                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| bb == b && masked)
+                            else {
+                                return false;
+                            };
+                            let joined = blk.phis.iter().find(|ph| ph.value == exec);
+                            let exec = joined.map_or(exec, |ph| ph.args[n]);
+                            let Some(&m) = st.masks.get(&exec) else { return false };
+                            let mut lanes = self.lane_edge(blk.preds[n], b);
+                            lanes.push((m, true));
+                            !st.bools.meet(&lanes)
+                        });
+                        if off {
+                            set.insert((phi.value, n));
+                        }
+                    }
+                }
+            }
+            loop {
+                let before = set.len();
+                for (b, blk) in p.blocks.iter().enumerate() {
+                    for phi in &blk.phis {
+                        for n in 0..blk.preds.len() {
+                            if !set.contains(&(phi.value, n)) {
+                                continue;
+                            }
+                            let on_n = self.lane_edge(blk.preds[n], b);
+                            let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                            let ok = uses.iter().all(|&(e, i, k)| {
+                                set.contains(&(p.blocks[e].phis[i].value, k))
+                                    || p.blocks[e].preds[k] == b
+                                        && !st
+                                            .bools
+                                            .meet(&[on_n.clone(), self.lane_edge(b, e)].concat())
+                            });
+                            if !ok {
+                                set.remove(&(phi.value, n));
+                            }
+                        }
+                    }
+                }
+                if set.len() == before {
+                    return set;
+                }
+            }
         })
-    }
-
-    /// The lane mask `low` (the low dword's value) as each lane's bit when it is a select in IR
-    /// block `q` of an inline -1 (every lane) or 0 (none) by SCC: SCC, the same for every lane.
-    fn scc_mask(&self, low: Value, q: usize) -> Option<V> {
-        let block = &self.x.p.blocks[q];
-        let op = if self.x.native.wave64 { "s_cselect_b64" } else { "s_cselect_b32" };
-        let (inst, [Operand::Const(a), Operand::Const(b)]) = scalar_def::<2>(block, low, op)? else {
-            return None;
-        };
-        if (crate::resource::inline(a)?, crate::resource::inline(b)?) != (u32::MAX, 0) {
-            return None;
-        }
-        match self.vals.get(&inst.read(Reg::Scc)?) {
-            Some(&Val::Bit(scc)) => Some(scc),
-            _ => None,
-        }
-    }
-
-    /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
-    /// only successor, is a move in `q` of an inline 0 (`false`: no lane) or -1 (`true`: every
-    /// lane), both dwords at once in a wave64 program. The wave holds that constant on the edge
-    /// whichever lanes run `q`, as nothing after the move runs before the join.
-    fn constant_mask(&self, low: Value, q: usize) -> Option<bool> {
-        let block = &self.x.p.blocks[q];
-        if block.exit.successors().len() != 1 {
-            return None;
-        }
-        let op = if self.x.native.wave64 { "s_mov_b64" } else { "s_mov_b32" };
-        let (_, [src]) = scalar_def::<1>(block, low, op)?;
-        match src {
-            Operand::Const(code) => match crate::resource::inline(code)? {
-                0 => Some(false),
-                u32::MAX => Some(true),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Whether every lane enters IR block `b` along the edge the console's
@@ -13270,6 +13411,38 @@ impl<'a> Lower<'a> {
             .then_some(u)
     }
 
+    /// Mesh: SCC of `s_and` of EXEC and a mask, or `s_andn2` of EXEC by one, where the mask is
+    /// a function of atoms [`Self::uniform_atom`] takes once EXEC decides the rest (the title's
+    /// NGG vertex programs test such masks so: compares of SGPRs, which hold 0 outside the
+    /// compare's EXEC, and `s_cselect` by SCC): the same bit in every lane, so SCC is the
+    /// function's bit, or its complement for `s_andn2`, with the atoms EXEC decides.
+    // Guess: EXEC is not empty there, as for `uniform_and_exec`.
+    fn uniform_with_exec(&self, inst: &Inst) -> Option<UniformBit> {
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else { return None };
+        let code = |k: usize| match src.get(k)? {
+            Operand::Scalar { code, .. } => Some(*code),
+            _ => None,
+        };
+        let (other, not) = match (inst.name().strip_suffix(width)?, code(0)?, code(1)?) {
+            ("s_and", EXEC, c) | ("s_and", c, EXEC) if c != EXEC => (c, false),
+            ("s_andn2", EXEC, c) if c != EXEC => (c, true),
+            _ => return None,
+        };
+        let v = inst.read(Reg::S(other))?;
+        let st = &self.x.st;
+        let &m = st.masks.get(&v).or_else(|| st.other.get(&v))?;
+        // Atoms EXEC decides (the EXEC a compare ANDs its lanes with) are those values in it.
+        let exec = inst.read(Reg::S(EXEC)).and_then(|e| st.masks.get(&e));
+        let mut fixed = Vec::new();
+        for a in st.bools.support(m) {
+            if !self.uniform_atom(a) {
+                fixed.push((a, st.bools.decides(&[(*exec?, true)], a)?));
+            }
+        }
+        Some((m, not, fixed))
+    }
+
     /// Whether `a` holds the same bit in every lane of a console wave: an SCC value, or a
     /// compare (or carry) of SGPRs and constants, which a wave holds once for all its lanes.
     fn uniform_atom(&self, a: Atom) -> bool {
@@ -13660,6 +13833,19 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
+        while let Some((x, b, i, lane)) = self.pending_spills.pop() {
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let a = p.blocks[b].phis[i].args[n];
+                let y = self
+                    .spill_slot(a, lane, &mut Vec::new(), true)
+                    .map_err(|w| unsupported(p.blocks[b].offset, w))?;
+                incoming.push((y, qb));
+            }
+            self.s.m.set_phi(x, incoming);
+        }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
@@ -13735,18 +13921,21 @@ impl<'a> Lower<'a> {
                         self.s.m.bool(false)
                     }
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
-                    // but by such joins: any bit will do, so what the edge brings (data, or a
-                    // value not made) is not needed.
-                    // shortcut: the search repeats work along a chain of joins (fine at the
-                    // title's ~10 deep); memoise it if a program's translation gets slow.
-                    (None, _) if self.unneeded_arg(b, phi, n, 16) => self.s.m.bool(false),
-                    // No lanes or every lane, moved just before the edge: each lane's bit,
-                    // whatever the lane layout and whichever lanes take the edge.
-                    (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
-                        self.s.m.bool(all)
+                    // but by joins that do not need it: any bit will do, so what the edge brings
+                    // (data, or a value not made) is not needed.
+                    (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
+                        self.s.m.bool(false)
                     }
-                    // -1 or 0 by SCC: SCC is every lane's bit.
-                    (None, Some(Val::I32(_))) if let Some(scc) = self.scc_mask(arg, q) => scc,
+                    // A lane function the structure knows though no mask tracks it (a constant,
+                    // SCC, a join that resolved): each lane's bit of it.
+                    (None, _)
+                        if let Some(&m) = self.x.st.other.get(&arg)
+                            && !self.x.st.bools.support(m).iter().any(|a| {
+                                matches!(a, Atom::Opaque(_) | Atom::Quad(_))
+                            }) =>
+                    {
+                        self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    }
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
                     }

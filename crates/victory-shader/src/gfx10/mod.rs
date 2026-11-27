@@ -154,50 +154,61 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 }
 
 /// Resolves the far jump compilers emit beyond the reach of a branch offset:
-/// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
-/// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
-/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
-/// merged stage through registers) gives `None`.
+/// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, the matching carry
+/// or borrow into s(n+1), then `s_setpc_b64 s[n:n+1]`, all contiguous.
+/// Any other `s_setpc_b64` gives `None`.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
-    let n = setpc.words[0] & 0xFF;
-    let mut delta = None;
     let mut at = setpc.offset;
-    for _ in 0..4 {
-        let Some(prev) = before(at) else {
-            break;
-        };
-        if prev.offset + 4 * prev.words.len() != at {
-            break;
-        }
-        let w = prev.words[0];
-        let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
-        match (prev.encoding, prev.name()) {
-            (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
-                if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
-            {
-                // The low dword of a signed 64-bit offset: a backward jump
-                // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
-                delta = Some(if op == "s_add_u32" { literal } else { -literal });
-            }
-            (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
-                let Some(delta) = delta else { break };
-                // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
-                    .ok()
-                    .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
-            }
-            _ => {}
-        }
-        at = prev.offset;
+    let mut previous = || {
+        let inst = before(at).filter(|i| i.offset + 4 * i.words.len() == at)?;
+        at = inst.offset;
+        Some(inst)
+    };
+    let (Some(high), Some(low), Some(getpc)) = (previous(), previous(), previous()) else {
+        return Ok(None);
+    };
+
+    let n = setpc.words[0] & 0xFF;
+    let dst = |i: &Instruction| (i.words[0] >> 16) & 0x7F;
+    let src0 = |i: &Instruction| i.words[0] & 0xFF;
+    let src1 = |i: &Instruction| (i.words[0] >> 8) & 0xFF;
+    if n > 104
+        || !n.is_multiple_of(2)
+        || getpc.name() != Some("s_getpc_b64")
+        || dst(getpc) != n
+        || dst(low) != n
+        || src0(low) != n
+        || src1(low) != 0xFF
+        || dst(high) != n + 1
+        || src0(high) != n + 1
+    {
+        return Ok(None);
     }
-    Ok(None)
+    let [_, literal] = low.words[..] else {
+        return Ok(None);
+    };
+    let literal = i64::from(literal as i32);
+    // The high operand must sign-extend the low literal (0 or -1): inline, or as a literal
+    // (a relocated `@rel32@hi` stays a 32-bit literal even when it resolves to 0 or -1).
+    let (inline, extension) = if literal < 0 { (0xC1, u32::MAX) } else { (0x80, 0) };
+    if src1(high) != inline && !(src1(high) == 0xFF && high.words.get(1) == Some(&extension)) {
+        return Ok(None);
+    }
+    let delta = match (low.name(), high.name()) {
+        (Some("s_add_u32"), Some("s_addc_u32")) => literal,
+        (Some("s_sub_u32"), Some("s_subb_u32")) => -literal,
+        _ => return Ok(None),
+    };
+    // getpc yields the address of the following instruction.
+    usize::try_from(low.offset as i64 + delta)
+        .ok()
+        .filter(|&t| t < len)
+        .map(Some)
+        .ok_or(isa(setpc.offset, "far jump target outside the code"))
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -494,6 +505,39 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
+    }
+
+    #[test]
+    fn follows_far_jump_with_a_literal_high_dword() {
+        let code = [
+            0xBE88_1F00, // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            24,          // s_add_u32 s8, s8, 24  -> 4 + 24 = 28
+            0x8209_FF09,
+            0,           // s_addc_u32 s9, s9, 0 (as a literal)
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+            0xFFFF_FFFF, // not code
+            S_ENDPGM,
+        ];
+        assert!(summary(&code).iter().any(|i| i.0 == 28 && i.2 == "s_endpgm"));
+        // A literal high dword that does not sign-extend the low one is not a far jump.
+        let mut wrong = code;
+        wrong[4] = 1;
+        assert!(!summary(&wrong).iter().any(|i| i.0 == 28));
+    }
+
+    #[test]
+    fn follows_far_jump_using_subtract_with_borrow() {
+        let code = [
+            sopp(0x02, 1), // s_branch -> 8
+            S_ENDPGM,      // target at byte 4
+            0xBE88_1F00,   // s_getpc_b64 s[8:9]
+            0x8088_FF08,
+            8,           // s_sub_u32 s8, s8, 8 -> 12 - 8 = 4
+            0x8289_8009, // s_subb_u32 s9, s9, 0
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+        ];
+        assert!(summary(&code).iter().any(|i| i.0 == 4));
     }
 
     #[test]

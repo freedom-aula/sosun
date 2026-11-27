@@ -250,6 +250,97 @@ fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
     }
 }
 
+/// As above, but SCC is that of EXEC without the compare ANDed with an `s_cselect` by bit 29 of
+/// s8 (`s_andn2_b64 sN, exec, mask`, as the NGG vertex programs ahead of the G-buffer test it):
+/// set, so the triangle drawn, unless s8 is at least 0 with bit 29 set. 1.0 leaves the target
+/// black; -1.0 (below 0) and 2.0 (bit 29 clear) colour it.
+#[test]
+fn a_mesh_program_branches_on_the_scc_of_exec_without_a_uniform_lane_mask() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x7E1A_0280, // v_mov_b32 v13, 0
+        0x7DA8_0283, // v_cmpx_gt_u32 3, v1
+        0xBF88_000A, // s_cbranch_execz 10
+        0xD406_006A, 0x0001_0008, // v_cmp_ge_f32 vcc, s8, 0
+        0xBF0D_9D08, // s_bitcmp1_b32 s8, 29
+        0x8598_80C1, // s_cselect_b64 s[24:25], -1, 0
+        0x8798_186A, // s_and_b64 s[24:25], vcc, s[24:25]
+        0x8A96_187E, // s_andn2_b64 s[22:23], exec, s[24:25]
+        0xBE94_03FD, // s_mov_b32 s20, src_scc
+        0xBF01_8014, // s_cmp_lg_i32 s20, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x1004_050D, // v_mul_f32 v2, v13, v2
+        0x1006_070D, // v_mul_f32 v3, v13, v3
+    ]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0, user data dword 0.
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let red = [255, 128, 128, 255];
+    for (s8, want) in [(1.0f32, [0; 4]), (-1.0, red), (2.0, red)] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_root_constants(0, &[s8.to_bits()]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "s8 = {s8}: {:?}", pixels(&t, &color));
+    }
+}
+
+/// An SGPR spilled to a VGPR lane on two paths and read back after the join, then swapped with
+/// a mask by three XORs and read as data (the NGG vertex programs ahead of the G-buffer do
+/// both): the triangle's scale is 1.0 when s8 is not negative, else 0. 1.0 colours the target,
+/// -1.0 leaves it black.
+#[test]
+fn a_mesh_program_reads_back_a_spill_joined_and_swapped_with_a_mask() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0xBE94_03F2, // s_mov_b32 s20, 1.0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBF0D_9F08, // s_bitcmp1_b32 s8, 31
+        0xBF85_0003, // s_cbranch_scc1 3
+        0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+        0xBF82_0002, // s_branch 2
+        0xD761_000E, 0x0001_0615, // v_writelane_b32 v14, s21, 3
+        0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x8918_1618, // s_xor_b32 s24, s24, s22
+        0x8916_1618, // s_xor_b32 s22, s24, s22
+        0x8918_1618, // s_xor_b32 s24, s24, s22
+        0x7E1A_0218, // v_mov_b32 v13, s24
+        0x1004_050D, // v_mul_f32 v2, v13, v2
+        0x1006_070D, // v_mul_f32 v3, v13, v3
+    ]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0, user data dword 0.
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    for (s8, want) in [(1.0f32, [255, 128, 128, 255]), (-1.0, [0; 4])] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_root_constants(0, &[s8.to_bits()]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "s8 = {s8}: {:?}", pixels(&t, &color));
+    }
+}
+
 /// A pixel program reading the halves of fewer channels than the vertex side exports still links
 /// (parameter elements are four channels on both sides, those the export leaves out written a
 /// copy of one it has): only x's low half, of a parameter of x and y. Before, the converter

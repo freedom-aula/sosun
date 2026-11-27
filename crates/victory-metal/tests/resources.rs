@@ -83,7 +83,8 @@ impl Grid<'_> {
         m.write_buffer(&res, 1, &a.buf, a.at(0), (cells * 16) as u32);
         let s = m
             .create_sampler(&SamplerDesc {
-                min_mag: self.filter,
+                min: self.filter,
+                mag: self.filter,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
                 border_color: BorderColor::TransparentBlack,
