@@ -1736,6 +1736,22 @@ fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
     })
 }
 
+#[test]
+fn signed_i16_add_and_sub_lower_with_and_without_clamp() {
+    for (opcode, opsel) in [(0x30d, 0b0001), (0x30e, 0b1010)] {
+        for clamp in [false, true] {
+            let setup = [
+                0x7E02_02FF, 0xA1B2_C3D4, // v1: old destination
+                0x7E04_02FF, 0x7FFF_8000, // v2: 32767 high, -32768 low
+                0x7E06_02FF, 0x0001_0001, // v3: 1 in either half
+                0xD400_0001 | opcode << 16 | u32::from(clamp) << 15 | opsel << 11,
+                0x0002_0702, // v1 = op(v2, v3)
+            ];
+            store_cs(4, &setup, [0xE070_0000, 0x8002_0100]).unwrap();
+        }
+    }
+}
+
 /// Typed stores of one, two or three channels write the whole element (0 in
 /// the channels they do not name: `stride_tests` runs one), so they lower as
 /// the four-channel store does.
