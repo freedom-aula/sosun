@@ -179,6 +179,25 @@ fn a_pixel_shader_loads_a_texture_by_heap_index() {
     assert!(pixels.iter().all(|p| *p == [0, 255, 0, 255]), "{pixels:?}");
 }
 
+#[test]
+fn a_pixel_shader_reads_the_heap_entry_after_masking_the_address_carry() {
+    // Address entry 1 explicitly, then run the same image load and export as PS_HEAP.
+    let mut words = vec![
+        0x8002_A002, // s_add_u32 s2, s2, 32
+        0x8203_8080, // s_addc_u32 s3, 0, 0
+        0x8703_FF03, 0xff, // s_and_b32 s3, s3, 0xff
+        0xF40C_0101, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], 0
+    ];
+    words.extend_from_slice(&PS_HEAP[3..]);
+    let ps = translate(HwStage::Ps, &words);
+    assert!(ps.heap);
+    let Some(mut t) = title() else { return };
+    let heap = Heap::new(&t);
+    let vs = translate(HwStage::Vs, COVER);
+    let pixels = draw(&mut t, &heap, &vs, &ps, |l| l.draw_instanced(3, 1, 0, 0).unwrap());
+    assert!(pixels.iter().all(|p| *p == [0, 255, 0, 255]), "{pixels:?}");
+}
+
 /// Loads the image descriptor at heap entry 1 (heap base in `base`, high half 0) into s[12:19] and
 /// its texel (0, 0) into v[12:15], then scales the position in v2, v3 by its green channel: 1.0
 /// for entry 1, 0.0 (no area, nothing drawn) for entry 0 or an unbound heap.

@@ -44,3 +44,35 @@ pub enum ShaderError {
     #[error("FSPX metadata resource of root type {root}: {what}")]
     FspxRoot { root: u8, what: &'static str },
 }
+
+#[cfg(test)]
+mod tests {
+    /// `build.rs` leaves `*_tests.rs` out of [`super::SOURCE_HASH`]: each must be a module only a
+    /// test build compiles, or a change to it could change translations the cache still serves.
+    #[test]
+    fn test_modules_are_test_only() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                if e.path().is_dir() { walk(&e.path(), out) } else { out.push(e.path()) }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let texts: Vec<String> = files.iter().filter_map(|f| std::fs::read_to_string(f).ok()).collect();
+        for f in files.iter().filter(|f| f.to_string_lossy().ends_with("_tests.rs")) {
+            let module = f.file_stem().unwrap().to_string_lossy();
+            let declared = format!("mod {module};");
+            let gated = texts.iter().any(|t| {
+                let lines: Vec<&str> = t.lines().map(str::trim).collect();
+                lines.iter().enumerate().any(|(i, l)| {
+                    l.ends_with(&declared)
+                        && i > 0
+                        && lines[i - 1].starts_with("#[cfg(")
+                        && lines[i - 1].contains("test")
+                })
+            });
+            assert!(gated, "{} is not declared under a cfg(test)", f.display());
+        }
+    }
+}

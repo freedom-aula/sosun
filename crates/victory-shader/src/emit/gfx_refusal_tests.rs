@@ -879,6 +879,19 @@ fn refusal2_pixel_system_inputs_lower_when_declared() {
     }
 }
 
+#[test]
+fn signed_flbit_i64_lowers_in_pixel_shader() {
+    let code = [
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBE84_1800, // s_flbit_i32_i64 s4, s[0:1]
+        0x7E00_0204, // v_mov_b32 v0, s4
+        0x7E02_02FD, // v_mov_b32 v1, src_scc
+        0xF800_180F, 0x0100_0100, // exp mrt0 v0, v1, v0, v1 done vm
+        0xBF81_0000,
+    ];
+    lower_ps(&code, false, vec![root_const(0, 3)], vec![], 0, 0, vec![], false).unwrap();
+}
+
 /// `s_absdiff_i32` translates (values: `victory-gpu` `addr_tests`).
 #[test]
 fn absdiff_translates() {
@@ -1804,6 +1817,22 @@ fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
         rect_list: false,
         copy_params: [0; 32],
     })
+}
+
+#[test]
+fn signed_i16_add_and_sub_lower_with_and_without_clamp() {
+    for (opcode, opsel) in [(0x30d, 0b0001), (0x30e, 0b1010)] {
+        for clamp in [false, true] {
+            let setup = [
+                0x7E02_02FF, 0xA1B2_C3D4, // v1: old destination
+                0x7E04_02FF, 0x7FFF_8000, // v2: 32767 high, -32768 low
+                0x7E06_02FF, 0x0001_0001, // v3: 1 in either half
+                0xD400_0001 | opcode << 16 | u32::from(clamp) << 15 | opsel << 11,
+                0x0002_0702, // v1 = op(v2, v3)
+            ];
+            store_cs(4, &setup, [0xE070_0000, 0x8002_0100]).unwrap();
+        }
+    }
 }
 
 /// Typed stores of one, two or three channels write the whole element (0 in

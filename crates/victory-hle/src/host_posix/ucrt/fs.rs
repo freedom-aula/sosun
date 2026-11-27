@@ -4,15 +4,15 @@
 //! `_S_IFREG`/`_S_IFDIR` and the read, write and execute bits as the CRT
 //! sets them, and the times are `time_t` seconds.
 
+use std::ffi::CString;
 use std::fs::Metadata;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::runtime::bad_param;
 use super::stdio::win_errno;
-use super::{
-    Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units,
-};
+use super::{Ch, EACCES, EEXIST, EINVAL, ENOENT, ERANGE, exports, fail, heap, set_errno, units};
 use crate::host_posix::files;
 
 const S_IFDIR: u16 = 0x4000;
@@ -232,16 +232,34 @@ pub extern "system" fn _wremove(path: *const u16) -> i32 {
 }
 
 fn rename_paths(from: Option<PathBuf>, to: Option<PathBuf>) -> i32 {
-    let (Some(from), Some(to)) = (from, to) else {
+    let (Some(from_path), Some(to_path)) = (from, to) else {
         set_errno(ENOENT);
         return -1;
     };
-    // Windows does not replace an existing file.
-    if to.exists() {
-        set_errno(EEXIST);
+    let [Ok(from), Ok(to)] = [&from_path, &to_path].map(|p| CString::new(p.as_os_str().as_bytes()))
+    else {
+        set_errno(EINVAL);
         return -1;
+    };
+    // SAFETY: both paths are live, NUL-terminated C strings.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        0
+    } else {
+        rename_error(&from_path, &to_path, std::io::Error::last_os_error())
     }
-    done(std::fs::rename(from, to))
+}
+
+fn rename_error(from_path: &Path, to_path: &Path, err: std::io::Error) -> i32 {
+    if err.raw_os_error() == Some(libc::ENOTSUP) {
+        // This filesystem has no RENAME_EXCL: check, then rename (not atomic).
+        if std::fs::symlink_metadata(to_path).is_ok() {
+            set_errno(EEXIST);
+            return -1;
+        }
+        return done(std::fs::rename(from_path, to_path));
+    }
+    set_errno(win_errno(&err));
+    -1
 }
 
 pub extern "system" fn rename(from: *const u8, to: *const u8) -> i32 {
@@ -680,19 +698,15 @@ fn list(path: Option<PathBuf>) -> Option<Vec<Entry>> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let mut entries: Vec<Entry> = vec![(".".into(), None), ("..".into(), None)];
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        entries.push((
-            e.file_name().to_string_lossy().into_owned(),
-            e.metadata().ok(),
-        ));
-    }
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut entries: Vec<Entry> = files::matching_entries(read, &pattern)
+        .map(|(name, entry)| (name, entry.and_then(|e| files::find_metadata(e.metadata()))))
+        .collect();
     for (name, meta) in entries.iter_mut() {
         if meta.is_none() {
-            *meta = std::fs::metadata(dir.join(&*name)).ok();
+            *meta = files::find_metadata(std::fs::metadata(dir.join(&*name)));
         }
     }
-    entries.retain(|(n, _)| files::wildcard(&pattern, &n.chars().collect::<Vec<_>>()));
     Some(entries)
 }
 
@@ -951,11 +965,87 @@ mod tests {
         let gp = c(g.to_str().unwrap());
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), -1);
         assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&f).unwrap(), b"12345");
+        assert_eq!(std::fs::read(&g).unwrap(), b"x");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(rename(fp.as_ptr(), gp.as_ptr()), 0);
+        assert!(!f.try_exists().unwrap());
+        assert_eq!(std::fs::read(&g).unwrap(), b"12345");
         assert_eq!(remove(gp.as_ptr()), 0);
         assert_eq!(remove(gp.as_ptr()), -1);
         assert_eq!(_rmdir(dp.as_ptr()), 0);
+    }
+
+    #[test]
+    fn rename_falls_back_when_exclusive_rename_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let fallback =
+            || rename_error(&from, &to, std::io::Error::from_raw_os_error(libc::ENOTSUP));
+
+        std::fs::write(&from, b"first").unwrap();
+        assert_eq!(fallback(), 0);
+        assert!(!from.try_exists().unwrap());
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::write(&from, b"second").unwrap();
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read(&to).unwrap(), b"first");
+
+        std::fs::remove_file(&to).unwrap();
+        let target = Path::new("missing");
+        std::os::unix::fs::symlink(target, &to).unwrap();
+        set_errno(0);
+        assert_eq!(fallback(), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"second");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
+    }
+
+    #[test]
+    fn wrename_preserves_dangling_destination_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("source");
+        let to = dir.path().join("destination");
+        let target = std::path::Path::new("missing");
+        std::fs::write(&from, b"source bytes").unwrap();
+        std::os::unix::fs::symlink(target, &to).unwrap();
+
+        let wide = |p: &std::path::Path| {
+            p.to_str()
+                .unwrap()
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(_wrename(wide(&from).as_ptr(), wide(&to).as_ptr()), -1);
+        assert_eq!(super::super::errno(), EEXIST);
+        assert_eq!(std::fs::read(&from).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read_link(&to).unwrap(), target);
+    }
+
+    #[test]
+    fn find_first_only_reads_metadata_for_matching_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..999 {
+            std::fs::File::create(dir.path().join(format!("{i}.bin"))).unwrap();
+        }
+        std::fs::write(dir.path().join("slot.sav"), b"saved").unwrap();
+
+        let pattern = c(dir.path().join("*.sav").to_str().unwrap());
+        let mut data = [0u8; 304];
+        files::FIND_METADATA_LOOKUPS.set(0);
+        let handle = _findfirst64i32(pattern.as_ptr(), data.as_mut_ptr());
+        assert!(handle > 0);
+        assert_eq!(files::FIND_METADATA_LOOKUPS.get(), 1);
+        assert_eq!(text(&data[36..]), "slot.sav");
+        assert_eq!(u32::from_le_bytes(data[32..36].try_into().unwrap()), 5);
+        assert_eq!(_findnext64i32(handle, data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
+        assert_eq!(_findclose(handle), 0);
     }
 
     #[test]
@@ -988,6 +1078,7 @@ mod tests {
         assert_eq!(_findclose(h), -1);
         let none = c(&format!("{}/*.zzz", dir.path().to_str().unwrap()));
         assert_eq!(_findfirst64i32(none.as_ptr(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), ENOENT);
         // `.` and `..` match `*`; the wide, 64-bit-size form has its name at 40.
         let all: Vec<u16> = format!("{}/*", dir.path().to_str().unwrap())
             .encode_utf16()
