@@ -456,7 +456,9 @@ impl<B: PresentBackend> Title<B> {
             signal: &mut signal,
         });
         stats.waited += done.waited.len() as u64;
-        waiting.retain(|token, _| held.waits_for(*token));
+        for token in done.retired_waits {
+            waiting.remove(&token);
+        }
     }
 
     /// The backend queue of each title queue made so far.
@@ -565,6 +567,29 @@ mod scheduling_tests {
     use super::*;
     use victory_backend::backend::ComputeBackend;
     use victory_metal::metal::Metal;
+
+    #[test]
+    fn signalling_a_fence_releases_all_its_queued_wait_tokens() {
+        let Ok(metal) = Metal::new() else {
+            eprintln!("skipping fence test: no Metal device");
+            return;
+        };
+        let mut title = Title::new(metal, Arc::new(PoolTable::default()));
+        for _ in 0..1024 {
+            title.wait_queue(1, 10, 0, 1);
+        }
+        title.wait_queue(2, 20, 0, 1);
+        title.pump();
+        title.pump();
+        assert_eq!(title.waiting.len(), 1025);
+
+        title.signal_cpu(10, 0, 1);
+        assert!(!title.held.holds_work(1));
+        assert!(title.held.holds_work(2));
+        assert_eq!(title.waiting.len(), 1);
+        title.signal_cpu(20, 0, 1);
+        assert!(title.waiting.is_empty());
+    }
 
     #[test]
     fn a_wait_retains_its_fence_across_release_and_address_reuse() {

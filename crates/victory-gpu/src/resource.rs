@@ -351,20 +351,42 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
-    /// The byte ranges (from the footprint's start) that a `size` texel
-    /// region at texel `at` covers: one per row of blocks; `None` if the
-    /// format has no size or the region leaves the footprint.
-    pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
-        let (element, block) = element(self.format)?;
+    /// Block coordinates and extents used by both row enumeration and span calculation.
+    fn block_region(&self, at: [u32; 3], size: [u32; 3], block: u64) -> Option<([u64; 3], [u64; 3])> {
         let blocks = |texels: u32| u64::from(texels).div_ceil(block);
         let [x, y, z] = at.map(u64::from);
-        let (w, h, d) = (blocks(size[0]), blocks(size[1]), u64::from(size[2]));
         let (x, y) = (x / block, y / block);
+        let (w, h, d) = (blocks(size[0]), blocks(size[1]), u64::from(size[2]));
         if x + w > blocks(self.width) || y + h > blocks(self.height) || z + d > u64::from(self.depth) {
             return None;
         }
+        Some(([x, y, z], [w, h, d]))
+    }
+
+    /// The first row start and exclusive last row end, relative to the footprint offset.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn span(&self, at: [u32; 3], size: [u32; 3]) -> Option<(u64, u64)> {
+        let (element, block) = element(self.format)?;
+        let ([x, y, z], [w, h, d]) = self.block_region(at, size, block)?;
         let pitch = u64::from(self.row_pitch);
-        let slice = pitch * blocks(self.height);
+        let slice = pitch * u64::from(self.height).div_ceil(block);
+        let row_start = |slice_index: u64, row: u64| {
+            slice_index.checked_mul(slice)?.checked_add(row * pitch)?.checked_add(x * element)
+        };
+        let last_slice = z + d.checked_sub(1)?;
+        let last_row = y + h.checked_sub(1)?;
+        Some((row_start(z, y)?, row_start(last_slice, last_row)?.checked_add(w * element)?))
+    }
+
+    /// The byte ranges (from the footprint's start) that a `size` texel
+    /// region at texel `at` covers: one per row of blocks; `None` if the
+    /// format has no size or the region leaves the footprint.
+    #[cfg(any(windows, test))]
+    pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
+        let (element, block) = element(self.format)?;
+        let ([x, y, z], [w, h, d]) = self.block_region(at, size, block)?;
+        let pitch = u64::from(self.row_pitch);
+        let slice = pitch * u64::from(self.height).div_ceil(block);
         Some(
             (z..z + d)
                 .flat_map(|k| (y..y + h).map(move |r| (k * slice + r * pitch + x * element, w * element)))
@@ -2471,6 +2493,54 @@ mod tests {
         let bc = PlacedFootprint { offset: 0, format: 71, width: 16, height: 16, depth: 1, row_pitch: 256 };
         assert_eq!(bc.rows([4, 4, 0], [8, 8, 1]), Some(vec![(256 + 8, 16), (2 * 256 + 8, 16)]));
     }
+
+    #[test]
+    fn footprint_span_matches_enumerated_rows() {
+        let rgba = PlacedFootprint { depth: 5, ..PlacedFootprint::new(4096, 28, 13, 9, 256) };
+        let bc1 = PlacedFootprint { format: 71, ..rgba };
+        let bc7 = PlacedFootprint { format: 98, width: 3, height: 2, ..rgba };
+
+        for (fp, at, size) in [
+            (rgba, [0; 3], [13, 9, 5]),
+            (rgba, [3, 2, 1], [7, 4, 3]),
+            (rgba, [12, 8, 4], [1, 1, 1]),
+            (bc1, [4, 4, 2], [9, 5, 3]),
+            (bc1, [13, 8, 4], [1, 1, 1]),
+            (bc7, [0; 3], [3, 2, 5]),
+            (rgba, [13, 2, 1], [0, 4, 2]),
+            (rgba, [2, 9, 1], [4, 0, 2]),
+            (rgba, [2, 1, 5], [4, 2, 0]),
+            (rgba, [12, 8, 4], [2, 1, 1]),
+            (bc1, [4, 8, 1], [1, 5, 1]),
+            (rgba, [0, 0, 4], [1, 1, 2]),
+            (PlacedFootprint { format: 0, ..rgba }, [0; 3], [1; 3]),
+        ] {
+            let expected = fp.rows(at, size).and_then(|rows| {
+                let (last, bytes) = *rows.last()?;
+                Some((rows.first()?.0, last.checked_add(bytes)?))
+            });
+            assert_eq!(fp.span(at, size), expected, "{fp:?} at {at:?} size {size:?}");
+        }
+    }
+
+    #[test]
+    fn footprint_span_checks_slice_offsets_and_exclusive_end() {
+        let max = u32::MAX;
+        let fp = PlacedFootprint { depth: 3, ..PlacedFootprint::new(0, 61, max, max, max) };
+        // One slice and two row pitches reach u64::MAX exactly.
+        assert_eq!(fp.span([max - 1, 1, 1], [1; 3]), Some((u64::MAX - 1, u64::MAX)));
+        assert_eq!(fp.span([0, 2, 1], [1; 3]), None); // last byte end
+        assert_eq!(fp.span([1, 2, 1], [0, 1, 1]), None); // x offset
+        assert_eq!(fp.span([0, 1, 1], [1, 3, 1]), None); // last row offset
+        assert_eq!(fp.span([0; 3], [1, 1, 3]), None); // last slice offset
+    }
+
+    #[test]
+    fn footprint_span_for_a_512_by_512_by_64_copy() {
+        let fp = PlacedFootprint { depth: 64, ..PlacedFootprint::new(512, 28, 512, 512, 2048) };
+        assert_eq!(fp.span([0; 3], [512, 512, 64]), Some((0, 64 * 1024 * 1024)));
+    }
+
     use crate::object::slot;
 
     #[test]

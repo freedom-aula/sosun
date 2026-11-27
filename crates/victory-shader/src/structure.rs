@@ -1094,6 +1094,22 @@ impl<'a> Lanes<'a> {
                         matches!(a, Operand::Scalar { code, .. } if *code != NULL) && a == c
                     };
                     match (inst.name(), src.as_slice()) {
+                        // A field mask of constant width and place; of a pair, this value's half.
+                        ("s_bfm_b32" | "s_bfm_b64", [w, at]) => {
+                            let bits = if inst.name() == "s_bfm_b32" { 31 } else { 63 };
+                            let w = Self::half_const(w)? & bits;
+                            let at = Self::half_const(at)? & bits;
+                            let m = ((1u64 << w) - 1) << at;
+                            let high = inst.writes.iter().position(|&(_, x)| x == v)? == 1;
+                            return Some((m >> (32 * u8::from(high))) as u32);
+                        }
+                        // A pair's integer constant, sign-extended; of a pair, this value's half.
+                        ("s_mov_b64", [Operand::Const(c @ 128..=208)]) => {
+                            let c = i64::from(*c);
+                            let m = (if c <= 192 { c - 128 } else { 192 - c }) as u64;
+                            let high = inst.writes.iter().position(|&(_, x)| x == v)? == 1;
+                            return Some((m >> (32 * u8::from(high))) as u32);
+                        }
                         ("s_mov_b32", [a]) => {
                             if let Some(c) = Self::half_const(a) {
                                 return Some(c);
@@ -1331,7 +1347,10 @@ impl<'a> Lanes<'a> {
                 cache.insert(k, m);
                 return Some((m, r.derived));
             }
-            return None;
+            // A wave32 constant a lane-width op does not make (`s_bfm_b64`'s halves).
+            if self.p.wave64 {
+                return None;
+            }
         }
         if !self.p.wave64 {
             if let Some(c) = self.const32(k.0) {
@@ -1510,6 +1529,9 @@ impl<'a> Lanes<'a> {
         let args: Vec<Key> = (0..target.preds.len())
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
+        if let Some(x) = self.unchanged(k, &args) {
+            return Some(self.mask(x));
+        }
         let id = lo.map_or(k.1, |_| k.0);
         let mut derived = false;
         // (edge condition, mask) per forward edge; back edges come later.
@@ -1550,6 +1572,61 @@ impl<'a> Lanes<'a> {
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
+    }
+
+    /// The one value a join of `args` at `k` holds when every edge brings `k` itself, a copy of
+    /// it, or that value (a register a loop carries round and spills, but never changes).
+    fn unchanged(&self, k: Key, args: &[Key]) -> Option<Key> {
+        let p = self.p;
+        let copy = |v: Value| -> Option<Value> {
+            if let Some(&s) = self.restored.get(&v) {
+                return Some(s);
+            }
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &p.blocks[b].insts[i];
+            let half = inst.writes.iter().position(|&(_, x)| x == v)? as u8;
+            match (inst.name(), &inst.fields) {
+                ("s_mov_b32" | "s_mov_b64", Fields::Sop { src, .. }) => match src.as_slice() {
+                    [Operand::Scalar { code, .. }] if *code != NULL => {
+                        inst.read(Reg::S(code + half))
+                    }
+                    _ => None,
+                },
+                _ => xored_back(inst, half, |x| {
+                    self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i])
+                }),
+            }
+        };
+        let phi_args = |k: Key| -> Option<Vec<Key>> {
+            let (&(b, i), &(hb, hi)) = (self.phis.get(&k.0)?, self.phis.get(&k.1)?);
+            (b == hb).then(|| {
+                let (lo, hi) = (&p.blocks[b].phis[i], &p.blocks[b].phis[hi]);
+                lo.args.iter().copied().zip(hi.args.iter().copied()).collect()
+            })
+        };
+        let (mut seen, mut todo, mut leaf) = (Set::default(), args.to_vec(), None);
+        seen.insert(k);
+        while let Some(mut a) = todo.pop() {
+            // Each half on its own: a pair's copy can be two `s_mov_b32`s, or one half's.
+            while let next @ (lo, hi) = (copy(a.0).unwrap_or(a.0), copy(a.1).unwrap_or(a.1))
+                && next != a
+            {
+                a = (lo, hi);
+            }
+            if !seen.insert(a) {
+                continue;
+            }
+            // shortcut: a bounded web, as joins of spilled loop registers are small.
+            if seen.len() > 64 {
+                return None;
+            }
+            match phi_args(a) {
+                Some(more) => todo.extend(more),
+                None if leaf.is_none_or(|x| x == a) => leaf = Some(a),
+                None => return None,
+            }
+        }
+        leaf
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -2094,6 +2171,35 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
         }),
         None => Ok(()),
     }
+}
+
+/// The value dword `half` of `s_xor` `inst` equals when one operand is itself an XOR (of the
+/// same width) of the other and that value: the last XOR of a swap by three, as the console
+/// compiler swaps two SGPRs. `def` gives a value's instruction.
+pub(crate) fn xored_back<'a>(
+    inst: &Inst,
+    half: u8,
+    def: impl Fn(Value) -> Option<&'a Inst>,
+) -> Option<Value> {
+    let name = inst.name();
+    if !matches!(name, "s_xor_b32" | "s_xor_b64") {
+        return None;
+    }
+    let pair = |i: &Inst, k: u8| -> Option<(Value, Value)> {
+        let Fields::Sop { src, .. } = &i.fields else { return None };
+        let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src[..] else {
+            return None;
+        };
+        Some((i.read(Reg::S(a + k))?, i.read(Reg::S(b + k))?))
+    };
+    let (x, y) = pair(inst, half)?;
+    let other = |v: Value, u: Value| {
+        let i = def(v).filter(|i| i.name() == name)?;
+        let k = i.writes.iter().position(|w| w.1 == v)? as u8;
+        let (a, b) = pair(i, k)?;
+        (b == u).then_some(a).or((a == u).then_some(b))
+    };
+    other(x, y).or_else(|| other(y, x))
 }
 
 #[cfg(test)]

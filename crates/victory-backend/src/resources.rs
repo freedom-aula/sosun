@@ -177,7 +177,8 @@ pub enum BorderColor {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplerDesc {
-    pub min_mag: Filter,
+    pub min: Filter,
+    pub mag: Filter,
     pub mip: Filter,
     pub address: [Address; 3],
     pub border_color: BorderColor,

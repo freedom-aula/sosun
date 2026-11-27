@@ -1,6 +1,7 @@
 //! `VICTORY_SHADER_SOURCE_HASH`: what the translator is built from (this
-//! crate's sources, manifest and build script, the workspace's lock file
-//! and the compiler's version), for caches of translations
+//! crate's sources but its `*_tests.rs` test modules, manifest and build
+//! script, the workspace's lock file and the compiler's version), for caches
+//! of translations
 //! (`victory_shader::SOURCE_HASH`).
 
 use std::hash::{DefaultHasher, Hasher};
@@ -44,7 +45,9 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             sources(&path, out);
-        } else {
+        } else if !path.to_string_lossy().ends_with("_tests.rs") {
+            // Test modules (`*_tests.rs`, declared under `cfg(test)`, which
+            // `tests::test_modules_are_test_only` checks) do not change the translator.
             out.push(path);
         }
     }

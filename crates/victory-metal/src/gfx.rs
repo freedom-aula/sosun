@@ -325,8 +325,8 @@ fn filter(f: Filter) -> MTLSamplerMinMagFilter {
 
 fn dynamic_sampler_descriptor(d: &SamplerDesc) -> Retained<MTLSamplerDescriptor> {
     let sd = MTLSamplerDescriptor::new();
-    sd.setMinFilter(filter(d.min_mag));
-    sd.setMagFilter(filter(d.min_mag));
+    sd.setMinFilter(filter(d.min));
+    sd.setMagFilter(filter(d.mag));
     sd.setMipFilter(match d.mip {
         Filter::Nearest => MTLSamplerMipFilter::Nearest,
         Filter::Linear => MTLSamplerMipFilter::Linear,
@@ -1050,10 +1050,20 @@ impl ResourceBackend for Metal {
     }
 }
 
+/// What a compiler crash is remembered by: the two stages' DXIL (the crash is in compiling them,
+/// whatever the targets and state).
+fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
+    crate::disk::key(&[d.vs, d.ps.unwrap_or_default()])
+}
+
 impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        if crate::disk::crashed(crash_key(d).as_bytes()) {
+            return Err("Metal's compiler crashed on it on an earlier run".into());
+        }
         let (stage, vf) = self.stage_function(d.vs, d.vs_layout)?;
         let ff = d.ps.map(|ps| self.stage_function(ps, d.ps_layout)).transpose()?.map(|f| f.1);
         let has_stencil = d.depth == Some(Format::D32FloatS8);
@@ -1330,12 +1340,10 @@ impl Metal {
                 pd.setStencilAttachmentPixelFormat(pixel_format(f));
             }
         }
+        let crash_key = crash_key(d);
         match self.archive() {
-            Some(a) => a.render(&self.dev, &pd),
-            None => self
-                .dev
-                .newRenderPipelineStateWithDescriptor_error(&pd)
-                .map_err(|e| e.localizedDescription().to_string()),
+            Some(a) => a.render(&self.dev, &pd, &crash_key),
+            None => crate::archive::compile_render(&self.dev, &pd, &crash_key),
         }
     }
 }
@@ -1344,10 +1352,9 @@ impl Metal {
 /// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and
 /// every fence and barrier word waiting on it would hang; `recover` pays them from the CPU.
 ///
-/// Not `Send`: the completed-handler block is only `Fn`, and Metal's objects are thread-safe to use
-/// this way. The fills write title memory the pool keeps mapped while the buffer lives (`buf` is
-/// held here to keep the wrapper alive).
+/// The fills retain their buffer wrappers so the pool keeps the title memory mapped.
 pub(crate) struct Owed {
+    recovery: std::sync::Once,
     events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
     /// Buffer, offset, length, byte.
     #[allow(clippy::type_complexity)]
@@ -1375,39 +1382,39 @@ impl Owed {
                 }
             }
         }
-        Owed { events, fills, signals: work.signals.len() }
+        Owed { recovery: std::sync::Once::new(), events, fills, signals: work.signals.len() }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
     /// its fence reached reads the values the submission wrote before it.
     pub(crate) fn recover(&self) {
-        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        for (buf, off, len, value) in &self.fills {
-            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
-            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
-        }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        for (e, v) in &self.events {
-            if e.signaledValue() < *v {
-                e.setSignaledValue(*v);
+        self.recovery.call_once(|| {
+            static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            for (buf, off, len, value) in &self.fills {
+                // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+                unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
             }
-        }
-        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-            tracing::warn!(
-                "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
-                self.signals,
-                self.fills.len()
-            );
-        }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            for (e, v) in &self.events {
+                if e.signaledValue() < *v {
+                    e.setSignaledValue(*v);
+                }
+            }
+            if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                tracing::warn!(
+                    "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                    self.signals,
+                    self.fills.len()
+                );
+            }
+        });
     }
 }
 
-// SAFETY: an `Owed` is shared between Metal's completion thread and the thread that looks for
-// lost command buffers. It holds shared events and buffers, which Metal lets any thread use, and
-// `recover` only stores bytes and raises events (never lowers one), so two recoveries of one
-// submission leave what one does.
+// SAFETY: Metal allows the retained shared events and buffers to be used from either thread.
 unsafe impl Send for Owed {}
-// SAFETY: as for `Send`: `recover` takes `&self` and changes nothing in the `Owed`.
+// SAFETY: the fills and events are immutable lists. The Once lets only one recovery write the
+// buffers and signal the events, even if the timeout and completion threads both call recover.
 unsafe impl Sync for Owed {}
 
 /// A command buffer committed and not yet reported on by Metal: its queue, when, what it owes.
@@ -1417,6 +1424,13 @@ struct Flight {
     since: std::time::Instant,
     owed: std::sync::Arc<Owed>,
 }
+
+/// Tests only. The list below is the process's, and a recovery with no age pays every command
+/// buffer in it, other tests' too: their fences are signalled before their work has run. So the
+/// test that recovers takes this for writing, and the tests that depend on when their own command
+/// buffers complete take it for reading.
+#[cfg(test)]
+pub(crate) static FLIGHTS_IN_TESTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// Committed command buffers Metal has not reported on, oldest first, and per queue the newest
 /// serial Metal failed and when.
@@ -2300,19 +2314,26 @@ impl Metal {
             e.setBlendColorRed_green_blue_alpha(r, g, b, a);
             // The target's size bounds the scissor (Metal refuses a rectangle outside it).
             let (tw, th) = rt_size;
-            if let Some(v) = d.state.viewport {
-                if v.width <= 0.0 || v.height <= 0.0 {
-                    continue;
-                }
-                e.setViewport(MTLViewport {
+            let viewport = match d.state.viewport {
+                Some(v) if v.width <= 0.0 || v.height <= 0.0 => continue,
+                Some(v) => MTLViewport {
                     originX: v.x as f64,
                     originY: v.y as f64,
                     width: v.width as f64,
                     height: v.height as f64,
                     znear: v.min_depth as f64,
                     zfar: v.max_depth as f64,
-                });
-            }
+                },
+                None => MTLViewport {
+                    originX: 0.0,
+                    originY: 0.0,
+                    width: tw as f64,
+                    height: th as f64,
+                    znear: 0.0,
+                    zfar: 1.0,
+                },
+            };
+            e.setViewport(viewport);
             let scissor = match d.state.scissor {
                 Some([l, t, r, b]) => {
                     let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
@@ -2607,29 +2628,8 @@ mod render_target_tests {
     use super::*;
     use objc2_foundation::NSString;
 
-    #[test]
-    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
-        let metal = Metal::new().expect("Metal device");
-        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
-        desc.dim = TexDim::D2Array;
-        desc.depth_or_layers = 2;
-        desc.mips = 2;
-        desc.render_target = true;
-        let texture = metal.create_texture(&desc).unwrap();
-        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
-        for slice in 0..2 {
-            for mip in 0..2 {
-                let n = 8 >> mip;
-                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
-            }
-        }
-        let target = metal.create_texture_view(&texture, &ViewDesc {
-            format: Format::Rgba8Unorm,
-            mips: (1, 1),
-            slices: (1, 1),
-        }).expect("narrowed render target");
-        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
-
+    fn draw_green_triangles(metal: &Metal, target: &Texture, clear: Option<[f32; 4]>, viewports: &[Option<Viewport>]) {
+        let _flight = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
             #include <metal_stdlib>
             using namespace metal;
@@ -2659,12 +2659,12 @@ mod render_target_tests {
         let queue = metal.create_queue().unwrap();
         let fence = metal.create_fence(0).unwrap();
         let passes = [Pass::Render(RenderPass {
-            color: vec![ColorTarget { texture: &target, clear: None }],
+            color: vec![ColorTarget { texture: target, clear }],
             depth: None,
-            draws: vec![Draw {
+            draws: viewports.iter().map(|&viewport| Draw {
                 pipeline: &pipeline,
                 topology: Topology::Triangles,
-                state: DrawState::default(),
+                state: DrawState { viewport, ..Default::default() },
                 root: RootArgs::default(),
                 fragment_root: None,
                 heaps: Heaps::default(),
@@ -2679,14 +2679,40 @@ mod render_target_tests {
                 },
                 indirect: None,
                 count: None,
-            }],
+            }).collect(),
         })];
         metal.submit_passes(&queue, &PassSubmission {
             passes: &passes,
             waits: &[],
             signals: &[(&fence, 1)],
-        }).expect("draw through narrowed view");
+        }).expect("draw green triangles");
         assert!(metal.wait(&fence, 1, 2000), "draw did not complete");
+    }
+
+    #[test]
+    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.dim = TexDim::D2Array;
+        desc.depth_or_layers = 2;
+        desc.mips = 2;
+        desc.render_target = true;
+        let texture = metal.create_texture(&desc).unwrap();
+        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
+            }
+        }
+        let target = metal.create_texture_view(&texture, &ViewDesc {
+            format: Format::Rgba8Unorm,
+            mips: (1, 1),
+            slices: (1, 1),
+        }).expect("narrowed render target");
+        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
+
+        draw_green_triangles(&metal, &target, None, &[None]);
         for slice in 0..2 {
             for mip in 0..2 {
                 let n = 8 >> mip;
@@ -2697,6 +2723,28 @@ mod render_target_tests {
                         "mip {mip} slice {slice}: expected {expected:?}, got {:?}", &data[..4]);
             }
         }
+    }
+
+    #[test]
+    fn default_viewport_restores_the_full_target_in_the_same_pass() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 16, 16);
+        desc.render_target = true;
+        let target = metal.create_texture(&desc).unwrap();
+        let half = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 16.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        draw_green_triangles(&metal, &target, Some([0.0; 4]), &[Some(half), None]);
+
+        let mut pixels = [0; 16 * 16 * 4];
+        metal.read_texture(&target, 0, 0, &mut pixels, 16 * 4, 0);
+        assert_eq!(pixels.as_chunks::<4>().0[8 * 16 + 12], [0, 255, 0, 255],
+                   "the second draw must reach (12, 8) outside the first viewport");
     }
 }
 
@@ -2741,11 +2789,36 @@ mod owed_tests {
         assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
     }
 
+    #[test]
+    fn repeated_recovery_preserves_the_waiters_write() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr), len: 8, value: 0xAB }])];
+        let signals = [(&fence, 7)];
+        let owed = Owed::new(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }, false);
+        let word = region.ptr.cast::<[u8; 8]>();
+
+        owed.recover();
+        assert_eq!(m.completed(&fence), 7);
+        // SAFETY: these eight bytes are inside the live region. Only this thread accesses them.
+        unsafe {
+            assert_eq!(word.read(), [0xAB; 8]);
+            word.write([0xCD; 8]);
+        }
+        owed.recover();
+        // SAFETY: same region and exclusive access as above.
+        assert_eq!(unsafe { word.read() }, [0xCD; 8]);
+    }
+
     /// A command buffer Metal never reports on (here one waiting for an event nobody signals) is
     /// found once it is old enough, and what it owes is paid: the fill and the fence signal the
     /// title's queues wait for.
     #[test]
     fn a_lost_command_buffer_pays_what_it_owes() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap();
         let region = Region::new(page_size(), None).unwrap();
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
@@ -2758,7 +2831,7 @@ mod owed_tests {
         let (long, zero) = (std::time::Duration::from_secs(3600), std::time::Duration::ZERO);
         assert_eq!(recover_lost_after(long, long), 0);
         assert_eq!(m.completed(&fence), 0);
-        // Other tests' command buffers may be in flight too (the list is the process's): at least ours.
+        // Other tests' command buffers may be in flight too (those that do not mind): at least ours.
         assert!(recover_lost_after(long, zero) >= 1);
         // SAFETY: inside the region.
         assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x5A; 8]);
@@ -2810,7 +2883,8 @@ mod sampler_tests {
             (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
         ] {
             let desc = dynamic_sampler_descriptor(&SamplerDesc {
-                min_mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [Address::Border, Address::Clamp, Address::Mirror],
                 border_color: color,
@@ -2916,7 +2990,8 @@ mod sampler_tests {
         let mut ids = std::collections::HashSet::new();
         for (mode, border_color, outside) in cases {
             let key = SamplerDesc {
-                min_mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [mode, Address::Clamp, Address::Clamp],
                 border_color,
@@ -2936,21 +3011,33 @@ mod sampler_tests {
     }
 
     #[test]
-    fn a_sampler_in_a_heap_keeps_its_id() {
+    fn heap_samplers_keep_distinct_ids_for_independent_min_and_mag_filters() {
+        use MTLSamplerMinMagFilter as MetalFilter;
+
         let m = Metal::new().unwrap();
-        let desc = |min_mag| SamplerDesc {
-            min_mag,
+        let nearest = SamplerDesc {
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
             border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         };
-        let id = |s: &Sampler| resource_id(s.0.gpuResourceID());
-        // The host drops its sampler once the ID is in the heap; a later one must not take that ID.
-        let first = id(&m.create_sampler(&desc(Filter::Nearest)).unwrap());
-        let second = id(&m.create_sampler(&desc(Filter::Linear)).unwrap());
-        assert_ne!(first, second, "a freed sampler's ID was reused while a heap still names it");
-        assert_eq!(id(&m.create_sampler(&desc(Filter::Nearest)).unwrap()), first, "samplers are shared by descriptor");
+        let cases = [
+            (nearest, (MetalFilter::Nearest, MetalFilter::Nearest)),
+            (SamplerDesc { min: Filter::Linear, ..nearest }, (MetalFilter::Linear, MetalFilter::Nearest)),
+            (SamplerDesc { mag: Filter::Linear, ..nearest }, (MetalFilter::Nearest, MetalFilter::Linear)),
+        ];
+        let id = |key: &SamplerDesc| resource_id(m.create_sampler(key).unwrap().0.gpuResourceID());
+        // Like a heap entry, keep just the ID after creating each sampler.
+        let mut ids = std::collections::HashSet::new();
+        let first = id(&nearest);
+        for (key, expected) in cases {
+            let desc = dynamic_sampler_descriptor(&key);
+            assert_eq!((desc.minFilter(), desc.magFilter()), expected);
+            assert!(ids.insert(id(&key)), "distinct filter pairs shared a sampler ID");
+        }
+        assert_eq!(id(&nearest), first, "samplers are shared by descriptor");
     }
 }
 

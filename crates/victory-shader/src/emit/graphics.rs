@@ -200,18 +200,22 @@ fn infer(
         }
     }
     // Guess: root constants that are a pixel program's last user data take the SGPRs after them
-    // that it reads on entry (the metadata names only their first), as compute's reach its user
-    // SGPR count (`constants_to_the_end`); observed: the upscale program's b500 in s9 to s12. The
-    // primitive mask, which follows the user SGPRs and only reaches M0, ends them.
+    // (the metadata names only their first), as compute's reach its user SGPR count
+    // (`constants_to_the_end`): up to the primitive mask, which follows the user SGPRs and only
+    // reaches M0, when the program reads one (observed: b500 in s10 to s14, the mask in s15, s13
+    // read on entry); else as far as it reads them on entry (the upscale program's b500 in s9 to
+    // s12, with no interpolation).
     if stage == HwStage::Ps
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
     {
         let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
-        let mut end = u32::from(last.user_data) + last.sgprs;
-        while end < 32 && live(end).is_some_and(|v| !crate::io::is_prim_mask_only(&p, v, true)) {
-            end += 1;
-        }
+        let mask = |s: u32| live(s).is_some_and(|v| crate::io::is_prim_mask_only(&p, v, true));
+        let start = u32::from(last.user_data) + last.sgprs;
+        let end = match (start..32).find(|&s| mask(s)) {
+            Some(m) => m,
+            None => (start..32).find(|&s| live(s).is_none()).unwrap_or(32),
+        };
         last.sgprs = end - u32::from(last.user_data);
     }
     // A vertex shader's own vertex fetch: usually s0/s1 address the table of vertex buffer
@@ -744,8 +748,13 @@ fn infer_wave64(list: &[Instruction]) -> bool {
             let is_32 = name.ends_with("_b32") || name.ends_with("_u32") || name.ends_with("_i32");
             for op in dst.iter().chain(src) {
                 if let Operand::Scalar { code, .. } = *op {
-                    if is_64 && matches!(code, 106 | 126) {
+                    if is_64 && code == 126 {
                         strong_w64 = true;
+                    }
+                    // A wave32 program may use the VCC pair as a spare 64-bit SGPR pair
+                    // (`s_mov_b64 vcc, s[82:83]` beside `s_and_saveexec_b32`), so only weak.
+                    if is_64 && code == 106 {
+                        weak_w64 = true;
                     }
                     if is_32 && code == 126 {
                         weak_w32 = true;
@@ -1100,6 +1109,13 @@ mod tests {
         // Wave32 saveexec_b32 with vcc_hi used as a scratch SGPR: strong wave32 wins.
         let w32_with_vcc_hi = words(&[0xBE80_3C01, 0xBEEB_0302, ENDPGM]);
         assert!(!infer(HwStage::Ps, &w32_with_vcc_hi, &meta).unwrap().0.wave64);
+
+        // s_mov_b64 vcc, s[2:3] alone: wave64 (the default holds).
+        let vcc_pair = words(&[0xBEEA_0402, ENDPGM]);
+        assert!(infer(HwStage::Ps, &vcc_pair, &meta).unwrap().0.wave64);
+        // Beside s_and_saveexec_b32 the VCC pair is a spare SGPR pair: wave32.
+        let w32_vcc_pair = words(&[0xBE80_3C01, 0xBEEA_0402, ENDPGM]);
+        assert!(!infer(HwStage::Ps, &w32_vcc_pair, &meta).unwrap().0.wave64);
     }
 
     #[test]
@@ -1450,6 +1466,21 @@ mod tests {
         ];
         let (p, _) = infer(HwStage::Ps, &words(&interp), &meta).unwrap();
         assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 1), "{:?}", p.layout);
+        // Constants the program reads past SGPRs it writes first (s10, s11) reach up to its
+        // primitive mask (s13): s12 is theirs (two of the title's G-buffer pixel programs).
+        let gap = [
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E06_020C, // v_mov_b32 v3, s12
+            0xBEFC_030D, // s_mov_b32 m0, s13
+            0xC808_0000, 0xC809_0001, // v_interp_p1_f32 v2, v0, attr0.x; v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_0803, 0x0000_0203, // exp mrt0 v3, v2 done
+            ENDPGM,
+        ];
+        let (p, _) = infer(HwStage::Ps, &words(&gap), &meta).unwrap();
+        assert!(p.layout.iter().any(|r| r.root == RootType::Constants && r.user_data == 9 && r.sgprs == 4), "{:?}", p.layout);
+        let c = container(HwStage::Ps, &words(&gap), &meta).unwrap();
+        super::super::translate_with(&c, super::super::Options::default()).unwrap();
     }
 
     /// `s_sext_i32_i16` and `s_sext_i32_i8` (some of the title's mesh programs) translate.
@@ -1528,5 +1559,84 @@ mod tests {
             let e = mesh(&program(exec, [0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
             assert!(e.to_string().contains("lane mask"), "{e}");
         }
+    }
+
+    /// The NGG vertex programs ahead of the G-buffer test EXEC without such a mask: the compare
+    /// ANDed with an `s_cselect` of -1 and 0 by SCC, then `s_andn2_b64 sN, exec, mask`, its SCC
+    /// kept and branched on (was refused: "a lane mask read as data"). On EXEC the mask is a
+    /// function of uniform atoms, so SCC (some lane of EXEC outside it) is its complement.
+    #[test]
+    fn a_mesh_program_keeps_the_scc_of_exec_without_a_uniform_lane_mask() {
+        let program = |cmp: [u32; 2]| {
+            [
+                0xBEFE_0481, // s_mov_b64 exec, 1
+                0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0x7DA8_0008, // v_cmpx_gt_u32 s8, v0
+                0xBF88_000A, // s_cbranch_execz 10
+                cmp[0], cmp[1], // v_cmp_ge_f32 vcc, <src0>, 0
+                0xBF0D_8008, // s_bitcmp1_b32 s8, 0
+                0x8598_80C1, // s_cselect_b64 s[24:25], -1, 0
+                0x8798_186A, // s_and_b64 s[24:25], vcc, s[24:25]
+                0x8A96_187E, // s_andn2_b64 s[22:23], exec, s[24:25]
+                0xBE94_03FD, // s_mov_b32 s20, src_scc
+                0xBF01_8014, // s_cmp_lg_i32 s20, 0
+                0xBF84_0001, // s_cbranch_scc0 1
+                0x7E00_02F2, // v_mov_b32 v0, 1.0
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+                0xF800_0941, 0x0000_0001, // exp prim v1 done
+                ENDPGM,
+            ]
+        };
+        mesh(&program([0xD406_006A, 0x0001_0008])).unwrap(); // src0 s8: uniform
+        let e = mesh(&program([0xD406_006A, 0x0001_0100])).unwrap_err(); // src0 v0
+        assert!(e.to_string().contains("lane mask"), "{e}");
+    }
+
+    /// The NGG vertex programs ahead of the G-buffer spill SGPRs to VGPR lanes on two paths
+    /// into a join and read the lane back after it (was refused: "a cross-lane operation in a
+    /// mesh shader"): the read is a phi of the SGPRs written.
+    #[test]
+    fn a_mesh_program_reads_back_an_sgpr_spilled_on_two_paths() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE94_03F2, // s_mov_b32 s20, 1.0
+            0xBE95_0380, // s_mov_b32 s21, 0
+            0xBF0D_9F08, // s_bitcmp1_b32 s8, 31
+            0xBF85_0003, // s_cbranch_scc1 3
+            0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+            0xBF82_0002, // s_branch 2
+            0xD761_000E, 0x0001_0615, // v_writelane_b32 v14, s21, 3
+            0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+            0x7E00_0216, // v_mov_b32 v0, s22
+            0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
+    }
+
+    /// They also swap a mask and data between two SGPRs by three XORs (was refused: "a lane
+    /// mask read as data"): the last XOR gives back the data.
+    #[test]
+    fn a_mesh_program_swaps_a_mask_and_data_by_three_xors() {
+        mesh(&[
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xBE96_0308, // s_mov_b32 s22, s8
+            0xBE98_047E, // s_mov_b64 s[24:25], exec
+            0x8918_1618, // s_xor_b32 s24, s24, s22
+            0x8916_1618, // s_xor_b32 s22, s24, s22
+            0x8918_1618, // s_xor_b32 s24, s24, s22
+            0x7E00_0218, // v_mov_b32 v0, s24
+            0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ])
+        .unwrap();
     }
 }

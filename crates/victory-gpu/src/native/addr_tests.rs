@@ -135,6 +135,18 @@ pub(super) fn translate_wave(
     wave64: bool,
     options: victory_shader::emit::Options,
 ) -> HostShader {
+    try_translate_wave(words, sgprs, rsrc2, threads, wave64, options).expect("emit")
+}
+
+/// [`translate_wave`], or what the translation refuses.
+pub(super) fn try_translate_wave(
+    words: &[u32],
+    sgprs: u32,
+    rsrc2: u32,
+    threads: u32,
+    wave64: bool,
+    options: victory_shader::emit::Options,
+) -> Result<HostShader, victory_shader::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -166,7 +178,7 @@ pub(super) fn translate_wave(
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     let c = Container::parse(&empty).expect("container");
-    emit_with(&c, &native, &p, &st, &io, &res, options).expect("emit")
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 pub(super) fn title() -> Option<Title<Metal>> {

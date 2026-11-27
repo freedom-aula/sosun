@@ -59,6 +59,12 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
     translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
+/// Whether [`translate_extra`]'s translation is in the disk cache already.
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+    crate::shader_cache::native_present(container, &format!("{o:?}"))
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
@@ -98,26 +104,6 @@ pub fn threads_of(dxil: &[u8]) -> Option<[usize; 3]> {
     let d = part.data.get(40..52)?;
     let n = |k: usize| u32::from_le_bytes(d[k * 4..k * 4 + 4].try_into().unwrap()) as usize;
     Some([n(0), n(1), n(2)]).filter(|t| t.iter().all(|&n| n > 0))
-}
-
-/// Whether Metal's compiler crashed on the pipeline `key` names on an earlier run (`victory_metal::disk::crashed`).
-fn compiler_crashed(key: &[u8; 32]) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        victory_metal::disk::crashed(key)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = key;
-        false
-    }
-}
-
-fn remember_compiler_crash(key: &[u8; 32]) {
-    #[cfg(target_os = "macos")]
-    victory_metal::disk::remember_crash(key);
-    #[cfg(not(target_os = "macos"))]
-    let _ = key;
 }
 
 /// Counts of what the shader path did, and why it refused what it did.
@@ -238,13 +224,7 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
-        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
-        if compiler_crashed(&key) {
-            self.shaders.refuse(name, "conversion: Metal's compiler crashed on it on an earlier run".into());
-            self.libraries.render.insert(key, Pipe::Refused);
-            return Pipe::Refused;
-        }
-        let made = self.make_render(vs, ps, graphics, name, &key);
+        let made = self.make_render(vs, ps, graphics, name);
         self.libraries.render.insert(key, made.clone());
         made
     }
@@ -255,7 +235,6 @@ impl<B: PresentBackend> Title<B> {
         ps: Option<&HostShader>,
         g: &Graphics,
         name: &str,
-        key: &[u8; 32],
     ) -> Pipe<B> {
         let Some(reads) = state::vertex_inputs(&vs.dxil) else {
             self.shaders.refuse(name, "no input signature".into());
@@ -318,9 +297,6 @@ impl<B: PresentBackend> Title<B> {
                 })))
             }
             Err(e) => {
-                if e.contains("XPC_ERROR_CONNECTION_INTERRUPTED") {
-                    remember_compiler_crash(key);
-                }
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }

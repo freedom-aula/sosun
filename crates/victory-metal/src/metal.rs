@@ -515,6 +515,7 @@ mod tests {
     #[test]
     fn queue_b_waits_for_queue_a_over_the_same_buffer() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let (qa, qb) = (m.create_queue().unwrap(), m.create_queue().unwrap());
         let fence = m.create_fence(0).unwrap();
         let done = m.create_fence(0).unwrap();
@@ -557,6 +558,7 @@ mod tests {
     #[test]
     fn cpu_signal_releases_a_waiting_queue() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let q = m.create_queue().unwrap();
         let (gate, done) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
         let p = m.create_compute_pipeline(AFFINE).unwrap();
@@ -583,6 +585,7 @@ mod tests {
     #[test]
     fn many_submissions_in_flight_one_wait() {
         let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         const SUBS: u64 = 64;
         let queues: Vec<_> = (0..4).map(|_| m.create_queue().unwrap()).collect();
         let chain = m.create_fence(0).unwrap();
