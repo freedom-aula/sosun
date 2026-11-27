@@ -1151,6 +1151,40 @@ are fixed here:
   refused as "a descriptor neither loaded nor built" or "outside the heaps" get past their
   descriptors; three now stop at "a lane mask read as data", one at a lane-mask join.
 
+### The G-buffer's mesh draws dispatch no groups: their culling shaders were refused (#182)
+
+Measured on a warm Series S run (M5 Pro), with `VICTORY_TRACE_CONTENT=<dir>,<s>,29` (the draws into
+the G-buffer's sRGB target): of 600 G-buffer draws traced, 578 were `ExecuteIndirect` mesh dispatches
+and 22 indexed indirect draws, and every record read, when it was encoded, a group count of
+`[0, 1, 1]` (an instance count of 0 for the indexed ones). The G-buffer stayed 0.000 non-black in
+every dump, also with `VICTORY_DEBUG_NO_DEPTH=1`: the draws were encoded, but no mesh group ran.
+
+The records (32 bytes each, 32 KiB) are written on the GPU. One compute shader (`e85d0ba6846a5b5e`)
+starts each frame's records as `[0, 1, 1]`, and six culling shaders then count the visible groups
+into them, in three pairs over the same buffers: `b30937e9de066fa9` with `4e2edbd69fe414f1`,
+`5833c0c20c5bec9b` with `f44473ebe75e0047`, `ff826810673a0198` with `898d9c1a5605ad81`. All six
+were refused, so their dispatches were dropped and every count stayed 0.
+
+- The first of each pair (an occlusion test: `image_gather4_l` of a depth pyramid) was refused as "a
+  gather at a level that may not be whole". The level is whole: `ceil(log2(...)) - 1`, clamped at 0,
+  minus 1, clamped at 0, then `v_cmpx_le_i32` and a `v_mov_b32` of another whole level. But those
+  writes are guarded, and `Lower::whole` also asked the value each one keeps where it is skipped to be
+  whole: here an unrelated product, kept only in lanes that never reach the gathers. `whole` now takes
+  the gather's site and looks at a guarded write's kept value only when a lane that runs the gather may
+  have skipped the write (`avoids`). Every step it follows is the lane's own, and a lane that reads
+  the value at the gather went through the write's block. All three translate. In game they run, and
+  the first non-zero group counts appear (`[1, 1, 1]`, `[5, 1, 1]`, `[24, 1, 1]`). Test:
+  `sample_tests::gathers_at_a_level_whole_in_the_lanes_that_gather_translate`.
+- The second of each pair is still refused: "a cross-lane operation between host waves in divergent
+  code". Each is a group of 128 threads (two console waves, so not the lockstep fallback) that ORs a
+  flag over its wave (a whole-wave section: `s_or_saveexec_b64 -1`, DPP, `v_permlanex16_b32`,
+  `v_readlane_b32` of lane 0). It then reads lane 63 with EXEC set to lane 0 alone, ORs the result
+  into LDS word 0, and reads it back after a group barrier. Until these run, the G-buffer stays almost
+  black (0-0.8% in the same run).
+
+`VICTORY_TRACE_TARGETS=1` cannot show this: an indirect draw counts as drawn when it is encoded,
+whatever the GPU later reads as its count.
+
 ## Descriptor dwords read as data
 
 The console compiler computes sizes from descriptor bits instead of querying them; those fields
