@@ -209,8 +209,9 @@ fn infer(
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
     {
+        let uses = crate::io::PrimMaskUses::new(&p);
         let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
-        let mask = |s: u32| live(s).is_some_and(|v| crate::io::is_prim_mask_only(&p, v, true));
+        let mask = |s: u32| live(s).is_some_and(|v| uses.is_prim_mask_only(v, true));
         let start = u32::from(last.user_data) + last.sgprs;
         let end = match (start..32).find(|&s| mask(s)) {
             Some(m) => m,
