@@ -134,6 +134,38 @@ fn report() {
                 tracing::warn!("  at {at}: signature {magic:#x}, {n} time(s)");
             }
         }
+        // Null-pointer writes the VICTORY_NULL_SINK guard moved into the sink page, or
+        // skipped where they could not be (`nullsink`): the sites as image offsets with the
+        // instruction's first bytes, most taken first.
+        let moved = crate::nullsink::MOVED.load(std::sync::atomic::Ordering::Relaxed);
+        if moved > 0 {
+            let sunk = crate::nullsink::SUNK.load(std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("null-pointer writes moved so far: {moved} (allocations handed the sink: {sunk})");
+            for site in crate::nullsink::sites() {
+                let at = unwind::image_base_of(site.rip as usize)
+                    .map(|base| format!("image+{:#x}", site.rip as usize - base))
+                    .unwrap_or_else(|| format!("{:#x}", site.rip));
+                let through = match site.base {
+                    // The x86 register names, in encoding order (8 to 15 are r8 to r15).
+                    Some((slot, value)) => {
+                        let name = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi"]
+                            .get(slot)
+                            .copied()
+                            .unwrap_or("r");
+                        let name = if name == "r" { format!("r{slot}") } else { name.into() };
+                        format!(" through {name} ({value:#x})")
+                    }
+                    None => String::new(),
+                };
+                tracing::warn!(
+                    "  at {at}: a {}-byte store{through} to {:#x}, bytes {:#x}, {} time(s)",
+                    site.len,
+                    site.at,
+                    site.code,
+                    site.count
+                );
+            }
+        }
         if let Some((at, n)) = std::env::var("VICTORY_DUMP_MEM").ok().and_then(|v| {
             let (a, n) = v.split_once(',')?;
             Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse::<usize>().ok()?))

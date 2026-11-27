@@ -45,6 +45,9 @@ mod windows;
 /// The title's deliberate crash writes (`mov dword [0], <signature>`), declined by the
 /// signal handler; compiled on every host so its pattern is tested everywhere.
 pub mod watchdog;
+/// `VICTORY_NULL_SINK=1`: the last-resort null-write guard and the sink page failed
+/// allocations hand out; compiled on every host so its decoder is tested everywhere.
+pub mod nullsink;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use crash::save_on_crash;

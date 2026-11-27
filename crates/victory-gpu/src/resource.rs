@@ -684,8 +684,19 @@ impl Memory {
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
             .map_err(|_| E_INVALIDARG)?;
         let attributes = resource_attributes(info, heap_kind);
-        let ptr =
-            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        let ptr = match NonNull::new(alloc(layout.size(), attributes).cast::<u8>()) {
+            Some(p) => p,
+            None => {
+                // The audit: the title sees E_OUTOFMEMORY (never a null buffer it could write
+                // through); a run log that names the size it asked for says which allocation
+                // the memory pressure refused.
+                tracing::warn!(
+                    size = layout.size(),
+                    "the resource allocator returned null; the title sees E_OUTOFMEMORY"
+                );
+                return Err(E_OUTOFMEMORY);
+            }
+        };
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
         Ok(Memory {

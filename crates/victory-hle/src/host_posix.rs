@@ -282,8 +282,48 @@ pub extern "system" fn VirtualAlloc(
     match result {
         Ok(p) => p.cast(),
         Err(_) => {
+            // The allocation audit: a failed reservation would hand the title null, and its
+            // first write through that null is the crash the loader's null-write guard is the
+            // last resort for — so the failure is logged with the size it asked for, once per
+            // distinct size, whatever the switch. With `VICTORY_NULL_SINK`, one of at most
+            // the sink's size is handed the 64 KiB sink page instead (a lie where Windows
+            // promises failure, for bring-up: the title's writes land somewhere harmless);
+            // a larger failure keeps its null, as the page cannot stand for it. `VirtualFree`
+            // of the sink is the invalid parameter it already is (the page is in no region).
+            static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            if kind & MEM_RESERVE != 0
+                && SEEN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_new(size)
+            {
+                tracing::warn!(size, kind, "VirtualAlloc failed; the title sees an allocation failure");
+            }
+            if victory_loader::nullsink::enabled()
+                && kind & MEM_RESERVE != 0
+                && size <= victory_loader::nullsink::SINK
+            {
+                victory_loader::nullsink::SUNK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return victory_loader::nullsink::sink().cast();
+            }
             set_error(ERROR_NOT_ENOUGH_MEMORY);
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// `Vec::push` that tells whether the value was new (the audit's once-per-size warning).
+trait PushNew {
+    fn push_new(&mut self, v: usize) -> bool;
+}
+impl PushNew for Vec<usize> {
+    fn push_new(&mut self, v: usize) -> bool {
+        match self.iter().any(|&s| s == v) {
+            true => false,
+            false => {
+                self.push(v);
+                true
+            }
         }
     }
 }

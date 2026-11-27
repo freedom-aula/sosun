@@ -300,6 +300,15 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
     // the saved rip moves past it, as the emulated instructions above are stepped over —
     // and the watchdog's thread returns to its caller instead of ending the run in the
     // crash handler. Recorded lock-free for the thread dump (`watchdog`).
+    //
+    // VICTORY_NULL_SINK: a genuine null-pointer write — a register holds the low address —
+    // is the title's own bug, and its exception ends the run. With the switch set, the store
+    // is moved into the 64 KiB sink page instead: the register is pointed at the sink, the
+    // store's displacement recomputed from the fault so it lands at the offset it wanted
+    // (bounded to the page first), and the instruction runs again; a REP form, a store that
+    // reaches past the page, or one addressed absolutely is skipped, the rip moving past it.
+    // Recorded lock-free for the thread dump (`nullsink`); off, the fault dispatches as any
+    // other.
     if signal == SIGSEGV {
         // SAFETY: fields of the signal's own records.
         let (err, fault, si_addr) = unsafe {
@@ -310,20 +319,47 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             )
         };
         let at = if fault != 0 { fault as usize } else { si_addr };
-        // A write (bit 1 of the page-fault error code) to address zero.
-        if err & 2 != 0 && at == 0 {
+        // A write (bit 1 of the page-fault error code) to the null page and its guard pages.
+        if err & 2 != 0 && at < 64 * 1024 {
             // SAFETY: rip is in the code that just faulted; 15 bytes is the
             // longest instruction and the page after is mapped or the read
             // faults like the instruction would have.
             let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
-            if let Some((len, magic)) = crate::watchdog::crash_write(code) {
-                crate::watchdog::record(rip, magic);
-                // SAFETY: the saved rip, past the declined store.
-                unsafe {
-                    mc.add(MC_THREAD + T_RIP * 8)
-                        .cast::<u64>()
-                        .write(rip + len as u64)
+            // A write to address zero.
+            if at == 0 {
+                if let Some((len, magic)) = crate::watchdog::crash_write(code) {
+                    crate::watchdog::record(rip, magic);
+                    // SAFETY: the saved rip, past the declined store.
+                    unsafe {
+                        mc.add(MC_THREAD + T_RIP * 8)
+                            .cast::<u64>()
+                            .write(rip + len as u64)
+                    };
+                    return;
+                }
+            }
+            if crate::nullsink::enabled()
+                && let Some(s) = crate::nullsink::store(code)
+            {
+                let slot = s.base.map(slot);
+                let value = slot.map_or(0, word);
+                crate::nullsink::record(rip, at as u64, s, value, code);
+                // The displacement, exactly as the cpu computed it: `at - value` in wrapping
+                // arithmetic. Pointing the register at the sink (its low bits kept) puts the
+                // store at that same displacement inside the page; what would not stay inside
+                // (a REP count, a displacement past the end) is skipped instead.
+                let off = (value & 0xffff).wrapping_add(at.wrapping_sub(value));
+                let set = |i: usize, v: u64| {
+                    // SAFETY: inside the thread state.
+                    unsafe { mc.add(MC_THREAD + i * 8).cast::<u64>().write(v) }
                 };
+                if let (false, Some(i)) = (s.rep, slot)
+                    && off.checked_add(s.width as u64).is_some_and(|end| end <= 64 * 1024)
+                {
+                    set(i, crate::nullsink::sink() as u64 + off);
+                } else {
+                    set(T_RIP, rip + s.len as u64);
+                }
                 return;
             }
         }
