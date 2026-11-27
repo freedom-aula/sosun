@@ -5260,9 +5260,16 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_flbit_i32_b64" => {
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_flbit_i32_i64" {
+                        // Turn bits differing from bit 63 into set bits in both halves.
+                        let k31 = self.s.m.i32(31);
+                        let sign = self.s.m.bin(c, Bin::AShr, b, k31);
+                        a = self.s.m.bin(c, Bin::Xor, a, sign);
+                        b = self.s.m.bin(c, Bin::Xor, b, sign);
+                    }
                     // Leading zeros; -1 for none (DXIL's first bit high).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s

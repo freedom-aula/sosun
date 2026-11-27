@@ -2818,6 +2818,34 @@ fn scalar_probes() -> Vec<Probe> {
 }
 
 #[test]
+fn signed_flbit_i64_counts_from_the_msb_and_preserves_scc() {
+    let cases = [
+        (0u64, u32::MAX),
+        (u64::MAX, u32::MAX),
+        (0x8000_0000_0000_0000, 1),
+        (0x0000_0000_0000_0001, 63),
+        (0xFFFF_FFFF_FFFF_FFFE, 63),
+        (0x0000_0001_0000_0000, 31),
+        (0xFFFF_FFFF_7FFF_FFFF, 32),
+    ];
+    let inputs = cases
+        .into_iter()
+        .flat_map(|(src, want)| [0, 1].map(|seed| [src as u32, (src >> 32) as u32, want, seed]))
+        .collect();
+    let probe = scalar(
+        [
+            sopc(0x06, s(19), int(0)), // s_cmp_eq_u32: seed SCC
+            sop1(0x18, 20, s(16)),     // s_flbit_i32_i64 s20, s[16:17]
+            vop1(0x01, 5, s(20)),
+            vop1(0x01, 6, SRC_SCC),
+        ],
+        inputs,
+        |i| vec![i[2], u32::from(i[3] == 0)],
+    );
+    assert_clean(check(&[probe]));
+}
+
+#[test]
 fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
