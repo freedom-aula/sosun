@@ -59,6 +59,12 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
     translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
+/// Whether [`translate_extra`]'s translation is in the disk cache already.
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+    crate::shader_cache::native_present(container, &format!("{o:?}"))
+}
+
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
 /// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
