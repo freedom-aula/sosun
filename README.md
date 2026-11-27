@@ -1,8 +1,9 @@
-<h1 align="center">Native VIctory for macOS</h1>
+<h1 align="center">SOSUN</h1>
 
 <p align="center">
 A <b>native</b> macOS port of <a href="https://github.com/Marvisak/VIctory">VIctory</a>, the Xbox Series emulator for GTA VI.<br>
-No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own process, and its GPU work goes straight to Metal.
+No Wine, no CrossOver, no Game Porting Toolkit: the game's code runs in our own process, and its GPU work goes straight to Metal.<br>
+<i>Continued from <a href="https://github.com/LakshanSivakumar/Native-Victory-macOS">Native-Victory-macOS</a>; full history and credits kept.</i>
 </p>
 
 <p align="center">
