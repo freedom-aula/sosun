@@ -348,7 +348,7 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
                 // arithmetic. Pointing the register at the sink (its low bits kept) puts the
                 // store at that same displacement inside the page; what would not stay inside
                 // (a REP count, a displacement past the end) is skipped instead.
-                let off = (value & 0xffff).wrapping_add(at.wrapping_sub(value));
+                let off = (value & 0xffff).wrapping_add((at as u64).wrapping_sub(value));
                 let set = |i: usize, v: u64| {
                     // SAFETY: inside the thread state.
                     unsafe { mc.add(MC_THREAD + i * 8).cast::<u64>().write(v) }
