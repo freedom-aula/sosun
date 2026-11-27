@@ -401,6 +401,7 @@ On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` l
 - **Libraries** (`metal/`, `victory_metal::disk`): the converter's metallib and shader stage, keyed by the DXIL, the root layout, the entry name, the format and the converter itself (its path, size and modification time). Each file has a magic and a checksum; a damaged file is a miss and is converted again.
 - **Pipeline states** (`metal/pipelines-<gpu>.metalarchive`, `victory_metal::archive`): an `MTLBinaryArchive` of the compiled compute and render pipelines. A pipeline is looked up with `FailOnBinaryArchiveMiss`; on a miss it is compiled as before and added. The archive is serialised at most every 5 s while pipelines are added, and when the backend drops. Metal refuses an archive from another GPU or OS version; it is then replaced by an empty one. Limit: a run killed within 5 s of its last new pipeline loses those pipelines.
 - **Reading the log.** The `native shader translation ms=.. hit=..` and `metal: library conversion .. ms (.. from the disk cache: ..)` lines are written only for work of 20 ms or more, which a hit never takes, so every such line says `hit=false`, even when nearly everything hits. That is what made a tester's warm runs look as if they missed everything. `VICTORY_TRACE_SHADER_CACHE=1` adds a `native shader cache so far` line to each frame log (every 64 frames), with `shaders_cached` and `shaders_translated` (translations from the cache and made, `shader_cache::counts`) and `libraries_cached` and `libraries_converted` (Metal library lookups that found or missed their entry, `victory_metal::disk::counts`). We checked the keys on our own logs (27 November, about 20 groups of runs that share a slot and a build folder). Each group's first run had 3,600 to 4,600 slow translations, and the later runs of the same build had 0 or 1. The exceptions (52 to 790) were shaders the first run never reached: the cold run was killed by the watchdog before prewarming finished, or the warm run went further. Most of those containers had never missed before. No key part changes between runs: the container's bytes, the `Options` text, the build key (the translator's sources, `Cargo.lock`, the compiler, this encoding, the loop limit), and, for libraries, the DXIL, the root layout text, the entry and the converter's path, size and mtime. A run is cold again after any change to `victory-shader`, `Cargo.lock` or `shader_cache.rs` (a new build folder, Metal libraries included), and in each `game-run.sh` slot, which has its own cache folder. Warm runs that still hit the title's watchdog (+0x23cf683, then +0x55e56f8) had no slow translations or conversions. Their world frames' first binds ended 23 to 27 s before the fault, and nothing was presented after that, so the stall there is not shader work. Test: `shader_cache::tests::a_second_run_reads_the_first_runs_translations`.
+- **Compiler crashes** (`metal/crash-<key>`, `victory_metal::disk::remember_crash`): a render pipeline whose compile ends in `XPC_ERROR_CONNECTION_INTERRUPTED` (Metal's compiler service crashed on it, after Metal's own retries) is remembered by its pipeline key (the DXIL of both stages, the graphics state and the user data) and the OS build (`kern.osversion`). Later runs refuse it at once ("Metal's compiler crashed on it on an earlier run") instead of crashing the service again: about 0.7 s a pipeline on macOS 27, about 30 s on macOS 15. The same seven G-buffer pipelines crashed it in every run of the world (`vertex a1785729710c22b3 pixel 80b896aafd2ec5f4` and six others), so the crash is the pipeline's, not the load's. An OS update, or deleting the files, tries them again.
 
 - **Prewarming** (`VICTORY_NO_SHADER_PREWARM=1` turns it off): each distinct shader the title registers is handed to six `shader-prewarm` threads that call `Shader::native()` and drop the result, so translation happens during the title's load, off its threads. Without it the first world frame binds about 1,300 pipelines for the first time and translates each inline on the render thread; large compute shaders take 190-600 ms each (mostly structurisation), 60-70 of them add up to 25-29 s, and the title's own 30 s watchdog kills the game. `native()` is a `OnceLock`, so a bind that beats the pool waits for or does the translation itself, as before. The log says `shaders prewarmed n=<n> pending=<queued> dxil_mb=<held>` at each power of two; `dxil_mb` is the DXIL the prewarmed translations keep. Measured cold on an M5 Pro (series-s, 2026-11-27): the title registers about 21,600 shaders, the pool spends about 640 CPU-seconds on them (two thirds in the ~700 compute shaders of 64 KB or more; there are no larger pixel or vertex shaders), and the translations keep about 40 MB of DXIL while their containers are let go, so the prewarm adds no measurable peak memory (peak RSS 9.1 and 13.9 GB with it, 16.0 and 16.4 GB without; the spread between runs is larger than any effect). The world frame came 3-87 s later with it in those runs, within the spread of runs without it (158-202 s).
 
@@ -1009,6 +1010,34 @@ Limits:
 - Other flag bits are ignored. `VICTORY_TRACE_DISPATCH_FLAGS=1` logs each flags value once, with its unknown bits.
 
 Tests: `split_wave_tests::a_dispatch_of_thread_counts_starts_the_lanes_past_them_off`, `a_dispatch_of_thread_counts_in_32_lane_waves` and `a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them` run our own programs on Metal (`victory-gpu`); `structure::tests::exec_on_entry_is_a_lane_mask_under_thread_counts` and `lower::tests::a_program_for_thread_counts_reads_the_count_of_each_dimension_with_lanes` need no GPU (`victory-shader`), nor do `pipeline::pieces_tests::a_compute_shader_is_translated_again_for_thread_counts` and `list::tests::dispatch_x_flags_say_when_the_counts_are_threads` (`victory-gpu`).
+
+## G-buffer and upscale pipelines refused (guessed path)
+
+A census of the world's frames found the G-buffer (1280x720, DXGI 29/28/34, six and three targets
+with D32S8) 1-11% non-black, with about 700 of its 1,600-1,900 draws a frame dropped. Three causes
+are fixed here:
+
+- **Extra parameters beside a `HALF` of their index.** A pixel shader that reads a `TEXCOORD<n>` its
+  vertex shader does not write gets the vertex shader translated again with that parameter added
+  (`Options::extra_params`, undefined values). The check for one already there matched any element
+  of index n, so a `HALF<n>` (the low or high half of parameter n / 2, "16-bit parameters of guessed
+  pipelines") hid it, the parameter was never added, and the converter refused the pipeline:
+  "Fragment input(s) `user(texcoord8)` ... not written by vertex shader" (five pipelines, about 219
+  dropped draws a frame). The check is by name now.
+- **Root constants of a guessed pixel program.** The metadata record of root constants names only
+  their first user SGPR; graphics stage data, which would give the count, is not decoded for guessed
+  programs. Guess: like compute's (`constants_to_the_end`), root constants that are a pixel program's
+  last user data take the SGPRs after them that it reads on entry, up to one that only reaches M0
+  (the primitive mask, which follows the user SGPRs). Observed: the upscale program (pixel
+  `41e09588771fe7a0`, which writes the 1920x1080 DXGI 10 target that tonemapping and present read)
+  reads b500 as s9 to s12 and interpolates nothing; s10 to s12 were refused as "a hardware SGPR
+  input".
+- **Descriptor dwords swapped by XORs.** The title's compiler swaps SGPRs in three XORs (`a ^= b;
+  b ^= a; a ^= b`, in 32 and 64 bits, `vcc` as the other register too), descriptor dwords included.
+  The tracer follows a value through `s_xor_b32/b64 d, x, y` when `x` is an XOR of `a` and `b` and
+  `y` holds what one of them does: `d` is the other (`Tracer::xor_undone`). Four vertex programs
+  refused as "a descriptor neither loaded nor built" or "outside the heaps" get past their
+  descriptors; three now stop at "a lane mask read as data", one at a lane-mask join.
 
 ## Descriptor dwords read as data
 
