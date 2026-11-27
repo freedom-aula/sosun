@@ -166,6 +166,22 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     if env_set!("VICTORY_TRACE_WRITES") {
         tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
     }
+    // One submission at a time, in the order they came: the lock below is let go while the
+    // textures are read, and the next submission must not overtake this one meanwhile.
+    static ORDER: Mutex<()> = Mutex::new(());
+    let _order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    // Tests share one title and count the uploads of their own `sync_dirty` calls, which another
+    // test's submission with textures read but not yet uploaded would upset: there the lock is
+    // kept from the probes to the uploads (`Title::submit`).
+    let unlocked = !cfg!(test);
+    if unlocked {
+        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        for batch in super::textures::batches(jobs) {
+            // Without the lock: the title's other threads go on recording.
+            let prepared = super::textures::prepare(&batch);
+            with_title(|t| t.sync_apply(prepared));
+        }
+    }
     with_title(|t| {
         if t.ensure_queue(queue as usize).is_err() {
             return;
@@ -175,7 +191,11 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             let list = crate::list::native(l);
             segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
-        t.submit(queue as usize, segments);
+        if unlocked {
+            t.submit_synced(queue as usize, segments);
+        } else {
+            t.submit(queue as usize, segments);
+        }
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {
@@ -419,6 +439,17 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
     warn_once("a texture copy or resolve");
+    // Once per operation and title formats (0: a buffer or not a texture), so a refused kind of
+    // copy shows what it was.
+    static SEEN: Mutex<Vec<(String, u32, u32)>> = Mutex::new(Vec::new());
+    let format = |r: This| crate::resource::texture_info(r).map_or(0, |i| i.format);
+    let key = (what.to_owned(), format(src), format(dst));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        tracing::warn!(what, src_format = key.1, dst_format = key.2, "a texture copy refused (first of this kind)");
+        seen.push(key);
+    }
+    drop(seen);
     if tracing_targets() {
         DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
     }
@@ -457,6 +488,7 @@ fn trace_present(resource: This) {
             targets = ?described,
             dropped_ops = ?ops.iter().take(8).collect::<Vec<_>>(),
             dropped = ops.len(),
+            copies = COPIES[1].swap(0, Ordering::Relaxed),
             ?reasons,
             "frame targets"
         );
@@ -613,14 +645,18 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     });
 }
 
-/// `ClearRenderTargetView`. shortcut: the selected attachment, regardless of rectangle arguments.
-pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
+/// `ClearRenderTargetView` against the attachment named by the descriptor.
+pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4], rects: &[crate::list::Rect]) {
     with_list(this, |t, l| {
         if let Some(record) = crate::descriptor::rtv_record(handle)
             && let Some((texture, _)) = t.target_of(record)
         {
             trace_bump(record.resource as usize, 1);
-            l.list.clear_render_target(&texture, color);
+            if rects.is_empty() {
+                l.list.clear_render_target(&texture, color);
+            } else {
+                l.list.clear_render_target_rects(&texture, color, rects);
+            }
         }
     });
 }
@@ -865,9 +901,10 @@ pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
 pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
+    let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
     let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
         let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
@@ -1522,12 +1559,9 @@ fn footprint_span(
         return None;
     }
     let fmt = super::descriptors::format(fp.format)?;
-    if matches!(
-        fmt,
-        victory_backend::resources::Format::D32Float
-            | victory_backend::resources::Format::D32FloatS8
-            | victory_backend::resources::Format::D16Unorm
-    ) {
+    // A depth and stencil footprint names both planes in one element; the host copies the depth
+    // plane alone (as a 4-byte format: `R32_TYPELESS` and the like).
+    if fmt == victory_backend::resources::Format::D32FloatS8 {
         return None;
     }
     let (element, block) = crate::resource::element(fp.format)?;
@@ -1545,6 +1579,77 @@ fn footprint_span(
     let slice_pitch = row_pitch.checked_mul((fp.height as usize).div_ceil(block as usize))?;
     let _ = element;
     Some((addr, len, row_pitch, slice_pitch))
+}
+
+/// Texture copies recorded so far, and since the last present (the `VICTORY_TRACE_TARGETS` frame
+/// line).
+static COPIES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A texture copy was recorded: counted, logged once per kind with `VICTORY_TRACE_TARGETS`, and its
+/// destination texture (if any) is the GPU's from now on ([`Title::gpu_written`]).
+fn copied(t: &mut MetalTitle, what: &str, src: This, dst: Option<This>) {
+    COPIES[0].fetch_add(1, Ordering::Relaxed);
+    COPIES[1].fetch_add(1, Ordering::Relaxed);
+    if let Some(d) = dst {
+        t.gpu_written(d as usize);
+        trace_bump(d as usize, 0);
+    }
+    if tracing_targets() {
+        static KINDS: Mutex<Vec<(String, Option<victory_backend::resources::Format>, Option<victory_backend::resources::Format>)>> = Mutex::new(Vec::new());
+        let kind = (what.to_owned(), t.format_of(src as usize), dst.and_then(|d| t.format_of(d as usize)));
+        let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+        if !kinds.contains(&kind) {
+            tracing::info!(what, src = ?kind.1, dst = ?kind.2, "a texture copy (first of its kind)");
+            kinds.push(kind);
+        }
+    }
+}
+
+/// Whether texels of `src` copy into `dst` on the host: one blit (the same format, or plain
+/// formats of one size through a view), or through a buffer, formats of one block size where one
+/// is block-compressed or depth (plain texels into a GPU encoder's compressed blocks, a depth
+/// plane into a 4-byte float), as D3D12 copies them.
+fn copy_formats(src: victory_backend::resources::Format, dst: victory_backend::resources::Format) -> bool {
+    use victory_backend::resources::Format;
+    let bytes = |f: Format| if f == Format::D32FloatS8 { 4 } else { f.block().1 };
+    let special = |f: Format| f.block().0 > 1 || f.is_depth();
+    victory_metal::gfx::direct_copy(src, dst) || ((special(src) || special(dst)) && bytes(src) == bytes(dst))
+}
+
+/// `size` source texels in the destination's texels: a plain texel is a whole compressed block
+/// (cut at the destination's edge, from `at`), and a block one texel.
+fn dest_size(src: victory_backend::resources::Format, dst: victory_backend::resources::Format, size: [usize; 3], at: [usize; 3], dims: [usize; 3]) -> [usize; 3] {
+    let (sw, dw) = (src.block().0, dst.block().0);
+    std::array::from_fn(|i| match i {
+        2 => size[2],
+        _ if dw > sw => (size[i] * dw).min(dims[i].saturating_sub(at[i])),
+        _ if sw > dw => size[i].div_ceil(sw),
+        _ => size[i],
+    })
+}
+
+/// Whether a footprint's rows hold the texels of a texture (a depth and stencil texture's: its
+/// 4-byte depth plane).
+fn rows_match(fp: &crate::resource::PlacedFootprint, info: &super::textures::TextureInfo) -> bool {
+    match (super::descriptors::format(fp.format), info.desc()) {
+        (Some(f), Some(d)) => copy_formats(f, d.format),
+        _ => false,
+    }
+}
+
+/// `ResolveSubresource`: host textures have one sample, so a resolve copies what both
+/// subresources hold (the console clips a larger source to the destination, as the D3D12 host
+/// does); the format argument names a view the copy makes when it needs one.
+pub(crate) fn resolve(this: This, dst: This, dst_sub: u32, src: This, src_sub: u32) -> bool {
+    let (Some(si), Some(di)) = (crate::resource::texture_info(src), crate::resource::texture_info(dst)) else {
+        return false;
+    };
+    let (Some((sm, _)), Some((dm, _))) = (subresource_mip_slice(&si, src_sub), subresource_mip_slice(&di, dst_sub)) else {
+        return false;
+    };
+    let (a, b) = (mip_dims(&si, sm), mip_dims(&di, dm));
+    let region = [0, 0, 0, a[0].min(b[0]) as u32, a[1].min(b[1]) as u32, a[2].min(b[2]) as u32];
+    copy_texture_region(this, crate::list::CopyLocation::sub(dst, dst_sub), [0; 3], crate::list::CopyLocation::sub(src, src_sub), Some(region))
 }
 
 /// `CopyResource` between two title textures. Returns `false` if the host cannot copy them.
@@ -1571,6 +1676,12 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         let (Some(src_tex), Some(dst_tex)) = (t.texture_of(src as usize), t.texture_of(dst as usize)) else {
             return false;
         };
+        let (Some(sf), Some(df)) = (t.format_of(src as usize), t.format_of(dst as usize)) else {
+            return false;
+        };
+        if !copy_formats(sf, df) {
+            return false;
+        }
         for slice in 0..slices {
             for mip in 0..mips {
                 let s = mip_dims(&src_info, mip);
@@ -1589,7 +1700,7 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
                 );
             }
         }
-        trace_bump(dst as usize, 0);
+        copied(t, "CopyResource", src, Some(dst));
         true
     })
     .unwrap_or(false)
@@ -1623,8 +1734,15 @@ pub(crate) fn copy_texture_region(
             let Some((src_origin, size)) = copy_box(&src_info, src_mip, source_box) else {
                 return false;
             };
+            let (Some(sf), Some(df)) = (src_info.desc().map(|d| d.format), dst_info.desc().map(|d| d.format)) else {
+                return false;
+            };
+            if !copy_formats(sf, df) {
+                return false;
+            }
             let dst_dims = mip_dims(&dst_info, dst_mip);
-            if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
+            let to = dest_size(sf, df, size, dst_origin, dst_dims);
+            if (0..3).any(|i| dst_origin[i].saturating_add(to[i]) > dst_dims[i]) {
                 return false;
             }
             if size.contains(&0) {
@@ -1647,13 +1765,13 @@ pub(crate) fn copy_texture_region(
                     dst_slice,
                     dst_origin,
                 );
-                trace_bump(dst.resource as usize, 0);
+                copied(t, "CopyTextureRegion", src.resource, Some(dst.resource));
                 true
             })
             .unwrap_or(false)
         }
         (SUBRESOURCE, FOOTPRINT) => {
-            let Some(dst_info) = crate::resource::texture_info(dst.resource) else {
+            let Some(dst_info) = crate::resource::texture_info(dst.resource).filter(|i| rows_match(&src.footprint, i)) else {
                 return false;
             };
             let Some((dst_mip, dst_slice)) = subresource_mip_slice(&dst_info, dst.footprint.offset as u32) else {
@@ -1697,13 +1815,13 @@ pub(crate) fn copy_texture_region(
                     dst_slice,
                     dst_origin,
                 );
-                trace_bump(dst.resource as usize, 0);
+                copied(t, "CopyTextureRegion", src.resource, Some(dst.resource));
                 true
             })
             .unwrap_or(false)
         }
         (FOOTPRINT, SUBRESOURCE) => {
-            let Some(src_info) = crate::resource::texture_info(src.resource) else {
+            let Some(src_info) = crate::resource::texture_info(src.resource).filter(|i| rows_match(&dst.footprint, i)) else {
                 return false;
             };
             let Some((src_mip, src_slice)) = subresource_mip_slice(&src_info, src.footprint.offset as u32) else {
@@ -1736,6 +1854,7 @@ pub(crate) fn copy_texture_region(
                     row_pitch,
                     slice_pitch,
                 );
+                copied(t, "CopyTextureRegion", src.resource, None);
                 true
             })
             .unwrap_or(false)

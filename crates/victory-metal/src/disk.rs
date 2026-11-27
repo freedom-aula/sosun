@@ -68,9 +68,59 @@ pub fn write(dir: &Path, key: &str, payload: &[u8]) {
     }
 }
 
+/// Whether compiling the pipeline `key` names crashed Metal's compiler service on an earlier run
+/// on this OS build ([`remember_crash`]).
+pub fn crashed(key: &[u8]) -> bool {
+    dir().is_some_and(|d| d.join(crash_name(key)).exists())
+}
+
+/// Remembers that compiling the pipeline `key` names crashed Metal's compiler service
+/// (`XPC_ERROR_CONNECTION_INTERRUPTED`), so later runs refuse it at once instead of waiting through
+/// Metal's retries again (about 30 s a pipeline on macOS 15). An OS update forgets it.
+pub fn remember_crash(key: &[u8]) {
+    if let Some(d) = dir() {
+        write(d, &crash_name(key), b"");
+    }
+}
+
+fn crash_name(k: &[u8]) -> String {
+    format!("crash-{}", &key(&[b"compiler crash", os_build().as_bytes(), k])[..32])
+}
+
+/// The OS build (`kern.osversion`), empty if it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn os_build() -> String {
+    String::new()
+}
+
+/// The OS build (`kern.osversion`), empty if it cannot be read.
+#[cfg(target_os = "macos")]
+fn os_build() -> String {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: the name is NUL-terminated and `buf` holds `len` bytes.
+    let ok = unsafe {
+        libc::sysctlbyname(c"kern.osversion".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    } == 0;
+    let s = if ok { &buf[..len.min(buf.len())] } else { &[][..] };
+    String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compiler_crash_is_remembered_for_its_pipeline_only() {
+        let d = tempfile::tempdir().unwrap();
+        // The folder is set once per process; this test is the only one that sets it.
+        use_dir(d.path().to_path_buf());
+        assert!(cfg!(not(target_os = "macos")) || !os_build().is_empty());
+        assert!(!crashed(b"pipeline a"));
+        remember_crash(b"pipeline a");
+        assert!(crashed(b"pipeline a"));
+        assert!(!crashed(b"pipeline b"));
+    }
 
     #[test]
     fn payloads_round_trip() {

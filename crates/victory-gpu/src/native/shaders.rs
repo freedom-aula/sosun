@@ -100,6 +100,26 @@ pub fn threads_of(dxil: &[u8]) -> Option<[usize; 3]> {
     Some([n(0), n(1), n(2)]).filter(|t| t.iter().all(|&n| n > 0))
 }
 
+/// Whether Metal's compiler crashed on the pipeline `key` names on an earlier run (`victory_metal::disk::crashed`).
+fn compiler_crashed(key: &[u8; 32]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        victory_metal::disk::crashed(key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = key;
+        false
+    }
+}
+
+fn remember_compiler_crash(key: &[u8; 32]) {
+    #[cfg(target_os = "macos")]
+    victory_metal::disk::remember_crash(key);
+    #[cfg(not(target_os = "macos"))]
+    let _ = key;
+}
+
 /// Counts of what the shader path did, and why it refused what it did.
 #[derive(Default, Debug, Clone)]
 pub struct ShaderStats {
@@ -173,7 +193,7 @@ impl<B: PresentBackend> Title<B> {
         };
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
-        let binding = Binding::of(shader);
+        let binding = Binding { name: name.into(), ..Binding::of(shader) };
         let made = match binding.layout() {
             Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
             None => self.host.backend.create_compute_pipeline(&shader.dxil),
@@ -218,7 +238,13 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
-        let made = self.make_render(vs, ps, graphics, name);
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        if compiler_crashed(&key) {
+            self.shaders.refuse(name, "conversion: Metal's compiler crashed on it on an earlier run".into());
+            self.libraries.render.insert(key, Pipe::Refused);
+            return Pipe::Refused;
+        }
+        let made = self.make_render(vs, ps, graphics, name, &key);
         self.libraries.render.insert(key, made.clone());
         made
     }
@@ -229,6 +255,7 @@ impl<B: PresentBackend> Title<B> {
         ps: Option<&HostShader>,
         g: &Graphics,
         name: &str,
+        key: &[u8; 32],
     ) -> Pipe<B> {
         let Some(reads) = state::vertex_inputs(&vs.dxil) else {
             self.shaders.refuse(name, "no input signature".into());
@@ -258,9 +285,9 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_PIPES") {
             tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
         }
-        let vs_binding = Binding::of(vs);
+        let vs_binding = Binding { name: name.into(), ..Binding::of(vs) };
         let ps_binding = ps
-            .map(Binding::of)
+            .map(|ps| Binding { name: name.into(), ..Binding::of(ps) })
             .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
@@ -291,6 +318,9 @@ impl<B: PresentBackend> Title<B> {
                 })))
             }
             Err(e) => {
+                if e.contains("XPC_ERROR_CONNECTION_INTERRUPTED") {
+                    remember_compiler_crash(key);
+                }
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }

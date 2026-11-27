@@ -599,6 +599,17 @@ impl Module {
             .count()
     }
 
+    /// Binary instructions of this type and opcode that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_bin_ops(&self, ty: Ty, op: Bin) -> usize {
+        let plan = self.plan();
+        plan.layout.iter().flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .map(|&i| &self.insts[i as usize])
+            .filter(|inst| inst.ty == ty && matches!(inst.op, Op::Bin(bin, _, _) if bin == op))
+            .count()
+    }
+
     /// The calls [`Module::write`] writes of functions whose name starts
     /// with `prefix`, in order: the name and each argument's constant value
     /// (a float's bits, through bitcasts), if it is one.

@@ -473,6 +473,8 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: Map<(usize, usize), Bool>,
+    /// Made by [`lockstep`]: the lowering runs the console wave's one PC in every lane.
+    pub lockstep: bool,
 }
 
 impl Structured {
@@ -487,7 +489,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -495,11 +497,20 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+/// The form a console wave run in lockstep takes (`emit/lockstep.rs`): every branch tests a
+/// value the same in all lanes (the program's EXEC and VCC branches made SCC tests of the
+/// whole mask first, [`crate::emit`]'s `lockstep_branches`), so every lane reaches every block
+/// and each vector instruction keeps EXEC as its guard.
+pub fn lockstep(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true, true)
+}
+
+fn structure_as(program: &Program, helpers: bool, lockstep: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.lockstep = lockstep;
     if !helpers {
         l.kills.clear();
     }
@@ -587,6 +598,8 @@ struct Lanes<'a> {
     /// A pixel's discards (see [`Structured::discards`]) by block and
     /// instruction.
     kills: HashSet<(usize, usize)>,
+    /// [`lockstep`]: SCC of a mask operation is a wave-wide test, not the lane's bit.
+    lockstep: bool,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -653,6 +666,7 @@ impl<'a> Lanes<'a> {
             restored: Map::default(),
             restored_const: Map::default(),
             kills: HashSet::new(),
+            lockstep: false,
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
@@ -978,6 +992,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            lockstep: self.lockstep,
         })
     }
 
@@ -2009,8 +2024,8 @@ impl<'a> Lanes<'a> {
                     return Bool::FALSE;
                 };
                 let set = match self.scc_lane.get(&scc) {
-                    Some(&m) => m,
-                    None => {
+                    Some(&m) if !self.lockstep => m,
+                    _ => {
                         let born = self.born(scc);
                         self.b.atom(Atom::Uniform(scc), born)
                     }

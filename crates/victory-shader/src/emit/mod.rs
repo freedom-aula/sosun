@@ -138,7 +138,8 @@
 //!   page with no copy an access reached, or for an address whose 256 MiB
 //!   region has no block, bit `level-1 index` (block 0's bits). Reads there
 //!   give 0, writes are dropped. In such a program (and one with root
-//!   parameters past its user SGPRs) root SRVs and UAVs are title memory
+//!   parameters past its user SGPRs, and a vertex or pixel program with
+//!   [`Options::zero_copy_memory`]) root SRVs and UAVs are title memory
 //!   too: no root views; the shader reads their addresses as user data
 //!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
 //!   dword 0 the address's low dword, 1 the high), and the host must have
@@ -221,6 +222,7 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lockstep;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
@@ -509,8 +511,27 @@ pub fn emit(
     emit_with(c, native, p, st, io, res, Options::default())
 }
 
-/// [`emit`] made as `options` say.
+/// [`emit`] made as `options` say. A refused compute program of one console wave on a 32-lane
+/// host is tried again in lockstep (`lockstep.rs`); its refusal is then lockstep's.
 pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    match emit_fast(c, native, p, st, io, res, options) {
+        Err(ShaderError::Unsupported { .. }) if lockstep::fits(native, st, &options) => {
+            lockstep::retry(c, native, p, io, res, options)
+        }
+        r => r,
+    }
+}
+
+/// [`emit_with`] without the lockstep fallback.
+fn emit_fast(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -531,7 +552,8 @@ pub fn emit_with(
     if !pixel && options.extra_params != 0 {
         let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
         for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
-            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+            // By name: a `HALF` element (`graphics::HALF`) of another parameter may have index n.
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n && e.name == "TEXCOORD") {
                 continue;
             }
             outputs.push(container::SigElement {
@@ -627,7 +649,7 @@ pub fn emit_with(
             let Some(q) = ir::keep_lanes_to_end(p) else {
                 return Err(e);
             };
-            return emit_with(c, native, &q, &structure::structure(&q)?, io, res, options);
+            return emit_fast(c, native, &q, &structure::structure(&q)?, io, res, options);
         }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a

@@ -337,6 +337,76 @@ fn a_whole_wave_product_combines_the_two_halves() {
 }
 
 #[test]
+fn whole_wave_float_prefix_products() {
+    for inclusive in [false, true] {
+        // Form an inclusive scan within each 16-lane row in v1.
+        let mut words = vec![
+            0xBE82_25C1, // s_or_saveexec_b64 s[2:3], -1
+            0xD501_0001,
+            0x000A_00F2, // v_cndmask_b32 v1, 1.0, v0, s[2:3]
+        ];
+        for shift in [1, 2, 4, 8] {
+            words.extend([0x1002_02FA, 0xFF01_1001 | (shift << 8)]); // v_mul_f32 row_shr
+        }
+        if inclusive {
+            words.push(0x7E04_0301); // v_mov_b32 v2, v1
+        } else {
+            // Shift the row prefix one lane, leaving 1.0 in its first lane.
+            words.extend([0x7E04_02F2, 0x7E04_02FA, 0xFF01_1101]);
+        }
+        // Multiply each completed row's product into all subsequent rows.
+        for lane in [15, 31, 47] {
+            let mask = u64::MAX << (lane + 1);
+            words.extend([
+                0xD760_0004,
+                ((128 + lane) << 9) | 257, // v_readlane_b32 s4, v1, lane
+                0xBEFE_03FF,
+                mask as u32, // s_mov_b32 exec_lo, mask.lo
+                0xBEFF_03FF,
+                (mask >> 32) as u32, // s_mov_b32 exec_hi, mask.hi
+                0x1004_0404,         // v_mul_f32 v2, s4, v2
+                0xBEFE_04C1,         // s_mov_b64 exec, -1
+            ]);
+        }
+        words.extend([
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xD834_0000,
+            0x0000_0203, // ds_write_b32 v3, v2
+            S_ENDPGM,
+        ]);
+
+        for host32 in [false, true] {
+            let l = lowered(&words, 64, true, host32).unwrap();
+            assert_eq!(
+                l.wave_prefix_calls,
+                [(
+                    "dx.op.wavePrefixOp.f32".into(),
+                    vec![Some(121), None, Some(1), Some(0)]
+                )]
+            );
+            if host32 {
+                assert_eq!(
+                    l.wave_active_calls,
+                    [(
+                        "dx.op.waveActiveOp.f32".into(),
+                        vec![Some(119), None, Some(1), Some(0)]
+                    )]
+                );
+            } else {
+                assert!(l.wave_active_calls.is_empty());
+            }
+            // Inclusive folds in this lane; the split wave folds in the lower half.
+            assert_eq!(
+                l.float_multiplies,
+                usize::from(inclusive) + usize::from(host32)
+            );
+            assert_eq!(l.barriers, if host32 { 2 } else { 0 });
+        }
+    }
+}
+
+#[test]
 fn permlane16_and_permlanex16_lower_within_host32_half() {
     // v_permlane16_b32 v2, v0, 0, 0 fi:1 (op 0x377, opsel=1 -> 0xD777_0802)
     // v_permlanex16_b32 v3, v2, -1, -1 fi:1 (op 0x378, opsel=1 -> 0xD778_0803)
