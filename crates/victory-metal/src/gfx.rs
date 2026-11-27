@@ -1087,10 +1087,8 @@ impl GraphicsBackend for Metal {
                     md.setStencilAttachmentPixelFormat(pixel_format(f));
                 }
             }
-            let pso = self
-                .dev
-                .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&md, MTLPipelineOption::None, None)
-                .map_err(|e| e.localizedDescription().to_string())?;
+            let crash_key = crash_key(d);
+            let pso = crate::archive::compile_mesh(&self.dev, &md, &crash_key)?;
             (pso, Some(size([x as usize, y as usize, z as usize])))
         } else {
             (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
@@ -1253,6 +1251,9 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
+        if let Some(a) = self.archive() {
+            a.flush_due();
+        }
         match refused {
             Some(e) => Err(e),
             None => Ok(()),

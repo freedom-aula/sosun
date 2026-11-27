@@ -232,6 +232,29 @@ impl Shader {
         self.rect.get().is_some()
     }
 
+    /// Whether the thread-count dispatch translation is made (or refused) already.
+    pub(crate) fn threads_ready(&self) -> bool {
+        self.threads.get().is_some()
+    }
+
+    /// The translation for dispatches of thread counts (`Options::thread_counts`), made on first use.
+    pub(crate) fn native_threads_shader(&self) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        self.threads
+            .get_or_init(|| {
+                self.native()?;
+                let mut container = vec![0; self.size];
+                let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+                if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+                    return Err("its container is no longer in title memory".into());
+                }
+                if blake3::hash(&container).to_hex()[..16] != *self.hash {
+                    return Err("its container changed since the pipeline was made".into());
+                }
+                crate::native::shaders::translate_threads(&container).map(Arc::new)
+            })
+            .clone()
+    }
+
     /// Whether [`Self::translate_extra`] would find its translation on disk.
     pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32]) -> bool {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
@@ -564,6 +587,18 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     Some(shader)
 }
 
+/// The compute stage's shared [`Shader`] on title compute pipeline `this`, if any.
+#[cfg(target_os = "macos")]
+pub(crate) fn compute_shader(this: This) -> Option<Arc<Shader>> {
+    if this.is_null() {
+        return None;
+    }
+    let [shader] = &pipeline(this).shaders[..] else {
+        return None;
+    };
+    Some(shader.clone())
+}
+
 /// Compute pipeline `this`'s shader hash (as logged) and its translation for dispatches of thread
 /// counts (`Options::thread_counts`), made at the first one. The first translation let the
 /// container go, so it is read again where the title held it, and used only if it still hashes
@@ -575,22 +610,11 @@ pub(crate) fn native_threads(this: This) -> (String, Result<Arc<victory_shader::
     if this.is_null() {
         return (String::new(), Err("no pipeline".into()));
     }
-    let [shader] = &pipeline(this).shaders[..] else {
+    let Some(shader) = compute_shader(this) else {
         return (String::new(), Err("not a compute pipeline".into()));
     };
-    let made = shader.threads.get_or_init(|| {
-        shader.native()?;
-        let mut container = vec![0; shader.size];
-        let at = shader.at.load(std::sync::atomic::Ordering::Relaxed);
-        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
-            return Err("its container is no longer in title memory".into());
-        }
-        if blake3::hash(&container).to_hex()[..16] != *shader.hash {
-            return Err("its container changed since the pipeline was made".into());
-        }
-        crate::native::shaders::translate_threads(&container).map(Arc::new)
-    });
-    (shader.hash.clone(), made.clone())
+    let made = shader.native_threads_shader();
+    (shader.hash.clone(), made)
 }
 
 /// The bytes a stage's bytecode names, if any.
