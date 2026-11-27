@@ -988,6 +988,55 @@ fn a_descriptor_with_its_stride_cleared_reads_the_loaded_view_raw() {
     assert!(format.contains("dword 1 masked or merged"), "{format}");
 }
 
+/// A buffer descriptor made raw (stride cleared, records times max(stride, 1), bounds in bytes:
+/// a title's form before typed loads too) read by a typed load that names its own format
+/// (`tbuffer_load_format_*`, by offset) is the loaded view read by bytes. A
+/// `buffer_load_format_*`, which reads the view's elements by its format, stays refused.
+#[test]
+fn a_descriptor_made_raw_serves_a_typed_load_of_its_own_format() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |load: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x9390_FF0D,
+            0x000E_0010, // s_bfe_u32 s16, s13, 0x000e0010
+            0x8490_8110, // s_max_u32 s16, s16, 1
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_100E, // s_mul_i32 s14, s14, s16
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            load,
+            0x8003_0100, // v1 from v0 through s[12:15], offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+    };
+    // tbuffer_load_format_x v1, v0, s[12:15], 0 offen format:[BUF_FMT_16_FLOAT]
+    program(0xE868_1000).unwrap();
+    // The same descriptor's dword loads translated before.
+    program(0xE030_1000).unwrap();
+    // buffer_load_format_x v1, v0, s[12:15], 0 offen
+    match program(0xE000_1000) {
+        Err(ShaderError::Unsupported { what, .. }) => {
+            assert!(what.contains("dword 1 masked or merged"), "{what}")
+        }
+        r => panic!("{:?}", r.err()),
+    }
+}
+
 #[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [

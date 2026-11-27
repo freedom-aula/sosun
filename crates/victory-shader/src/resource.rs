@@ -1181,8 +1181,12 @@ impl<'a> Tracer<'a> {
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
         // A byte access through a buffer descriptor made raw reads what the
-        // descriptor's view does with a raw host view.
-        if !inst.name().contains("format")
+        // descriptor's view does with a raw host view. So does a typed load
+        // that names its own format (`tbuffer_load_format_*`), which reads
+        // the raw view by bytes; `buffer_load_format_*` reads the view's
+        // elements, which the cleared stride would change.
+        let own_format = matches!(inst.fields, Fields::Buffer { format: Some(_), .. });
+        if (own_format || !inst.name().contains("format"))
             && let Some(raw) = self.made_raw(&words)
         {
             words = raw.to_vec();
