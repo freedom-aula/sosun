@@ -16,7 +16,7 @@
 use super::descriptors::format;
 use super::host::NativeHost;
 use super::title::Title;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_formats::texture::{Dimension, Layout};
@@ -77,13 +77,77 @@ impl TextureInfo {
     }
 }
 
+/// Uploads and change probes must see the same bytes, including across holes in title memory.
+fn read_texture_bytes(at: *const u8, out: &mut [u8]) {
+    #[cfg(target_os = "macos")]
+    read_texture_chunk(
+        at,
+        out,
+        super::safe_read,
+        victory_platform::mem::next_region,
+    );
+    #[cfg(not(target_os = "macos"))]
+    if !super::safe_read(at, out) {
+        out.fill(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_texture_chunk(
+    at: *const u8,
+    out: &mut [u8],
+    mut read: impl FnMut(*const u8, &mut [u8]) -> bool,
+    mut next_region: impl FnMut(usize) -> Option<victory_platform::mem::Region>,
+) {
+    use victory_platform::mem::{Protect, page_size};
+
+    if read(at, out) {
+        return;
+    }
+    // A failed read can leave partial data in a reused probe buffer.
+    out.fill(0);
+    let base = at.addr();
+    let page = page_size();
+    if out.len() <= page - base % page {
+        return;
+    }
+    let Some(end) = base.checked_add(out.len()) else {
+        return;
+    };
+    let mut cur = base;
+    while cur < end {
+        let Some(region) = next_region(cur) else {
+            break;
+        };
+        let start = cur.max(region.base);
+        let stop = end.min(region.base.saturating_add(region.len));
+        if start >= stop {
+            break;
+        }
+        if region.protect.0 & Protect::READ.0 != 0
+            && !read(start as *const u8, &mut out[start - base..stop - base])
+        {
+            // The mapping may have changed after the query. Salvage this span page by page.
+            let mut pos = start;
+            while pos < stop {
+                let n = (page - pos % page).min(stop - pos);
+                let part = &mut out[pos - base..pos - base + n];
+                if !read(pos as *const u8, part) {
+                    part.fill(0);
+                }
+                pos += n;
+            }
+        }
+        cur = stop;
+    }
+}
+
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     const CHUNK: usize = 1 << 20;
     let mut out = vec![0u8; len];
     for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
-        // Only an address, checked by the kernel when read.
-        let _ = super::safe_read(at.wrapping_add(i * CHUNK), chunk);
+        read_texture_bytes(at.wrapping_add(i * CHUNK), chunk);
     }
     out
 }
@@ -267,8 +331,7 @@ fn scan_round(
         let mut h = blake3::Hasher::new();
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
-            buf[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut buf[..n]);
             h.update(&buf[..n]);
         }
         let h = h.finalize();
@@ -383,8 +446,7 @@ fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
     if scratch.len() < n {
         scratch.resize(n, 0);
     }
-    scratch[..n].fill(0);
-    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+    read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
     scratch[..n].iter().any(|&b| b != 0)
 }
 
@@ -402,8 +464,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
         }
         for off in (0..size).step_by(CHUNK) {
             let n = CHUNK.min(size - off);
-            scratch[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
             seen(&scratch[..n]);
         }
         return;
@@ -416,8 +477,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     for k in 0..PROBE_PAGES {
         let off = k * pages / PROBE_PAGES * PAGE;
         let n = PROBE_SAMPLE.min(size - off);
-        scratch[..n].fill(0);
-        let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+        read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
         seen(&scratch[..n]);
     }
 }
@@ -791,13 +851,7 @@ impl<B: PresentBackend> Title<B> {
         if unloaded.is_empty() && dirty.is_empty() {
             return;
         }
-        let mut todo: Vec<usize> = unloaded.into_iter().collect();
-        for key in dirty {
-            if !todo.contains(&key) {
-                todo.push(key);
-            }
-        }
-        self.sync_keys(todo);
+        self.sync_keys(keys_to_sync(&unloaded, &dirty));
     }
 
     fn sync_keys(&mut self, keys: Vec<usize>) {
@@ -850,12 +904,29 @@ impl<B: PresentBackend> Title<B> {
     }
 }
 
+fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize> {
+    unloaded.iter().chain(dirty.difference(unloaded)).copied().collect()
+}
+
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {
+        let unloaded = (0..20_000).collect();
+        let dirty = (10_000..30_000).collect();
+        let mut keys = keys_to_sync(&unloaded, &dirty);
+
+        let (first, rest) = keys.split_at_mut(unloaded.len());
+        first.sort_unstable();
+        rest.sort_unstable();
+        assert!(first.iter().copied().eq(0..20_000));
+        assert!(rest.iter().copied().eq(20_000..30_000));
+    }
 
     fn dirty_this_round(
         entries: &HashMap<usize, (usize, usize, bool)>,
@@ -972,6 +1043,94 @@ mod tests {
             from_host(format, &mut texels);
             assert_eq!(texels, title, "{format}");
         }
+    }
+
+    #[test]
+    fn an_inaccessible_megabyte_takes_one_failed_read_and_one_region_query() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, protect};
+
+        let len = 1 << 20;
+        let memory = Region::new(len, None).unwrap();
+        // SAFETY: the test owns this entire mapping until the reader finishes.
+        unsafe { protect(memory.ptr, len, Protect::NO_ACCESS) }.unwrap();
+        let mut out = vec![0xff; len];
+        let (mut reads, mut queries) = (0, 0);
+        read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            |at, out| {
+                reads += 1;
+                crate::native::safe_read(at, out)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(out.iter().all(|&b| b == 0));
+        assert_eq!((reads, queries), (1, 1));
+    }
+
+    #[test]
+    fn a_region_that_changes_after_the_query_still_preserves_readable_pages() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(4 * page, None).unwrap();
+        // SAFETY: the test owns all four pages and writes them before changing protection.
+        unsafe {
+            memory.ptr.write_bytes(0x72, 4 * page);
+            protect(memory.ptr, page, Protect::NO_ACCESS).unwrap();
+        }
+        let mut out = vec![0xff; 4 * page - 2];
+        read_texture_chunk(
+            memory.ptr.wrapping_add(1),
+            &mut out,
+            crate::native::safe_read,
+            |at| {
+                let region = next_region(at);
+                if at == memory.ptr.addr() + page {
+                    // SAFETY: the third page is ours. Revoke access just after querying the span.
+                    unsafe { protect(memory.ptr.add(2 * page), page, Protect::NO_ACCESS) }.unwrap();
+                }
+                region
+            },
+        );
+        for (offset, &byte) in out.iter().enumerate() {
+            let readable = matches!((offset + 1) / page, 1 | 3);
+            assert_eq!(byte, if readable { 0x72 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_texture_read_preserves_texels_on_both_sides_of_an_unreadable_page() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(3 * page, None).unwrap();
+        // SAFETY: all three pages belong to this test. Protect only the middle one after filling it.
+        unsafe {
+            memory.ptr.write_bytes(0x31, 2 * page);
+            memory.ptr.add(2 * page).write_bytes(0x72, page);
+            protect(memory.ptr.add(page), page, Protect::NO_ACCESS).unwrap();
+        }
+        let start = memory.ptr.wrapping_add(page - 7);
+        let mut expected = vec![0; 7 + page + 11];
+        expected[..7].fill(0x31);
+        expected[7 + page..].fill(0x72);
+
+        let bytes = read_memory(start, expected.len());
+        assert_eq!(&bytes[..7], &expected[..7]);
+        assert!(bytes[7..7 + page].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[7 + page..], &expected[7 + page..]);
+        let mut scratch = vec![0xff; expected.len()];
+        assert_eq!(
+            probe_hash(start as usize, expected.len(), true, &mut scratch),
+            blake3::hash(&expected)
+        );
     }
 
     #[test]

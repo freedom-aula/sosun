@@ -55,7 +55,8 @@ impl Lower<'_> {
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
-        if self.once[ir] {
+        // In lockstep every thread reaches every block together (`lockstep.rs`).
+        if self.once[ir] || self.x.st.lockstep {
             return Ok(());
         }
         Err(super::DIVERGENT_EXCHANGE)
@@ -154,6 +155,29 @@ impl Lower<'_> {
             Some(there) => self.s.m.select(c, there, r, z),
             None => r,
         })
+    }
+
+    /// The console lane `v_readfirstlane_b32` reads in lockstep (`lockstep.rs`): the lowest bit of
+    /// EXEC as `inst` reads it, as a number (0 when none is set).
+    pub(super) fn lockstep_first_lane(&mut self, inst: &crate::ir::Inst) -> Result<V, Why> {
+        use crate::ir::{EXEC, Reg};
+        let c = self.cur;
+        let word = |l: &mut Self, r: u8| -> Result<V, Why> {
+            let v = inst.read(Reg::S(r)).ok_or("EXEC of a first lane read")?;
+            let was = std::mem::replace(&mut l.mask_ok, true);
+            let x = l.i32_of(v);
+            l.mask_ok = was;
+            x
+        };
+        let (lo, hi) = (word(self, EXEC)?, word(self, EXEC + 1)?);
+        let i32t = self.s.t.i32;
+        let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let low = self.s.m.cmp(c, pred::NE, lo, z);
+        let r = self.s.m.select(c, low, flo, fhi);
+        Ok(self.s.m.bin(c, Bin::And, r, k63))
     }
 
     /// Extend a host wave's result over the console's 64 lanes. A prefix
