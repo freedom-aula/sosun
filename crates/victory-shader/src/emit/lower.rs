@@ -4462,6 +4462,19 @@ impl<'a> Lower<'a> {
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
+        // The geometry a threadgroup outputs must fit the host's 32 KiB (the converter's limit;
+        // a mesh over it reaches Metal's compiler, which crashes on it rather than refusing:
+        // issue #181). A signature row is a 16-byte element per vertex (as the converter takes
+        // it), a primitive's indices are three dwords. The declared maxima count, as the prologue
+        // below asks the host for exactly those.
+        let rows = |sig: &[SigElement]| {
+            sig.iter().filter_map(|o| o.row).collect::<std::collections::BTreeSet<u32>>().len() as u64
+        };
+        let payload = 16 * rows(&self.s.outputs) * u64::from(mesh.max_vertices)
+            + (16 * rows(&self.s.prims) + 12) * u64::from(mesh.max_primitives);
+        if payload > 32 * 1024 {
+            return Err("a mesh shader whose output exceeds the host's 32 KiB a threadgroup");
+        }
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (
