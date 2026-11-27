@@ -209,8 +209,9 @@ fn infer(
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
     {
+        let uses = crate::io::PrimMaskUses::new(&p);
         let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
-        let mask = |s: u32| live(s).is_some_and(|v| crate::io::is_prim_mask_only(&p, v, true));
+        let mask = |s: u32| live(s).is_some_and(|v| uses.is_prim_mask_only(v, true));
         let start = u32::from(last.user_data) + last.sgprs;
         let end = match (start..32).find(|&s| mask(s)) {
             Some(m) => m,
@@ -593,6 +594,20 @@ fn packed_params(p: &Program) -> std::collections::HashMap<u8, Packing> {
             }
             let Some(i) = insts.get(&v) else { continue };
             let name = i.name();
+            // A write to part of the dword (`sdwa.dst_sel`) that preserves the other bits leaves
+            // what the parameter held there, and that old value is as much a source of this one.
+            // A half packed into a dword is written one word at a time, and the last write before
+            // an export is often a zero to the half the lane does not export (`v_cvt_f16_f32 v3,
+            // v9`, then `v_mov_b32 v3, 0 dst_sel:WORD_1`), which would otherwise hide the half.
+            if let Fields::Valu(f) = &i.fields
+                && let Some(sd) = f.sdwa
+                && sd.dst_sel < 6
+                && sd.dst_unused == 2
+                && let Some(Operand::Vector { reg, .. }) = f.dst
+                && let Some(old) = i.read(Reg::V(reg))
+            {
+                todo.push(old);
+            }
             let srcs = match (&i.fields, name) {
                 (Fields::Valu(f), "v_mov_b32") => &f.src[..f.src.len().min(1)],
                 (Fields::Valu(f), "v_cndmask_b32") => &f.src[..f.src.len().min(2)],
@@ -1314,6 +1329,28 @@ mod tests {
         assert_eq!(named("TEXCOORD"), [0, 1, 2], "{outs:?}");
         let k = packed_params(&crate::ir::build(&words(&code), true, 256).unwrap());
         assert_eq!((k[&0], k[&1], k[&2]), (Packing::Plain, Packing::Unknown, Packing::Halves));
+    }
+
+    /// A parameter whose last write zeroes one half of its dword and keeps the other (`v_mov_b32
+    /// v2, 0 dst_sel:WORD_1` after `v_cvt_f16_f32 v2, v1`) still holds halves: the bits the write
+    /// keeps are the half. Judged by the write alone the parameter is plain 0 and the vertex
+    /// program exports no `HALF` rows, so the pixel program's `user(half10)` links to nothing (the
+    /// world's particle pass, refused by the converter).
+    #[test]
+    fn a_half_kept_below_a_zeroed_word_still_counts() {
+        let code = [
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0x7E04_1501, // v_cvt_f16_f32 v2, v1
+            0x7E04_02F9, 0x0086_1580, // v_mov_b32 v2, 0 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE
+            0xF800_0201, 0x0000_0002, // exp param0 v2
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let k = packed_params(&crate::ir::build(&words(&code), true, 256).unwrap());
+        assert_eq!(k[&0], Packing::Halves);
+        let (_, (_, outs)) = infer(HwStage::Vs, &words(&code), &meta_with(&[])).unwrap();
+        let named = |name: &str| -> Vec<u32> { outs.iter().filter(|o| o.name == name).map(|o| o.index).collect() };
+        assert_eq!(named(HALF), [0, 1], "{outs:?}");
     }
 
     /// A parameter its pixel shader reads and the vertex program does not write is written too

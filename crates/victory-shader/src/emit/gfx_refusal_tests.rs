@@ -49,6 +49,39 @@ fn packed_fmac_takes_constant_operands() {
     }
 }
 
+/// Joins of values with no DXIL form are all found by one lowering pass, however many there are:
+/// a pass for each made pixel shaders with some hundreds of them take 40 s instead of 0.2 s.
+/// Here a branch's arm copies a descriptor's dword (nothing the host has) to 32 SGPRs, each
+/// joined after it with what it held on entry and copied to a VGPR nothing reads.
+#[test]
+fn joins_without_a_value_are_found_in_one_pass() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |joins: u32| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBE8C_0380, // s_mov_b32 s12, 0
+            0xBF06_800C, // s_cmp_eq_u32 s12, 0
+            0xBF85_0000 | joins, // s_cbranch_scc1 past the arm
+        ];
+        code.extend((0..joins).map(|k| 0xBE80_0308 | (20 + k) << 16)); // s_mov_b32 s(20 + k), s8
+        code.extend((0..joins).map(|k| 0x7E00_0200 | (1 + k) << 17 | (20 + k))); // v_mov_b32 v(1 + k), s(20 + k)
+        code.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    for joins in [1, 32] {
+        translate_with(&program(joins), Options::default()).unwrap();
+        assert_eq!(lower::PASSES.get(), 2, "{joins} joins");
+    }
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];

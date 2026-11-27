@@ -180,13 +180,14 @@ pub fn root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) 
 
 /// Root view in a pool-table snapshot: starts are strictly increasing and no range extends
 /// past the next start, so only the last mapping starting at or before the address can contain it.
-pub(super) fn sorted_root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+#[cfg(test)]
+fn sorted_root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
     let end = maps.partition_point(|m| m.at <= address);
     let mapping = maps[..end].last().filter(|m| address - m.at < m.len);
     mapped_root_view(mapping, pairs, first, address)
 }
 
-fn mapped_root_view(mapping: Option<&Mapping>, pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+pub(super) fn mapped_root_view(mapping: Option<&Mapping>, pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
     let null = (pair_index(first, 0), 0);
     let Some(m) = mapping else { return null };
     let pool_at = m.offset + (address - m.at);

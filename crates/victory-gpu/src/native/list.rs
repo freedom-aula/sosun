@@ -12,6 +12,9 @@ use victory_backend::resources::{
     ClearRect, DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport,
 };
 
+/// `(record, pool_generation, resources_epoch)` of a heap entry whose mirror attempt has not completed yet.
+type PendingMirror = ([u8; 12], u64, u64);
+
 /// A heap the title wrote views into: `start` is its descriptor memory (title addresses).
 pub struct NativeHeap<B: GraphicsBackend> {
     pub heap: B::Heap,
@@ -26,6 +29,9 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    /// Entries whose last mirror attempt could not complete yet, keyed by `(record, pool_gen, res_gen)`
+    /// so unchanged entries are retried only once the pool table or registered resources change.
+    pub pending_mirror: std::cell::RefCell<std::collections::HashMap<usize, PendingMirror>>,
     pub images: std::cell::RefCell<Shown>,
 }
 

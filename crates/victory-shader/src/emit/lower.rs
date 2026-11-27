@@ -153,8 +153,10 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// Phis whose incoming value has no DXIL form were read: redo with them missing. All that
+    /// one pass finds, not the first: a pass for each made a program with some hundreds of
+    /// them take that many times as long (tens of seconds).
+    Retry(Vec<(Value, Why)>),
     Fail(ShaderError),
 }
 
@@ -163,21 +165,33 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_graphics(parts, false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Lowering passes of this thread's last [`lower_graphics`].
+    pub(super) static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    #[cfg(test)]
+    PASSES.set(0);
     // Compute programs hold masks the structurisation cannot see into
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
     loop {
+        #[cfg(test)]
+        PASSES.set(PASSES.get() + 1);
         match Lower::new(parts, &bad, console, guessed).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
+            Err(Stop::Retry(phis)) => {
+                for (v, why) in phis {
+                    if bad.insert(v, why).is_some() {
+                        return Err(ShaderError::Unsupported {
+                            offset: 0,
+                            what: "a phi that does not settle",
+                        });
+                    }
                 }
             }
             Err(Stop::Fail(ShaderError::Unsupported {
@@ -280,6 +294,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
+    /// [`Lower::load_use`], made at the first descriptor load read as data.
+    load_uses: std::cell::OnceCell<Map<Site, (Site, u8)>>,
     data_phis: Vec<(V, usize, usize)>,
     /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
     /// incoming values are still to fill (block, phi index, lane).
@@ -1044,6 +1060,7 @@ impl<'a> Lower<'a> {
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
+            load_uses: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
@@ -1986,6 +2003,7 @@ impl<'a> Lower<'a> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         let p = self.x.p;
         let interp_uses = std::cell::LazyCell::new(|| InterpUses::new(p));
+        let prim_uses = std::cell::LazyCell::new(|| crate::io::PrimMaskUses::new(p));
         for &(reg, v) in &p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2011,7 +2029,7 @@ impl<'a> Lower<'a> {
                     // value goes unread.
                     None if self.s.pixel
                         && ((self.x.io.initialized_sgprs == Some(n + 2)
-                            && (!self.guessed || crate::io::is_prim_mask_only(self.x.p, v, true)))
+                            && (!self.guessed || prim_uses.is_prim_mask_only(v, true)))
                             || interp_uses.is_interp_m0_only(v)) =>
                     {
                         Val::I32(self.s.m.i32(0))
@@ -6106,6 +6124,26 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Where the program uses the descriptor that load `site` reads, and the load's first
+    /// dword of it: the first resource descriptor (in their order) with that load among its
+    /// sources. One table for all loads: searching every descriptor's sources for each load
+    /// read as data, and again for each load of the same address, took a pixel shader with
+    /// some hundreds of each tens of seconds.
+    fn load_use(&self, site: Site) -> Option<(Site, u8)> {
+        let uses = self.load_uses.get_or_init(|| {
+            let mut uses = Map::default();
+            for d in self.x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+                for l in d.source.leaves() {
+                    if let Source::Loaded { load, first } = *l {
+                        uses.entry(load).or_insert((d.site, first));
+                    }
+                }
+            }
+            uses
+        });
+        uses.get(&site).copied()
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -6151,19 +6189,7 @@ impl<'a> Lower<'a> {
         // read only as data takes it from a load of the same descriptor that
         // the program uses (the compiler loads a descriptor again rather than
         // keep it, and queries sizes in loops of their own).
-        let use_of = |site: Site| {
-            self.x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .find_map(|d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
+        let use_of = |site: Site| self.load_use(site);
         // The VGPR a waterfall loop reads the first lane of.
         let lane_source = |v: Value| {
             let i = self.def_inst(v)?;
@@ -10752,31 +10778,49 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            let mut cycle_cache: Vec<Option<bool>> = vec![None; p.blocks.len()];
+            let mut on_cycle = |x: usize| -> bool {
+                *cycle_cache[x].get_or_insert_with(|| self.on_cycle(x))
+            };
             let mut set = Set::default();
+            let mut read_execs = Vec::new();
             for (b, blk) in p.blocks.iter().enumerate() {
                 for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
                     let reads = reads.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    read_execs.clear();
+                    let eligible = reads.iter().all(|&(bb, i)| {
+                        let inst = &p.blocks[bb].insts[i];
+                        let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
+                            if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                        // The lanes whose bits of the join the result keeps: EXEC's, or
+                        // (`s_andn2` by EXEC) the others.
+                        let keeps_exec = match inst.name() {
+                            "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
+                            "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
+                            "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
+                            _ => return false,
+                        };
+                        // In another block the edge's lanes are the same lanes only where
+                        // neither block runs again (the else part of an if, further down).
+                        let Some(exec) = inst
+                            .read(Reg::S(EXEC))
+                            .filter(|_| bb == b || !on_cycle(b) && !on_cycle(bb))
+                        else {
+                            return false;
+                        };
+                        read_execs.push((exec, keeps_exec));
+                        true
+                    });
+                    if !eligible {
+                        continue;
+                    }
                     for n in 0..blk.preds.len() {
-                        let off = reads.iter().all(|&(bb, i)| {
-                            let inst = &p.blocks[bb].insts[i];
-                            let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
-                                if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                            // The lanes whose bits of the join the result keeps: EXEC's, or
-                            // (`s_andn2` by EXEC) the others.
-                            let keeps_exec = match inst.name() {
-                                "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
-                                "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
-                                "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
-                                _ => return false,
-                            };
-                            // In another block the edge's lanes are the same lanes only where
-                            // neither block runs again (the else part of an if, further down).
-                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| {
-                                bb == b || !self.on_cycle(b) && !self.on_cycle(bb)
-                            }) else {
-                                return false;
-                            };
-                            let joined = blk.phis.iter().find(|ph| ph.value == exec);
+                        let off = read_execs.iter().all(|&(exec, keeps_exec)| {
+                            let joined = self
+                                .phi_at
+                                .get(&exec)
+                                .filter(|&&(pb, _)| pb == b)
+                                .map(|&(_, pi)| &blk.phis[pi]);
                             let exec = joined.map_or(exec, |ph| ph.args[n]);
                             let Some(&m) = st.masks.get(&exec) else { return false };
                             let mut lanes = self.lane_edge(blk.preds[n], b);
@@ -10789,33 +10833,49 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            loop {
-                let before = set.len();
-                for (b, blk) in p.blocks.iter().enumerate() {
-                    for phi in &blk.phis {
-                        for n in 0..blk.preds.len() {
-                            if !set.contains(&(phi.value, n)) {
+            let mut relay_cache: Map<(usize, usize, usize), bool> = Map::default();
+            let mut dead_relay = |b: usize, n: usize, e: usize| -> bool {
+                *relay_cache.entry((b, n, e)).or_insert_with(|| {
+                    let mut path = self.lane_edge(p.blocks[b].preds[n], b);
+                    path.extend(self.lane_edge(b, e));
+                    !st.bools.meet(&path)
+                })
+            };
+            let mut dependents: Map<(Value, usize), Vec<(Value, usize)>> = Map::default();
+            let mut worklist = Vec::new();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
+                    let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    for n in 0..blk.preds.len() {
+                        let item = (phi.value, n);
+                        if !set.contains(&item) {
+                            continue;
+                        }
+                        for &(e, i, k) in uses {
+                            if p.blocks[e].preds[k] == b && dead_relay(b, n, e) {
                                 continue;
                             }
-                            let on_n = self.lane_edge(blk.preds[n], b);
-                            let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
-                            let ok = uses.iter().all(|&(e, i, k)| {
-                                set.contains(&(p.blocks[e].phis[i].value, k))
-                                    || p.blocks[e].preds[k] == b
-                                        && !st
-                                            .bools
-                                            .meet(&[on_n.clone(), self.lane_edge(b, e)].concat())
-                            });
-                            if !ok {
-                                set.remove(&(phi.value, n));
+                            let next = (p.blocks[e].phis[i].value, k);
+                            if !set.contains(&next) {
+                                set.remove(&item);
+                                worklist.push(item);
+                                break;
                             }
+                            dependents.entry(next).or_default().push(item);
                         }
                     }
                 }
-                if set.len() == before {
-                    return set;
+            }
+            while let Some(bad) = worklist.pop() {
+                if let Some(deps) = dependents.remove(&bad) {
+                    for dep in deps {
+                        if set.remove(&dep) {
+                            worklist.push(dep);
+                        }
+                    }
                 }
             }
+            set
         })
     }
 
@@ -10876,6 +10936,51 @@ impl<'a> Lower<'a> {
             }
         }
         some
+    }
+
+    /// Whether, at a per-lane join `b` that edge `n` reaches by a per-lane branch, another edge
+    /// brings a mask that may differ from the lane function `x` in a lane taking edge `n`. The
+    /// console wave runs every path some lane takes, so where that edge's block ran, the
+    /// register holds its mask for the lanes of edge `n` too: their bit of it, which `x`, what
+    /// edge `n` brings, then does not tell.
+    fn mask_differs_on_edge(&self, b: usize, args: &[Value], n: usize, x: Bool) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        // Where the whole wave leaves by edge `n`, no other path runs before the join.
+        let per_lane = matches!(st.exits[preds[n]], LaneExit::Branch { when, taken, not_taken }
+            if taken != not_taken
+                && st.bools.support(when).iter().any(|a| !matches!(a, Atom::Uniform(_))));
+        let on_n = self.lane_edge(preds[n], b);
+        per_lane && args.iter().enumerate().any(|(k, arg)| {
+            // A back edge's block (one the join dominates) runs after the lanes of edge `n`
+            // have gone on. An arm inside a loop's body is no back edge.
+            k != n
+                && !self.dominates(b, preds[k])
+                && st.masks.get(arg).is_some_and(|&m| {
+                    [true, false].into_iter().any(|set| {
+                        let mut lanes = on_n.clone();
+                        lanes.extend([(m, set), (x, !set)]);
+                        st.bools.meet(&lanes)
+                    })
+                })
+        })
+    }
+
+    /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.
+    fn dominates(&self, b: usize, q: usize) -> bool {
+        let blocks = &self.x.p.blocks;
+        let mut seen = vec![false; blocks.len()];
+        seen[b] = true;
+        let mut stack = vec![0];
+        while let Some(x) = stack.pop() {
+            if !std::mem::replace(&mut seen[x], true) {
+                if x == q {
+                    return false;
+                }
+                stack.extend(blocks[x].exit.successors());
+            }
+        }
+        true
     }
 
     /// Whether IR block `b` can reach itself.
@@ -13934,7 +14039,8 @@ impl<'a> Lower<'a> {
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+        let mut retry = Vec::new();
+        'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
@@ -13962,7 +14068,8 @@ impl<'a> Lower<'a> {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if read => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        retry.push((phi.value, "an SCC joined with SGPR values"));
+                        continue 'phi;
                     }
                     // A lane mask joined with data at a join every lane
                     // enters along one edge: the register holds the mask's
@@ -13977,14 +14084,21 @@ impl<'a> Lower<'a> {
                             || self.x.st.highs.contains_key(&arg))
                         && self.uniform_join(b, |_| true) =>
                     {
-                        self.mask_dword(arg)
-                            .map_err(|w| Stop::Retry(phi.value, w))?
+                        match self.mask_dword(arg) {
+                            Ok(x) => x,
+                            Err(why) => {
+                                retry.push((phi.value, why));
+                                continue 'phi;
+                            }
+                        }
                     }
                     (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
+                        retry.push((phi.value, why));
+                        continue 'phi;
                     }
                     _ if read => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        retry.push((phi.value, "a join of mismatched values"));
+                        continue 'phi;
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
@@ -13992,6 +14106,9 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        if !retry.is_empty() {
+            return Err(Stop::Retry(retry));
         }
         while let Some((x, b, i, lane)) = self.pending_spills.pop() {
             let mut incoming = Vec::new();
@@ -14087,9 +14204,11 @@ impl<'a> Lower<'a> {
                         self.s.m.bool(false)
                     }
                     // A lane function the structure knows though no mask tracks it (a constant,
-                    // SCC, a join that resolved): each lane's bit of it.
+                    // SCC, a join that resolved): each lane's bit of it, unless another edge's
+                    // mask may differ from it in the lanes of this one (`mask_differs_on_edge`).
                     (None, _)
                         if let Some(&m) = self.x.st.other.get(&arg)
+                            && (uniform || !self.mask_differs_on_edge(b, &phi.args, n, m))
                             && !self.x.st.bools.support(m).iter().any(|a| {
                                 matches!(a, Atom::Opaque(_) | Atom::Quad(_))
                             }) =>
@@ -15192,6 +15311,70 @@ mod tests {
         lowers(&words, 1 << 7).expect("a uniform loop's mask join");
     }
 
+    /// s6 holds a constant where lanes 16 and up skip the arm, which is `arm`; in a uniform
+    /// loop's body if `looped`.
+    fn skip_edge_constant(constant: u32, arm: [u32; 2], looped: bool) -> Vec<u32> {
+        let mut words = vec![
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0x7E12_0280, // v_mov_b32 v9, 0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            constant,    // loop: s_mov_b32 s6, 5 (or 0)
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2
+            arm[0],
+            arm[1],
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xD501_0003,
+            0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        ];
+        if looped {
+            words.extend([
+                0x8007_8107, // s_add_u32 s7, s7, 1
+                0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+                0xBF85_FFF4, // s_cbranch_scc1 loop
+            ]);
+        }
+        words.extend([
+            0xDC70_8000,
+            0x007D_0308, // global_store_dword v[8:9], v3
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// `s_mov_b32 s6, s8; s_nop 0`: the saved EXEC, which holds the skipping lanes.
+    const SAVED_EXEC: [u32; 2] = [0xBE86_0308, 0xBF80_0000];
+
+    #[test]
+    fn a_skip_edge_constant_is_not_the_bit_where_the_arm_keeps_the_skipping_lanes() {
+        // With a compare in the arm the skipping lanes read 0, their bit of it. With the saved
+        // EXEC there the console's register holds their bit set, which the constant 5 does not
+        // say: refused, in a uniform loop's body too.
+        const COMPARE: [u32; 2] = [0xD4C4_0006, 0x0002_0088]; // v_cmp_gt_u32 s6, 8, v0
+        for looped in [false, true] {
+            lowers(&skip_edge_constant(0xBE86_0385, COMPARE, looped), 1 << 7)
+                .unwrap_or_else(|e| panic!("a compare the skipping lanes are not in: {e}"));
+            let Err(crate::ShaderError::Unsupported { what, .. }) =
+                lowers(&skip_edge_constant(0xBE86_0385, SAVED_EXEC, looped), 1 << 7)
+            else {
+                panic!("5 joined with the saved EXEC translated (loop: {looped})");
+            };
+            assert!(what.contains("lane-mask join"), "{what}");
+        }
+    }
+
+    #[test]
+    #[ignore = "known gap: on the host's lanes a constant 0 or -1 is taken as every lane's bit unchecked"]
+    fn a_skip_edge_constant_of_no_lane_is_not_the_bit_either() {
+        let Err(crate::ShaderError::Unsupported { what, .. }) =
+            lowers(&skip_edge_constant(0xBE86_0380, SAVED_EXEC, false), 1 << 7)
+        else {
+            panic!("0 joined with the saved EXEC translated");
+        };
+        assert!(what.contains("lane-mask join"), "{what}");
+    }
+
     #[test]
     fn a_scalar_result_needs_no_exec() {
         // s6 is 0 where every lane skips and the saved EXEC where some run:
@@ -15768,6 +15951,49 @@ mod tests {
                 "dx.op.wavePrefixOp.i32".to_string(),
                 vec![Some(121), None, Some(0), Some(1)]
             )]
+        );
+    }
+
+    #[test]
+    fn unneeded_edges_propagates_across_deep_sgpr_phi_chains_without_quadratic_scans() {
+        // 160 sequential per-lane diamonds carrying 32 live SGPRs (`s10..s41`) as SSA phis at
+        // every merge block before reading them at the end, plus one genuine `unneeded_edges`
+        // mask join (`s6`) read only ANDed with the taken arm's EXEC.
+        let mut w = Vec::new();
+        for r in 10..42u32 {
+            w.push(0xBE80_0300 | (r << 16) | 0x81); // s_mov_b32 sr, 1
+        }
+        w.push(0xBE86_0300); // s_mov_b32 s6, s0 (data on skip edge)
+        w.push(0x7D88_0090); // v_cmp_gt_u32 vcc_lo, 16, v0
+        w.push(0xBE88_3C6A); // s_and_saveexec_b32 s8, vcc_lo
+        w.push(0xBF88_0002); // s_cbranch_execz +2
+        w.extend([0xD4C4_0006, 0x0002_0088]); // v_cmp_gt_u32 s6, 8, v0
+        w.push(0x8706_7E06); // join: s_and_b32 s6, s6, exec_lo
+        w.push(0xBEFE_0308); // s_mov_b32 exec_lo, s8
+
+        for k in 0..160u32 {
+            let s = 10 + (k % 32);
+            w.push(0x7D88_0084); // v_cmp_gt_u32 vcc_lo, 4, v0
+            w.push(0xBE88_3C6A); // s_and_saveexec_b32 s8, vcc_lo
+            w.push(0xBF88_0001); // s_cbranch_execz +1
+            w.push(0x8000_8100 | (s << 16) | s); // s_add_u32 ss, ss, 1
+            w.push(0xBEFE_0308); // s_mov_b32 exec_lo, s8
+        }
+
+        w.extend([0xD501_0001, 0x0019_0280]); // v_cndmask_b32 v1, 0, 1, s6
+        for r in 10..42u32 {
+            w.push(0x4A02_0200 | r); // v_add_nc_u32 v1, sr, v1
+        }
+        w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+        w.extend([0xD834_0000, 0x0000_0102]); // ds_write_b32 v2, v1
+        w.push(S_ENDPGM);
+
+        let started = std::time::Instant::now();
+        lowers(&w, 1 << 15).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "deep SGPR phi chain took {:?}",
+            started.elapsed()
         );
     }
 }
