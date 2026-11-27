@@ -95,6 +95,65 @@ const COVER: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// A pixel input the vertex shader does not write, added to it (`translate_extra`) with another
+/// parameter's values, beside a `HALF` of the same index: the pair converts, the input gets the
+/// copied values and the `HALF` keeps its own. The vertex shader exports param1 and param3 as
+/// packed halves (0.25 and 0.5: `HALF2`, `HALF6`) and param2 as 1.0; `TEXCOORD6` is written with
+/// param2's values. The pixel shader writes attr6.x (flat) to red and blue, and attr3.x's low half
+/// to green. Before, the converter refused the pair (`TEXCOORD6` was taken for written), and the
+/// copy then overwrote `HALF6` with `HALF2` (green 64).
+#[test]
+fn an_extra_parameter_beside_a_half_of_its_index_links_with_its_own_values() {
+    let mut vs_words = COVER.to_vec();
+    let at = vs_words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    vs_words.splice(
+        at..at,
+        [
+            0x7E0A_02F0, // v_mov_b32 v5, 0.5
+            0x7E0E_02FF,
+            0x3E80_0000, // v_mov_b32 v7, 0.25
+            0x5E10_0B05, // v_cvt_pkrtz_f16_f32 v8, v5, v5
+            0x5E12_0F07, // v_cvt_pkrtz_f16_f32 v9, v7, v7
+            0x1018_0D06, // v_mul_f32 v12, v6, v6 (1.0)
+            // param3 first: a copy made at param1's export would be the last write to `HALF6`.
+            0xF800_0231,
+            0x0000_0008, // exp param3 v8
+            0xF800_0211,
+            0x0000_0009, // exp param1 v9
+            0xF800_0221,
+            0x0000_000C, // exp param2 v12
+        ],
+    );
+    let ps_words = [
+        0xC80E_1802, // v_interp_mov_f32 v3, p0, attr6.x
+        0xD742_0002,
+        0x0202_0003, // v_interp_p1ll_f16 v2, v0, attr3.x
+        0xD75A_0004,
+        0x040A_0203, // v_interp_p2_f16 v4, v1, attr3.x, v2
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0xF800_180F,
+        0x0303_0403, // exp mrt0 v3, v4, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = vs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let mut copy = [0; 32];
+    copy[6] = 3; // TEXCOORD2 + 1
+    let vs = shaders::translate_extra(&c, false, 1 << 6, copy).unwrap();
+    let ps = translate(HwStage::Ps, &ps_words);
+    let Some(mut t) = title() else { return };
+    let heap = Heap::new(&t);
+    let pixels = draw(&mut t, &heap, &vs, &ps, |l| {
+        l.draw_instanced(3, 1, 0, 0).unwrap()
+    });
+    assert!(
+        pixels.iter().all(|p| *p == [255, 128, 255, 255]),
+        "{pixels:?}"
+    );
+}
+
 /// A pixel shader that loads the image descriptor at heap entry 1 (byte 0x20 from the heap base in
 /// s2, high half 0) and writes its texel (0, 0).
 const PS_HEAP: &[u32] = &[
