@@ -11443,7 +11443,7 @@ impl<'a> Lower<'a> {
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
-                return self.gather_at_level(inst, h, ss, &a, lod, guard);
+                return self.gather_at_level(inst, site, h, ss, &a, lod, guard);
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
@@ -11870,9 +11870,11 @@ impl<'a> Lower<'a> {
     /// and a level of detail proven whole (which level a fraction picks is
     /// not known; a whole one is that level, clamped to the sampler's and
     /// the view's).
+    #[allow(clippy::too_many_arguments)]
     fn gather_at_level(
         &mut self,
         inst: &Inst,
+        site: Site,
         h: V,
         sampler: &Source,
         a: &[V],
@@ -11906,7 +11908,7 @@ impl<'a> Lower<'a> {
             return Err("a gather of several channels");
         }
         let mip_filter = bits(w2, 26, 2) != 0;
-        if mip_filter && self.whole(lod, &mut HashSet::new()) != Some(true) {
+        if mip_filter && self.whole(lod, site, &mut HashSet::new()) != Some(true) {
             return Err("a gather at a level that may not be whole");
         }
         let c = self.cur;
@@ -12037,12 +12039,15 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether `v` holds, as a float, a whole number or an infinity in
-    /// every lane: `Some(true)` and never NaN, `Some(false)` or NaN, `None`
-    /// perhaps a fraction. Follows moves, selects, minimum and maximum,
-    /// sums with constants, rounding and conversions from integers (a level
-    /// of detail made with `ceil`), through phis and guarded writes' kept
-    /// values.
-    fn whole(&self, v: Value, seen: &mut HashSet<Value>) -> Option<bool> {
+    /// every lane that runs the instruction at `at` (which reads it):
+    /// `Some(true)` and never NaN, `Some(false)` or NaN, `None` perhaps a
+    /// fraction. Follows moves, selects, minimum and maximum, sums with
+    /// constants, rounding and conversions from integers (a level of detail
+    /// made with `ceil`), through phis and guarded writes' kept values. A
+    /// guarded write's kept value counts only if a lane that runs `at` may
+    /// have skipped the write: every step here is the lane's own, and a lane
+    /// that reads the value at `at` went through the write's block.
+    fn whole(&self, v: Value, at: Site, seen: &mut HashSet<Value>) -> Option<bool> {
         if !seen.insert(v) {
             // Around a loop: what enters it decides.
             return Some(true);
@@ -12051,7 +12056,7 @@ impl<'a> Lower<'a> {
         if let Some(&(b, i)) = self.phi_at.get(&v) {
             let mut never_nan = true;
             for &arg in &p.blocks[b].phis[i].args {
-                never_nan &= self.whole(arg, seen)?;
+                never_nan &= self.whole(arg, at, seen)?;
             }
             return Some(never_nan);
         }
@@ -12076,17 +12081,17 @@ impl<'a> Lower<'a> {
             return None;
         }
         let mut never_nan = true;
-        if self.x.st.guards[b][i].is_some() {
+        if self.x.st.guards[b][i].is_some() && !self.avoids(at, &[Elsewhere::Skip((b, i))]) {
             let Some(Operand::Vector { reg, .. }) = f.dst else {
                 return None;
             };
-            never_nan = self.whole(inst.read(Reg::V(reg))?, seen)?;
+            never_nan = self.whole(inst.read(Reg::V(reg))?, at, seen)?;
         }
         // Per source: (never NaN, a finite constant).
         let mut src = |k: usize| -> Option<(bool, bool)> {
             let x = match *f.src.get(k)? {
                 Operand::Vector { reg, .. } => {
-                    return Some((self.whole(inst.read(Reg::V(reg))?, seen)?, false));
+                    return Some((self.whole(inst.read(Reg::V(reg))?, at, seen)?, false));
                 }
                 Operand::Const(c) => crate::resource::inline(c)?,
                 Operand::Literal(x) => x,
