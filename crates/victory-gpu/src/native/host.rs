@@ -409,6 +409,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match decoded {
             Decoded::Buffer { addr, size } => {
+                // Read before resolving: a pool mapped by a title thread after a failed resolve
+                // must bump past these, so the entry is retried.
+                let (pool_gen, res_gen) = (self.memory.generation(), self.resources_epoch.get());
                 let (buf, ptr) = match self.resolve(addr, u64::from(size)) {
                     Ok(found) => found,
                     Err(e) => {
@@ -426,8 +429,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             index,
                             (
                                 record_at(handle),
-                                self.memory.generation(),
-                                self.resources_epoch.get(),
+                                pool_gen,
+                                res_gen,
                             ),
                         );
                         heap.shows(index, None);
