@@ -31,6 +31,7 @@ fn a_draw_with_only_vertex_slot_two_submits_its_buffer() {
 
 #[derive(Default)]
 pub(super) struct Capture {
+    pub(super) views: RefCell<Vec<ViewDesc>>,
     // For each draw, the (slot, pool base, resolved address) bindings received.
     draws: RefCell<Vec<Vec<(usize, usize, usize)>>>,
     host_buffers: RefCell<Vec<Box<[u8]>>>,
@@ -134,8 +135,9 @@ impl ResourceBackend for Capture {
     fn create_texture(&self, desc: &TextureDesc) -> Result<TextureDesc, String> {
         Ok(*desc)
     }
-    fn create_texture_view(&self, _: &TextureDesc, _: &ViewDesc) -> Result<TextureDesc, String> {
-        unreachable!()
+    fn create_texture_view(&self, tex: &TextureDesc, view: &ViewDesc) -> Result<TextureDesc, String> {
+        self.views.borrow_mut().push(*view);
+        Ok(*tex)
     }
     fn create_texture_over_memory(
         &self,

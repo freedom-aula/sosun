@@ -802,13 +802,12 @@ texture is released (guess: the title is done with it once it places another the
 old description still in a heap would name a released texture). Every texture placed in a pool is
 released at the first submission after the pool is (`NativeHost::released_pools`).
 
-#### Texture views show every array slice
+#### Texture views over 2D arrays
 
-A texture view with a mip range (2D views, and every placed texture view) was made with one array
-slice, so a view of a texture array (placed views do not look at the view's dimension) showed
-slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend cuts the range to
-the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
-count are not read; a view of part of an array shows all of it.
+Object and placed `TEXTURE2DARRAY` SRVs select the requested mip levels and array slices.
+UAVs select one mip and the requested slices. Level 0 and slice 0 of the Metal view refer to
+the first mip and slice in the descriptor. A count of `UINT_MAX` includes the remaining mips
+or slices from that starting index. The host refuses an array view with an empty range.
 
 A shader resource view created with a null description binds the registered texture itself,
 including its native format, all mips and all slices. This also preserves the format chosen
