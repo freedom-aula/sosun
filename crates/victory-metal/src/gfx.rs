@@ -2307,19 +2307,26 @@ impl Metal {
             e.setBlendColorRed_green_blue_alpha(r, g, b, a);
             // The target's size bounds the scissor (Metal refuses a rectangle outside it).
             let (tw, th) = rt_size;
-            if let Some(v) = d.state.viewport {
-                if v.width <= 0.0 || v.height <= 0.0 {
-                    continue;
-                }
-                e.setViewport(MTLViewport {
+            let viewport = match d.state.viewport {
+                Some(v) if v.width <= 0.0 || v.height <= 0.0 => continue,
+                Some(v) => MTLViewport {
                     originX: v.x as f64,
                     originY: v.y as f64,
                     width: v.width as f64,
                     height: v.height as f64,
                     znear: v.min_depth as f64,
                     zfar: v.max_depth as f64,
-                });
-            }
+                },
+                None => MTLViewport {
+                    originX: 0.0,
+                    originY: 0.0,
+                    width: tw as f64,
+                    height: th as f64,
+                    znear: 0.0,
+                    zfar: 1.0,
+                },
+            };
+            e.setViewport(viewport);
             let scissor = match d.state.scissor {
                 Some([l, t, r, b]) => {
                     let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
@@ -2614,29 +2621,7 @@ mod render_target_tests {
     use super::*;
     use objc2_foundation::NSString;
 
-    #[test]
-    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
-        let metal = Metal::new().expect("Metal device");
-        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
-        desc.dim = TexDim::D2Array;
-        desc.depth_or_layers = 2;
-        desc.mips = 2;
-        desc.render_target = true;
-        let texture = metal.create_texture(&desc).unwrap();
-        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
-        for slice in 0..2 {
-            for mip in 0..2 {
-                let n = 8 >> mip;
-                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
-            }
-        }
-        let target = metal.create_texture_view(&texture, &ViewDesc {
-            format: Format::Rgba8Unorm,
-            mips: (1, 1),
-            slices: (1, 1),
-        }).expect("narrowed render target");
-        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
-
+    fn draw_green_triangles(metal: &Metal, target: &Texture, clear: Option<[f32; 4]>, viewports: &[Option<Viewport>]) {
         let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
             #include <metal_stdlib>
             using namespace metal;
@@ -2666,12 +2651,12 @@ mod render_target_tests {
         let queue = metal.create_queue().unwrap();
         let fence = metal.create_fence(0).unwrap();
         let passes = [Pass::Render(RenderPass {
-            color: vec![ColorTarget { texture: &target, clear: None }],
+            color: vec![ColorTarget { texture: target, clear }],
             depth: None,
-            draws: vec![Draw {
+            draws: viewports.iter().map(|&viewport| Draw {
                 pipeline: &pipeline,
                 topology: Topology::Triangles,
-                state: DrawState::default(),
+                state: DrawState { viewport, ..Default::default() },
                 root: RootArgs::default(),
                 fragment_root: None,
                 heaps: Heaps::default(),
@@ -2686,14 +2671,40 @@ mod render_target_tests {
                 },
                 indirect: None,
                 count: None,
-            }],
+            }).collect(),
         })];
         metal.submit_passes(&queue, &PassSubmission {
             passes: &passes,
             waits: &[],
             signals: &[(&fence, 1)],
-        }).expect("draw through narrowed view");
+        }).expect("draw green triangles");
         assert!(metal.wait(&fence, 1, 2000), "draw did not complete");
+    }
+
+    #[test]
+    fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.dim = TexDim::D2Array;
+        desc.depth_or_layers = 2;
+        desc.mips = 2;
+        desc.render_target = true;
+        let texture = metal.create_texture(&desc).unwrap();
+        let sentinel = |mip, slice| [17 + (mip * 40 + slice * 80) as u8, 31, 47, 255];
+        for slice in 0..2 {
+            for mip in 0..2 {
+                let n = 8 >> mip;
+                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
+            }
+        }
+        let target = metal.create_texture_view(&texture, &ViewDesc {
+            format: Format::Rgba8Unorm,
+            mips: (1, 1),
+            slices: (1, 1),
+        }).expect("narrowed render target");
+        assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
+
+        draw_green_triangles(&metal, &target, None, &[None]);
         for slice in 0..2 {
             for mip in 0..2 {
                 let n = 8 >> mip;
@@ -2704,6 +2715,28 @@ mod render_target_tests {
                         "mip {mip} slice {slice}: expected {expected:?}, got {:?}", &data[..4]);
             }
         }
+    }
+
+    #[test]
+    fn default_viewport_restores_the_full_target_in_the_same_pass() {
+        let metal = Metal::new().expect("Metal device");
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 16, 16);
+        desc.render_target = true;
+        let target = metal.create_texture(&desc).unwrap();
+        let half = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 8.0,
+            height: 16.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        draw_green_triangles(&metal, &target, Some([0.0; 4]), &[Some(half), None]);
+
+        let mut pixels = [0; 16 * 16 * 4];
+        metal.read_texture(&target, 0, 0, &mut pixels, 16 * 4, 0);
+        assert_eq!(pixels.as_chunks::<4>().0[8 * 16 + 12], [0, 255, 0, 255],
+                   "the second draw must reach (12, 8) outside the first viewport");
     }
 }
 
