@@ -1344,10 +1344,9 @@ impl Metal {
 /// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and
 /// every fence and barrier word waiting on it would hang; `recover` pays them from the CPU.
 ///
-/// Not `Send`: the completed-handler block is only `Fn`, and Metal's objects are thread-safe to use
-/// this way. The fills write title memory the pool keeps mapped while the buffer lives (`buf` is
-/// held here to keep the wrapper alive).
+/// The fills retain their buffer wrappers so the pool keeps the title memory mapped.
 pub(crate) struct Owed {
+    recovery: std::sync::Once,
     events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
     /// Buffer, offset, length, byte.
     #[allow(clippy::type_complexity)]
@@ -1375,39 +1374,39 @@ impl Owed {
                 }
             }
         }
-        Owed { events, fills, signals: work.signals.len() }
+        Owed { recovery: std::sync::Once::new(), events, fills, signals: work.signals.len() }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
     /// its fence reached reads the values the submission wrote before it.
     pub(crate) fn recover(&self) {
-        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        for (buf, off, len, value) in &self.fills {
-            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
-            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
-        }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        for (e, v) in &self.events {
-            if e.signaledValue() < *v {
-                e.setSignaledValue(*v);
+        self.recovery.call_once(|| {
+            static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            for (buf, off, len, value) in &self.fills {
+                // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+                unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
             }
-        }
-        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-            tracing::warn!(
-                "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
-                self.signals,
-                self.fills.len()
-            );
-        }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            for (e, v) in &self.events {
+                if e.signaledValue() < *v {
+                    e.setSignaledValue(*v);
+                }
+            }
+            if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                tracing::warn!(
+                    "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                    self.signals,
+                    self.fills.len()
+                );
+            }
+        });
     }
 }
 
-// SAFETY: an `Owed` is shared between Metal's completion thread and the thread that looks for
-// lost command buffers. It holds shared events and buffers, which Metal lets any thread use, and
-// `recover` only stores bytes and raises events (never lowers one), so two recoveries of one
-// submission leave what one does.
+// SAFETY: Metal allows the retained shared events and buffers to be used from either thread.
 unsafe impl Send for Owed {}
-// SAFETY: as for `Send`: `recover` takes `&self` and changes nothing in the `Owed`.
+// SAFETY: the fills and events are immutable lists. The Once lets only one recovery write the
+// buffers and signal the events, even if the timeout and completion threads both call recover.
 unsafe impl Sync for Owed {}
 
 /// A command buffer committed and not yet reported on by Metal: its queue, when, what it owes.
@@ -2739,6 +2738,30 @@ mod owed_tests {
         // A normal submission after it still completes: the queue is not stuck behind the order value.
         m.submit_passes(&q, &sub(&s9)).unwrap();
         assert!(m.wait(&fence, 9, 5000), "queue stuck after recovery");
+    }
+
+    #[test]
+    fn repeated_recovery_preserves_the_waiters_write() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr), len: 8, value: 0xAB }])];
+        let signals = [(&fence, 7)];
+        let owed = Owed::new(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }, false);
+        let word = region.ptr.cast::<[u8; 8]>();
+
+        owed.recover();
+        assert_eq!(m.completed(&fence), 7);
+        // SAFETY: these eight bytes are inside the live region. Only this thread accesses them.
+        unsafe {
+            assert_eq!(word.read(), [0xAB; 8]);
+            word.write([0xCD; 8]);
+        }
+        owed.recover();
+        // SAFETY: same region and exclusive access as above.
+        assert_eq!(unsafe { word.read() }, [0xCD; 8]);
     }
 
     /// A command buffer Metal never reports on (here one waiting for an event nobody signals) is
