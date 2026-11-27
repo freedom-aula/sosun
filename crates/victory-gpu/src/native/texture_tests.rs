@@ -219,6 +219,50 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
     assert_eq!(sync(), 6, "and the next one at the next submission");
 }
 
+/// A texture whose last write missed the sampled pages (a streamed mip tail, or a single glyph) is
+/// checked whole at the next probe for a burst, then returns to periodic checks with backoff once
+/// a whole read finds nothing changed instead of reading whole at every probe until it cools.
+#[test]
+fn a_missed_write_not_followed_by_another_backs_off_whole_reads() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pool) = pool(9131, (256 << 10) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    with_title(|t| {
+        assert!(t.realize(key));
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 1);
+    });
+    pool.write(0, &vec![0xABu8; info.size]);
+    with_title(|t| {
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 2);
+    });
+    // Write in page 3, which the 8 sampled pages skip.
+    pool.write(3 * 4096 + 100, &[7u8; 16]);
+    with_title(|t| {
+        let found = (1..=2 * crate::native::textures::WHOLE_EVERY).any(|_| {
+            t.sync_dirty();
+            t.uploads_of(key) == 3
+        });
+        assert!(found, "missed-sample write uploaded");
+    });
+    // Over 64 idle submissions: 1 immediate follow-up check, then +8, +16, +32 (at most 4 reads,
+    // instead of all 64).
+    with_title(|t| {
+        let reads = (0..64)
+            .filter(|_| {
+                let jobs = t.sync_jobs();
+                let read = jobs.iter().any(|j| j.key == key);
+                t.sync(jobs);
+                read
+            })
+            .count();
+        assert!(reads <= 4, "unchanged texture read whole {reads} times across 64 idle submissions");
+    });
+}
+
 /// A movie plane uploaded blank among hundreds of other hot textures (a title streaming) is still
 /// probed at the next submission when the probe deadline allows it: a count limit on the probes
 /// left its first frames green.
