@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(sites[0].count, 2, "the twice-taken site first");
         assert_eq!(sites[0].base, Some((0, 0)));
         assert_eq!(sites[0].len, 3);
-        assert_eq!(sites[0].code, 0x9008_89, "the instruction's first bytes");
+        assert_eq!(sites[0].code, 0x90_08_89, "the instruction's first bytes");
         assert_eq!(sites[1].base, None, "the absolute store has no register");
         assert_eq!(sites[1].len, 7);
         assert!(MOVED.load(Ordering::Relaxed) >= 3);
