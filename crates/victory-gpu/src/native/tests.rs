@@ -41,6 +41,50 @@ fn host() -> Option<Host> {
     Some(Host::new(Metal::new().unwrap()))
 }
 
+#[test]
+fn array_texture_ranges_reach_the_backend_for_object_and_placed_views() {
+    use crate::descriptor::{View, record};
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    host.heap(HeapKind::Resource, handle, 1).unwrap();
+
+    let mut resource = [0; 14];
+    resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+    let address = 0x12000;
+    let texture = Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 4, 4));
+    let key = Rc::as_ptr(&texture) as usize;
+    host.register_texture(key, &texture);
+    host.register_texture(super::textures::placed_key(address, &resource), &texture);
+
+    for unordered in [false, true] {
+        let mut desc = [0; 10];
+        desc[..2].copy_from_slice(&[28, 5]); // RGBA8_UNORM, TEXTURE2DARRAY
+        let object = if unordered {
+            desc[2..5].copy_from_slice(&[1, 2, 1]);
+            View::Unordered(key, 0, Some(desc))
+        } else {
+            desc[4..8].copy_from_slice(&[1, 3, 2, 4]);
+            View::Shader(key, Some(desc))
+        };
+        let mut placed = [0; 16];
+        placed[..10].copy_from_slice(&desc);
+        placed[10] = address as u32;
+        for view in [object, View::Placed(unordered, resource, placed)] {
+            record(handle, view);
+            assert!(host.mirror(handle).unwrap());
+            assert_eq!(
+                host.backend.views.borrow_mut().pop(),
+                Some(ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    mips: (1, if unordered { 1 } else { 3 }),
+                    slices: (2, if unordered { 1 } else { 4 }),
+                })
+            );
+        }
+    }
+}
+
 fn fixture(name: &str) -> Vec<u8> {
     let p = format!(
         "{}/../victory-metal/tests/fixtures/{name}.dxil",
