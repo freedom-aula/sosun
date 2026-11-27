@@ -58,31 +58,39 @@ impl Archive {
         d: &MTLRenderPipelineDescriptor,
         crash_key: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
+        let started = Instant::now();
         d.setBinaryArchives(Some(&self.list));
         if let Ok(p) = dev.newRenderPipelineStateWithDescriptor_options_reflection_error(
             d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
             None,
         ) {
+            note(started, "render pipeline from the archive");
             return Ok(p);
         }
         let p = compile_render(dev, d, crash_key)?;
+        let started = Instant::now();
         if self.archive.addRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
             self.added_one();
         }
+        note(started, "render pipeline added to the archive");
         Ok(p)
     }
 
     /// As [`Self::render`], for a mesh pipeline. Without this each run compiled every mesh pipeline
     /// again on the frame that first draws with it: seconds each at the first frame of the world.
     pub(crate) fn mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
+        let started = Instant::now();
         if let Some(p) = self.archived_mesh(dev, d) {
+            note(started, "mesh pipeline from the archive");
             return Ok(p);
         }
         let p = compile_mesh(dev, d)?;
+        let started = Instant::now();
         if self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
             self.added_one();
         }
+        note(started, "mesh pipeline added to the archive");
         Ok(p)
     }
 
@@ -102,6 +110,7 @@ impl Archive {
         dev: &Dev,
         f: &ProtocolObject<dyn MTLFunction>,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+        let started = Instant::now();
         let d = MTLComputePipelineDescriptor::new();
         d.setComputeFunction(Some(f));
         d.setBinaryArchives(Some(&self.list));
@@ -110,14 +119,19 @@ impl Archive {
             MTLPipelineOption::FailOnBinaryArchiveMiss,
             None,
         ) {
+            note(started, "compute pipeline from the archive");
             return Ok(p);
         }
         let p = dev
             .newComputePipelineStateWithDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)
-            .map_err(|e| e.localizedDescription().to_string())?;
+            .map_err(|e| e.localizedDescription().to_string());
+        note(started, "compute pipeline compiled");
+        let p = p?;
+        let started = Instant::now();
         if self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok() {
             self.added_one();
         }
+        note(started, "compute pipeline added to the archive");
         Ok(p)
     }
 
@@ -138,6 +152,7 @@ impl Archive {
         if self.archive.serializeToURL_error(&url(&tmp)).is_err() || std::fs::rename(&tmp, &self.path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
+        note(self.saved.get(), "pipeline archive written");
     }
 }
 
@@ -174,7 +189,9 @@ pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_k
         Sendable(dev.newRenderPipelineStateWithDescriptor_error(d).map_err(|e| e.localizedDescription().to_string()))
     };
     let late_key = crash_key.to_owned();
+    let started = Instant::now();
     let made = with_deadline(COMPILE_DEADLINE, compile, move |r| remember_crash(&r.0, &late_key));
+    note(started, "render pipeline compiled");
     let Some(Sendable(r)) = made else {
         return Err(format!(
             "Metal's compiler took over {} s (refused for this run; a crash is remembered when it ends)",
@@ -192,8 +209,20 @@ fn is_compiler_crash(error: &str) -> bool {
 /// Compiles the mesh pipeline `d`. shortcut: no deadline and no crash memory as
 /// [`compile_render`] has; add them if Metal's compiler ever crashes on a mesh pipeline.
 pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Result<RenderPso, String> {
-    dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
-        .map_err(|e| e.localizedDescription().to_string())
+    let started = Instant::now();
+    let p = dev
+        .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
+        .map_err(|e| e.localizedDescription().to_string());
+    note(started, "mesh pipeline compiled");
+    p
+}
+
+/// Logs slow pipeline work, as `msc` does a slow conversion: the frame's thread waits for it.
+fn note(started: Instant, what: &str) {
+    let ms = started.elapsed().as_millis();
+    if ms >= 20 {
+        eprintln!("metal: {what}: {ms} ms");
+    }
 }
 
 fn remember_crash<T>(r: &Result<T, String>, key: &str) {
