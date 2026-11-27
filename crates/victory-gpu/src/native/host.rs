@@ -418,6 +418,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             null.ptr().cast_const(),
                             0,
                         );
+                        // The null view has replaced whatever the cached record used to show.
+                        heap.mirrored.borrow_mut().remove(&index);
+                        heap.shows(index, None);
                         return Err(e);
                     }
                 };
@@ -531,7 +534,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     record_at(handle)
                 };
                 checked += 1;
-                if h.mirrored.borrow().get(&index) == Some(&record) {
+                if h.mirrored.borrow().get(&index) == Some(&record) || record == [0; 12] {
                     continue;
                 }
                 changed += 1;
@@ -540,8 +543,6 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if let Err(e) = self.mirror(handle) {
                     tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
                 }
-                // Tried once per record, whatever the result.
-                h.mirrored.borrow_mut().insert(index, record);
             }
             super::descriptor_trace::record(h.start, checked, changed);
         }

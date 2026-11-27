@@ -30,9 +30,12 @@ fn a_draw_with_only_vertex_slot_two_submits_its_buffer() {
 }
 
 #[derive(Default)]
-struct Capture {
+pub(super) struct Capture {
     // For each draw, the (slot, pool base, resolved address) bindings received.
     draws: RefCell<Vec<Vec<(usize, usize, usize)>>>,
+    host_buffers: RefCell<Vec<Box<[u8]>>>,
+    // (heap index, pool base, resolved address, size) for each buffer descriptor write.
+    pub(super) buffer_writes: RefCell<Vec<(usize, usize, usize, u32)>>,
 }
 
 impl GraphicsBackend for Capture {
@@ -77,8 +80,11 @@ impl ComputeBackend for Capture {
     fn create_fence(&self, _: u64) -> Result<(), String> {
         unreachable!()
     }
-    fn host_buffer(&self, _: usize) -> Result<(usize, *mut u8), String> {
-        unreachable!()
+    fn host_buffer(&self, len: usize) -> Result<(usize, *mut u8), String> {
+        let mut bytes = vec![0; len].into_boxed_slice();
+        let ptr = bytes.as_mut_ptr();
+        self.host_buffers.borrow_mut().push(bytes);
+        Ok((ptr as usize, ptr))
     }
     fn gpu_address(&self, _: &usize, _: *const u8) -> u64 {
         unreachable!()
@@ -108,13 +114,13 @@ impl ResourceBackend for Capture {
     type Sampler = ();
 
     fn create_heap(&self, _: HeapKind, _: usize) -> Result<(), String> {
-        unreachable!()
+        Ok(())
     }
-    fn heap_address(&self, _: &(), _: usize) -> u64 {
-        unreachable!()
+    fn heap_address(&self, _: &(), index: usize) -> u64 {
+        (index * 32) as u64
     }
-    fn write_buffer(&self, _: &(), _: usize, _: &usize, _: *const u8, _: u32) {
-        unreachable!()
+    fn write_buffer(&self, _: &(), index: usize, base: &usize, address: *const u8, size: u32) {
+        self.buffer_writes.borrow_mut().push((index, *base, address as usize, size));
     }
     fn write_texture(&self, _: &(), _: usize, _: &(), _: f32) {
         unreachable!()

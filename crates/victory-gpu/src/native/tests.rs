@@ -3,7 +3,7 @@
 //! [`NativeList`], submitted through [`Host`], read back from title memory. Title memory is a pool
 //! (`Alias::primary`, what the GPU buffer wraps) shown to the "title" at a second address
 //! (`Alias::alias`) through the pool table, so every address the list names is translated.
-//! Skipped when Apple's Metal Shader Converter is not installed.
+//! Tests using `host()` skip when Apple's Metal Shader Converter is not installed.
 
 use super::Host;
 use super::list::NativeList;
@@ -396,6 +396,46 @@ fn a_view_of_unmapped_memory_no_longer_shows_the_previous_buffer() {
         (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
     );
     drop(slots);
+}
+
+#[test]
+fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let address = 0x80100;
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[address, 0, 256, 0], handle);
+
+    let mut list = NativeList::default();
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(&[Rc::new(())], None);
+    list.set_heaps(Some(&heap), None);
+    list.set_graphics_root_table(0, &heap, 0);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    let submit = || host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    submit();
+    assert!(matches!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        [(0, _, _, 0)]
+    ));
+
+    let pool = PoolInfo {
+        id: 1,
+        base: 0x40000,
+        len: 0x4000,
+        memory_entry: None,
+    };
+    host.memory().mapped(0x80000, pool.len, &pool, 0);
+    submit();
+    assert_eq!(
+        &host.backend.buffer_writes.borrow()[1..],
+        &[(0, pool.base, pool.base + 0x100, 256)]
+    );
+
+    submit();
+    assert_eq!(host.backend.buffer_writes.borrow().len(), 2);
 }
 
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
