@@ -175,13 +175,15 @@ u32 probe_netaudio(ptr unused)
         u32 buffer[12] = {0x40, 960, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         *(ptr *)(buffer + 2) = pcm;
         int submitted = ((int (*)(ptr, const void *, ptr))vslot(voice, 21))(voice, buffer, 0) == 0;
+        /* XAUDIO2_VOICE_STATE, packed to 1 byte as in xaudio2.h: SamplesPlayed at 12. */
         u8 state[24];
         ((void (*)(ptr, void *, u32))vslot(voice, 25))(voice, state, 0);
         int queued_first = *(u32 *)(state + 8) == 1;
         ((int (*)(ptr, u32, u32))vslot(voice, 19))(voice, 0, 0);
         Sleep(300);
         ((void (*)(ptr, void *, u32))vslot(voice, 25))(voice, state, 0);
-        if (submitted && queued_first && *(u32 *)(state + 8) == 0 && *(u64 *)(state + 16) == 480)
+        if (submitted && queued_first && *(u32 *)(state + 8) == 0 && *(u32 *)(state + 12) == 480 &&
+            *(u32 *)(state + 16) == 0)
             ok |= N_XA_PLAYED;
         ((void (*)(ptr))vslot(voice, 18))(voice);
     }

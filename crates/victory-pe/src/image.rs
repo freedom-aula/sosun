@@ -152,9 +152,24 @@ impl ImageInfo {
             })
             .collect();
 
-        // Validate section raw-data boundaries before accepting
-        // the PE image.
+        let size_of_image = opt.size_of_image();
         for section in &sections {
+            let extent = match section.virtual_size {
+                0 => section.file_size,
+                size => size,
+            };
+            if extent != 0
+                && section
+                    .rva
+                    .checked_add(extent)
+                    .is_none_or(|end| end > size_of_image)
+            {
+                return Err(PeError::Malformed(format!(
+                    "section '{}' extends beyond SizeOfImage",
+                    section.name
+                )));
+            }
+
             if section.file_size == 0 {
                 continue;
             }
@@ -202,7 +217,7 @@ impl ImageInfo {
             subsystem: opt.subsystem().0,
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
-            size_of_image: opt.size_of_image(),
+            size_of_image,
             entry_rva: opt.address_of_entry_point(),
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
@@ -701,26 +716,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepts_section_with_zero_raw_size() {
-        let mut data = synthetic_image(&vec![0u8; 0x200]);
-
-        // Disable the export directory.
+    fn synthetic_bss(virtual_size: u32) -> Vec<u8> {
+        let mut data = synthetic_image(&[]);
         let opt = 0x58;
-        data[opt + 112..opt + 120].fill(0);
-
-        // Section header begins after the optional header.
+        data[opt + 112..opt + 120].fill(0); // no exports
         let sec = opt + 240;
+        data[sec..sec + 8].copy_from_slice(b".bss\0\0\0\0");
+        data[sec + 8..sec + 12].copy_from_slice(&virtual_size.to_le_bytes());
+        data[sec + 16..sec + 24].fill(0); // no raw data
+        data
+    }
 
-        // A section may occupy virtual memory without having raw data.
-        data[sec + 16..sec + 20].copy_from_slice(&0u32.to_le_bytes());
+    #[test]
+    fn accepts_bss_ending_at_image_boundary() {
+        // RVA 0x1000 + VirtualSize 0x1000 == SizeOfImage 0x2000.
+        ImageInfo::parse(&synthetic_bss(0x1000)).unwrap();
+    }
 
-        let info = ImageInfo::parse(&data);
+    #[test]
+    fn rejects_bss_one_byte_past_image_boundary() {
+        assert!(matches!(
+            ImageInfo::parse(&synthetic_bss(0x1001)),
+            Err(PeError::Malformed(_))
+        ));
+    }
 
-        assert!(
-            info.is_ok(),
-            "section with zero raw size should be accepted"
-        );
+    #[test]
+    fn rejects_bss_with_overflowing_virtual_end() {
+        let mut data = synthetic_bss(0xffff_f000); // RVA 0x1000 + size == 2^32
+        let opt = 0x58;
+        data[opt + 56..opt + 60].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
     }
 
     #[test]
