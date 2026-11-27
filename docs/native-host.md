@@ -548,6 +548,11 @@ vector compare result. At the join each mesh thread uses its group index modulo 
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
 A branch or operand that depends on a first-lane read can differ between the host waves and
 stays refused.
+
+## Liveness of phi edges: a bound on the paths walked
+
+`Lower::live_edges` decides which incoming edges of a join can bring a value to a read: it walks back from the read phis, carrying the last four branch conditions a lane took (`MAX_KNOWN`), and an edge is dead if they contradict. It kept every distinct set of conditions it had walked a phi with and compared each new one with all of them. Six of the title's pixel shaders (`0c138380aac06bee`, `1dc240e3ad667c4a`, `3b005093d9f023ac`, `6569ab9190d883bc`, `b84cdfce7b2dcc1e`, `cf5c1203d7f09fa0`) are branchy enough that a phi gathered thousands of sets (150 phis, 3,520 sets on one after 32,768 steps) and the translation never finished. Once the root-view and descriptor changes of late November let these shaders get that far, the world frame's pipeline of vertex `fd0cfdb9141c858c` and pixel `b84cdfce7b2dcc1e` stopped every run: the thread making it waited on the translation under the title lock, nothing else logged but the audio thread, and the title's watchdog fired 30 s later (+120-133 s, warm or cold). Now a phi walked with 64 sets (`MAX_PATHS`) is walked once more knowing nothing, which covers every later set; knowing less only keeps more edges live (a refusal at worst, never wrong code), as the existing rule of four conditions already does. Over the 12,279 containers one run translated (dumped to a scratch folder, translated offline by the `guess` example, arm64 release), the six now finish in 2 s each (two translate, four are refused for a lane mask read as data) and the other 12,273 give byte-identical results; the slowest translation is a compute shader of 10-11 s, before and after. Test: `emit::lower::tests::liveness_through_joins_of_many_conditions_ends` (six joins of twelve branches each: 0.02 s, 80 s without the bound).
+
 ## Lockstep: refused one-wave compute on a 32-lane host
 
 The fast translation runs a program as one lane does (`structure`, decision 0003): a branch on EXEC is a branch on the lane's own bit. On a 32-lane host a console wave of 64 lanes is two host waves, and a cross-lane operation reaching across them (`lower/halves.rs`) needs both at a group barrier, which lanes that went separate ways never reach together; each such shape needed its own proof, and the rest were refused ("a cross-lane operation between host waves in divergent code", "LDS shared in a wave the host splits, in divergent code" and others).
@@ -734,6 +739,7 @@ Residency itself: what a descriptor heap names is resident through the heap's ow
 * The text pixel shaders (`ac967781...` and the body font's) write the vertex colour unmultiplied and the atlas coverage in alpha, so they need blending: guessed pipelines had none, and every glyph quad wrote a solid box into the UI target's colour while its alpha held the right glyph. The glyphs that looked right were the ones whose quads later draws covered. The title draws text with the base pipeline 0x1c8 made, not one of the variants 0x1b8 makes (43,000 of those at boot, few ever bound), so the state is in the base's register image.
 * Pair 0 of a description slot is the register image (0x17c to 0x208 bytes). Decoded from 23,000 images: word 1 is 4 or 6, and the eight `CB_BLEND<n>_CONTROL` registers start at byte 0xd0 or 0x124 (every image has DISABLE_ROP3, bit 31, in all eight, and 0xffffffff after them; then three words and the eight `SX_MRT<n>_BLEND_OPT`, which agree: 0x06000600 is "blend disabled"). The text pipeline's is `e5010504`, straight alpha. Common values: `80000000` (off), `e5010504`, `f1010f01` (dual source), `e5040504`, `e0010161` (max). `Graphics::guess_from` reads them into the guessed state (hardware factors are D3D12's less one; combine functions add, subtract, min, max, reverse subtract), and variants' blend records apply over it.
 * With it the legal-notices screen is right: text, the purple gradient background and the faded art behind it (scratchpad `legal-notices-blend.png`); the white block and stepped black areas were opaque quads too. Still guessed: culling, depth, stencil and the write mask (the word before the blend registers is not the target mask: it is 0 for the text pipeline).
+* **Dual-source blending** (`f1010f01` above, 27 November). Target 0's blend can name `SRC1_*` / `INV_SRC1_*` factors: the pixel shader then gives the target two outputs, the second (`SV_Target1`) a blend source only, so it writes one more output than the pipeline has targets. Metal writes that as `[[color(0) index(1)]]`, which its converter only emits when `IRCompilerSetDualSourceBlendingConfiguration` enables it; without that, Metal refuses the pipeline with "Fragment shader does not write to render target color(0), index(1) that is required for blending" and every draw with it is dropped (two such pipelines, every run, before the fix; their pixel shaders write targets 0 and 1 into one `Rgba16Float` target). `state::dual_source` decides per pipeline (one more shader output than targets, in order, and target 0's blend reads it), and the converter's cache is keyed by the answer: the same shader converts differently for the two cases.
 * Two fixes found on the way: title threads get at least 8 MiB of stack (`host_posix::MIN_STACK`; the title's 1 MiB overflowed while the host built a Metal pipeline at the first guessed draw), and a released pipeline object's host pipelines are forgotten (`glue::pipeline_released`), as a new object at a freed one's address got the old one's pipeline.
 * `VICTORY_DUMP_DESC_DIR=<dir>` (with `VICTORY_GUESS_GRAPHICS=1`) writes each guessed pipeline's register image as `regs_<vs>_<ps>_<address>.bin`.
 
@@ -804,13 +810,12 @@ texture is released (guess: the title is done with it once it places another the
 old description still in a heap would name a released texture). Every texture placed in a pool is
 released at the first submission after the pool is (`NativeHost::released_pools`).
 
-#### Texture views show every array slice
+#### Texture views over 2D arrays
 
-A texture view with a mip range (2D views, and every placed texture view) was made with one array
-slice, so a view of a texture array (placed views do not look at the view's dimension) showed
-slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend cuts the range to
-the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
-count are not read; a view of part of an array shows all of it.
+Object and placed `TEXTURE2DARRAY` SRVs select the requested mip levels and array slices.
+UAVs select one mip and the requested slices. Level 0 and slice 0 of the Metal view refer to
+the first mip and slice in the descriptor. A count of `UINT_MAX` includes the remaining mips
+or slices from that starting index. The host refuses an array view with an empty range.
 
 A shader resource view created with a null description binds the registered texture itself,
 including its native format, all mips and all slices. This also preserves the format chosen

@@ -15314,6 +15314,36 @@ mod tests {
     }
 
     #[test]
+    fn liveness_through_joins_of_many_conditions_ends() {
+        // Six joins in a row, each reached by twelve branches on bits of the group id; s6 passes
+        // every one to the read at the end, so the deeper joins' phis were walked back once per
+        // set of the last four conditions on the way, 12^4 sets each, every new one compared with
+        // all the ones before it (minutes; a title pixel shader never finished). Past
+        // `live_edges` now goes through each join about once (visits kept as a set).
+        const K: u32 = 12;
+        const D: u32 = 6;
+        let mut words = vec![0xBE86_0380]; // s_mov_b32 s6, 0
+        for j in 0..D {
+            for i in 0..K {
+                let bit = j * K + i;
+                // s_bitcmp1_b32 s0, s1 or s2 (group id X, Y, Z), its bit `bit % 32`
+                words.push(0xBF0D_0000 | ((0x80 + bit % 32) << 8) | (bit / 32));
+                words.push(0xBF85_0000 | (2 * (K - 1 - i) + 1)); // s_cbranch_scc1 to the join
+            }
+            words.push(0xBE86_0380 | (j + 1)); // s_mov_b32 s6, j + 1 (the fall-through)
+        }
+        words.extend([
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ]);
+        let start = std::time::Instant::now();
+        lowers(&words, 1 << 7 | 1 << 8 | 1 << 9).expect("lowers");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+    }
+
+    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.

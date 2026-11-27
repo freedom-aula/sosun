@@ -4,9 +4,8 @@
 //! description (in the host's layout, as words) and leaves `[tag, index, generation]` in the 32-byte
 //! (16 for samplers) slot, so that titles that copy slots as bytes move whole descriptors. The D3D12
 //! host builds its views from those records (`descriptor::host`); this module reads the same records
-//! and gives the backend's `write_*` calls what they need. Texture descriptors made by
-//! `CreateShaderResourceViewPlaced` (the title's own tiled memory) are not decoded here: they need the
-//! detile pass (see docs/metal-backend.md, "What is left").
+//! and gives the backend's `write_*` calls what they need. Placed views identify a texture by its title address
+//! and resource description.
 
 use crate::descriptor::View;
 use std::collections::HashMap;
@@ -26,12 +25,14 @@ pub enum Decoded {
         addr: u64,
         size: u32,
     },
-    /// A texture SRV or UAV of a registered resource: the first mip and count of its view.
-    /// A count of `u32::MAX` includes every remaining mip; the backend clips it to the texture.
-    /// With no mip or format override, bind the original texture, including every mip and slice.
+    /// A texture SRV or UAV of a registered resource: optional `(first, count)` mip and array-slice
+    /// ranges and an optional format override. A count of `u32::MAX` includes every remaining mip
+    /// or slice; the backend clips it to the texture. With no mip, slice, or format override, bind
+    /// the original texture, including every mip and slice.
     Image {
         resource: usize,
         mips: Option<(u32, u32)>,
+        slices: Option<(u32, u32)>,
         format: Option<Format>,
     },
     Sampler {
@@ -44,6 +45,7 @@ pub enum Decoded {
 const BUFFER: u32 = 1;
 /// SRV `ViewDimension` of `Texture2D`; UAV's numbering is the same up to 3D.
 const TEXTURE_2D: u32 = 4;
+const TEXTURE_2D_ARRAY: u32 = 5;
 const FLAG_RAW: u32 = 1;
 
 /// Bytes per element of a buffer view and the range it covers from `base`.
@@ -123,6 +125,31 @@ pub fn format(dxgi: u32) -> Option<Format> {
     })
 }
 
+/// Object and placed views have the same SRV/UAV union layout.
+fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> {
+    let (mips, layers) = if unordered {
+        ((d[2], 1), (d[3], d[4]))
+    } else {
+        ((d[4], d[5]), (d[6], d[7]))
+    };
+    let format = format(d[0]);
+    let slices = if d[1] == TEXTURE_2D_ARRAY {
+        // An empty or unrepresentable array view must not fall back to the whole texture.
+        if layers.1 == 0 || mips.1 == 0 || format.is_none() {
+            return None;
+        }
+        Some(layers)
+    } else {
+        None
+    };
+    Some(Decoded::Image {
+        resource,
+        mips: Some(mips),
+        slices,
+        format,
+    })
+}
+
 pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Option<Decoded> {
     let buffer_base = |r: &usize| match resources.get(r)? {
         Res::Buffer(addr, _) => Some(*addr),
@@ -165,15 +192,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
         // A texture the title placed in its own memory: named by address and description.
         View::Placed(unordered, res, d) if res[0] > BUFFER => {
             let base = u64::from(d[10]) | u64::from(d[11]) << 32;
-            Some(Decoded::Image {
-                resource: super::textures::placed_key(base, res),
-                mips: if *unordered {
-                    Some((d[2], 1))
-                } else {
-                    Some((d[4], d[5]))
-                },
-                format: format(d[0]),
-            })
+            texture_view(super::textures::placed_key(base, res), *unordered, d)
         }
         View::Shader(r, None) | View::Unordered(r, _, None) => match *resources.get(r)? {
             Res::Buffer(addr, size) => Some(Decoded::Buffer {
@@ -183,23 +202,21 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             Res::Texture(_) if matches!(view, View::Shader(..)) => Some(Decoded::Image {
                 resource: *r,
                 mips: None,
+                slices: None,
                 format: None,
             }),
             Res::Texture(_) => None,
         },
-        View::Shader(r, Some(d)) if d[1] == TEXTURE_2D => Some(Decoded::Image {
-            resource: *r,
-            mips: Some((d[4], d[5])),
-            format: format(d[0]),
-        }),
-        View::Unordered(r, _, Some(d)) if d[1] == TEXTURE_2D => Some(Decoded::Image {
-            resource: *r,
-            mips: Some((d[2], 1)),
-            format: format(d[0]),
-        }),
+        View::Shader(r, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+            texture_view(*r, false, d)
+        }
+        View::Unordered(r, _, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+            texture_view(*r, true, d)
+        }
         View::Shader(r, Some(d)) | View::Unordered(r, _, Some(d)) => Some(Decoded::Image {
             resource: *r,
             mips: None,
+            slices: None,
             format: format(d[0]),
         }),
         View::ConsoleSampler(w) => Some(sampler(&crate::sampler::console_fields(w))),
@@ -342,7 +359,7 @@ mod tests {
         let resources = Resources::from([(7, Res::Texture(())), (8, Res::Buffer(0x1000, 256))]);
         assert_eq!(
             decode(&View::Shader(7, None), &resources),
-            Some(Decoded::Image { resource: 7, mips: None, format: None })
+            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None })
         );
         assert_eq!(
             decode(&View::Shader(8, None), &resources),
@@ -396,6 +413,39 @@ mod tests {
             crate::descriptor::forget(key_b);
         }
         crate::descriptor::forget(key_a);
+    }
+
+    #[test]
+    fn array_texture_views_preserve_remaining_counts_and_refuse_empty_ranges() {
+        let mut resource = [0; 14];
+        resource[0] = 3;
+        for unordered in [false, true] {
+            for count in [0, 1, u32::MAX] {
+                let mut words = [0; 10];
+                words[..2].copy_from_slice(&[28, TEXTURE_2D_ARRAY]);
+                let object = if unordered {
+                    words[2..5].copy_from_slice(&[1, 2, count]);
+                    View::Unordered(7, 0, Some(words))
+                } else {
+                    words[4..8].copy_from_slice(&[1, u32::MAX, 2, count]);
+                    View::Shader(7, Some(words))
+                };
+                let mut placed = [0; 16];
+                placed[..10].copy_from_slice(&words);
+                for view in [object, View::Placed(unordered, resource, placed)] {
+                    let decoded = decode(&view, &Resources::new());
+                    if count == 0 {
+                        assert_eq!(decoded, None);
+                    } else {
+                        let Some(Decoded::Image { mips, slices, .. }) = decoded else {
+                            panic!("expected a texture array view");
+                        };
+                        assert_eq!(mips, Some((1, if unordered { 1 } else { u32::MAX })));
+                        assert_eq!(slices, Some((2, count)));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

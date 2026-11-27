@@ -420,6 +420,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Decoded::Image {
                 resource,
                 mips,
+                slices,
                 format,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
@@ -432,9 +433,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             &ViewDesc {
                                 format,
                                 mips: (first as usize, count as usize),
-                                // Every slice of an array (the backend cuts it to what is there):
-                                // one slice showed an array view's first alone.
-                                slices: (0, usize::MAX),
+                                slices: slices.map_or((0, usize::MAX), |(first, count)| {
+                                    (first as usize, count as usize)
+                                }),
                             },
                         )?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);

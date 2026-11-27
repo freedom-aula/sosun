@@ -427,7 +427,7 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
         return;
     }
     let layout = crate::native::list::Binding::of(&ps).layout().unwrap();
-    Msc::open_default().convert_with(&ps.dxil, None, Some(&layout)).unwrap();
+    Msc::open_default().convert_with(&ps.dxil, None, Some(&layout), false).unwrap();
     let Ok(metal) = Metal::new() else {
         eprintln!("skipped the draw: no Metal device");
         return;

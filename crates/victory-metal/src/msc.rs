@@ -21,9 +21,14 @@ type Payload = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -> *mut c_void;
 type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
 type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
+type SetDualSource = unsafe extern "C" fn(*mut c_void, u32);
 type GetReflection = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> bool;
 type CopyMeshInfo = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
 type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
+
+/// `IRDualSourceBlendingConfigurationForceEnabled`: one target's two sources are shader outputs
+/// 0 and 1, both `[[color(0)]]` (`index(0)` and `index(1)`).
+const DUAL_SOURCE_ON: u32 = 1;
 
 /// `IRShaderStageMesh`.
 pub const STAGE_MESH: i32 = 5;
@@ -230,7 +235,7 @@ impl Msc {
 
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
     pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), ConvError> {
-        self.convert_with(dxil, entry, None)
+        self.convert_with(dxil, entry, None, false)
     }
 
     /// Where the converter lays out `l` in the top-level argument buffer: (resource type, space,
@@ -264,18 +269,33 @@ impl Msc {
 
     /// [`Self::convert`] with the top-level argument buffer laid out as `layout` says (for DXIL
     /// that carries no root signature), and out-of-range raw buffer accesses made safe if it asks.
+    /// `dual_source`: the pixel shader's second output is target 0's second blend source, which
+    /// the converter only emits as `[[color(0) index(1)]]` when told.
     pub fn convert_with(
         &self,
         dxil: &[u8],
         entry: Option<&str>,
         layout: Option<&RootLayout>,
+        dual_source: bool,
     ) -> Result<(i32, Vec<u8>), ConvError> {
         let Some(dir) = crate::disk::dir() else {
-            return self.convert_uncached(dxil, entry, layout);
+            return self.convert_uncached(dxil, entry, layout, dual_source);
         };
         let started = std::time::Instant::now();
         let layout_text = format!("{layout:?}");
-        let key = crate::disk::key(&[dxil, entry.unwrap_or("").as_bytes(), layout_text.as_bytes(), self.id.as_bytes()]);
+        // A dual-source conversion is a different shader laid out for the same DXIL, so it gets
+        // an entry of its own; the other case keeps the key it had, so those entries stay warm.
+        let mut parts: Vec<&[u8]> = Vec::new();
+        if dual_source {
+            parts.push(b"dual-source");
+        }
+        parts.extend([
+            dxil,
+            entry.unwrap_or("").as_bytes(),
+            layout_text.as_bytes(),
+            self.id.as_bytes(),
+        ]);
+        let key = crate::disk::key(&parts);
         if let Some((stage, lib)) = crate::disk::read(dir, &key).and_then(|b| {
             let (stage, lib) = b.split_at_checked(4)?;
             Some((i32::from_le_bytes(stage.try_into().ok()?), lib.to_vec()))
@@ -283,7 +303,7 @@ impl Msc {
             note(started, dxil.len(), true);
             return Ok((stage, lib));
         }
-        let (stage, lib) = self.convert_uncached(dxil, entry, layout)?;
+        let (stage, lib) = self.convert_uncached(dxil, entry, layout, dual_source)?;
         crate::disk::write(dir, &key, &[&stage.to_le_bytes()[..], &lib].concat());
         note(started, dxil.len(), false);
         Ok((stage, lib))
@@ -302,7 +322,7 @@ impl Msc {
             return Ok(t);
         }
         let h = self.h;
-        let threads = self.compiled(dxil, None, layout, |out| {
+        let threads = self.compiled(dxil, None, layout, false, |out| {
             // SAFETY: the converter's documented C API (`IRShaderReflection*`, `IRObjectGetReflection`,
             // `IRShaderReflectionCopyMeshInfo` with `IRReflectionVersion_1_0`); the reflection is
             // destroyed before returning.
@@ -333,9 +353,10 @@ impl Msc {
         dxil: &[u8],
         entry: Option<&str>,
         layout: Option<&RootLayout>,
+        dual_source: bool,
     ) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
-        self.compiled(dxil, entry, layout, |out| {
+        self.compiled(dxil, entry, layout, dual_source, |out| {
             // SAFETY: the converter's documented C API; the binary is destroyed below.
             unsafe {
                 let stage = sym::<Stage>(h, "IRObjectGetMetalIRShaderStage")(out);
@@ -363,12 +384,22 @@ impl Msc {
         dxil: &[u8],
         entry: Option<&str>,
         layout: Option<&RootLayout>,
+        dual_source: bool,
         f: impl FnOnce(*mut c_void) -> Result<T, ConvError>,
     ) -> Result<T, ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
             let comp = sym::<Create>(h, "IRCompilerCreate")();
+            // Older converters have no dual-source switch; those keep refusing such pipelines.
+            // Every other conversion leaves the option alone, as before.
+            if dual_source {
+                let set = libc::dlsym(h, c"IRCompilerSetDualSourceBlendingConfiguration".as_ptr());
+                if !set.is_null() {
+                    let set: SetDualSource = std::mem::transmute_copy(&set);
+                    set(comp, DUAL_SOURCE_ON);
+                }
+            }
             let mut signature = std::ptr::null_mut();
             if let Some(l) = layout {
                 signature = match make_signature(h, l) {

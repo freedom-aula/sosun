@@ -6,7 +6,11 @@ set -u
 export LC_ALL=C
 
 summarise() {
-  sed 's/\x1b\[[0-9;]*m//g' "$1" | awk -v file="$1" '
+  # The logger colours every line even into a file, and macOS's sed has no `\x1b` escape (it
+  # matches a literal "x1b"), so the escape is built here: the timestamp-driven parts below read
+  # nothing otherwise.
+  esc=$(printf '\033')
+  sed "s/${esc}\\[[0-9;]*m//g" "$1" | awk -v file="$1" '
 function secs(ts,   h) { # ISO time of day to seconds; wraps at midnight
   h = substr(ts, 12, 2) * 3600 + substr(ts, 15, 2) * 60 + substr(ts, 18, 9)
   if (h < lastsec - 43200) day++
@@ -153,20 +157,23 @@ END {
 }
 
 self_test() {
-  local f out ok=1
+  local f out ok=1 esc
   f=$(mktemp) || exit 1
-  # Synthetic log, made up for this test.
-  cat > "$f" <<'LOG'
+  # Synthetic log, made up for this test. Its lines wear the colours the logger writes even into a
+  # file (`ESC[2m` … `ESC[0m`); without stripping them the timestamps below read as nothing, so
+  # this also covers the strip.
+  esc=$(printf '\033')
+  sed "s/@ESC@/${esc}/g" > "$f" <<'LOG'
 # fake header
-2026-01-01T00:00:00.000000Z  INFO victory_gpu::native::glue: native draws so far frame=64 recorded=1
-2026-01-01T00:00:02.000000Z  INFO victory_gpu::native::glue: native draws so far frame=128 recorded=1
-2026-01-01T00:00:03.000000Z  INFO victory_gpu::pipeline: first bind pipeline=0x1 frame=100 stage="pixel" size=1 hash=abc took=12.5ms
-2026-01-01T00:00:03.100000Z  WARN victory_gpu::native::shaders: title shader refused; its work is dropped shader="vertex aa pixel bb" reason=translation: code at 0x10: a thing
-2026-01-01T00:00:03.200000Z  WARN victory_gpu::list: indirect execution dropped (first time) stride=12 address=Some("0xdead")
-2026-01-01T00:00:03.300000Z  WARN victory_gpu::list: indirect execution dropped (first time) stride=16 address=Some("0xbeef")
+@ESC@[2m2026-01-01T00:00:00.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=64 recorded=1
+@ESC@[2m2026-01-01T00:00:02.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=128 recorded=1
+@ESC@[2m2026-01-01T00:00:03.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::pipeline: first bind pipeline=0x1 frame=100 stage="pixel" size=1 hash=abc took=12.5ms
+@ESC@[2m2026-01-01T00:00:03.100000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::native::shaders: title shader refused; its work is dropped shader="vertex aa pixel bb" reason=translation: code at 0x10: a thing
+@ESC@[2m2026-01-01T00:00:03.200000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=12 address=Some("0xdead")
+@ESC@[2m2026-01-01T00:00:03.300000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_gpu::list: indirect execution dropped (first time) stride=16 address=Some("0xbeef")
 metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)" }
-2026-01-01T00:00:04.000000Z  WARN victory_hle::x: profile at 4.0s: 1 methods
-2026-01-01T00:00:04.000100Z  WARN victory_hle::x: profile k!f0x1 calls 3 total 9.0 ms max 4.00 ms
+@ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile at 4.0s: 1 methods
+@ESC@[2m2026-01-01T00:00:04.000100Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile k!f0x1 calls 3 total 9.0 ms max 4.00 ms
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
 LOG
   out=$(summarise "$f")
