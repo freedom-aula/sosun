@@ -663,10 +663,11 @@ impl Metal {
         &self,
         dxil: &[u8],
         layout: Option<&victory_backend::backend::RootLayout>,
+        dual_source: bool,
     ) -> Result<(i32, Retained<ProtocolObject<dyn MTLFunction>>), String> {
         let (stage, lib) = self
             .msc()?
-            .convert_with(dxil, None, layout)
+            .convert_with(dxil, None, layout, dual_source)
             .map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
         let name = l
@@ -1064,8 +1065,12 @@ impl GraphicsBackend for Metal {
         if crate::disk::crashed(crash_key(d).as_bytes()) {
             return Err("Metal's compiler crashed on it on an earlier run".into());
         }
-        let (stage, vf) = self.stage_function(d.vs, d.vs_layout)?;
-        let ff = d.ps.map(|ps| self.stage_function(ps, d.ps_layout)).transpose()?.map(|f| f.1);
+        let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
+        let ff = d
+            .ps
+            .map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
+            .transpose()?
+            .map(|f| f.1);
         let has_stencil = d.depth == Some(Format::D32FloatS8);
         let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
             let [x, y, z] = self.msc()?.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;

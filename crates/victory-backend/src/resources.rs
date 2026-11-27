@@ -394,6 +394,17 @@ pub struct Blend {
     pub op_alpha: BlendOp,
 }
 
+impl Blend {
+    /// Whether a factor reads the pixel shader's second output (`SRC1_*`): dual-source blending,
+    /// where one target takes two shader outputs and the second is a blend input only.
+    pub fn second_source(&self) -> bool {
+        use BlendFactor::*;
+        [self.src, self.dst, self.src_alpha, self.dst_alpha]
+            .into_iter()
+            .any(|f| matches!(f, Src1Color | InvSrc1Color | Src1Alpha | InvSrc1Alpha))
+    }
+}
+
 /// One colour target's output state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ColorState {
@@ -486,6 +497,10 @@ pub struct RenderPipelineDesc<'a> {
     pub cull: Cull,
     /// Blend and write mask per colour target; targets past the end are opaque, all channels.
     pub color_state: &'a [ColorState],
+    /// The pixel shader writes a second output for target 0, used only as a blend input
+    /// (dual-source blending). Metal wants that declared when the shader is converted, or the
+    /// pipeline is refused for not writing `color(0), index(1)`.
+    pub dual_source: bool,
     pub stencil: Option<StencilState>,
     pub raster: Raster,
 }

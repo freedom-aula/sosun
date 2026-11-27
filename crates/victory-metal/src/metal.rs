@@ -403,7 +403,7 @@ impl ComputeBackend for Metal {
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
         self.compute_from(
-            self.msc()?.convert_with(dxil, None, Some(layout)),
+            self.msc()?.convert_with(dxil, None, Some(layout), false),
             Some(layout),
         )
     }
