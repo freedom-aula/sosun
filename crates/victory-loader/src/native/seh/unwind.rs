@@ -103,7 +103,9 @@ pub fn lookup(pc: usize) -> Option<(usize, *const RuntimeFunction)> {
         if !in_range || t.count == 0 {
             continue;
         }
-        let rva = (pc - t.base) as u32;
+        let Ok(rva) = u32::try_from(pc - t.base) else {
+            continue;
+        };
         let (mut lo, mut hi) = (0, t.count);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -500,5 +502,24 @@ pub(crate) mod tests {
         assert_eq!(image_base_of(fake.base() + 0x10D), Some(fake.base()));
         remove_image(fake.base());
         assert!(lookup(fake.base() + 0x105).is_none());
+    }
+
+    #[test]
+    fn dynamic_lookup_rejects_pc_four_gib_above_function() {
+        let entry = RuntimeFunction {
+            begin: 0x100,
+            end: 0x110,
+            unwind: 0x200,
+        };
+        let entry_ptr = &raw const entry;
+        let base = 0x1000_0000_0000;
+        let pc = base + 0x105;
+        add_function_table(entry_ptr as usize, 1, base);
+        let inside = lookup(pc);
+        let four_gib_above = lookup(pc + (1usize << 32));
+        assert!(delete_function_table(entry_ptr as usize));
+
+        assert_eq!(inside, Some((base, entry_ptr)));
+        assert_eq!(four_gib_above, None);
     }
 }

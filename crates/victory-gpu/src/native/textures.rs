@@ -82,6 +82,77 @@ impl TextureInfo {
     }
 }
 
+/// Uploads and change probes must see the same bytes, including across holes in title memory.
+/// False if they could not be read at once (a hole: zeros there).
+fn read_texture_bytes(at: *const u8, out: &mut [u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    return read_texture_chunk(
+        at,
+        out,
+        super::safe_read,
+        victory_platform::mem::next_region,
+    );
+    #[cfg(not(target_os = "macos"))]
+    {
+        let read = super::safe_read(at, out);
+        if !read {
+            out.fill(0);
+        }
+        read
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_texture_chunk(
+    at: *const u8,
+    out: &mut [u8],
+    mut read: impl FnMut(*const u8, &mut [u8]) -> bool,
+    mut next_region: impl FnMut(usize) -> Option<victory_platform::mem::Region>,
+) -> bool {
+    use victory_platform::mem::{Protect, page_size};
+
+    if read(at, out) {
+        return true;
+    }
+    // A failed read can leave partial data in a reused probe buffer.
+    out.fill(0);
+    let base = at.addr();
+    let page = page_size();
+    if out.len() <= page - base % page {
+        return false;
+    }
+    let Some(end) = base.checked_add(out.len()) else {
+        return false;
+    };
+    let mut cur = base;
+    while cur < end {
+        let Some(region) = next_region(cur) else {
+            break;
+        };
+        let start = cur.max(region.base);
+        let stop = end.min(region.base.saturating_add(region.len));
+        if start >= stop {
+            break;
+        }
+        if region.protect.0 & Protect::READ.0 != 0
+            && !read(start as *const u8, &mut out[start - base..stop - base])
+        {
+            // The mapping may have changed after the query. Salvage this span page by page.
+            let mut pos = start;
+            while pos < stop {
+                let n = (page - pos % page).min(stop - pos);
+                let part = &mut out[pos - base..pos - base + n];
+                if !read(pos as *const u8, part) {
+                    part.fill(0);
+                }
+                pos += n;
+            }
+        }
+        cur = stop;
+    }
+    false
+}
+
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
@@ -90,19 +161,12 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
 }
 
 /// Fills `out` from title memory at `at`, with zeros where it cannot be read; whether some of it
-/// could not.
-///
-/// shortcut: a megabyte with one page that cannot be read is all zeros; read page by page if a
-/// title's textures turn out to be mapped in pieces (`VICTORY_TRACE_TEXTURE_SYNC=1` counts them).
+/// could not be read at once (`VICTORY_TRACE_TEXTURE_SYNC=1` counts those textures).
 fn read_into(at: usize, out: &mut [u8]) -> bool {
     const CHUNK: usize = 1 << 20;
     let mut unreadable = false;
     for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
-        // Only an address, checked by the kernel when read.
-        if !super::safe_read((at + i * CHUNK) as *const u8, chunk) {
-            chunk.fill(0);
-            unreadable = true;
-        }
+        unreadable |= !read_texture_bytes((at + i * CHUNK) as *const u8, chunk);
     }
     unreadable
 }
@@ -293,10 +357,50 @@ struct Watch {
     seen: HashMap<usize, blake3::Hash>,
 }
 
-static WATCH: std::sync::Mutex<Option<Watch>> = std::sync::Mutex::new(None);
+type Watched = std::sync::Mutex<Option<Watch>>;
+
+static WATCH: Watched = std::sync::Mutex::new(None);
 
 fn watch<R>(f: impl FnOnce(&mut Watch) -> R) -> R {
-    f(WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+    watch_in(&WATCH, f)
+}
+
+fn watch_in<R>(watched: &Watched, f: impl FnOnce(&mut Watch) -> R) -> R {
+    f(watched.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
+/// One round of the scanner: hashes the memory of each texture `watched` lists, without holding
+/// it, and marks those that changed since they were last read whole.
+fn scan_round(watched: &Watched, buf: &mut [u8]) {
+    let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
+        let Watch { entries, seen, .. } = w;
+        seen.retain(|k, _| entries.contains_key(k));
+        entries.iter().map(|(&k, &v)| (k, v)).collect()
+    });
+    for &(key, entry) in &list {
+        let (at, size, target, _) = entry;
+        // What it is compared with; `None` (skipped) if it was released since the list.
+        let known = |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
+        let Some(before) = watch_in(watched, |w| known(w)) else { continue };
+        let mut h = blake3::Hasher::new();
+        for off in (0..size).step_by(buf.len()) {
+            let n = buf.len().min(size - off);
+            read_texture_bytes((at + off) as *const u8, &mut buf[..n]);
+            h.update(&buf[..n]);
+        }
+        let h = h.finalize();
+        watch_in(watched, |w| {
+            // Released, or read by a submission while it was hashed here: this reading is the
+            // older one, and the next round compares with the submission's.
+            if known(w) != Some(before) {
+                return;
+            }
+            w.seen.insert(key, h);
+            if before != Some(h) && !(target && before.is_none()) {
+                w.dirty.insert(key);
+            }
+        });
+    }
 }
 
 fn start_scanner() {
@@ -305,33 +409,7 @@ fn start_scanner() {
         let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                let list: Vec<(usize, (usize, usize, bool, u64))> =
-                    watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
-                for &(key, entry) in &list {
-                    let (at, size, target, _) = entry;
-                    // What it is compared with; `None` (skipped) if it was released since the list.
-                    let known = |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
-                    let Some(before) = watch(|w| known(w)) else { continue };
-                    let mut h = blake3::Hasher::new();
-                    for off in (0..size).step_by(buf.len()) {
-                        let n = buf.len().min(size - off);
-                        buf[..n].fill(0);
-                        let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
-                        h.update(&buf[..n]);
-                    }
-                    let h = h.finalize();
-                    watch(|w| {
-                        // Released, or read by a submission while it was hashed here: this reading
-                        // is the older one, and the next round compares with the submission's.
-                        if known(w) != Some(before) {
-                            return;
-                        }
-                        w.seen.insert(key, h);
-                        if before != Some(h) && !(target && before.is_none()) {
-                            w.dirty.insert(key);
-                        }
-                    });
-                }
+                scan_round(&WATCH, &mut buf);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
@@ -362,11 +440,13 @@ pub struct Tracked<B: ResourceBackend> {
     /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
     /// them; once left to the scanner, their first frames showed green for a second or two).
     blank: bool,
-    /// Its view in the other format of its sRGB pair, once a render target view named it.
-    twin: Option<Rc<B::Texture>>,
+    /// Render-target views already made, kept so the same attachment keeps its identity.
+    #[cfg(target_os = "macos")]
+    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
 }
 
 /// The other format of an sRGB pair.
+#[cfg(target_os = "macos")]
 fn srgb_twin(f: Format) -> Option<Format> {
     Some(match f {
         Format::Rgba8Unorm => Format::Rgba8UnormSrgb,
@@ -440,8 +520,7 @@ fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
     if scratch.len() < n {
         scratch.resize(n, 0);
     }
-    scratch[..n].fill(0);
-    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+    read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
     scratch[..n].iter().any(|&b| b != 0)
 }
 
@@ -459,8 +538,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
         }
         for off in (0..size).step_by(CHUNK) {
             let n = CHUNK.min(size - off);
-            scratch[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
             seen(&scratch[..n]);
         }
         return;
@@ -473,8 +551,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     for k in 0..PROBE_PAGES {
         let off = k * pages / PROBE_PAGES * PAGE;
         let n = PROBE_SAMPLE.min(size - off);
-        scratch[..n].fill(0);
-        let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+        read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
         seen(&scratch[..n]);
     }
 }
@@ -675,24 +752,29 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
-        // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
-        // it changes, as it is not otherwise seen (a GPU write never changes title memory).
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target(), serial)));
-        start_scanner();
-        // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
-        // was never drawn into, and a black one was drawn black.
-        if info.render_target() && env_set!("VICTORY_MAGENTA") {
-            let m = &info.layout.mips[0];
-            let n = info.layout.desc.element_bytes as usize;
-            let row = m.width as usize * n;
-            let pixel = [0xffu8, 0, 0xff, 0xff];
-            let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
-            self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
-        }
-        if !info.render_target() {
-            self.unloaded.insert(key);
+        // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
+        // 4-byte or 2-byte plane 0) does not match Metal's combined depth-stencil texel layout,
+        // so watching or uploading CPU memory cannot produce valid replaceRegion transfers.
+        if !desc.format.is_depth() {
+            // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded
+            // when it changes, as it is not otherwise seen (a GPU write never changes title memory).
+            watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target(), serial)));
+            start_scanner();
+            // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
+            // was never drawn into, and a black one was drawn black.
+            if info.render_target() && env_set!("VICTORY_MAGENTA") {
+                let m = &info.layout.mips[0];
+                let n = info.layout.desc.element_bytes as usize;
+                let row = m.width as usize * n;
+                let pixel = [0xffu8, 0, 0xff, 0xff];
+                let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
+                self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
+            }
+            if !info.render_target() {
+                self.unloaded.insert(key);
+            }
         }
         self.textures.insert(
             key,
@@ -707,7 +789,8 @@ impl<B: PresentBackend> Title<B> {
                 sampled_sees_writes: false,
                 skipped: 0,
                 blank: false,
-                twin: None,
+                #[cfg(target_os = "macos")]
+                target_views: Vec::new(),
             },
         );
         true
@@ -724,33 +807,50 @@ impl<B: PresentBackend> Title<B> {
         self.textures.get(&key).map(|t| t.texture.clone())
     }
 
-    /// What a render target view of title texture `key` in DXGI format `named` (0: the texture's
-    /// own) draws into, and its format: the host texture, or its view in the other format of
-    /// its sRGB pair when the view names that one. The view's format says how writes are stored:
-    /// a picture written through a plain view of an sRGB texture is display values already (a
-    /// movie), and drawn into the texture itself it was encoded again and shown too bright.
-    pub fn target_of(&mut self, key: usize, named: u32) -> Option<(Rc<B::Texture>, Format)> {
+    /// Resolves a render-target view to its attachment and its effective format. The base
+    /// attachment can use the texture itself. A narrowed view also supplies the mip's extent.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn target_of(
+        &mut self,
+        record: crate::descriptor::RtvRecord,
+    ) -> Option<(Rc<B::Texture>, Format)> {
+        let key = record.resource as usize;
         self.realize(key);
         let t = self.textures.get_mut(&key)?;
-        let own = t.info.desc()?.format;
-        let Some(twin) = format(named).filter(|&f| srgb_twin(own) == Some(f)) else {
-            return Some((t.texture.clone(), own));
-        };
-        if t.twin.is_none() {
+        let desc = t.info.desc()?;
+        let (mip, slice) = record.native_rtv_subresource(
+            t.info.dimension,
+            t.info.depth_or_layers,
+            desc.mips,
+            t.info.layout.desc.samples,
+        )?;
+        let base = (mip, slice) == (0, 0);
+        let own = desc.format;
+        let twin = format(record.format()).filter(|&f| srgb_twin(own) == Some(f));
+        // A failed format reinterpretation can fall back to the resource format, but must
+        // keep the same mip and slice.
+        for format in twin.into_iter().chain([own]) {
+            if base && format == own {
+                return Some((t.texture.clone(), own));
+            }
             let view = ViewDesc {
-                format: twin,
-                mips: (0, usize::MAX),
-                slices: (0, usize::MAX),
+                format,
+                mips: if base { (0, usize::MAX) } else { (mip, 1) },
+                slices: if base { (0, usize::MAX) } else { (slice, 1) },
             };
+            if let Some((_, texture)) = t.target_views.iter().find(|(cached, _)| *cached == view) {
+                return Some((texture.clone(), format));
+            }
             match self.host.backend.create_texture_view(&t.texture, &view) {
-                Ok(v) => t.twin = Some(Rc::new(v)),
-                Err(e) => {
-                    tracing::warn!(error = %e, ?own, view = ?twin, "no host view for a render target view: drawn in the texture's format");
-                    return Some((t.texture.clone(), own));
+                Ok(texture) => {
+                    let texture = Rc::new(texture);
+                    t.target_views.push((view, texture.clone()));
+                    return Some((texture, format));
                 }
+                Err(e) => tracing::warn!(error = %e, ?view, "no host view for a render target view"),
             }
         }
-        t.twin.clone().map(|v| (v, twin))
+        None
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -871,6 +971,10 @@ impl<B: PresentBackend> Title<B> {
     fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
         let job = |key| {
             let t = self.textures.get(&key)?;
+            // Depth-stencil memory is not laid out as the host's texels are (`realize`).
+            if t.info.desc().is_some_and(|d| d.format.is_depth()) {
+                return None;
+            }
             Some(Job {
                 key,
                 serial: t.serial,
@@ -1031,9 +1135,8 @@ impl Job {
     /// faults in new pages) and detiles it unless it is what the host texture holds.
     fn read(&self, tiled: &mut Vec<u8>) -> Ready {
         let started = std::time::Instant::now();
-        // Sampled as the probes sample it (a page that can be read in a megabyte that cannot
-        // counts there and not in the whole read), and before the whole read: a write between
-        // the two is then a change to the next probe, not part of what it compares with.
+        // Sampled before the whole read: a write between the two is then a change to the next
+        // probe, not part of what it compares with.
         let probe = probe_hash(self.memory, self.size, false, tiled);
         if tiled.len() < self.size {
             tiled.resize(self.size, 0);
@@ -1148,6 +1251,72 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 mod tests {
     use super::*;
 
+    fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
+        Watched::new(Some(Watch { entries: entries.into(), ..Default::default() }))
+    }
+
+    fn dirty_this_round(watched: &Watched) -> std::collections::HashSet<usize> {
+        scan_round(watched, &mut [0; 2]);
+        watch_in(watched, |w| std::mem::take(&mut w.dirty))
+    }
+
+    fn seen(watched: &Watched) -> HashMap<usize, blake3::Hash> {
+        watch_in(watched, |w| w.seen.clone())
+    }
+
+    #[test]
+    fn scanner_forgets_removed_keys_and_reports_them_when_they_reappear() {
+        let bytes = [1u8, 2, 3];
+        let entry = (bytes.as_ptr() as usize, bytes.len(), false, 0);
+        let w = watched([(1, entry), (2, entry)]);
+
+        assert_eq!(dirty_this_round(&w), [1, 2].into());
+        assert!(dirty_this_round(&w).is_empty());
+
+        watch_in(&w, |w| w.entries.remove(&1));
+        assert!(dirty_this_round(&w).is_empty());
+        assert_eq!(seen(&w), HashMap::from([(2, blake3::hash(&bytes))]));
+
+        watch_in(&w, |w| w.entries.insert(1, entry));
+        assert_eq!(dirty_this_round(&w), [1].into());
+    }
+
+    #[test]
+    fn scanner_uses_the_first_render_target_hash_as_its_baseline() {
+        let mut bytes = [3u8];
+        let w = watched([(1, (bytes.as_ptr() as usize, bytes.len(), true, 0))]);
+        assert!(dirty_this_round(&w).is_empty());
+        assert_eq!(seen(&w)[&1], blake3::hash(&bytes));
+
+        bytes[0] = 4;
+        assert_eq!(dirty_this_round(&w), [1].into());
+        assert_eq!(seen(&w)[&1], blake3::hash(&bytes));
+    }
+
+    /// What a submission read whole is what the scanner compares with: it reports the write after
+    /// it, not that content once more. A texture made anew under a key starts over (a render
+    /// target's first sight is its baseline again, not a change to upload over what was drawn).
+    #[test]
+    fn scanner_compares_with_what_a_submission_read_and_starts_over_for_a_new_texture() {
+        let mut bytes = [3u8];
+        let entry = (bytes.as_ptr() as usize, bytes.len(), true, 0);
+        let w = watched([(1, entry)]);
+        assert!(dirty_this_round(&w).is_empty());
+        bytes[0] = 4;
+        // A submission read it meanwhile (`sync_apply`).
+        watch_in(&w, |w| w.seen.insert(1, blake3::hash(&bytes)));
+        assert!(dirty_this_round(&w).is_empty());
+        bytes[0] = 5;
+        assert_eq!(dirty_this_round(&w), [1].into());
+        // Released and made again under the same key, with other content (`texture_released`).
+        watch_in(&w, |w| {
+            w.seen.remove(&1);
+            w.entries.insert(1, (entry.0, entry.1, true, 1));
+        });
+        bytes[0] = 6;
+        assert!(dirty_this_round(&w).is_empty());
+    }
+
     /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
     /// element sizes 1 to 8, the shapes a world run names (#46).
     #[test]
@@ -1221,6 +1390,94 @@ mod tests {
             from_host(format, &mut texels);
             assert_eq!(texels, title, "{format}");
         }
+    }
+
+    #[test]
+    fn an_inaccessible_megabyte_takes_one_failed_read_and_one_region_query() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, protect};
+
+        let len = 1 << 20;
+        let memory = Region::new(len, None).unwrap();
+        // SAFETY: the test owns this entire mapping until the reader finishes.
+        unsafe { protect(memory.ptr, len, Protect::NO_ACCESS) }.unwrap();
+        let mut out = vec![0xff; len];
+        let (mut reads, mut queries) = (0, 0);
+        read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            |at, out| {
+                reads += 1;
+                crate::native::safe_read(at, out)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(out.iter().all(|&b| b == 0));
+        assert_eq!((reads, queries), (1, 1));
+    }
+
+    #[test]
+    fn a_region_that_changes_after_the_query_still_preserves_readable_pages() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(4 * page, None).unwrap();
+        // SAFETY: the test owns all four pages and writes them before changing protection.
+        unsafe {
+            memory.ptr.write_bytes(0x72, 4 * page);
+            protect(memory.ptr, page, Protect::NO_ACCESS).unwrap();
+        }
+        let mut out = vec![0xff; 4 * page - 2];
+        read_texture_chunk(
+            memory.ptr.wrapping_add(1),
+            &mut out,
+            crate::native::safe_read,
+            |at| {
+                let region = next_region(at);
+                if at == memory.ptr.addr() + page {
+                    // SAFETY: the third page is ours. Revoke access just after querying the span.
+                    unsafe { protect(memory.ptr.add(2 * page), page, Protect::NO_ACCESS) }.unwrap();
+                }
+                region
+            },
+        );
+        for (offset, &byte) in out.iter().enumerate() {
+            let readable = matches!((offset + 1) / page, 1 | 3);
+            assert_eq!(byte, if readable { 0x72 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_texture_read_preserves_texels_on_both_sides_of_an_unreadable_page() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(3 * page, None).unwrap();
+        // SAFETY: all three pages belong to this test. Protect only the middle one after filling it.
+        unsafe {
+            memory.ptr.write_bytes(0x31, 2 * page);
+            memory.ptr.add(2 * page).write_bytes(0x72, page);
+            protect(memory.ptr.add(page), page, Protect::NO_ACCESS).unwrap();
+        }
+        let start = memory.ptr.wrapping_add(page - 7);
+        let mut expected = vec![0; 7 + page + 11];
+        expected[..7].fill(0x31);
+        expected[7 + page..].fill(0x72);
+
+        let bytes = read_memory(start, expected.len());
+        assert_eq!(&bytes[..7], &expected[..7]);
+        assert!(bytes[7..7 + page].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[7 + page..], &expected[7 + page..]);
+        let mut scratch = vec![0xff; expected.len()];
+        assert_eq!(
+            probe_hash(start as usize, expected.len(), true, &mut scratch),
+            blake3::hash(&expected)
+        );
     }
 
     #[test]

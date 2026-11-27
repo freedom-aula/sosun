@@ -791,3 +791,329 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
         t.texture_released(key);
     }
 }
+
+/// Depth and depth-stencil textures are GPU targets whose CPU tile layout (e.g. a 4-byte or
+/// 2-byte depth plane) does not match Metal's combined texel layout, so they must not be watched
+/// or uploaded from CPU memory even when placed/typeless (not marked as a render target).
+#[test]
+fn depth_textures_are_not_watched_or_uploaded_from_cpu_memory() {
+    let Some(pool) = pool(9202, (512 << 10) / page_size() + 1) else { return };
+    // DXGI formats: 20 (D32_FLOAT_S8X24_UINT), 40 (D32_FLOAT), 55 (D16_UNORM),
+    // and typeless 19 (R32G8X24_TYPELESS) with flags = 0 (not marked ALLOW_RENDER_TARGET).
+    for (i, format) in [20u32, 40, 55, 19].into_iter().enumerate() {
+        let at = i * 0x20000;
+        let res = crate::resource::test_texture_at(
+            pool.va(at),
+            (64, 64),
+            1,
+            format,
+            Swizzle::SW_64KB_R_X.0,
+            0,
+        );
+        let key = res as usize;
+        with_title(|t| {
+            assert!(t.realize(key), "format {format} should realize");
+            t.sync_textures();
+            assert_eq!(t.uploads_of(key), 0, "depth format {format} must not upload on sync_textures");
+        });
+        pool.write(at, &[0xA5u8; 64]);
+        with_title(|t| {
+            t.sync_dirty();
+            assert_eq!(t.uploads_of(key), 0, "depth format {format} must not upload on sync_dirty");
+        });
+    }
+}
+
+/// A described RTV binds and clears its selected subresource in the named format.
+#[test]
+fn a_render_target_view_selects_its_mip_and_slice() {
+    use std::rc::Rc;
+    use victory_backend::backend::ComputeBackend;
+
+    let pool = pool(9138, 16).expect("Metal device and generated texture pool");
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let other_heap = crate::descriptor::test_heap(false, 4);
+    let next_handle = slot::<extern "system" fn(This) -> u64>(other_heap, 0x48)(other_heap);
+    let grey = [0.5, 0.5, 0.5, 1.0];
+
+    for (case, own_format, layers, array_view, mip, slice) in [
+        ("2D mip", 28, 1, false, 1, 0),
+        ("array slice", 28, 2, true, 0, 1),
+        ("array mip and slice", 28, 2, true, 1, 1),
+        ("plain view of an sRGB array mip and slice", 29, 2, true, 1, 1),
+        ("nonarray view of the first slice", 28, 2, false, 1, 0),
+    ] {
+        let rt = crate::resource::test_texture_array_at(pool.va(0), (8, 8), 2, layers, own_format, Swizzle::LINEAR.0, 1);
+        let key = rt as usize;
+        let subresources: Vec<_> = (0..usize::from(layers))
+            .flat_map(|layer| (0..2).map(move |level| {
+                (level, layer, 8 >> level, [17 + (level * 40 + layer * 80) as u8, 31, 47, 255])
+            }))
+            .collect();
+        with_title(|title| {
+            let texture = title.texture_of(key).expect("realized texture");
+            for &(level, layer, n, sentinel) in &subresources {
+                title.host.backend.upload_texture(&texture, level, layer, &sentinel.repeat(n * n), n * 4, 0);
+            }
+        }).expect("Metal title");
+        let desc = if array_view {
+            [28, 5, mip, slice, 1, 0]
+        } else {
+            [28, 4, mip, 0, 0, 0]
+        };
+        crate::descriptor::create_rtv(std::ptr::null(), rt, &desc, handle);
+        crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), next_handle);
+        let list = crate::list::test_list(false, std::ptr::null());
+        glue::targets(list, &[handle], 0);
+        with_list(list, |title, l| {
+            let (expected, format) = title.target_of(crate::descriptor::rtv_record(handle).unwrap()).unwrap();
+            let (base, base_format) = title.target_of(crate::descriptor::rtv_record(next_handle).unwrap()).unwrap();
+            assert!(l.targets_ready);
+            assert_eq!(l.targets.color, [Format::Rgba8Unorm]);
+            assert_eq!(format, Format::Rgba8Unorm);
+            let [attached] = l.list.color_targets() else { panic!("one attachment was expected") };
+            assert!(Rc::ptr_eq(attached, &expected), "binding reuses the cached attachment");
+            assert!(Rc::ptr_eq(&base, &title.texture_of(key).unwrap()), "default keeps base attachment");
+            assert!(!Rc::ptr_eq(&base, attached));
+            assert_eq!(base_format, if own_format == 29 { Format::Rgba8UnormSrgb } else { Format::Rgba8Unorm });
+            if array_view {
+                for (other_mip, other_slice) in [(1 - mip, slice), (mip, 1 - slice)] {
+                    let other_desc = [28, 5, other_mip, other_slice, 1, 0];
+                    crate::descriptor::create_rtv(std::ptr::null(), rt, &other_desc, next_handle);
+                    let (other, _) = title.target_of(crate::descriptor::rtv_record(next_handle).unwrap()).unwrap();
+                    assert!(!Rc::ptr_eq(attached, &other), "distinct subresources must keep distinct identities");
+                }
+            }
+        }).expect("native command list");
+
+        let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const u8)>(list, 0x1a0);
+        clear(list, handle, &grey, 0, std::ptr::null());
+        with_list(list, |_, l| {
+            let [super::super::list::Cmd::Clear { color: Some((cleared, _)), .. }] = l.list.cmds.as_slice() else {
+                panic!("one clear was expected");
+            };
+            assert!(Rc::ptr_eq(&l.list.color_targets()[0], cleared), "draw binding and clear resolve the same view");
+        }).expect("native command list");
+        if layers == 2 {
+            for invalid in [
+                [28, 5, 2, 0, 1, 0], // Out-of-range mip.
+                [28, 5, 0, 2, 1, 0], // Out-of-range slice.
+                [28, 5, 0, 0, 0, 0], // Empty array view.
+                [28, 5, 0, 0, 2, 0], // Unsupported layered view.
+                [28, 5, 0, 0, 1, 1], // Unsupported plane.
+                [28, 2, 0, 0, 0, 0], // 1D view of a 2D resource.
+                [28, 6, 0, 0, 0, 0], // Multisampled view of a single-sampled resource.
+            ] {
+                crate::descriptor::create_rtv(std::ptr::null(), rt, &invalid, next_handle);
+                glue::targets(list, &[next_handle, handle], 0);
+                clear(list, next_handle, &[1.0, 0.0, 0.0, 1.0], 0, std::ptr::null());
+                with_list(list, |_, l| {
+                    assert!(!l.targets_ready, "{case} accepted {invalid:?}");
+                    assert!(l.list.color_targets().is_empty(), "valid attachment must keep its slot");
+                    assert_eq!(l.list.cmds.len(), 1, "an invalid clear must record no command");
+                }).expect("native command list");
+            }
+        }
+
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        let queue = crate::queue::test_queue(false);
+        let mut fence = std::ptr::null();
+        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(slot::<extern "system" fn(This, This, u64) -> i32>(queue, 0x70)(queue, fence, 1), 0);
+        with_title(|title| {
+            let fence = title.fence(fence as usize, 0).expect("native fence");
+            assert!(title.host.backend.wait(&fence, 1, 2000), "native clear did not finish");
+            let texture = title.texture_of(key).expect("realized texture");
+            let mut pixels = 0;
+            for &(level, layer, n, sentinel) in &subresources {
+                let expected = if (level, layer) == (mip as usize, slice as usize) { [128, 128, 128, 255] } else { sentinel };
+                let mut data = vec![0u8; n * n * 4];
+                title.host.backend.read_texture(&texture, level, layer, &mut data, n * 4, 0);
+                assert!(data.as_chunks::<4>().0.iter().all(|p| *p == expected),
+                        "{case} mip {level} slice {layer}: expected {expected:?}, got {:?}", &data[..4]);
+                pixels += n * n;
+            }
+            println!("{case}: cleared mip {mip} slice {slice}, verified {pixels} texels");
+        }).expect("Metal title");
+    }
+}
+
+/// A rectangle-list draw (`D3D_PRIMITIVE_TOPOLOGY_RECTLIST`, 17) on a described (non-guessed)
+/// pipeline must draw the supplied vertices as `Topology::Triangles` instead of issuing
+/// 4-vertex instanced strips designed for `Options::rect_list`.
+#[test]
+fn described_rectangle_list_draw_uses_supplied_triangles() {
+    let Some(pool) = pool(9204, 4) else { return };
+    let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    let pso = with_title(|t| {
+        let vs = super::fixture("tri_vs");
+        let ps = super::fixture("tri_ps");
+        t.host
+            .render_pipeline(&RenderPipelineDesc {
+                vs: &vs,
+                ps: Some(&ps),
+                vs_layout: None,
+                ps_layout: None,
+                attributes: &[
+                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                    VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+                ],
+                streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+                color: &[Format::Rgba8Unorm],
+                depth: None,
+                depth_test: None,
+                cull: Cull::None,
+                ..Default::default()
+            })
+            .unwrap()
+    })
+    .unwrap();
+    let pipe_key = 0xDEAD_BEE0usize;
+    glue::install_test_render_pipeline(pipe_key, pso);
+
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+        list,
+        1,
+        &handle,
+        0,
+        std::ptr::null(),
+    );
+    glue::topology(list, 17);
+    glue::draw(list, 6, 1, 3, 0);
+
+    let recorded = with_list(list, |_, l| match l.list.cmds.last() {
+        Some(crate::native::list::Cmd::Draw {
+            topology,
+            call:
+                DrawCall::Arrays {
+                    vertex_count,
+                    instance_count,
+                    first_vertex,
+                    first_instance,
+                },
+            ..
+        }) => Some((*topology, *vertex_count, *instance_count, *first_vertex, *first_instance)),
+        _ => None,
+    })
+    .flatten()
+    .expect("recorded draw");
+    assert_eq!(recorded, (Topology::Triangles, 6, 1, 3, 0));
+}
+
+/// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
+/// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
+#[test]
+fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
+    let Some(pool) = pool(9203, (512 << 10) / page_size() + 1) else { return };
+    let tex_a = crate::resource::test_texture_at(
+        pool.va(0),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let tex_b = crate::resource::test_texture_at(
+        pool.va(0x10000),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let tex_c = crate::resource::test_texture_at(
+        pool.va(0x20000),
+        (16, 16),
+        1,
+        28,
+        Swizzle::SW_64KB_R_X.0,
+        1,
+    );
+    let up_buf = crate::resource::test_buffer_at(pool.va(0x30000), 0x4000);
+    let down_buf = crate::resource::test_buffer_at(pool.va(0x40000), 0x4000);
+
+    // Stage 8x8 linear texels at row pitch 256 into `up_buf`.
+    let pitch = 256usize;
+    let mut staged = vec![0u8; 7 * pitch + 8 * 4];
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let at = y * pitch + x * 4;
+            staged[at..at + 4].copy_from_slice(&[x as u8 * 11, y as u8 * 23, 77, 255]);
+        }
+    }
+    pool.write(0x30000, &staged);
+
+    let list = crate::list::test_list(false, std::ptr::null());
+    let q = crate::queue::test_queue(false);
+    let mut f = std::ptr::null();
+    crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+
+    // 1. CopyTextureRegion (footprint -> tex_a at (4, 4, 0) from 4x4 box starting at (2, 3))
+    let src_fp = crate::list::CopyLocation::placed(
+        up_buf,
+        crate::resource::PlacedFootprint::new(0, 28, 8, 8, pitch as u32),
+    );
+    let dst_a = crate::list::CopyLocation::whole(tex_a);
+    let box_a = [2u32, 3, 0, 6, 7, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_a, 4, 4, 0, &src_fp, &box_a);
+
+    // 2. CopyResource (tex_a -> tex_b whole texture)
+    slot::<extern "system" fn(This, This, This)>(list, 0x88)(list, tex_b, tex_a);
+
+    // 3. CopyTextureRegion (tex_b subresource (4, 4)..(8, 8) -> tex_c at (1, 2))
+    let src_b = crate::list::CopyLocation::whole(tex_b);
+    let dst_c = crate::list::CopyLocation::whole(tex_c);
+    let box_b = [4u32, 4, 0, 8, 8, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_c, 1, 2, 0, &src_b, &box_b);
+
+    // 4. CopyTextureRegion (tex_c subresource (1, 2)..(5, 6) -> down_buf footprint at (0, 0))
+    let src_c = crate::list::CopyLocation::whole(tex_c);
+    let dst_fp = crate::list::CopyLocation::placed(
+        down_buf,
+        crate::resource::PlacedFootprint::new(0, 28, 4, 4, pitch as u32),
+    );
+    let box_c = [1u32, 2, 0, 5, 6, 1];
+    slot::<extern "system" fn(This, *const crate::list::CopyLocation, u32, u32, u32, *const crate::list::CopyLocation, *const [u32; 6])>(
+        list, 0x80,
+    )(list, &dst_fp, 0, 0, 0, &src_c, &box_c);
+
+    assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+    let before_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
+    slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
+    assert_eq!(
+        slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(f, 0x48)(
+            f,
+            1,
+            std::ptr::null_mut()
+        ),
+        0
+    );
+    let after_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(after_drops, before_drops, "texture copies must not be counted as dropped");
+
+    let mut readback = vec![0u8; 3 * pitch + 16];
+    assert!(crate::native::safe_read(pool.va(0x40000) as *const u8, &mut readback));
+    for row in 0..4usize {
+        for col in 0..4usize {
+            let at = row * pitch + col * 4;
+            assert_eq!(
+                &readback[at..at + 4],
+                &[(col as u8 + 2) * 11, (row as u8 + 3) * 23, 77, 255],
+                "readback texel ({col}, {row})"
+            );
+        }
+    }
+}

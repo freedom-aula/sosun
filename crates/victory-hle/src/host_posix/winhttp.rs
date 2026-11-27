@@ -447,7 +447,11 @@ pub extern "system" fn WinHttpCrackUrl(
     // An IPv6 literal keeps its brackets out of the host and its colons out of the port.
     let (host, port) = match host_port.strip_prefix('[') {
         Some(v6) => match v6.split_once(']') {
-            Some((h, p)) => (h, p.strip_prefix(':')),
+            Some((h, "")) => (h, None),
+            Some((h, p)) => match p.strip_prefix(':') {
+                Some(port) => (h, Some(port)),
+                None => return error(ERROR_WINHTTP_INVALID_URL),
+            },
             None => return error(ERROR_WINHTTP_INVALID_URL),
         },
         None => match host_port.rsplit_once(':') {
@@ -492,9 +496,14 @@ pub extern "system" fn WinHttpCrackUrl(
             }
             let units: Vec<u16> = part.encode_utf16().collect();
             if buffer.is_null() {
-                // Point into the URL itself.
-                pointer.write_unaligned(url.add(at(part)).cast_mut());
-                capacity.write_unaligned(units.len() as u32);
+                if units.is_empty() {
+                    pointer.write_unaligned(std::ptr::null_mut());
+                    capacity.write_unaligned(0);
+                } else {
+                    // Point into the URL itself.
+                    pointer.write_unaligned(url.add(at(part)).cast_mut());
+                    capacity.write_unaligned(units.len() as u32);
+                }
             } else if (room as usize) < units.len() + 1 {
                 capacity.write_unaligned(units.len() as u32 + 1);
                 return error(ERROR_INSUFFICIENT_BUFFER);
@@ -649,5 +658,60 @@ mod tests {
         let bad = w("ftp://x/");
         assert_eq!(WinHttpCrackUrl(bad.as_ptr(), 0, 0, c.as_mut_ptr()), 0);
         assert_eq!(last(), ERROR_WINHTTP_UNRECOGNIZED_SCHEME);
+    }
+
+    #[test]
+    fn crack_url_handles_absent_pointer_components_and_ipv6_syntax() {
+        // Requesting absent user/password/extra in pointer mode must return null/0, not panic.
+        let url = w("https://example.com/a/b");
+        let mut c = [0u8; 104];
+        c[0..4].copy_from_slice(&104u32.to_le_bytes());
+        for off in [SCHEME, HOST, USER, PASSWORD, PATH, EXTRA] {
+            c[off + 8..off + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert_eq!(WinHttpCrackUrl(url.as_ptr(), 0, 0, c.as_mut_ptr()), 1);
+        let read_ptr = |c: &[u8; 104], off: usize| {
+            usize::from_le_bytes(c[off..off + 8].try_into().unwrap())
+        };
+        let read_len = |c: &[u8; 104], off: usize| {
+            u32::from_le_bytes(c[off + 8..off + 12].try_into().unwrap())
+        };
+        for off in [USER, PASSWORD, EXTRA] {
+            assert_eq!((read_ptr(&c, off), read_len(&c, off)), (0, 0));
+        }
+        // SAFETY: points into `url` for `host_len` UTF-16 units.
+        let host = unsafe {
+            std::slice::from_raw_parts(read_ptr(&c, HOST) as *const u16, read_len(&c, HOST) as usize)
+        };
+        assert_eq!(String::from_utf16_lossy(host), "example.com");
+
+        // User without password in pointer mode.
+        let user_only = w("https://alice@example.com/");
+        let mut c2 = [0u8; 104];
+        c2[0..4].copy_from_slice(&104u32.to_le_bytes());
+        c2[USER + 8..USER + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        c2[PASSWORD + 8..PASSWORD + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(WinHttpCrackUrl(user_only.as_ptr(), 0, 0, c2.as_mut_ptr()), 1);
+        // SAFETY: points into `user_only`.
+        let user = unsafe {
+            std::slice::from_raw_parts(
+                read_ptr(&c2, USER) as *const u16,
+                read_len(&c2, USER) as usize,
+            )
+        };
+        assert_eq!(String::from_utf16_lossy(user), "alice");
+        assert_eq!((read_ptr(&c2, PASSWORD), read_len(&c2, PASSWORD)), (0, 0));
+
+        // Trailing garbage after an IPv6 literal is rejected; valid IPv6 with/without port succeeds.
+        let bad_v6 = w("http://[::1]garbage/path");
+        let mut c3 = [0u8; 104];
+        c3[0..4].copy_from_slice(&104u32.to_le_bytes());
+        assert_eq!(WinHttpCrackUrl(bad_v6.as_ptr(), 0, 0, c3.as_mut_ptr()), 0);
+        assert_eq!(last(), ERROR_WINHTTP_INVALID_URL);
+
+        let good_v6 = w("http://[::1]:8080/path");
+        c3[HOST + 8..HOST + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(WinHttpCrackUrl(good_v6.as_ptr(), 0, 0, c3.as_mut_ptr()), 1);
+        assert_eq!(u16::from_le_bytes(c3[HOST + 12..HOST + 14].try_into().unwrap()), 8080);
     }
 }

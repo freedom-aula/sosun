@@ -94,6 +94,12 @@ impl Format {
         matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
     }
 
+    /// A depth or depth-stencil format.
+    pub fn is_depth(self) -> bool {
+        use Format::*;
+        matches!(self, D32Float | D32FloatS8 | D16Unorm)
+    }
+
     /// Bytes of one row of `width` texels (of blocks, for BC).
     pub fn row_bytes(self, width: usize) -> usize {
         let (b, n) = self.block();
@@ -139,7 +145,7 @@ impl TextureDesc {
 }
 
 /// A view of part of a texture, possibly in another (size-compatible) format.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewDesc {
     pub format: Format,
     /// First mip, count.
@@ -159,6 +165,14 @@ pub enum Address {
     Wrap,
     Mirror,
     Clamp,
+    Border,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorderColor {
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -166,6 +180,7 @@ pub struct SamplerDesc {
     pub min_mag: Filter,
     pub mip: Filter,
     pub address: [Address; 3],
+    pub border_color: BorderColor,
     pub max_anisotropy: usize,
 }
 
@@ -539,8 +554,8 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,
-    /// `(buffer, title address)` per vertex stream, in `streams` order.
-    pub vertex_buffers: Vec<(&'a B::Buffer, *const u8)>,
+    /// `(input slot, buffer, title address)` for each bound vertex stream.
+    pub vertex_buffers: Vec<(usize, &'a B::Buffer, *const u8)>,
     pub index_buffer: Option<(&'a B::Buffer, *const u8)>,
     pub call: DrawCall,
     /// `ExecuteIndirect`: the call's counts are read on the GPU from this title address (the
@@ -557,8 +572,8 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
     pub draws: Vec<Draw<'a, B>>,
 }
 
-/// A GPU-side buffer operation on title memory (`CopyBufferRegion`, a fill), ordered with the passes around it.
-pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
+/// A GPU-side copy or fill operation, ordered with the passes around it.
+pub enum BlitOp<'a, B: ResourceBackend + ?Sized> {
     Copy {
         src: (&'a B::Buffer, *const u8),
         dst: (&'a B::Buffer, *const u8),
@@ -568,6 +583,39 @@ pub enum BlitOp<'a, B: ComputeBackend + ?Sized> {
         dst: (&'a B::Buffer, *const u8),
         len: usize,
         value: u8,
+    },
+    CopyTexture {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &'a B::Texture,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: &'a B::Texture,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: (&'a B::Buffer, *const u8),
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
     },
 }
 

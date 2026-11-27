@@ -852,9 +852,9 @@ pub extern "system" fn wcsftime(
 
 /// `"Sun Sep 16 01:03:52 1973\n"`.
 fn asctime_text(tm: &Tm) -> Option<String> {
-    valid(tm).then(|| {
+    (valid(tm) && tm.year <= 8099).then(|| {
         format!(
-            "{} {} {:>2} {:02}:{:02}:{:02} {}\n",
+            "{} {} {:>2} {:02}:{:02}:{:02} {:04}\n",
             &DAYS[tm.wday as usize][..3],
             &MONTHS[tm.mon as usize][..3],
             tm.mday,
@@ -893,13 +893,17 @@ pub extern "system" fn asctime(tm: *const Tm) -> *const u8 {
 }
 
 pub extern "system" fn _asctime_s(buf: *mut u8, size: usize, tm: *const Tm) -> i32 {
-    if buf.is_null() || size < 26 || tm.is_null() {
+    if buf.is_null() || size == 0 {
+        return bad_param(EINVAL);
+    }
+    // SAFETY: `buf` holds at least one byte.
+    unsafe { buf.write(0) };
+    if size < 26 || tm.is_null() {
         return bad_param(EINVAL);
     }
     // SAFETY: the title's `tm` and buffer.
     unsafe {
         let Some(t) = asctime_text(&tm.read()) else {
-            buf.write(0);
             return bad_param(EINVAL);
         };
         std::ptr::copy_nonoverlapping(t.as_ptr(), buf, t.len());
@@ -909,6 +913,14 @@ pub extern "system" fn _asctime_s(buf: *mut u8, size: usize, tm: *const Tm) -> i
 }
 
 pub extern "system" fn _ctime64_s(buf: *mut u8, size: usize, t: *const i64) -> i32 {
+    if buf.is_null() || size == 0 {
+        return bad_param(EINVAL);
+    }
+    // SAFETY: `buf` holds at least one byte.
+    unsafe { buf.write(0) };
+    if size < 26 {
+        return bad_param(EINVAL);
+    }
     let mut tm = Tm::default();
     match _localtime64_s(&mut tm, t) {
         0 => _asctime_s(buf, size, &tm),
@@ -1158,5 +1170,33 @@ mod tests {
             assert_eq!(super::super::bytes(first[0] as *const u8), b"UTC");
             assert_eq!(super::super::bytes(first[1] as *const u8), b"UTC");
         }
+    }
+
+    #[test]
+    fn asctime_and_ctime_reject_five_digit_years_and_clear_buffer_on_error() {
+        let mut far = gmtime(0);
+        far.year = 9000; // year 10900: would overflow a 26-byte buffer
+        set_errno(0);
+        assert!(asctime(&far).is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+
+        let mut buf = [b'Z'; 28];
+        assert_eq!(_asctime_s(buf.as_mut_ptr(), 26, &far), EINVAL);
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[26], b'Z');
+
+        buf = [b'Z'; 28];
+        assert_eq!(_asctime_s(buf.as_mut_ptr(), 10, &gmtime(0)), EINVAL);
+        assert_eq!(buf[0], 0);
+
+        let neg = -1i64;
+        buf = [b'Z'; 28];
+        assert_eq!(_ctime64_s(buf.as_mut_ptr(), 26, &neg), EINVAL);
+        assert_eq!(buf[0], 0);
+
+        let zero = 0i64;
+        buf = [b'Z'; 28];
+        assert_eq!(_ctime64_s(buf.as_mut_ptr(), 10, &zero), EINVAL);
+        assert_eq!(buf[0], 0);
     }
 }

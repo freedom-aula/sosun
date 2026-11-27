@@ -9,7 +9,7 @@
 //! detile pass (see docs/metal-backend.md, "What is left").
 
 use crate::descriptor::View;
-use victory_backend::resources::{Address, Filter, Format, SamplerDesc};
+use victory_backend::resources::{Address, BorderColor, Filter, Format, SamplerDesc};
 
 /// What a heap entry holds, in backend terms.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,9 +206,21 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
         }
     };
     let aniso = f.mag >= 2 || f.min >= 2;
+    // Metal has three fixed border colors. Keep the existing edge clamp for other colors.
+    let border_color = if f.address.contains(&4) {
+        match f.border {
+            [0.0, 0.0, 0.0, 0.0] => Some(BorderColor::TransparentBlack),
+            [0.0, 0.0, 0.0, 1.0] => Some(BorderColor::OpaqueBlack),
+            [1.0, 1.0, 1.0, 1.0] => Some(BorderColor::OpaqueWhite),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mode = |m: u32| match m {
         1 => Address::Wrap,
         2 => Address::Mirror,
+        4 if border_color.is_some() => Address::Border,
         _ => Address::Clamp,
     };
     Decoded::Sampler {
@@ -219,7 +231,8 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
             } else {
                 Filter::Nearest
             },
-            address: [mode(f.address[0]), mode(f.address[1]), mode(f.address[2])],
+            address: f.address.map(mode),
+            border_color: border_color.unwrap_or(BorderColor::TransparentBlack),
             max_anisotropy: if aniso {
                 f.anisotropy.clamp(1, 16) as usize
             } else {
@@ -356,6 +369,35 @@ mod tests {
                 size: 256
             })
         );
+    }
+
+    #[test]
+    fn console_samplers_preserve_supported_border_modes_and_colors() {
+        let sampler = |mode, rgba: [f32; 4]| {
+            let mut words = [0; 27];
+            words[6..9].copy_from_slice(&[mode, 3, 3]);
+            words[17..21].copy_from_slice(&rgba.map(f32::to_bits));
+            let Some(Decoded::Sampler { desc, .. }) = decode(&View::ConsoleSampler(words), &|_| None) else {
+                panic!("expected a sampler");
+            };
+            desc
+        };
+
+        for (rgba, color) in [
+            ([0.0; 4], BorderColor::TransparentBlack),
+            ([0.0, 0.0, 0.0, 1.0], BorderColor::OpaqueBlack),
+            ([1.0; 4], BorderColor::OpaqueWhite),
+        ] {
+            let border = sampler(4, rgba);
+            let edge = sampler(3, rgba);
+            assert_eq!(border.address, [Address::Border, Address::Clamp, Address::Clamp]);
+            assert_eq!(border.border_color, color);
+            assert_eq!(edge.address, [Address::Clamp; 3]);
+            assert_eq!(edge.border_color, BorderColor::TransparentBlack);
+            assert_ne!(border, edge);
+        }
+        let custom = [0.25, 0.5, 0.0, 1.0];
+        assert_eq!(sampler(4, custom), sampler(3, custom), "unsupported color retains edge clamp");
     }
 
     #[test]

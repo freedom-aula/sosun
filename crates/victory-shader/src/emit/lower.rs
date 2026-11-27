@@ -1276,11 +1276,14 @@ impl<'a> Lower<'a> {
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+    fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
+        let inst = &self.x.p.blocks[b].insts[i];
+        if !super::wave::register_only(inst) {
+            return Err(unsupported(inst.machine.offset, inst.name()));
+        }
         // The first step the simulation does not model names the refusal.
         let sec = &self.sections[&b][&start];
         let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
-        let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
@@ -1293,6 +1296,7 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1551,7 +1555,7 @@ impl<'a> Lower<'a> {
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        self.section_inst(b, j, i)?;
                     }
                     i = end;
                     continue;
@@ -10335,17 +10339,10 @@ impl<'a> Lower<'a> {
         all
     }
 
-    /// Whether every lane enters IR block `b` along the edge the console's
-    /// wave takes, so that an SGPR joined there holds what that edge
-    /// brought: every branch into it is uniform (SCC values). The wave runs
-    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
-    /// per-lane exit) is where lanes would take edges the wave did not, and
-    /// the console compiler's if/else always skips into its join that way.
-    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
-    /// edge into its header; the others take the wave's.
     /// Whether the mask joined as `value` at IR block `b` is read only by `s_and_b32`/`_b64`s of
-    /// it and EXEC (or `s_orn2` of it by EXEC) in `b`, with no lane of edge `n` in that EXEC as the
-    /// edge brings it: those lanes' bits of the result are 0 (1) whatever the mask holds for them.
+    /// it and EXEC (or `s_nand` with EXEC, or `s_orn2` of it by EXEC) in `b`, with no lane of
+    /// edge `n` in that EXEC as the edge brings it: those lanes' bits of the result are 0 (1)
+    /// whatever the mask holds for them.
     fn anded_off_on_edge(&self, b: usize, value: Value, n: usize) -> bool {
         let (p, st) = (self.x.p, self.x.st);
         let block = &p.blocks[b];
@@ -10359,7 +10356,10 @@ impl<'a> Lower<'a> {
                 let orn2_of_exec = matches!(inst.name(), "s_orn2_b32" | "s_orn2_b64")
                     && matches!(&inst.fields, Fields::Sop { src, .. }
                         if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                if bb != b || !(matches!(inst.name(), "s_and_b32" | "s_and_b64") || orn2_of_exec) {
+                // `s_nand` with EXEC sets those bits whatever it holds, as `s_and` clears them.
+                let and =
+                    matches!(inst.name(), "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64");
+                if bb != b || !(and || orn2_of_exec) {
                     return false;
                 }
                 let Some(exec) = inst.read(Reg::S(EXEC)) else { return false };
@@ -10374,6 +10374,71 @@ impl<'a> Lower<'a> {
             }
         }
         reads > 0
+    }
+
+    /// Whether no lane ever sees the mask joined as `value`: nothing reads it but joins (up to
+    /// `depth` deep) whose edge from it needs no value ([`Self::unneeded_arg`]), so the wave can
+    /// hold any bits there.
+    fn never_seen(&self, value: Value, depth: u32) -> bool {
+        let p = self.x.p;
+        depth > 0
+            && !self.read_by_code(value)
+            && p.blocks.iter().enumerate().all(|(e, blk)| {
+                blk.phis.iter().all(|phi| {
+                    phi.args.iter().enumerate().filter(|&(_, &a)| a == value).all(|(k, _)| {
+                        self.unneeded_arg(e, phi, k, depth - 1)
+                    })
+                })
+            })
+    }
+
+    /// Whether an instruction (not a join) reads `value`.
+    fn read_by_code(&self, value: Value) -> bool {
+        let reads = |i: &Inst| i.reads.iter().any(|r| r.1 == value);
+        self.x.p.blocks.iter().any(|b| b.insts.iter().any(reads))
+    }
+
+    /// Whether no lane taking edge `n` into IR block `b` sees what that edge brings to `phi`:
+    /// only an AND with an EXEC those lanes are not in reads it ([`Self::anded_off_on_edge`]),
+    /// no lane sees the join at all, or (with nothing reading the join) those lanes leave `b`
+    /// only by edges whose joins do not take it or need no value there either (a register the
+    /// console compiler reuses on a path those lanes skip, as a nested if's else part writes
+    /// it again before any read).
+    fn unneeded_arg(&self, b: usize, phi: &Phi, n: usize, depth: u32) -> bool {
+        let p = self.x.p;
+        if self.anded_off_on_edge(b, phi.value, n) || self.never_seen(phi.value, depth) {
+            return true;
+        }
+        if depth == 0 || self.read_by_code(phi.value) {
+            return false;
+        }
+        let on_n = self.lane_edge(p.blocks[b].preds[n], b);
+        p.blocks.iter().enumerate().all(|(e, blk)| {
+            blk.phis.iter().all(|next| {
+                next.args.iter().enumerate().filter(|&(_, &a)| a == phi.value).all(|(k, _)| {
+                    let taken = || [on_n.clone(), self.lane_edge(b, e)].concat();
+                    (blk.preds[k] == b && !self.x.st.bools.meet(&taken()))
+                        || self.unneeded_arg(e, next, k, depth - 1)
+                })
+            })
+        })
+    }
+
+    /// The lane mask `low` (the low dword's value) as each lane's bit when it is a select in IR
+    /// block `q` of an inline -1 (every lane) or 0 (none) by SCC: SCC, the same for every lane.
+    fn scc_mask(&self, low: Value, q: usize) -> Option<V> {
+        let block = &self.x.p.blocks[q];
+        let op = if self.x.native.wave64 { "s_cselect_b64" } else { "s_cselect_b32" };
+        let (inst, [Operand::Const(a), Operand::Const(b)]) = scalar_def::<2>(block, low, op)? else {
+            return None;
+        };
+        if (crate::resource::inline(a)?, crate::resource::inline(b)?) != (u32::MAX, 0) {
+            return None;
+        }
+        match self.vals.get(&inst.read(Reg::Scc)?) {
+            Some(&Val::Bit(scc)) => Some(scc),
+            _ => None,
+        }
     }
 
     /// Whether the lane mask `low` (the low dword's value), on the edge from IR block `q` to its
@@ -10397,7 +10462,15 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn uniform_join(&self, b: usize) -> bool {
+    /// Whether every lane enters IR block `b` along the edge the console's
+    /// wave takes, so that an SGPR joined there holds what that edge
+    /// brought: every branch into it is uniform (SCC values). The wave runs
+    /// one path; a per-lane branch into the join (an EXEC skip, a loop's
+    /// per-lane exit) is where lanes would take edges the wave did not, and
+    /// the console compiler's if/else always skips into its join that way.
+    /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
+    /// edge into its header; the others take the wave's.
+    fn uniform_join(&self, b: usize, uniform_scc: impl Fn(Value) -> bool) -> bool {
         let st = self.x.st;
         let preds = &self.x.p.blocks[b].preds;
         preds
@@ -10412,7 +10485,7 @@ impl<'a> Lower<'a> {
                     .bools
                     .support(when)
                     .iter()
-                    .all(|a| matches!(a, Atom::Uniform(_))),
+                    .all(|a| matches!(a, Atom::Uniform(v) if uniform_scc(*v))),
                 _ => true,
             })
     }
@@ -13505,7 +13578,7 @@ impl<'a> Lower<'a> {
                                 && self.is_host_wave_mask_phi(phi.value))
                         && (self.x.st.masks.contains_key(&arg)
                             || self.x.st.highs.contains_key(&arg))
-                        && self.uniform_join(b) =>
+                        && self.uniform_join(b, |_| true) =>
                     {
                         self.mask_dword(arg)
                             .map_err(|w| Stop::Retry(phi.value, w))?
@@ -13526,6 +13599,7 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        let mut mesh_split = None;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -13534,8 +13608,27 @@ impl<'a> Lower<'a> {
                 .pair_high(phi.value)
                 .and_then(|h| self.phi_at.get(&h))
                 .map(|&(hb, hi)| &p.blocks[hb].phis[hi]);
+            // A mesh thread knows its console lane. If a uniform branch skips a
+            // single block, the whole wave brings either its mask or the scalar
+            // data. Two unconditional jumps from separate arms prove no such thing.
+            let preds = &p.blocks[b].preds;
+            let mesh_branch = self.s.mesh.is_some()
+                && matches!(preds.as_slice(), &[a, c] if a != b && c != b
+                    && (p.blocks[a].preds == [c] || p.blocks[c].preds == [a]))
+                && phi.args.iter().enumerate().any(|(n, &lo)| {
+                    self.x.st.mask_bits(lo, high.map(|h| h.args[n])).is_some()
+                });
+            let uniform = self.uniform_join(b, |_| true);
+            let mesh_number = uniform && mesh_branch && {
+                // Each host half can read a different first lane.
+                let split = mesh_split.get_or_insert_with(|| split_scc(p));
+                !split.contains(&phi.value)
+                    && high.is_none_or(|h| !split.contains(&h.value))
+                    && self.uniform_join(b, |scc| !split.contains(&scc))
+            };
+            let number = self.console_lanes && uniform || mesh_number;
             let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+            for (n, &q) in preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -13556,9 +13649,13 @@ impl<'a> Lower<'a> {
                 // own bit of the number, as `Atom::Opaque`: of the low dword for
                 // lanes below 32, of the high one above (a mask pair's lane `i`
                 // is its bit `i`).
-                let number = self.console_lanes && self.uniform_join(b);
-                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                let mask = if mesh_number {
+                    self.x.st.mask_bits(arg, high.map(|h| h.args[n]))
+                } else {
+                    self.x.st.masks.get(&arg).copied()
+                };
+                let x = match (mask, self.vals.get(&arg)) {
+                    (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     (None, Some(&Val::I32(word))) if number => {
                         let hi = if self.x.native.wave64 {
                             match high.and_then(|h| self.vals.get(&h.args[n])) {
@@ -13570,20 +13667,22 @@ impl<'a> Lower<'a> {
                         };
                         self.lane_bit(qb, word, hi)
                     }
-                    (None, _)
-                        if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) =>
-                    {
+                    (None, _) if !uniform && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
                     }
-                    // Read only ANDed with an EXEC those lanes are not in: any bit will do.
-                    (None, Some(Val::I32(_))) if self.anded_off_on_edge(b, phi.value, n) => {
-                        self.s.m.bool(false)
-                    }
+                    // Read only ANDed with an EXEC those lanes are not in, or not read at all
+                    // but by such joins: any bit will do, so what the edge brings (data, or a
+                    // value not made) is not needed.
+                    // shortcut: the search repeats work along a chain of joins (fine at the
+                    // title's ~10 deep); memoise it if a program's translation gets slow.
+                    (None, _) if self.unneeded_arg(b, phi, n, 16) => self.s.m.bool(false),
                     // No lanes or every lane, moved just before the edge: each lane's bit,
                     // whatever the lane layout and whichever lanes take the edge.
                     (None, Some(Val::I32(_))) if let Some(all) = self.constant_mask(arg, q) => {
                         self.s.m.bool(all)
                     }
+                    // -1 or 0 by SCC: SCC is every lane's bit.
+                    (None, Some(Val::I32(_))) if let Some(scc) = self.scc_mask(arg, q) => scc,
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));
                     }

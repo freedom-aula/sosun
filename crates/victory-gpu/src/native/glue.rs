@@ -600,19 +600,15 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources, in the views' formats.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let views: Vec<Option<(usize, u32)>> = color
-            .iter()
-            .map(|&h| crate::descriptor::rtv_record(h).map(|r| (r.resource as usize, r.format())))
-            .collect();
-        let keys: Vec<Option<usize>> = views.iter().map(|v| v.map(|(k, _)| k)).collect();
+        let views: Vec<_> = color.iter().map(|&h| crate::descriptor::rtv_record(h)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
-        l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
+        l.target_keys = views.iter().flatten().map(|r| r.resource as usize).chain(depth_key).collect();
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
         let made: Option<Vec<_>> = views
             .iter()
-            .map(|slot| slot.and_then(|(k, named)| t.target_of(k, named)))
+            .map(|slot| slot.and_then(|r| t.target_of(r)))
             .collect();
         let Some(made) = made else {
             l.targets_ready = false;
@@ -637,16 +633,14 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     });
 }
 
-/// `ClearRenderTargetView`. shortcut: the whole target, whatever rectangles the title passes.
+/// `ClearRenderTargetView`. shortcut: the selected attachment, regardless of rectangle arguments.
 pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     with_list(this, |t, l| {
-        if let Some((tex, _)) = crate::descriptor::rtv_record(handle)
-            .and_then(|r| t.target_of(r.resource as usize, r.format()))
+        if let Some(record) = crate::descriptor::rtv_record(handle)
+            && let Some((texture, _)) = t.target_of(record)
         {
-            if let Some(r) = crate::descriptor::rtv_record(handle) {
-                trace_bump(r.resource as usize, 1);
-            }
-            l.list.clear_render_target(&tex, color);
+            trace_bump(record.resource as usize, 1);
+            l.list.clear_render_target(&texture, color);
         }
     });
 }
@@ -870,6 +864,12 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let indirect = crate::list::indirect_dropped();
     let (r, heap_cleared) = with_title(|t| (t.host.backend.residency_counts(), t.host.cleared())).unwrap_or_default();
     tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, "native draws so far");
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
+        let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
+        let (libraries_cached, libraries_converted) = victory_metal::disk::counts();
+        tracing::info!(frame, shaders_cached, shaders_translated, libraries_cached, libraries_converted, "native shader cache so far");
+    }
     super::descriptor_trace::log(frame);
 }
 
@@ -979,6 +979,16 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
     .unwrap_or_else(|| Err("no native host GPU".into()))
 }
 
+#[cfg(test)]
+pub(crate) fn install_test_render_pipeline(
+    key: usize,
+    pso: Rc<<Metal as victory_backend::resources::GraphicsBackend>::RenderPipeline>,
+) {
+    with_title(|t| {
+        t.pipelines.insert(key, Pipe::Render(pso, None));
+    });
+}
+
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
         Pipe::Compute(pso) => {
@@ -1079,16 +1089,27 @@ pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
     });
 }
 
-/// `IASetVertexBuffers`: the addresses of the streams from `start`.
-pub(crate) fn vertex_buffers(this: This, start: u32, addresses: &[u64], strides: &[u32]) {
+/// Title ABI for `D3D12_VERTEX_BUFFER_VIEW`.
+#[repr(C)]
+pub(crate) struct VertexBufferView {
+    address: u64,
+    size: u32,
+    stride: u32,
+}
+
+pub(crate) fn vertex_buffers(this: This, start: u32, count: u32, views: &[VertexBufferView]) {
     with_list(this, |_, l| {
-        for (i, a) in addresses.iter().enumerate() {
-            l.list.set_vertex_buffer(start as usize + i, *a);
+        for i in 0..count as usize {
             let slot = start as usize + i;
+            let (address, stride) = match views.get(i) {
+                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.stride),
+                _ => (0, 0),
+            };
+            l.list.set_vertex_buffer(slot, address);
             if l.strides.len() <= slot {
                 l.strides.resize(slot + 1, 0);
             }
-            l.strides[slot] = strides.get(i).copied().unwrap_or(0);
+            l.strides[slot] = stride;
         }
     });
 }
@@ -1156,17 +1177,19 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
         return None;
     }
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
-    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
+    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`). A described
+    // pipeline has no fourth-corner shader translation, so it falls back to its supplied vertices
+    // drawn as triangles rather than issuing 4-vertex instanced strips.
     let rect = l.topology == 17;
     let targets = l.targets.clone();
-    let made = match pipe(t, l.pipeline, &targets) {
-        Pipe::Guess(g) => guess(t, l, &g, rect),
+    let (made, rect) = match pipe(t, l.pipeline, &targets) {
+        Pipe::Guess(g) => (guess(t, l, &g, rect), rect),
         p if rect => {
             if env_set!("VICTORY_TRACE_RECTS") {
                 tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
             }
             warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
-            p
+            (p, false)
         }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
@@ -1174,7 +1197,7 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
             trace_drop(l);
             return None;
         }
-        p => p,
+        p => (p, false),
     };
     let Pipe::Render(pso, binding) = made else {
         dropped("a draw without a host render pipeline (refused or not translated)");
@@ -1191,8 +1214,9 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     }
     let topology = if rect {
         Some(victory_backend::resources::Topology::TriangleStrip)
-    } else if mesh {
-        // A mesh shader declares its own topology; the list's is unused.
+    } else if l.topology == 17 || mesh {
+        // Described rectangle lists draw each 3-corner rectangle as a triangle; a mesh shader
+        // declares its own topology and ignores the list's.
         Some(victory_backend::resources::Topology::Triangles)
     } else {
         super::state::topology(l.topology)
@@ -1445,6 +1469,275 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
     with_list(this, |_, l| {
         l.list.copy_buffer_region(dst, src, len as usize);
     });
+}
+
+fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) -> Option<(usize, usize)> {
+    let mips = info.layout.mips.len().max(1);
+    let slices = if info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        info.layout.slices.max(1) as usize
+    };
+    let sub = subresource as usize;
+    (sub < mips * slices).then(|| (sub % mips, sub / mips))
+}
+
+fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
+    [
+        (info.width as usize >> mip).max(1),
+        (info.height.max(1) as usize >> mip).max(1),
+        info.layout.subresource_depth(mip as u32).max(1) as usize,
+    ]
+}
+
+fn copy_box(
+    info: &super::textures::TextureInfo,
+    mip: usize,
+    source_box: Option<[u32; 6]>,
+) -> Option<([usize; 3], [usize; 3])> {
+    let dims = mip_dims(info, mip);
+    let Some([l, t, f, r, b, back]) = source_box else {
+        return Some(([0, 0, 0], dims));
+    };
+    if r < l || b < t || back < f {
+        return None;
+    }
+    let origin = [l as usize, t as usize, f as usize];
+    let size = [(r - l) as usize, (b - t) as usize, (back - f) as usize];
+    (0..3).all(|i| origin[i].saturating_add(size[i]) <= dims[i]).then_some((origin, size))
+}
+
+fn footprint_span(
+    res: This,
+    fp: &crate::resource::PlacedFootprint,
+    at: [u32; 3],
+    size: [u32; 3],
+) -> Option<(u64, usize, usize, usize)> {
+    // 115 (B4G4R4A4_UNORM) needs CPU nibble rotation; depth formats need plane-separated copies.
+    if fp.format == 115 {
+        return None;
+    }
+    let fmt = super::descriptors::format(fp.format)?;
+    if matches!(
+        fmt,
+        victory_backend::resources::Format::D32Float
+            | victory_backend::resources::Format::D32FloatS8
+            | victory_backend::resources::Format::D16Unorm
+    ) {
+        return None;
+    }
+    let (element, block) = crate::resource::element(fp.format)?;
+    let (base, buf_size) = crate::resource::buffer_bytes(res)?;
+    let rows = fp.rows(at, size)?;
+    let start = rows.first()?.0;
+    let end = rows.last().map_or(start, |&(o, n)| o + n);
+    let byte_end = fp.offset.checked_add(end)?;
+    if byte_end > buf_size {
+        return None;
+    }
+    let addr = (base as u64).checked_add(fp.offset + start)?;
+    let len = usize::try_from(end - start).ok()?;
+    let row_pitch = fp.row_pitch as usize;
+    let slice_pitch = row_pitch.checked_mul((fp.height as usize).div_ceil(block as usize))?;
+    let _ = element;
+    Some((addr, len, row_pitch, slice_pitch))
+}
+
+/// `CopyResource` between two title textures. Returns `false` if the host cannot copy them.
+pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
+    let (Some(src_info), Some(dst_info)) = (
+        crate::resource::texture_info(src),
+        crate::resource::texture_info(dst),
+    ) else {
+        return false;
+    };
+    let mips = src_info.layout.mips.len().max(1).min(dst_info.layout.mips.len().max(1));
+    let src_slices = if src_info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        src_info.layout.slices.max(1) as usize
+    };
+    let dst_slices = if dst_info.dimension == victory_formats::texture::Dimension::Tex3d {
+        1
+    } else {
+        dst_info.layout.slices.max(1) as usize
+    };
+    let slices = src_slices.min(dst_slices);
+    with_list(this, |t, l| {
+        let (Some(src_tex), Some(dst_tex)) = (t.texture_of(src as usize), t.texture_of(dst as usize)) else {
+            return false;
+        };
+        for slice in 0..slices {
+            for mip in 0..mips {
+                let s = mip_dims(&src_info, mip);
+                let d = mip_dims(&dst_info, mip);
+                let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
+                l.list.copy_texture_region(
+                    &src_tex,
+                    mip,
+                    slice,
+                    [0, 0, 0],
+                    size,
+                    &dst_tex,
+                    mip,
+                    slice,
+                    [0, 0, 0],
+                );
+            }
+        }
+        trace_bump(dst as usize, 0);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// `CopyTextureRegion` on macOS: texture-to-texture and placed footprint <-> texture.
+pub(crate) fn copy_texture_region(
+    this: This,
+    dst: crate::list::CopyLocation,
+    origin: [u32; 3],
+    src: crate::list::CopyLocation,
+    source_box: Option<[u32; 6]>,
+) -> bool {
+    const SUBRESOURCE: u32 = 0;
+    const FOOTPRINT: u32 = 1;
+    let dst_origin = [origin[0] as usize, origin[1] as usize, origin[2] as usize];
+    match (dst.kind, src.kind) {
+        (SUBRESOURCE, SUBRESOURCE) => {
+            let (Some(src_info), Some(dst_info)) = (
+                crate::resource::texture_info(src.resource),
+                crate::resource::texture_info(dst.resource),
+            ) else {
+                return false;
+            };
+            let Some((src_mip, src_slice)) = subresource_mip_slice(&src_info, src.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((dst_mip, dst_slice)) = subresource_mip_slice(&dst_info, dst.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((src_origin, size)) = copy_box(&src_info, src_mip, source_box) else {
+                return false;
+            };
+            let dst_dims = mip_dims(&dst_info, dst_mip);
+            if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
+                return false;
+            }
+            if size.contains(&0) {
+                return true;
+            }
+            with_list(this, |t, l| {
+                let (Some(src_tex), Some(dst_tex)) =
+                    (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
+                else {
+                    return false;
+                };
+                l.list.copy_texture_region(
+                    &src_tex,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size,
+                    &dst_tex,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                );
+                trace_bump(dst.resource as usize, 0);
+                true
+            })
+            .unwrap_or(false)
+        }
+        (SUBRESOURCE, FOOTPRINT) => {
+            let Some(dst_info) = crate::resource::texture_info(dst.resource) else {
+                return false;
+            };
+            let Some((dst_mip, dst_slice)) = subresource_mip_slice(&dst_info, dst.footprint.offset as u32) else {
+                return false;
+            };
+            let (src_at, size_u32) = match source_box {
+                Some([l, t, f, r, b, back]) if r >= l && b >= t && back >= f => {
+                    ([l, t, f], [r - l, b - t, back - f])
+                }
+                Some(_) => return false,
+                None => (
+                    [0, 0, 0],
+                    [src.footprint.width, src.footprint.height, src.footprint.depth],
+                ),
+            };
+            let size = size_u32.map(|v| v as usize);
+            if size.contains(&0) {
+                return true;
+            }
+            let dst_dims = mip_dims(&dst_info, dst_mip);
+            if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
+                return false;
+            }
+            let Some((src_addr, len, row_pitch, slice_pitch)) =
+                footprint_span(src.resource, &src.footprint, src_at, size_u32)
+            else {
+                return false;
+            };
+            with_list(this, |t, l| {
+                let Some(dst_tex) = t.texture_of(dst.resource as usize) else {
+                    return false;
+                };
+                l.list.copy_buffer_to_texture(
+                    src_addr,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                    size,
+                    &dst_tex,
+                    dst_mip,
+                    dst_slice,
+                    dst_origin,
+                );
+                trace_bump(dst.resource as usize, 0);
+                true
+            })
+            .unwrap_or(false)
+        }
+        (FOOTPRINT, SUBRESOURCE) => {
+            let Some(src_info) = crate::resource::texture_info(src.resource) else {
+                return false;
+            };
+            let Some((src_mip, src_slice)) = subresource_mip_slice(&src_info, src.footprint.offset as u32) else {
+                return false;
+            };
+            let Some((src_origin, size)) = copy_box(&src_info, src_mip, source_box) else {
+                return false;
+            };
+            if size.contains(&0) {
+                return true;
+            }
+            let size_u32 = size.map(|v| v as u32);
+            let Some((dst_addr, len, row_pitch, slice_pitch)) =
+                footprint_span(dst.resource, &dst.footprint, origin, size_u32)
+            else {
+                return false;
+            };
+            with_list(this, |t, l| {
+                let Some(src_tex) = t.texture_of(src.resource as usize) else {
+                    return false;
+                };
+                l.list.copy_texture_to_buffer(
+                    &src_tex,
+                    src_mip,
+                    src_slice,
+                    src_origin,
+                    size,
+                    dst_addr,
+                    len,
+                    row_pitch,
+                    slice_pitch,
+                );
+                true
+            })
+            .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// A bottom-of-pipe value write of `value`, `bytes` long.

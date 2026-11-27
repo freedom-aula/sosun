@@ -180,7 +180,9 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= heap.blocks[&host].size)
         // SAFETY: inside a live heap block, which the title and the audio
         // hardware share like on the console.
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
@@ -550,8 +552,10 @@ fn pump(context: Context, voice: &mut Voice) {
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
-        let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let Some(address) = context.get(7).checked_add(write * BLOCK_BYTES as u32) else {
+            return;
+        };
+        let Some(out) = heap_bytes(address, BLOCK_BYTES) else {
             return;
         };
         for pair in out.as_chunks_mut::<2>().0 {
@@ -898,10 +902,18 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(bytes) = heap_bytes(notification, size_of::<u32>())
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        let ptr = bytes.as_mut_ptr();
+        if (ptr as usize).is_multiple_of(align_of::<u32>()) {
+            // SAFETY: a 4-byte aligned u32 inside a live heap block.
+            unsafe { ptr.cast::<u32>().write_volatile(1) };
+        } else {
+            for (i, byte) in 1u32.to_le_bytes().into_iter().enumerate() {
+                // SAFETY: `bytes` holds 4 bytes inside a live heap block.
+                unsafe { ptr.add(i).write_volatile(byte) };
+            }
+        }
     }
     S_OK
 }
@@ -1580,5 +1592,88 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn heap_bounds_notification_word_and_xma_address_wrap_are_guarded() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 8, 16, 1), S_OK);
+
+        // Overflowing length must not wrap `offset + len`.
+        assert!(heap_bytes(apu + 4, usize::MAX).is_none());
+
+        // A notification word near the end of a heap block (< 4 bytes left) is ignored;
+        // aligned and unaligned addresses that fit write `1u32` cleanly.
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 16, 16), S_OK);
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 6),
+            S_OK
+        );
+        // SAFETY: 8-byte zeroed allocation.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), 8) };
+        assert_eq!(bytes, &[0u8; 8], "too-short tail must not be written");
+        assert_eq!(
+            (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + 1),
+            S_OK
+        );
+        // SAFETY: 8-byte allocation.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), 8) };
+        assert_eq!(&bytes[1..5], &1u32.to_le_bytes());
+
+        // An XMA output ring address near u32::MAX must not wrap around to a low APU block.
+        let mut guard = vec![0x55u8; BLOCK_BYTES];
+        let low_apu = 0x0000_0100u32;
+        let host_addr = guard.as_mut_ptr() as usize;
+        {
+            let mut heap = lock(&HEAP);
+            heap.blocks.insert(
+                host_addr,
+                Block {
+                    size: BLOCK_BYTES,
+                    apu: low_apu,
+                    layout: Layout::from_size_align(BLOCK_BYTES, 16).unwrap(),
+                },
+            );
+            heap.by_apu.insert(low_apu, host_addr);
+        }
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 4 << 22 | 2 << 27); // ring of 4 blocks, write block 2
+        context.set(1, 1 << 31); // writable
+        // 0xFFFF_FF00 + 2 * 0x100 wraps u32 to 0x0000_0100 (`low_apu`).
+        context.set(7, 0xFFFF_FF00);
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::from(vec![0x1234i16; SAMPLES_PER_BLOCK]),
+            skip: 0,
+            ended: true,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        pump(context, &mut voice);
+        {
+            let mut heap = lock(&HEAP);
+            heap.by_apu.remove(&low_apu);
+            heap.blocks.remove(&host_addr);
+        }
+        assert_eq!(voice.trace.produced, 0, "wrapped output address must not write");
+        assert!(guard.iter().all(|&b| b == 0x55), "wrapped write corrupted low APU block");
+
+        (m.release)(acp);
+        ApuFree(ptr);
     }
 }

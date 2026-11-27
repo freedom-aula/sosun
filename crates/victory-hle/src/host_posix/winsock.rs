@@ -39,6 +39,7 @@ const WSAEINVAL: i32 = 10022;
 const WSAEMFILE: i32 = 10024;
 const WSAEWOULDBLOCK: i32 = 10035;
 const WSAENOTSOCK: i32 = 10038;
+const WSAEMSGSIZE: i32 = 10040;
 const WSAEOPNOTSUPP: i32 = 10045;
 const WSAEAFNOSUPPORT: i32 = 10047;
 const WSAENETUNREACH: i32 = 10051;
@@ -75,7 +76,6 @@ unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn accept(fd: c_int, addr: *mut u8, len: *mut u32) -> c_int;
     fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
-    fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
     fn sendto(
         fd: c_int,
         buf: *const c_void,
@@ -83,14 +83,6 @@ unsafe extern "C" {
         flags: c_int,
         addr: *const u8,
         addr_len: u32,
-    ) -> isize;
-    fn recvfrom(
-        fd: c_int,
-        buf: *mut c_void,
-        len: usize,
-        flags: c_int,
-        addr: *mut u8,
-        addr_len: *mut u32,
     ) -> isize;
     fn select(
         nfds: c_int,
@@ -535,24 +527,29 @@ fn transferred(n: isize) -> i32 {
     if n < 0 { fail() } else { n as i32 }
 }
 
+fn validate_buf(buf: *const u8, len: i32) -> Result<usize, i32> {
+    if len < 0 {
+        return Err(fail_with(WSAEINVAL));
+    }
+    if len > 0 && buf.is_null() {
+        return Err(fail_with(WSAEFAULT));
+    }
+    Ok(len as usize)
+}
+
 pub extern "system" fn send_(s: Socket, buf: *const u8, len: i32, flags: i32) -> i32 {
     let Some(fd) = fd_of(s) else {
         return SOCKET_ERROR;
     };
-    // SAFETY: a socket of ours and the title's buffer.
-    transferred(unsafe {
-        send(fd, buf.cast(), len.max(0) as usize, bsd_msg_flags(flags))
-    })
-}
-
-pub extern "system" fn recv_(s: Socket, buf: *mut u8, len: i32, flags: i32) -> i32 {
-    let Some(fd) = fd_of(s) else {
+    let Ok(len) = validate_buf(buf, len) else {
         return SOCKET_ERROR;
     };
     // SAFETY: a socket of ours and the title's buffer.
-    transferred(unsafe {
-        recv(fd, buf.cast(), len.max(0) as usize, bsd_msg_flags(flags))
-    })
+    transferred(unsafe { send(fd, buf.cast(), len, bsd_msg_flags(flags)) })
+}
+
+pub extern "system" fn recv_(s: Socket, buf: *mut u8, len: i32, flags: i32) -> i32 {
+    recvfrom_(s, buf, len, flags, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 pub extern "system" fn sendto_(
@@ -566,15 +563,21 @@ pub extern "system" fn sendto_(
     let Some(fd) = fd_of(s) else {
         return SOCKET_ERROR;
     };
+    let Ok(len) = validate_buf(buf, len) else {
+        return SOCKET_ERROR;
+    };
+    if to.is_null() {
+        // Connected sockets may call sendto with a null destination address.
+        // SAFETY: a socket of ours and the title's buffer.
+        return transferred(unsafe { send(fd, buf.cast(), len, bsd_msg_flags(flags)) });
+    }
     let (b, n) = match to_bsd(to, to_len) {
         Some((b, n)) if reachable(&b) => (b, n),
         Some(_) => return SOCKET_ERROR,
         None => return fail_with(WSAEAFNOSUPPORT),
     };
     // SAFETY: a socket of ours, the title's buffer and a built address.
-    transferred(unsafe {
-        sendto(fd, buf.cast(), len.max(0) as usize, bsd_msg_flags(flags), b.as_ptr(), n)
-    })
+    transferred(unsafe { sendto(fd, buf.cast(), len, bsd_msg_flags(flags), b.as_ptr(), n) })
 }
 
 pub extern "system" fn recvfrom_(
@@ -588,23 +591,37 @@ pub extern "system" fn recvfrom_(
     let Some(fd) = fd_of(s) else {
         return SOCKET_ERROR;
     };
-    let mut b = [0u8; 28];
-    let mut n = 28u32;
-    // SAFETY: a socket of ours, the title's buffer and one of ours for the address.
-    let r = unsafe {
-        recvfrom(
-            fd,
-            buf.cast(),
-            len.max(0) as usize,
-            bsd_msg_flags(flags),
-            b.as_mut_ptr(),
-            &mut n,
-        )
+    let Ok(len) = validate_buf(buf.cast_const(), len) else {
+        return SOCKET_ERROR;
     };
-    if r >= 0 && n > 0 {
+    let mut b = [0u8; 28];
+    let mut iov = libc::iovec { iov_base: buf.cast(), iov_len: len };
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    if !from.is_null() && !from_len.is_null() {
+        msg.msg_name = b.as_mut_ptr().cast();
+        msg.msg_namelen = b.len() as u32;
+    }
+    // SAFETY: iov describes the title's writable buffer. The header, iov and address
+    // all live through the call.
+    let r = unsafe { libc::recvmsg(fd, &mut msg, bsd_msg_flags(flags)) };
+    if r < 0 {
+        return fail();
+    }
+    if msg.msg_namelen > 0 {
         from_bsd(&b, from, from_len);
     }
-    transferred(r)
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return fail_with(WSAEMSGSIZE);
+    }
+    r as i32
 }
 
 // Control.
@@ -659,6 +676,9 @@ pub extern "system" fn WSAIoctl(
     if !returned.is_null() {
         // SAFETY: the title's out parameter.
         unsafe { returned.write(0) };
+    }
+    if fd_of(s).is_none() {
+        return SOCKET_ERROR;
     }
     match code {
         FIONBIO if input_len >= 4 && !input.is_null() => {
@@ -731,7 +751,10 @@ pub extern "system" fn setsockopt_(
     let given = unsafe { std::slice::from_raw_parts(value, len as usize) };
     let r = match (level, name) {
         // SO_LINGER: two u_shorts on Windows, two ints here.
-        (0xFFFF, 0x80) if given.len() >= 4 => {
+        (0xFFFF, 0x80) => {
+            if given.len() < 4 {
+                return fail_with(WSAEFAULT);
+            }
             let on = i32::from(u16::from_le_bytes([given[0], given[1]]));
             let secs = i32::from(u16::from_le_bytes([given[2], given[3]]));
             let linger = [on, secs];
@@ -739,7 +762,10 @@ pub extern "system" fn setsockopt_(
             unsafe { setsockopt(fd, level, name, linger.as_ptr().cast(), 8) }
         }
         // Timeouts: milliseconds on Windows, a timeval here.
-        (0xFFFF, 0x1005 | 0x1006) if given.len() >= 4 => {
+        (0xFFFF, 0x1005 | 0x1006) => {
+            if given.len() < 4 {
+                return fail_with(WSAEFAULT);
+            }
             let ms = u32::from_le_bytes([given[0], given[1], given[2], given[3]]);
             let tv = BsdTimeval {
                 sec: i64::from(ms / 1000),
@@ -751,6 +777,9 @@ pub extern "system" fn setsockopt_(
         // Booleans and sizes are a BOOL or DWORD on Windows, an int here;
         // a byte-sized value (some titles pass one) is widened.
         _ => {
+            if given.is_empty() {
+                return fail_with(WSAEFAULT);
+            }
             let mut word = [0u8; 4];
             let n = given.len().min(4);
             word[..n].copy_from_slice(&given[..n]);
@@ -829,20 +858,31 @@ pub(super) struct WinTimeval {
     usec: i32,
 }
 
+enum FillError {
+    NotSock,
+    HighFd,
+}
+
 /// The descriptors of a Windows set, set in `bsd`; the highest descriptor
-/// plus one. Fails on a socket that is not ours.
-fn fill(set: *const WinFdSet, bsd: &mut [u32; BSD_FD_WORDS], max: &mut c_int) -> Option<()> {
+/// plus one. Fails on a socket that is not ours, or reports `HighFd` when a
+/// descriptor exceeds BSD `FD_SETSIZE` (1024).
+fn fill(set: *const WinFdSet, bsd: &mut [u32; BSD_FD_WORDS], max: &mut c_int) -> Result<(), FillError> {
     if set.is_null() {
-        return Some(());
+        return Ok(());
     }
     // SAFETY: the title passes an fd_set.
     let set = unsafe { &*set };
     for &s in &set.sockets[..(set.count as usize).min(WIN_FD_SETSIZE)] {
-        let fd = lock(&SOCKETS).get(&s).copied()?;
+        let Some(fd) = lock(&SOCKETS).get(&s).copied() else {
+            return Err(FillError::NotSock);
+        };
+        if fd < 0 || fd as usize >= BSD_FD_WORDS * 32 {
+            return Err(FillError::HighFd);
+        }
         bsd[fd as usize / 32] |= 1 << (fd % 32);
         *max = (*max).max(fd + 1);
     }
-    Some(())
+    Ok(())
 }
 
 /// Keeps in the Windows set only the sockets set in `bsd`.
@@ -856,6 +896,8 @@ fn keep(set: *mut WinFdSet, bsd: &[u32; BSD_FD_WORDS]) -> i32 {
     for i in 0..(set.count as usize).min(WIN_FD_SETSIZE) {
         let s = set.sockets[i];
         if let Some(&fd) = lock(&SOCKETS).get(&s)
+            && fd >= 0
+            && (fd as usize) < BSD_FD_WORDS * 32
             && bsd[fd as usize / 32] >> (fd % 32) & 1 != 0
         {
             set.sockets[kept] = s;
@@ -864,6 +906,84 @@ fn keep(set: *mut WinFdSet, bsd: &[u32; BSD_FD_WORDS]) -> i32 {
     }
     set.count = kept as u32;
     kept as i32
+}
+
+/// Fallback for `select_` when a socket descriptor is `>= 1024` (past BSD `FD_SETSIZE`).
+fn select_via_poll(
+    read: *mut WinFdSet,
+    write: *mut WinFdSet,
+    except: *mut WinFdSet,
+    timeout: *const WinTimeval,
+) -> i32 {
+    const POLLIN: i16 = 0x0001;
+    const POLLPRI: i16 = 0x0002;
+    const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
+    const POLLHUP: i16 = 0x0010;
+    let mut fds: Vec<BsdPollFd> = Vec::new();
+    let mut index: HashMap<c_int, usize> = HashMap::new();
+    for (set, ev) in [(read, POLLIN), (write, POLLOUT), (except, POLLPRI)] {
+        if set.is_null() {
+            continue;
+        }
+        // SAFETY: the title passes an fd_set.
+        let set = unsafe { &*set };
+        for &s in &set.sockets[..(set.count as usize).min(WIN_FD_SETSIZE)] {
+            let Some(fd) = lock(&SOCKETS).get(&s).copied() else {
+                return fail_with(WSAENOTSOCK);
+            };
+            if let Some(&pos) = index.get(&fd) {
+                fds[pos].events |= ev;
+            } else {
+                index.insert(fd, fds.len());
+                fds.push(BsdPollFd { fd, events: ev, revents: 0 });
+            }
+        }
+    }
+    let timeout_ms = if timeout.is_null() {
+        -1
+    } else {
+        // SAFETY: the title passes a timeval.
+        let t = unsafe { &*timeout };
+        if t.sec < 0 || t.usec < 0 {
+            return fail_with(WSAEINVAL);
+        }
+        let ms = i64::from(t.sec)
+            .saturating_mul(1000)
+            .saturating_add(i64::from(t.usec).saturating_add(999) / 1000);
+        ms.clamp(0, i64::from(i32::MAX)) as c_int
+    };
+    // SAFETY: `fds.len()` valid poll descriptors.
+    let n = unsafe { poll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms) };
+    if n < 0 {
+        return fail();
+    }
+    let mut ready = 0i32;
+    for (set, mask) in [
+        (read, POLLIN | POLLHUP | POLLERR),
+        (write, POLLOUT | POLLERR),
+        (except, POLLPRI | POLLERR),
+    ] {
+        if set.is_null() {
+            continue;
+        }
+        // SAFETY: the title passes an fd_set.
+        let set = unsafe { &mut *set };
+        let mut kept = 0;
+        for i in 0..(set.count as usize).min(WIN_FD_SETSIZE) {
+            let s = set.sockets[i];
+            if let Some(&fd) = lock(&SOCKETS).get(&s)
+                && let Some(&pos) = index.get(&fd)
+                && fds[pos].revents & mask != 0
+            {
+                set.sockets[kept] = s;
+                kept += 1;
+            }
+        }
+        set.count = kept as u32;
+        ready += kept as i32;
+    }
+    ready
 }
 
 pub extern "system" fn select_(
@@ -879,8 +999,10 @@ pub extern "system" fn select_(
     let mut sets = [[0u32; BSD_FD_WORDS]; 3];
     let mut max = 0;
     for (set, bsd) in [read, write, except].into_iter().zip(&mut sets) {
-        if fill(set, bsd, &mut max).is_none() {
-            return fail_with(WSAENOTSOCK);
+        match fill(set, bsd, &mut max) {
+            Ok(()) => {}
+            Err(FillError::NotSock) => return fail_with(WSAENOTSOCK),
+            Err(FillError::HighFd) => return select_via_poll(read, write, except, timeout),
         }
     }
     let mut tv = BsdTimeval { sec: 0, usec: 0 };
@@ -899,8 +1021,7 @@ pub extern "system" fn select_(
     if n < 0 {
         return fail();
     }
-    let ready = keep(read, r) + keep(write, w) + keep(except, e);
-    ready
+    keep(read, r) + keep(write, w) + keep(except, e)
 }
 
 pub extern "system" fn __WSAFDIsSet(s: Socket, set: *const WinFdSet) -> i32 {
@@ -942,6 +1063,7 @@ pub extern "system" fn WSAPoll(fds: *mut u8, count: u32, timeout: i32) -> i32 {
     if n < 0 {
         return fail();
     }
+    let mut ready = 0i32;
     for (i, p) in list.iter().enumerate() {
         let mut revents = 0i16;
         if p.fd < 0 || p.revents & 0x20 != 0 {
@@ -959,10 +1081,13 @@ pub extern "system" fn WSAPoll(fds: *mut u8, count: u32, timeout: i32) -> i32 {
         if p.revents & 0x10 != 0 {
             revents |= 2;
         }
+        if revents != 0 {
+            ready += 1;
+        }
         // SAFETY: as above.
         unsafe { fds.add(i * 16 + 10).cast::<i16>().write_unaligned(revents) };
     }
-    list.iter().filter(|p| p.fd < 0 || p.revents != 0).count() as i32
+    ready
 }
 
 // Byte order and address text.
@@ -1122,6 +1247,8 @@ pub extern "system" fn getaddrinfo_(
         set_wsa_error(WSAEINVAL);
         return WSAEINVAL;
     }
+    // SAFETY: the title's out parameter; cleared on every error path.
+    unsafe { result.write(std::ptr::null_mut()) };
     let name = text_of(node);
     if !resolvable(&name) {
         set_wsa_error(WSAHOST_NOT_FOUND);
@@ -1145,7 +1272,8 @@ pub extern "system" fn getaddrinfo_(
         let flags = word(0);
         wanted.flags = (flags & 0x507) | if flags & 8 != 0 { 0x1000 } else { 0 };
         let Some(family) = bsd_family(word(4)) else {
-            return fail_with(WSAEAFNOSUPPORT);
+            set_wsa_error(WSAEAFNOSUPPORT);
+            return WSAEAFNOSUPPORT;
         };
         wanted.family = family;
         wanted.socktype = word(8);
@@ -1249,7 +1377,8 @@ pub extern "system" fn getnameinfo_(
         return WSANOTINITIALISED;
     }
     let Some((b, _)) = to_bsd(addr, len) else {
-        return fail_with(WSAEAFNOSUPPORT);
+        set_wsa_error(WSAEAFNOSUPPORT);
+        return WSAEAFNOSUPPORT;
     };
     let ip = ip_of(&b);
     let port = u16::from_be_bytes([b[2], b[3]]);
@@ -1257,7 +1386,10 @@ pub extern "system" fn getnameinfo_(
     let name = match ip {
         Some(ip) if loopback(ip) && flags & 2 == 0 => "localhost".to_owned(),
         Some(ip) if flags & NI_NAMEREQD == 0 || flags & 2 != 0 => ip.to_string(),
-        _ => return fail_with(WSAHOST_NOT_FOUND),
+        _ => {
+            set_wsa_error(WSAHOST_NOT_FOUND);
+            return WSAHOST_NOT_FOUND;
+        }
     };
     let put = |out: *mut u8, room: u32, text: &str| -> bool {
         if out.is_null() {
@@ -1274,7 +1406,8 @@ pub extern "system" fn getnameinfo_(
         true
     };
     if !put(host, host_len, &name) || !put(service, service_len, &port.to_string()) {
-        return fail_with(WSA_NOT_ENOUGH_MEMORY);
+        set_wsa_error(WSA_NOT_ENOUGH_MEMORY);
+        return WSA_NOT_ENOUGH_MEMORY;
     }
     0
 }
@@ -1494,6 +1627,43 @@ mod tests {
     }
 
     #[test]
+    fn udp_receive_reports_truncation_and_accepts_an_exact_fit() {
+        let _turn = serial();
+        assert_eq!(WSAStartup(0x0202, std::ptr::null_mut()), 0);
+        let server = socket_(2, 2, 17);
+        let client = socket_(2, 2, 17);
+        assert_eq!(bind_(server, loopback_addr(0).as_ptr(), 16), 0);
+        assert_eq!(connect_(client, loopback_addr(port_of(server)).as_ptr(), 16), 0);
+        let sender = loopback_addr(port_of(client));
+        let mut buf = [0; 8];
+
+        for (packet, expected) in [(b"123456789".as_slice(), SOCKET_ERROR), (b"abcdefgh", 8)] {
+            let len = packet.len() as i32;
+            assert_eq!(send_(client, packet.as_ptr(), len, 0), len);
+            let mut from = [0; 28];
+            let mut from_len = 28;
+            assert_eq!(
+                recvfrom_(server, buf.as_mut_ptr(), 8, 0, from.as_mut_ptr(), &mut from_len),
+                expected
+            );
+            if expected == SOCKET_ERROR {
+                assert_eq!(WSAGetLastError(), 10040);
+            }
+            assert_eq!(&buf, &packet[..8]);
+            assert_eq!(from_len, 16);
+            assert_eq!(from[..16], sender);
+        }
+
+        assert_eq!(send_(client, b"987654321".as_ptr(), 9, 0), 9);
+        assert_eq!(recv_(server, buf.as_mut_ptr(), 8, 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), 10040);
+        assert_eq!(&buf, b"98765432");
+        assert_eq!(closesocket(client), 0);
+        assert_eq!(closesocket(server), 0);
+        assert_eq!(WSACleanup(), 0);
+    }
+
+    #[test]
     fn non_blocking_sockets_and_options_use_windows_semantics() {
         let _turn = serial();
         assert_eq!(WSAStartup(0x0202, std::ptr::null_mut()), 0);
@@ -1635,5 +1805,120 @@ mod tests {
             assert!(lookup("ws2_32.dll", name).is_some());
         }
         assert!(lookup("kernel32.dll", "connect").is_none());
+    }
+
+    #[test]
+    fn getaddrinfo_getnameinfo_sendto_and_validation_return_wsa_codes() {
+        let _turn = serial();
+        assert_eq!(WSAStartup(0x0202, std::ptr::null_mut()), 0);
+
+        // getaddrinfo returns the WSA error code directly (not SOCKET_ERROR) and clears *result.
+        let mut hints = [0u8; 48];
+        hints[4..8].copy_from_slice(&99i32.to_le_bytes());
+        let mut out = 0x1234 as *mut u8;
+        assert_eq!(
+            getaddrinfo_(c"localhost".as_ptr(), std::ptr::null(), hints.as_ptr(), &mut out),
+            WSAEAFNOSUPPORT
+        );
+        assert_eq!(WSAGetLastError(), WSAEAFNOSUPPORT);
+        assert!(out.is_null());
+
+        // getnameinfo returns the WSA error code directly (not SOCKET_ERROR).
+        let mut small = [0u8; 2];
+        assert_eq!(
+            getnameinfo_(
+                loopback_addr(443).as_ptr(),
+                16,
+                small.as_mut_ptr(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                2
+            ),
+            WSA_NOT_ENOUGH_MEMORY
+        );
+        assert_eq!(WSAGetLastError(), WSA_NOT_ENOUGH_MEMORY);
+        let mut bad_sa = loopback_addr(443);
+        bad_sa[0..2].copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            getnameinfo_(bad_sa.as_ptr(), 16, small.as_mut_ptr(), 2, std::ptr::null_mut(), 0, 2),
+            WSAEAFNOSUPPORT
+        );
+        let mut remote = loopback_addr(443);
+        remote[4..8].copy_from_slice(&[8, 8, 8, 8]);
+        let mut host = [0u8; 32];
+        assert_eq!(
+            getnameinfo_(
+                remote.as_ptr(),
+                16,
+                host.as_mut_ptr(),
+                32,
+                std::ptr::null_mut(),
+                0,
+                NI_NAMEREQD
+            ),
+            WSAHOST_NOT_FOUND
+        );
+
+        // Connected UDP socket accepts sendto with a null destination address.
+        let server = socket_(2, 2, 17);
+        let client = socket_(2, 2, 17);
+        assert_eq!(bind_(server, loopback_addr(0).as_ptr(), 16), 0);
+        let port = port_of(server);
+        assert_eq!(connect_(client, loopback_addr(port).as_ptr(), 16), 0);
+        assert_eq!(sendto_(client, b"ping".as_ptr(), 4, 0, std::ptr::null(), 0), 4);
+        let mut buf = [0u8; 8];
+        assert_eq!(recv_(server, buf.as_mut_ptr(), 8, 0), 4);
+        assert_eq!(&buf[..4], b"ping");
+
+        // Negative buffer lengths and null non-empty buffers fail instead of sending 0 bytes.
+        assert_eq!(send_(client, b"x".as_ptr(), -1, 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEINVAL);
+        assert_eq!(recv_(server, buf.as_mut_ptr(), -5, 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEINVAL);
+        assert_eq!(send_(client, std::ptr::null(), 4, 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEFAULT);
+
+        // Truncated SO_LINGER / timeout options fail with WSAEFAULT instead of falling through.
+        let short = [1u8; 2];
+        assert_eq!(setsockopt_(client, SOL_SOCKET_WIN, 0x80, short.as_ptr(), 2), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEFAULT);
+        assert_eq!(setsockopt_(client, SOL_SOCKET_WIN, 0x1006, short.as_ptr(), 2), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEFAULT);
+        assert_eq!(setsockopt_(client, IPPROTO_TCP, 1, short.as_ptr(), 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), WSAEFAULT);
+
+        // WSAIoctl checks socket validity before reporting WSAEOPNOTSUPP.
+        let mut returned = 7u32;
+        assert_eq!(
+            WSAIoctl(
+                INVALID_SOCKET,
+                0x1234_5678,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(WSAGetLastError(), WSAENOTSOCK);
+
+        // select_via_poll handles readiness cleanly for descriptors beyond FD_SETSIZE.
+        assert_eq!(sendto_(client, b"ok".as_ptr(), 2, 0, std::ptr::null(), 0), 2);
+        let mut read = WinFdSet { count: 1, sockets: [0; 64] };
+        read.sockets[0] = server;
+        let tv = WinTimeval { sec: 1, usec: 0 };
+        assert_eq!(
+            select_via_poll(&mut read, std::ptr::null_mut(), std::ptr::null_mut(), &tv),
+            1
+        );
+        assert_eq!(__WSAFDIsSet(server, &read), 1);
+
+        closesocket(client);
+        closesocket(server);
+        assert_eq!(WSACleanup(), 0);
     }
 }

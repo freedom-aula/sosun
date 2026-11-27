@@ -171,12 +171,24 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
 
 /// A root SRV or UAV address as the translator's root views want it (`emit`, "Root SRVs and root
 /// UAVs"): the heap index of the view pair's SRV (the UAV is the next entry) and the byte offset of
-/// the address in the view. An address no mapping shows is the null view at offset 0.
+/// the address in the view. The first containing mapping wins. An unmapped address gets the null
+/// view at offset 0.
 pub fn root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+    let mapping = maps.iter().find(|m| address >= m.at && address - m.at < m.len);
+    mapped_root_view(mapping, pairs, first, address)
+}
+
+/// Root view in a pool-table snapshot: starts are strictly increasing and no range extends
+/// past the next start, so only the last mapping starting at or before the address can contain it.
+pub(super) fn sorted_root_view(maps: &[Mapping], pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
+    let end = maps.partition_point(|m| m.at <= address);
+    let mapping = maps[..end].last().filter(|m| address - m.at < m.len);
+    mapped_root_view(mapping, pairs, first, address)
+}
+
+fn mapped_root_view(mapping: Option<&Mapping>, pairs: &mut Pairs, first: u32, address: u64) -> (u32, u32) {
     let null = (pair_index(first, 0), 0);
-    let Some(m) = maps.iter().find(|m| address >= m.at && address - m.at < m.len) else {
-        return null;
-    };
+    let Some(m) = mapping else { return null };
     let pool_at = m.offset + (address - m.at);
     let key = PairKey {
         pool: m.pool,
@@ -258,6 +270,39 @@ mod tests {
         assert_eq!(root_view(&maps, &mut pairs, first, 0x20_0000_0010).0, pair_index(first, 2));
         // Nothing mapped: the null view.
         assert_eq!(root_view(&maps, &mut pairs, first, 0x30_0000_0000), (pair_index(first, 0), 0));
+    }
+
+    #[test]
+    fn sorted_root_views_match_linear_lookup_at_mapping_and_chunk_boundaries() {
+        let start = (1 << 32) + 100;
+        let maps = [
+            map(start, 0, 1, 16, 0),
+            map(start + 2, 8, 2, CHUNK + 4, CHUNK - 4),
+            map(start + 10, 3, 3, 32, 17),
+            map(start + 14, 0, 4, 16, 0),
+            map(start + 17, 2, 2, CHUNK + 4, 1),
+        ];
+        // Try every prefix so each mapping is also tested as the final entry, and the table can be empty.
+        for len in 0..=maps.len() {
+            let maps = &maps[..len];
+            let (mut sorted, mut linear) = (Pairs::default(), Pairs::default());
+            for address in (start - 1..=start + 20).chain([0, u64::MAX]) {
+                assert_eq!(
+                    sorted_root_view(maps, &mut sorted, FIRST, address),
+                    root_view(maps, &mut linear, FIRST, address),
+                    "len {len}, address {address:#x}"
+                );
+                assert_eq!(sorted.keys, linear.keys);
+            }
+        }
+    }
+
+    #[test]
+    fn root_view_uses_the_first_match_in_an_unsorted_slice() {
+        let maps = [map(12, 4, 1, 32, 23), map(10, 10, 2, 16, 0)];
+        let mut pairs = Pairs::default();
+        assert_eq!(root_view(&maps, &mut pairs, FIRST, 13), (pair_index(FIRST, 1), 24));
+        assert_eq!(pairs.keys[0].unwrap().pool, 1);
     }
 
     /// Where a heap of a thousand title entries has its pairs.

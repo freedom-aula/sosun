@@ -152,6 +152,18 @@ const VALU: &str = unfollowed!("a VALU operation it does not model");
 /// Every step modelled, but the value is no single reduction or prefix.
 pub(crate) const NO_SHAPE: &str = unfollowed!("a value that is no reduction or prefix");
 
+/// Section lowering can replace register results, but cannot replay effects on
+/// lanes the host is not executing. Admit register operations conservatively.
+pub(super) fn register_only(inst: &Inst) -> bool {
+    match &inst.fields {
+        Fields::Valu(v) => v.dst.is_some(),
+        Fields::Sop { .. } => {
+            matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
+        }
+        _ => false,
+    }
+}
+
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;

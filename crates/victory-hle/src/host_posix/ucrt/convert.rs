@@ -353,6 +353,14 @@ fn ascii_of(u: &[u16]) -> Vec<u8> {
 }
 
 pub extern "system" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
+    if s.is_null() {
+        if !end.is_null() {
+            // SAFETY: the title passes a valid pointer or null.
+            unsafe { end.write(s) };
+        }
+        bad_param(EINVAL);
+        return 0.0;
+    }
     // SAFETY: a NUL-terminated string.
     let b = unsafe { super::bytes(s) };
     let (v, n) = parse_double(b).unwrap_or((0.0, 0));
@@ -364,6 +372,14 @@ pub extern "system" fn strtod(s: *const u8, end: *mut *const u8) -> f64 {
 }
 
 pub extern "system" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
+    if s.is_null() {
+        if !end.is_null() {
+            // SAFETY: the title passes a valid pointer or null.
+            unsafe { end.write(s) };
+        }
+        bad_param(EINVAL);
+        return 0.0;
+    }
     // SAFETY: a NUL-terminated string.
     let b = unsafe { super::bytes(s) };
     let (v, n) = parse_single(b).unwrap_or((0.0, 0));
@@ -375,6 +391,14 @@ pub extern "system" fn strtof(s: *const u8, end: *mut *const u8) -> f32 {
 }
 
 pub extern "system" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
+    if s.is_null() {
+        if !end.is_null() {
+            // SAFETY: the title passes a valid pointer or null.
+            unsafe { end.write(s) };
+        }
+        bad_param(EINVAL);
+        return 0.0;
+    }
     // SAFETY: a NUL-terminated string.
     let b = ascii_of(unsafe { super::wide(s) });
     let (v, n) = parse_double(&b).unwrap_or((0.0, 0));
@@ -386,6 +410,14 @@ pub extern "system" fn wcstod(s: *const u16, end: *mut *const u16) -> f64 {
 }
 
 pub extern "system" fn wcstof(s: *const u16, end: *mut *const u16) -> f32 {
+    if s.is_null() {
+        if !end.is_null() {
+            // SAFETY: the title passes a valid pointer or null.
+            unsafe { end.write(s) };
+        }
+        bad_param(EINVAL);
+        return 0.0;
+    }
     // SAFETY: a NUL-terminated string.
     let b = ascii_of(unsafe { super::wide(s) });
     let (v, n) = parse_single(&b).unwrap_or((0.0, 0));
@@ -569,6 +601,15 @@ pub extern "system" fn mbstowcs(dst: *mut u16, src: *const u8, count: usize) -> 
     }
 }
 
+/// The largest prefix of valid UTF-8 `m` of at most `limit` bytes on a character boundary.
+fn utf8_floor(m: &[u8], limit: usize) -> usize {
+    let mut n = m.len().min(limit);
+    while n < m.len() && n > 0 && m[n] & 0xC0 == 0x80 {
+        n -= 1;
+    }
+    n
+}
+
 pub extern "system" fn wcstombs(dst: *mut u8, src: *const u16, count: usize) -> usize {
     // SAFETY: a NUL-terminated string and the title's buffer of `count` bytes.
     unsafe {
@@ -580,10 +621,7 @@ pub extern "system" fn wcstombs(dst: *mut u8, src: *const u16, count: usize) -> 
             return m.len();
         }
         // Whole characters only.
-        let mut n = m.len().min(count);
-        while n < m.len() && n > 0 && m[n] & 0xC0 == 0x80 {
-            n -= 1;
-        }
+        let n = utf8_floor(&m, count);
         std::ptr::copy_nonoverlapping(m.as_ptr(), dst, n);
         if n < count {
             dst.add(n).write(0);
@@ -603,7 +641,14 @@ pub extern "system" fn mbstowcs_s(
         // SAFETY: the title passes a valid pointer or null.
         unsafe { ret.write(0) };
     }
-    if src.is_null() || (dst.is_null() && size != 0) || (!dst.is_null() && size == 0) {
+    if (dst.is_null() && size != 0) || (!dst.is_null() && size == 0) {
+        return bad_param(EINVAL);
+    }
+    if src.is_null() {
+        if !dst.is_null() {
+            // SAFETY: the title's buffer has at least one unit.
+            unsafe { dst.write(0) };
+        }
         return bad_param(EINVAL);
     }
     // SAFETY: a NUL-terminated string.
@@ -614,15 +659,16 @@ pub extern "system" fn mbstowcs_s(
         }
         return super::fail(EILSEQ);
     };
-    if count != TRUNCATE {
-        w.truncate(count);
-    }
+    // Size query: `count` is ignored when `dst` is null.
     if dst.is_null() {
         if !ret.is_null() {
             // SAFETY: valid pointer.
             unsafe { ret.write(w.len() + 1) };
         }
         return 0;
+    }
+    if count != TRUNCATE {
+        w.truncate(count);
     }
     let mut status = 0;
     if w.len() + 1 > size {
@@ -656,7 +702,14 @@ pub extern "system" fn wcstombs_s(
         // SAFETY: the title passes a valid pointer or null.
         unsafe { ret.write(0) };
     }
-    if src.is_null() || (dst.is_null() && size != 0) || (!dst.is_null() && size == 0) {
+    if (dst.is_null() && size != 0) || (!dst.is_null() && size == 0) {
+        return bad_param(EINVAL);
+    }
+    if src.is_null() {
+        if !dst.is_null() {
+            // SAFETY: the title's buffer has at least one byte.
+            unsafe { dst.write(0) };
+        }
         return bad_param(EINVAL);
     }
     // SAFETY: a NUL-terminated string.
@@ -667,15 +720,16 @@ pub extern "system" fn wcstombs_s(
         }
         return super::fail(EILSEQ);
     };
-    if count != TRUNCATE {
-        m.truncate(count);
-    }
+    // Size query: `count` is ignored when `dst` is null.
     if dst.is_null() {
         if !ret.is_null() {
             // SAFETY: valid pointer.
             unsafe { ret.write(m.len() + 1) };
         }
         return 0;
+    }
+    if count != TRUNCATE {
+        m.truncate(utf8_floor(&m, count));
     }
     let mut status = 0;
     if m.len() + 1 > size {
@@ -684,11 +738,7 @@ pub extern "system" fn wcstombs_s(
             unsafe { dst.write(0) };
             return bad_param(ERANGE);
         }
-        let mut n = size - 1;
-        while n > 0 && m[n] & 0xC0 == 0x80 {
-            n -= 1;
-        }
-        m.truncate(n);
+        m.truncate(utf8_floor(&m, size - 1));
         status = super::STRUNCATE;
     }
     // SAFETY: the title's buffer holds `m` and a NUL.
@@ -1172,5 +1222,82 @@ mod tests {
         assert_eq!(wcsrtombs(bytes[2..].as_mut_ptr(), &mut src, 5, 0), 4);
         assert!(src.is_null());
         assert_eq!(&bytes[..6], "é€x".as_bytes());
+    }
+
+    #[test]
+    fn size_queries_utf8_boundaries_and_null_float_inputs() {
+        let narrow = "aé€😀\0".as_bytes();
+        let mut n = 99;
+        // Null destination queries full converted length + NUL, ignoring `count`.
+        assert_eq!(
+            mbstowcs_s(&mut n, std::ptr::null_mut(), 0, narrow.as_ptr(), 0),
+            0
+        );
+        assert_eq!(n, 6);
+        let wide = w("aé€");
+        n = 99;
+        assert_eq!(
+            wcstombs_s(&mut n, std::ptr::null_mut(), 0, wide.as_ptr(), 0),
+            0
+        );
+        assert_eq!(n, 7);
+
+        // `wcstombs_s` with an explicit byte `count` stops on a UTF-8 character boundary.
+        let mut out = [0xEEu8; 8];
+        let a_euro = w("a€");
+        assert_eq!(
+            wcstombs_s(&mut n, out.as_mut_ptr(), out.len(), a_euro.as_ptr(), 2),
+            0
+        );
+        assert_eq!(n, 2);
+        assert_eq!(&out[..2], b"a\0");
+
+        let euro = w("€");
+        out = [0xEEu8; 8];
+        assert_eq!(
+            wcstombs_s(&mut n, out.as_mut_ptr(), out.len(), euro.as_ptr(), 2),
+            0
+        );
+        assert_eq!(n, 1);
+        assert_eq!(out[0], 0);
+
+        // Null `src` empties `dst` and reports `EINVAL`.
+        out[0] = b'x';
+        assert_eq!(
+            wcstombs_s(&mut n, out.as_mut_ptr(), out.len(), std::ptr::null(), 4),
+            EINVAL
+        );
+        assert_eq!(out[0], 0);
+        let mut wout = [u16::from(b'x'); 4];
+        assert_eq!(
+            mbstowcs_s(&mut n, wout.as_mut_ptr(), wout.len(), std::ptr::null(), 4),
+            EINVAL
+        );
+        assert_eq!(wout[0], 0);
+
+        // Null input pointers to floating-point parsers report `EINVAL` instead of dereferencing.
+        let mut end8 = narrow.as_ptr();
+        set_errno(0);
+        assert_eq!(strtod(std::ptr::null(), &mut end8), 0.0);
+        assert!(end8.is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+
+        end8 = narrow.as_ptr();
+        set_errno(0);
+        assert_eq!(strtof(std::ptr::null(), &mut end8), 0.0);
+        assert!(end8.is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+
+        let mut end16 = wide.as_ptr();
+        set_errno(0);
+        assert_eq!(wcstod(std::ptr::null(), &mut end16), 0.0);
+        assert!(end16.is_null());
+        assert_eq!(super::super::errno(), EINVAL);
+
+        end16 = wide.as_ptr();
+        set_errno(0);
+        assert_eq!(wcstof(std::ptr::null(), &mut end16), 0.0);
+        assert!(end16.is_null());
+        assert_eq!(super::super::errno(), EINVAL);
     }
 }

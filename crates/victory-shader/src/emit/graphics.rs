@@ -1293,6 +1293,69 @@ mod tests {
         super::super::translate_with(&c, options)
     }
 
+    #[test]
+    fn a_mesh_mask_join_reads_each_lanes_bit_of_the_scalar_pair() {
+        let code = [
+            0xBEFE_0481, // s_mov_b64 exec, 1
+            0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5 (128 mesh threads)
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            0xD765_0000, 0x0201_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+            0x8014_8108, // s_add_u32 s20, s8, 1
+            0x8095_8108, // s_sub_u32 s21, s8, 1
+            0xBF06_8008, // s_cmp_eq_u32 s8, 0
+            0xBF85_0002, // s_cbranch_scc1 join
+            0xD4C4_0014, 0x0002_0089, // v_cmp_gt_u32 s[20:21], 9, v0
+            0xD501_0001, 0x0051_0280, // join: v_cndmask_b32 v1, 0, 1, s[20:21]
+            0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            0xF800_0941, 0x0000_0001, // exp prim v1 done
+            ENDPGM,
+        ];
+        let shader = mesh(&code).unwrap();
+        assert_eq!(shader.stage, HwStage::Ms);
+
+        let mut missing_high = code;
+        missing_high[6] = 0xBF80_0000; // s_nop 0: s21 is an unknown hardware input
+        let err = mesh(&missing_high).unwrap_err();
+        assert!(err.to_string().contains("high dword is not known"), "{err}");
+
+        // Wave32 needs only s20, even when s21 has no value on the data edge.
+        let mut wave32 = missing_high;
+        wave32[0] = 0xBEFE_0381; // s_mov_b32 exec_lo, 1
+        wave32[2] = 0xBEFE_03C1; // s_mov_b32 exec_lo, -1
+        mesh(&wave32).unwrap();
+
+        // Each 32-lane host wave can read a different first lane of v0.
+        let mut split = code.to_vec();
+        split.splice(7..8, [
+            0x7E14_0500, // v_readfirstlane_b32 s10, v0
+            0xBF06_800A, // s_cmp_eq_u32 s10, 0
+        ]);
+        let err = mesh(&split).unwrap_err();
+        assert!(err.to_string().contains("lane-mask join"), "{err}");
+        let mut split_high = code;
+        split_high[6] = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+        let err = mesh(&split_high).unwrap_err();
+        assert!(err.to_string().contains("lane-mask join"), "{err}");
+
+        // Both arms jump to the join, but different lanes enter them. The
+        // compare before the fork can include lanes that take the data arm.
+        let divergent = [
+            &code[..5],
+            &[
+                0xD4C4_000A, 0x0002_0089, // v_cmp_gt_u32 s[10:11], 9, v0
+                0x7DA8_0084, // v_cmpx_gt_u32 4, v0
+                0xBF88_0003, // s_cbranch_execz mask
+                code[5], code[6], // data arm
+                0xBF82_0001, // s_branch join
+                0xBE94_040A, // mask: s_mov_b64 s[20:21], s[10:11]
+                0xBEFE_04C1, // join: s_mov_b64 exec, -1
+            ],
+            &code[11..],
+        ].concat();
+        let err = mesh(&divergent).unwrap_err();
+        assert!(err.to_string().contains("lane-mask join"), "{err}");
+    }
+
     /// The title's mesh programs read root constants of two dwords (b500, user data 13 and 14 in
     /// their metadata, which gives one) just below the descriptor heap's SGPR (15, inferred).
     /// The constants reach up to the heap, so the second dword is user data, not a hardware SGPR.

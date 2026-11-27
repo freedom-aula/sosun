@@ -16,18 +16,27 @@ use victory_loader::native::call_win64;
 // memory
 
 pub extern "system" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if n == 0 {
+        return dst;
+    }
     // SAFETY: the title's buffers; they do not overlap by contract.
     unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
     dst
 }
 
 pub extern "system" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if n == 0 {
+        return dst;
+    }
     // SAFETY: the title's buffers.
     unsafe { std::ptr::copy(src, dst, n) };
     dst
 }
 
 pub extern "system" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
+    if n == 0 {
+        return dst;
+    }
     // SAFETY: the title's buffer.
     unsafe { dst.write_bytes(c as u8, n) };
     dst
@@ -38,6 +47,9 @@ fn sign(o: std::cmp::Ordering) -> i32 {
 }
 
 pub extern "system" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    if n == 0 {
+        return 0;
+    }
     // SAFETY: the title's buffers.
     let (a, b) = unsafe {
         (
@@ -49,6 +61,9 @@ pub extern "system" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 }
 
 pub extern "system" fn memchr(p: *const u8, c: i32, n: usize) -> *const u8 {
+    if n == 0 {
+        return std::ptr::null();
+    }
     // SAFETY: the title's buffer.
     let s = unsafe { std::slice::from_raw_parts(p, n) };
     s.iter()
@@ -57,6 +72,9 @@ pub extern "system" fn memchr(p: *const u8, c: i32, n: usize) -> *const u8 {
 }
 
 pub extern "system" fn _memicmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    if n == 0 {
+        return 0;
+    }
     // SAFETY: the title's buffers.
     let (a, b) = unsafe {
         (
@@ -199,7 +217,9 @@ unsafe fn g_ncpy<C: Ch>(dst: *mut C, src: *const C, n: usize) -> *mut C {
     // SAFETY: the title's buffers; pads with NULs as `strncpy` does.
     unsafe {
         let len = len_max(src, n);
-        std::ptr::copy(src, dst, len);
+        if len > 0 {
+            std::ptr::copy(src, dst, len);
+        }
         for i in len..n {
             dst.add(i).write(C::default());
         }
@@ -218,7 +238,9 @@ unsafe fn g_ncat<C: Ch>(dst: *mut C, src: *const C, n: usize) -> *mut C {
     unsafe {
         let end = dst.add(g_len(dst));
         let len = len_max(src, n);
-        std::ptr::copy(src, end, len);
+        if len > 0 {
+            std::ptr::copy(src, end, len);
+        }
         end.add(len).write(C::default());
     }
     dst
@@ -362,7 +384,9 @@ unsafe fn g_put_s<C: Ch>(
             dst.write(C::default());
             return bad_param(ERANGE);
         }
-        std::ptr::copy(src, at, take);
+        if take > 0 {
+            std::ptr::copy(src, at, take);
+        }
         at.add(take).write(C::default());
         if truncating {
             set_errno(STRUNCATE);
@@ -880,24 +904,36 @@ pub extern "system" fn _wcserror(e: i32) -> *const u16 {
 }
 
 pub extern "system" fn wmemcpy(d: *mut u16, s: *const u16, n: usize) -> *mut u16 {
+    if n == 0 {
+        return d;
+    }
     // SAFETY: the title's buffers.
     unsafe { std::ptr::copy_nonoverlapping(s, d, n) };
     d
 }
 
 pub extern "system" fn wmemmove(d: *mut u16, s: *const u16, n: usize) -> *mut u16 {
+    if n == 0 {
+        return d;
+    }
     // SAFETY: the title's buffers.
     unsafe { std::ptr::copy(s, d, n) };
     d
 }
 
 pub extern "system" fn wmemset(d: *mut u16, c: u16, n: usize) -> *mut u16 {
+    if n == 0 {
+        return d;
+    }
     // SAFETY: the title's buffer.
     unsafe { std::slice::from_raw_parts_mut(d, n) }.fill(c);
     d
 }
 
 pub extern "system" fn wmemcmp(a: *const u16, b: *const u16, n: usize) -> i32 {
+    if n == 0 {
+        return 0;
+    }
     // SAFETY: the title's buffers.
     let (a, b) = unsafe {
         (
@@ -909,6 +945,9 @@ pub extern "system" fn wmemcmp(a: *const u16, b: *const u16, n: usize) -> i32 {
 }
 
 pub extern "system" fn wmemchr(p: *const u16, c: u16, n: usize) -> *const u16 {
+    if n == 0 {
+        return std::ptr::null();
+    }
     // SAFETY: the title's buffer.
     let s = unsafe { std::slice::from_raw_parts(p, n) };
     s.iter()
@@ -1769,5 +1808,36 @@ mod tests {
             unsafe { super::super::bytes(strerror(9999)) },
             b"Unknown error"
         );
+    }
+
+    #[test]
+    fn zero_length_memory_and_copy_ops_accept_null_pointers() {
+        assert!(memcpy(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        assert!(memmove(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        assert!(memset(std::ptr::null_mut(), 0xAA, 0).is_null());
+        assert_eq!(memcmp(std::ptr::null(), std::ptr::null(), 0), 0);
+        assert!(memchr(std::ptr::null(), i32::from(b'a'), 0).is_null());
+        assert_eq!(_memicmp(std::ptr::null(), std::ptr::null(), 0), 0);
+
+        assert!(wmemcpy(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        assert!(wmemmove(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        assert!(wmemset(std::ptr::null_mut(), 0x1234, 0).is_null());
+        assert_eq!(wmemcmp(std::ptr::null(), std::ptr::null(), 0), 0);
+        assert!(wmemchr(std::ptr::null(), u16::from(b'a'), 0).is_null());
+
+        assert!(strncpy(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        assert!(wcsncpy(std::ptr::null_mut(), std::ptr::null(), 0).is_null());
+        let mut narrow = *b"hi\0x";
+        assert_eq!(
+            strncat(narrow.as_mut_ptr(), std::ptr::null(), 0),
+            narrow.as_mut_ptr()
+        );
+        assert_eq!(&narrow[..3], b"hi\0");
+        let mut wide = w("hi");
+        assert_eq!(
+            wcsncat(wide.as_mut_ptr(), std::ptr::null(), 0),
+            wide.as_mut_ptr()
+        );
+        assert_eq!(wide, w("hi"));
     }
 }

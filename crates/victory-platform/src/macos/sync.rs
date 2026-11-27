@@ -112,8 +112,10 @@ impl Semaphore {
         }
         *count += n;
         drop(count);
-        for _ in 0..n {
-            self.cv.notify_one();
+        match n {
+            0 => {}
+            1 => self.cv.notify_one(),
+            _ => self.cv.notify_all(),
         }
         Some(before)
     }
@@ -201,4 +203,59 @@ pub fn wake_one(addr: &AtomicU32) {
 pub fn wake_all(addr: &AtomicU32) {
     // SAFETY: as above.
     unsafe { os_sync_wake_by_address_all(addr.as_ptr(), 4, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Semaphore;
+    use std::sync::{Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn semaphore_can_release_the_maximum_count_promptly() {
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let semaphore = Semaphore::new(0, u32::MAX).unwrap();
+            let previous = semaphore.release(u32::MAX);
+            tx.send((previous, semaphore.release(0))).unwrap();
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("bulk release timed out"),
+            (Some(0), Some(u32::MAX))
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn semaphore_waiters_can_only_take_released_permits() {
+        let semaphore = Semaphore::new(0, 2).unwrap();
+        let ready = Barrier::new(4);
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..3 {
+                let (semaphore, ready, tx) = (&semaphore, &ready, tx.clone());
+                scope.spawn(move || {
+                    ready.wait();
+                    tx.send(semaphore.wait(Some(Duration::from_secs(5))))
+                        .unwrap();
+                });
+            }
+            ready.wait();
+            // Give the workers a chance to enter the condition variable wait.
+            thread::sleep(Duration::from_millis(20));
+
+            assert_eq!(semaphore.release(0), Some(0));
+            assert!(!semaphore.wait(Some(Duration::ZERO)));
+            assert_eq!(semaphore.release(2), Some(0));
+            for _ in 0..2 {
+                assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            }
+            assert_eq!(semaphore.release(1), Some(0));
+            assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            assert!(!semaphore.wait(Some(Duration::ZERO)));
+        });
+    }
 }

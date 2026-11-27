@@ -127,6 +127,18 @@ fn last_error() -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
+#[cfg(not(windows))]
+extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return super::xasync::E_INVALIDARG;
+    }
+    put(out, std::ptr::null_mut());
+    NOT_SUPPORTED
+}
+
+#[cfg(not(windows))]
+extern "system" fn close_deferral(_: This, _handle: *mut c_void) {}
+
 // shortcut: screenshots fail as if capture were unavailable. Taking one needs
 // a hook in the GPU side: the last presented frame read back as BGRA8 (size,
 // row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
@@ -144,7 +156,6 @@ static HDR_VTABLE: Methods<5> = Methods([
     try_enable_hdr as *const (), // 0x20
 ]);
 
-#[cfg(windows)]
 static SHELL_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
@@ -152,13 +163,6 @@ static SHELL_VTABLE: Methods<6> = Methods([
     launch_uri as *const (),       // 0x18
     acquire_deferral as *const (), // 0x20
     close_deferral as *const (),   // 0x28
-]);
-#[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    launch_uri as *const (),
 ]);
 
 static CAPTURE_VTABLE: Methods<6> = Methods([
@@ -170,10 +174,10 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::xgameruntime::{S_OK, method};
+    use crate::modules::xgameruntime::method;
 
     #[test]
     fn sdr_and_display_deferrals() {
@@ -184,14 +188,22 @@ mod tests {
         );
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
-        let mut handle = std::ptr::null_mut();
+        assert_eq!(
+            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, std::ptr::null_mut()),
+            super::super::xasync::E_INVALIDARG
+        );
+        let mut handle = std::ptr::dangling_mut::<c_void>();
         match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
-            S_OK => {
+            #[cfg(windows)]
+            crate::modules::xgameruntime::S_OK => {
                 assert!(!handle.is_null());
                 method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
             }
-            // Windows can reject display power requests on some hosts.
-            NOT_SUPPORTED => assert!(handle.is_null()),
+            // Non-Windows hosts (and some Windows hosts) report display deferrals unsupported.
+            NOT_SUPPORTED => {
+                assert!(handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
             hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
         }
     }
