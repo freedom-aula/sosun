@@ -2708,6 +2708,38 @@ fn a_pixel_program_joins_a_loop_mask_of_all_lanes_or_none_on_the_hosts_lanes() {
     assert!(err.contains("data, on the host's lanes"), "{err}");
 }
 
+/// A register holding data is reused as a mask in an if's then part, and the else part, a block
+/// further down, first clears its own lanes' bits of it (`s_andn2` by EXEC). No lane that skipped
+/// the then part reads the data, so the join needs no bit from that edge. With `s_and` by EXEC
+/// the else lanes read it, and that stays refused.
+#[test]
+fn a_pixel_program_joins_data_an_else_part_clears_with_its_exec() {
+    let program = |clear: u32| {
+        [
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0xD404_0001, 0x0002_0300, // v_cmp_gt_f32 s1, v0, v1
+            0xBE82_3C01, // s_and_saveexec_b32 s2, s1
+            0xBF88_0001, // s_cbranch_execz else
+            0xBE80_03C1, // s_mov_b32 s0, -1
+            // else:
+            0x8A7E_7E02, // s_andn2_b32 exec_lo, s2, exec_lo
+            0xBF88_0004, // s_cbranch_execz end
+            0xD401_0003, 0x0002_0500, // v_cmp_lt_f32 s3, v0, v2
+            clear,       // s_andn2_b32 (or s_and_b32) s0, s0, exec_lo
+            0x8800_0300, // s_or_b32 s0, s0, s3
+            // end:
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xD501_0001, 0x0002_0300, // v_cndmask_b32 v1, v0, v1, s0
+            0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ]
+    };
+    let ps = |code: &[u32]| lower_ps(code, false, vec![], vec![], 0, 0, vec![], false);
+    ps(&program(0x8A00_7E00)).unwrap_or_else(|e| panic!("s_andn2: {e}"));
+    let err = ps(&program(0x8700_7E00)).err().expect("s_and keeps the data").to_string();
+    assert!(err.contains("data, on the host's lanes"), "{err}");
+}
+
 /// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
 fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};

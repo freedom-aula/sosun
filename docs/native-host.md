@@ -534,6 +534,14 @@ SCC's all-or-nothing (`s_cselect_b64 s, -1, 0`) on entry and -1 on the way round
 structure cannot join because it is no function of fixed lane bits. Of the 9,995 dumped pixel
 programs, 338 more translate (7,172 to 7,510), and none regress. Test:
 `emit::gfx_refusal_tests::a_pixel_program_joins_a_loop_mask_of_all_lanes_or_none_on_the_hosts_lanes`.
+Data an edge brings is not needed at all where no lane of that edge reads its bit
+(`Lower::unneeded_edges`). That now covers the else part of an if that reuses a data register as
+a mask: the then part writes the mask, the lanes that skipped it bring the data to the join, and
+the else part, a block further down, first clears its own lanes' bits (`s_andn2` by EXEC, where
+every lane of the edge is in EXEC). A read in another block counts only where neither block is on
+a cycle. Of the 9,995 dumped pixel programs, 273 more translate (7,606 to 7,879), none regress and
+24 lane-mask joins stay refused (285 before); the vertex corpus is unchanged. Test:
+`emit::gfx_refusal_tests::a_pixel_program_joins_data_an_else_part_clears_with_its_exec`.
 
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
