@@ -2437,12 +2437,10 @@ fn a_cross_lane_operation_outside_compute_says_which_and_where() {
     }
 }
 
-/// A `v_mul_f32` butterfly over the wave, as `WaveActiveProduct` expands, is
-/// the product of the lanes: it lowers like the sum and min/max sections.
-#[test]
-fn whole_wave_float_products_lower() {
+/// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
+fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};
-    let code = [
+    let mut code = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202,
         0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -2460,15 +2458,96 @@ fn whole_wave_float_products_lower() {
         0xD778_0002,
         0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
         0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+    ];
+    code.extend_from_slice(step);
+    code.extend([
         0xBEFE_0302, // s_mov_b32 exec_lo, s2
         0xE070_0000,
         0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
         0xBF81_0000, // s_endpgm
-    ];
+    ]);
     let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
     let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
     let container = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
-    if let Err(e) = translate_with(&container, Options::default()) {
+    translate_with(&container, Options::default())
+}
+
+#[test]
+fn whole_wave_float_products_lower() {
+    let product = whole_wave_product(&[]).expect("pure wave product");
+    let dead_move = whole_wave_product(&[0x7E04_0280]).expect("v_mov_b32 v2, 0");
+    assert_eq!(product.dxil, dead_move.dxil);
+}
+
+#[test]
+fn whole_wave_sections_refuse_unmodeled_effects_at_the_instruction() {
+    for (name, step) in [
+        ("buffer_store_dword", &[0xE070_0004, 0x8002_0100][..]),
+        ("buffer_atomic_add", &[0xE0C8_4004, 0x8002_0000]), // glc, unused result in v0
+        ("global_store_dword", &[0xDC70_8000, 0x007D_0100]),
+        ("image_store", &[0xF020_9F08, 0x0002_0100]),
+        ("exp", &[0xF800_1890, 0x0000_0000]), // exp null, done vm
+        ("ds_write_b32", &[0xD834_0000, 0x0000_0001]),
+        ("s_barrier", &[0xBF8A_0000]),
+        ("s_setreg_imm32_b32", &[0xBA80_0881, 3]), // change FP rounding mode
+    ] {
+        let err = whole_wave_product(step).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { offset: 68, what }) if what == name),
+            "{name}: {err:?}"
+        );
+    }
+}
+
+/// A wave64 compute program of `threads` lanes with five root-constant SGPRs (`s[2:3]` an
+/// address), through `emit_with` as `translate_with` runs it on a 32-lane host.
+fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![root_const(0, 5)],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo { rsrc2: u32::from(lds) << 15 | 5 << 1, threads: [threads, 1, 1] }),
+        code: bytes_of(words),
+    };
+    let p = ir::build(&native.code, true, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty)?;
+    super::emit_with(&c, &native, &p, &st, &io, &res, Options { wave32_host: true, ..Options::default() })
+}
+
+/// Lanes below 40 read lane 35 and `exec_hi` as data behind an EXEC branch (`lockstep.rs`): the
+/// halves no longer meet at the exchange on the fast path, so the lockstep one translates it.
+pub(crate) const LOCKSTEP_READLANE: &[u32] = &[
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+    0xBF88_0008, // s_cbranch_execz 8
+    0xD760_0006,
+    0x0001_4703, // v_readlane_b32 s6, v3, 35
+    0x7E04_0206, // v_mov_b32 v2, s6
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0x7E04_027F, // v_mov_b32 v2, exec_hi
+    0xDC70_8100,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:256
+    0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_lane_read_behind_an_exec_branch_translates_in_lockstep() {
+    if let Err(e) = emit_wave64_cs(LOCKSTEP_READLANE, 64, false) {
         panic!("{e}");
     }
 }

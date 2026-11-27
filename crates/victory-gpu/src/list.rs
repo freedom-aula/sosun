@@ -742,8 +742,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         crate::resource::buffer_bytes(src),
     ) {
         crate::native::glue::copy_memory(this, to as u64, from as u64, a.min(b));
-    } else {
-        #[cfg(target_os = "macos")]
+    } else if !crate::native::glue::copy_texture_resource(this, dst, src) {
         crate::native::glue::dropped_op("CopyResource", dst, src);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -759,9 +758,9 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLocation {
-    resource: This,
-    kind: u32,
-    footprint: crate::resource::PlacedFootprint,
+    pub(crate) resource: This,
+    pub(crate) kind: u32,
+    pub(crate) footprint: crate::resource::PlacedFootprint,
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -777,9 +776,12 @@ extern "system" fn copy_texture_region(
     source_box: *const [u32; 6],
 ) {
     #[cfg(target_os = "macos")]
-    // SAFETY: the title passes both locations (null is tolerated).
-    if let (Some(d), Some(s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
-        crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+    // SAFETY: the title passes both locations and an optional box (null is tolerated).
+    if let (Some(&d), Some(&s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        let b = unsafe { source_box.as_ref().copied() };
+        if !crate::native::glue::copy_texture_region(this, d, [x, y, z], s, b) {
+            crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
+        }
     }
     #[cfg(windows)]
     {
@@ -1854,11 +1856,11 @@ mod state {
         this: This,
         start: u32,
         count: u32,
-        views: *const (u64, u32, u32),
+        views: *const glue::VertexBufferView,
     ) {
-        let addresses: Vec<u64> = items(views, count).iter().map(|v| v.0).collect();
-        let strides: Vec<u32> = items(views, count).iter().map(|v| v.2).collect();
-        glue::vertex_buffers(this, start, &addresses, &strides);
+        // D3D12 has 32 input slots. A null views pointer unbinds the requested range.
+        let count = count.min(32u32.saturating_sub(start));
+        glue::vertex_buffers(this, start, count, items(views, count));
     }
 
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {

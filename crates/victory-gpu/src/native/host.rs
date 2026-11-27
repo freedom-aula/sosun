@@ -99,7 +99,7 @@ struct Prep<B: GraphicsBackend> {
     /// The pixel stage's own arguments.
     ps_root: Option<RootArgs>,
     bufs: Vec<Rc<B::Buffer>>,
-    vertex: Vec<(Rc<B::Buffer>, *const u8)>,
+    vertex: Vec<(usize, Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
     /// The `ExecuteIndirect` argument record.
@@ -866,7 +866,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -936,7 +936,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 None => "unset".into(),
             })
             .collect();
-        let head = vertex.first().map(|&a| {
+        let head = vertex.first().map(|&(_, a)| {
             let mut b = [0u8; 32];
             super::safe_read(a as *const u8, &mut b);
             b
@@ -1112,8 +1112,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     None => self.root_args(root, &mut p)?,
                 }
-                for a in vertex {
-                    p.vertex.push(self.resolve(*a, 1)?);
+                for &(slot, address) in vertex {
+                    let (buffer, ptr) = self.resolve(address, 1)?;
+                    p.vertex.push((slot, buffer, ptr));
                 }
                 if let Some((a, _)) = index {
                     p.index = Some(self.resolve(*a, 1)?);
@@ -1124,7 +1125,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 p.blit.push(self.resolve(*dst, *len as u64)?);
             }
             Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
-            Cmd::Clear { .. } => {}
+            Cmd::CopyBufferToTexture { src, len, .. } => {
+                p.blit.push(self.resolve(*src, *len as u64)?);
+            }
+            Cmd::CopyTextureToBuffer { dst, len, .. } => {
+                p.blit.push(self.resolve(*dst, *len as u64)?);
+            }
+            Cmd::CopyTexture { .. } | Cmd::Clear { .. } => {}
         }
         Ok(p)
     }
@@ -1149,7 +1156,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
         let same = |a: &Cmd<B>, b: &Cmd<B>| match (a, b) {
             (Cmd::Dispatch { .. }, Cmd::Dispatch { .. }) => true,
-            (Cmd::Copy { .. } | Cmd::Fill { .. }, Cmd::Copy { .. } | Cmd::Fill { .. }) => true,
+            (
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. },
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. },
+            ) => true,
             (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
             _ => false,
         };
@@ -1238,7 +1256,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             groups.push(match cmds[i] {
                 Cmd::Dispatch { .. } => Group::Compute(i, j),
-                Cmd::Copy { .. } | Cmd::Fill { .. } => Group::Blit(i, j),
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. } => Group::Blit(i, j),
                 Cmd::Draw { .. } => Group::Render(i, j),
                 Cmd::Clear { .. } => {
                     j = i + 1;
@@ -1252,7 +1274,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let mut buffers: Vec<&B::Buffer> = Vec::new();
         for p in &preps {
             buffers.extend(p.bufs.iter().map(|b| &**b));
-            buffers.extend(p.vertex.iter().map(|b| &*b.0));
+            buffers.extend(p.vertex.iter().map(|(_, buffer, _)| &**buffer));
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
             buffers.extend(p.indirect.iter().map(|b| &*b.0));
@@ -1319,6 +1341,75 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     dst: (&*p.0, p.1),
                                     len: *len,
                                     value: *value,
+                                }
+                            }
+                            Cmd::CopyTexture {
+                                src,
+                                src_mip,
+                                src_slice,
+                                src_origin,
+                                size,
+                                dst,
+                                dst_mip,
+                                dst_slice,
+                                dst_origin,
+                            } => BlitOp::CopyTexture {
+                                src: &**src,
+                                src_mip: *src_mip,
+                                src_slice: *src_slice,
+                                src_origin: *src_origin,
+                                size: *size,
+                                dst: &**dst,
+                                dst_mip: *dst_mip,
+                                dst_slice: *dst_slice,
+                                dst_origin: *dst_origin,
+                            },
+                            Cmd::CopyBufferToTexture {
+                                len,
+                                row_pitch,
+                                slice_pitch,
+                                size,
+                                dst,
+                                dst_mip,
+                                dst_slice,
+                                dst_origin,
+                                ..
+                            } => {
+                                let p = &preps[k].blit[0];
+                                BlitOp::CopyBufferToTexture {
+                                    src: (&*p.0, p.1),
+                                    len: *len,
+                                    row_pitch: *row_pitch,
+                                    slice_pitch: *slice_pitch,
+                                    size: *size,
+                                    dst: &**dst,
+                                    dst_mip: *dst_mip,
+                                    dst_slice: *dst_slice,
+                                    dst_origin: *dst_origin,
+                                }
+                            }
+                            Cmd::CopyTextureToBuffer {
+                                src,
+                                src_mip,
+                                src_slice,
+                                src_origin,
+                                size,
+                                len,
+                                row_pitch,
+                                slice_pitch,
+                                ..
+                            } => {
+                                let p = &preps[k].blit[0];
+                                BlitOp::CopyTextureToBuffer {
+                                    src: &**src,
+                                    src_mip: *src_mip,
+                                    src_slice: *src_slice,
+                                    src_origin: *src_origin,
+                                    size: *size,
+                                    dst: (&*p.0, p.1),
+                                    len: *len,
+                                    row_pitch: *row_pitch,
+                                    slice_pitch: *slice_pitch,
                                 }
                             }
                             _ => unreachable!(),
@@ -1396,7 +1487,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     vertex_buffers: preps[k]
                                         .vertex
                                         .iter()
-                                        .map(|(b, p)| (&**b, *p))
+                                        .map(|(slot, b, p)| (*slot, &**b, *p))
                                         .collect(),
                                     index_buffer: preps[k].index.as_ref().map(|(b, p)| (&**b, *p)),
                                     call: *call,

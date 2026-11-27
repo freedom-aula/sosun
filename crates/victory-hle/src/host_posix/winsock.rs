@@ -39,6 +39,7 @@ const WSAEINVAL: i32 = 10022;
 const WSAEMFILE: i32 = 10024;
 const WSAEWOULDBLOCK: i32 = 10035;
 const WSAENOTSOCK: i32 = 10038;
+const WSAEMSGSIZE: i32 = 10040;
 const WSAEOPNOTSUPP: i32 = 10045;
 const WSAEAFNOSUPPORT: i32 = 10047;
 const WSAENETUNREACH: i32 = 10051;
@@ -75,7 +76,6 @@ unsafe extern "C" {
     fn listen(fd: c_int, backlog: c_int) -> c_int;
     fn accept(fd: c_int, addr: *mut u8, len: *mut u32) -> c_int;
     fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
-    fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;
     fn sendto(
         fd: c_int,
         buf: *const c_void,
@@ -83,14 +83,6 @@ unsafe extern "C" {
         flags: c_int,
         addr: *const u8,
         addr_len: u32,
-    ) -> isize;
-    fn recvfrom(
-        fd: c_int,
-        buf: *mut c_void,
-        len: usize,
-        flags: c_int,
-        addr: *mut u8,
-        addr_len: *mut u32,
     ) -> isize;
     fn select(
         nfds: c_int,
@@ -557,14 +549,7 @@ pub extern "system" fn send_(s: Socket, buf: *const u8, len: i32, flags: i32) ->
 }
 
 pub extern "system" fn recv_(s: Socket, buf: *mut u8, len: i32, flags: i32) -> i32 {
-    let Some(fd) = fd_of(s) else {
-        return SOCKET_ERROR;
-    };
-    let Ok(len) = validate_buf(buf.cast_const(), len) else {
-        return SOCKET_ERROR;
-    };
-    // SAFETY: a socket of ours and the title's buffer.
-    transferred(unsafe { recv(fd, buf.cast(), len, bsd_msg_flags(flags)) })
+    recvfrom_(s, buf, len, flags, std::ptr::null_mut(), std::ptr::null_mut())
 }
 
 pub extern "system" fn sendto_(
@@ -610,22 +595,33 @@ pub extern "system" fn recvfrom_(
         return SOCKET_ERROR;
     };
     let mut b = [0u8; 28];
-    let mut n = 28u32;
-    // SAFETY: a socket of ours, the title's buffer and one of ours for the address.
-    let r = unsafe {
-        recvfrom(
-            fd,
-            buf.cast(),
-            len,
-            bsd_msg_flags(flags),
-            b.as_mut_ptr(),
-            &mut n,
-        )
+    let mut iov = libc::iovec { iov_base: buf.cast(), iov_len: len };
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
     };
-    if r >= 0 && n > 0 {
+    if !from.is_null() && !from_len.is_null() {
+        msg.msg_name = b.as_mut_ptr().cast();
+        msg.msg_namelen = b.len() as u32;
+    }
+    // SAFETY: iov describes the title's writable buffer. The header, iov and address
+    // all live through the call.
+    let r = unsafe { libc::recvmsg(fd, &mut msg, bsd_msg_flags(flags)) };
+    if r < 0 {
+        return fail();
+    }
+    if msg.msg_namelen > 0 {
         from_bsd(&b, from, from_len);
     }
-    transferred(r)
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return fail_with(WSAEMSGSIZE);
+    }
+    r as i32
 }
 
 // Control.
@@ -1627,6 +1623,43 @@ mod tests {
         // A closed socket is not one.
         assert_eq!(send_(server, b"x".as_ptr(), 1, 0), SOCKET_ERROR);
         assert_eq!(WSAGetLastError(), WSAENOTSOCK);
+        assert_eq!(WSACleanup(), 0);
+    }
+
+    #[test]
+    fn udp_receive_reports_truncation_and_accepts_an_exact_fit() {
+        let _turn = serial();
+        assert_eq!(WSAStartup(0x0202, std::ptr::null_mut()), 0);
+        let server = socket_(2, 2, 17);
+        let client = socket_(2, 2, 17);
+        assert_eq!(bind_(server, loopback_addr(0).as_ptr(), 16), 0);
+        assert_eq!(connect_(client, loopback_addr(port_of(server)).as_ptr(), 16), 0);
+        let sender = loopback_addr(port_of(client));
+        let mut buf = [0; 8];
+
+        for (packet, expected) in [(b"123456789".as_slice(), SOCKET_ERROR), (b"abcdefgh", 8)] {
+            let len = packet.len() as i32;
+            assert_eq!(send_(client, packet.as_ptr(), len, 0), len);
+            let mut from = [0; 28];
+            let mut from_len = 28;
+            assert_eq!(
+                recvfrom_(server, buf.as_mut_ptr(), 8, 0, from.as_mut_ptr(), &mut from_len),
+                expected
+            );
+            if expected == SOCKET_ERROR {
+                assert_eq!(WSAGetLastError(), 10040);
+            }
+            assert_eq!(&buf, &packet[..8]);
+            assert_eq!(from_len, 16);
+            assert_eq!(from[..16], sender);
+        }
+
+        assert_eq!(send_(client, b"987654321".as_ptr(), 9, 0), 9);
+        assert_eq!(recv_(server, buf.as_mut_ptr(), 8, 0), SOCKET_ERROR);
+        assert_eq!(WSAGetLastError(), 10040);
+        assert_eq!(&buf, b"98765432");
+        assert_eq!(closesocket(client), 0);
+        assert_eq!(closesocket(server), 0);
         assert_eq!(WSACleanup(), 0);
     }
 

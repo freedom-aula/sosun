@@ -716,7 +716,10 @@ impl<'a> Lower<'a> {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p, x.st) {
+                if x.st.lockstep {
+                    split_barriers = super::lockstep::lds_barriers(p);
+                    synced = true;
+                } else if let Some(b) = split_wave_barriers(p, x.st) {
                     split_barriers = b;
                     synced = true;
                 }
@@ -729,7 +732,7 @@ impl<'a> Lower<'a> {
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
                 let sections = (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty());
-                halves = lanes > 32 && (console_lanes || sections);
+                halves = lanes > 32 && (console_lanes || sections || x.st.lockstep);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
@@ -1242,6 +1245,10 @@ impl<'a> Lower<'a> {
 
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
+        // Lockstep runs whole-wave code literally: every thread is there (`lockstep.rs`).
+        if self.x.st.lockstep {
+            return;
+        }
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
@@ -1279,11 +1286,14 @@ impl<'a> Lower<'a> {
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
-    fn section_inst(&mut self, b: usize, i: usize, start: usize) {
+    fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
+        let inst = &self.x.p.blocks[b].insts[i];
+        if !super::wave::register_only(inst) {
+            return Err(unsupported(inst.machine.offset, inst.name()));
+        }
         // The first step the simulation does not model names the refusal.
         let sec = &self.sections[&b][&start];
         let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
-        let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
@@ -1296,6 +1306,7 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+        Ok(())
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -1554,7 +1565,7 @@ impl<'a> Lower<'a> {
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        self.section_inst(b, j, i)?;
                     }
                     i = end;
                     continue;
@@ -8690,6 +8701,13 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32" if self.x.st.lockstep => {
+                // Lockstep: every thread runs, so the first lane is the wide EXEC's.
+                let a = s(self, 0)?;
+                let lane = self.lockstep_first_lane(inst)?;
+                let r = self.wide_read_lane(a, lane)?;
+                int(self, r)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;

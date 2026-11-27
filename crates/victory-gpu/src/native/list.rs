@@ -5,6 +5,7 @@
 //! Title addresses are kept as addresses: they resolve to GPU buffers when the list is submitted, by
 //! which time the pool observer has told us about every mapping the title made.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use victory_backend::backend::{RootLayout, RootParam};
 use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
@@ -267,6 +268,39 @@ pub enum Cmd<B: GraphicsBackend> {
         len: usize,
         value: u8,
     },
+    CopyTexture {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
         depth: Option<DepthClear<B::Texture>>,
@@ -278,7 +312,7 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         targets: Targets<B>,
-        vertex: Vec<u64>,
+        vertex: Vec<(usize, u64)>,
         index: Option<(u64, bool)>,
         state: DrawState,
         call: DrawCall,
@@ -319,6 +353,69 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 dst: *dst,
                 len: *len,
                 value: *value,
+            },
+            Cmd::CopyTexture {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyTexture {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyBufferToTexture {
+                src,
+                len,
+                row_pitch,
+                slice_pitch,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyBufferToTexture {
+                src: *src,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyTextureToBuffer {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                len,
+                row_pitch,
+                slice_pitch,
+            } => Cmd::CopyTextureToBuffer {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: *dst,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
             },
             Cmd::Clear { color, depth } => Cmd::Clear {
                 color: color.clone(),
@@ -364,7 +461,7 @@ struct State<B: GraphicsBackend> {
     graphics_root: Vec<Option<Root<B>>>,
     heaps: Heaps<B>,
     targets: Targets<B>,
-    vertex: Vec<u64>,
+    vertex: BTreeMap<usize, u64>,
     index: Option<(u64, bool)>,
     draw: DrawState,
 }
@@ -396,7 +493,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
                     color: Vec::new(),
                     depth: None,
                 },
-                vertex: Vec::new(),
+                vertex: BTreeMap::new(),
                 index: None,
                 draw: DrawState::default(),
             },
@@ -608,6 +705,96 @@ impl<B: GraphicsBackend> NativeList<B> {
         }
     }
 
+    /// Texture-to-texture region copy, ordered on the GPU with the rest of the list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_region(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTexture {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Linear buffer footprint to texture region copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyBufferToTexture {
+            src,
+            len,
+            row_pitch,
+            slice_pitch,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Texture region to linear buffer footprint copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_to_buffer(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTextureToBuffer {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst,
+            len,
+            row_pitch,
+            slice_pitch,
+        });
+    }
+
     /// `OMSetRenderTargets`.
     pub fn set_render_targets(&mut self, color: &[Rc<B::Texture>], depth: Option<&Rc<B::Texture>>) {
         self.state.targets = Targets {
@@ -671,15 +858,16 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
     pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
-        if self.state.vertex.len() <= slot {
-            self.state.vertex.resize(slot + 1, 0);
+        if address == 0 {
+            self.state.vertex.remove(&slot);
+        } else {
+            self.state.vertex.insert(slot, address);
         }
-        self.state.vertex[slot] = address;
     }
 
     /// The address bound as vertex buffer `slot`, if any (for the target trace).
     pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
-        self.state.vertex.get(slot).copied()
+        self.state.vertex.get(&slot).copied()
     }
 
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
@@ -776,7 +964,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.clone(),
+            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
             index: self.state.index,
             state: self.state.draw,
             call,
