@@ -1051,9 +1051,41 @@ impl<B: PresentBackend> Title<B> {
         probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
+            self.log_mirror();
         }
         let unloaded = std::mem::take(&mut self.unloaded);
-        self.jobs(keys_to_sync(&unloaded, &dirty))
+        let mut jobs = self.jobs(keys_to_sync(&unloaded, &dirty));
+        // VICTORY_TEXTURE_SYNC_BUDGET_MB: at most this much texture memory a submission reads.
+        // The jobs beyond it are re-queued as unloaded, at the front of the next submission's set
+        // (no texture is starved: what was deferred goes first), so a world load's copies spread
+        // over submissions instead of one long stall — the 16 GB Air's 0.5 fps decay (#110).
+        if let Some(budget) = sync_budget() {
+            let deferred = within_budget(&mut jobs, budget);
+            DEFERRED[0].fetch_add(deferred.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            DEFERRED[1].fetch_add(
+                deferred.iter().map(|j| j.size as u64).sum(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.unloaded.extend(deferred.into_iter().map(|j| j.key));
+        }
+        jobs
+    }
+
+    /// `VICTORY_TRACE_TEXTURE_SYNC=1`: once a second, how much title memory the host's texture
+    /// mirrors hold (the mirror is the footprint a 16 GB Mac runs out of: title memory once,
+    /// its textures twice).
+    fn log_mirror(&self) {
+        static AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let mut at = AT.lock().unwrap_or_else(|e| e.into_inner());
+        if at.is_some_and(|at| at.elapsed().as_secs() < 1) {
+            return;
+        }
+        *at = Some(std::time::Instant::now());
+        let (n, bytes) = self
+            .textures
+            .values()
+            .fold((0u64, 0u64), |(n, b), t| (n + 1, b + t.info.size as u64));
+        tracing::info!(textures = n, mib = bytes >> 20, "texture mirrors of title memory");
     }
 
     pub(super) fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
@@ -1337,11 +1369,12 @@ impl SyncCost {
         if since.elapsed().as_secs() >= 1 {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before)",
+                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before); budget deferred {} ({} MiB)",
                 since.elapsed().as_secs_f32(), s[0], s[1], s[2], s[3], s[4], s[5], s[6] >> 20,
                 take(&HOT), s[7] / 1000, take(&WHOLE_PROBES[0]), take(&WHOLE_PROBES[1]) >> 20, s[8] / 1000, s[9] / 1000,
                 s[10] / 1000, s[11] / 1000, s[12] / 1000, s[13] / 1000,
-                take(&REPLACED[0]), take(&REPLACED[1])
+                take(&REPLACED[0]), take(&REPLACED[1]),
+                take(&DEFERRED[0]), take(&DEFERRED[1]) >> 20
             );
             *sum = None;
         }
@@ -1352,8 +1385,122 @@ fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize>
     unloaded.iter().chain(dirty.difference(unloaded)).copied().collect()
 }
 
+/// `VICTORY_TEXTURE_SYNC_BUDGET_MB`: the most texture memory one submission's sync reads,
+/// off unless set. What it defers is re-queued as unloaded and so goes first next submission.
+fn sync_budget() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SYNC_BUDGET_MB")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+    })
+}
+
+/// Keeps the first of `jobs` whose bytes fit `budget`, and returns the rest for re-queueing
+/// (they go back to the front of the next submission's set, so nothing is starved). A single
+/// job larger than the budget still runs when it is first — like [`batches`], which never
+/// splits a texture — so a budget never wedges one big texture behind smaller ones forever.
+fn within_budget(jobs: &mut Vec<Job>, budget: u64) -> Vec<Job> {
+    let mut bytes = 0u64;
+    let keep = jobs.iter().position(|j| {
+        if bytes == 0 || bytes + j.size as u64 <= budget {
+            bytes += j.size as u64;
+            false
+        } else {
+            true
+        }
+    });
+    match keep {
+        None => Vec::new(),
+        Some(at) => jobs.split_off(at),
+    }
+}
+
+/// What the sync budget deferred: jobs and bytes, taken by the trace line each second.
+static DEFERRED: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
+
+/// The sync budget's shape, checked on every host (the `VICTORY_TRACE_TEXTURE_SYNC` GPU tests
+/// are macOS-only; this is the part a 16 GB Mac's log depends on).
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn job(key: usize, size: usize) -> Job {
+        // Any layout the decoder accepts: `within_budget` reads `size` alone.
+        let desc = victory_formats::texture::Desc {
+            dimension: Dimension::Tex2d,
+            width: 1,
+            height: 1,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: victory_formats::texture::Swizzle::LINEAR,
+        };
+        Job {
+            key,
+            serial: 0,
+            memory: 0,
+            size,
+            format: 0,
+            dimension: Dimension::Tex2d,
+            layout: Layout::new_for(&desc, Default::default()).unwrap(),
+            last: None,
+            partial: false,
+        }
+    }
+
+    fn keys(jobs: &[Job]) -> Vec<usize> {
+        jobs.iter().map(|j| j.key).collect()
+    }
+
+    #[test]
+    fn a_budget_keeps_the_first_jobs_that_fit_and_defers_the_rest_in_order() {
+        let mut jobs = vec![job(1, 100), job(2, 200), job(3, 300), job(4, 50)];
+        let deferred = within_budget(&mut jobs, 350);
+        assert_eq!(keys(&jobs), [1, 2], "the first two fit in 350 bytes");
+        assert_eq!(keys(&deferred), [3, 4], "the rest is deferred, in order");
+        assert_eq!(deferred.iter().map(|j| j.size).sum::<usize>(), 350);
+    }
+
+    #[test]
+    fn one_job_larger_than_the_budget_alone_still_runs() {
+        // As `batches` never splits a texture, a budget must not wedge a large texture behind
+        // smaller ones: when it is first it runs alone, and what follows it defers.
+        let mut jobs = vec![job(1, 1_000), job(2, 1), job(3, 1)];
+        let deferred = within_budget(&mut jobs, 100);
+        assert_eq!(keys(&jobs), [1]);
+        assert_eq!(keys(&deferred), [2, 3]);
+        // But a second large one behind it defers like any other.
+        let mut jobs = vec![job(4, 1), job(5, 1_000), job(6, 1)];
+        let deferred = within_budget(&mut jobs, 100);
+        assert_eq!(keys(&jobs), [4]);
+        assert_eq!(keys(&deferred), [5, 6]);
+    }
+
+    #[test]
+    fn everything_fitting_or_nothing_defers_are_both_fine() {
+        let mut jobs = vec![job(1, 10), job(2, 10)];
+        assert!(within_budget(&mut jobs, 1_000).is_empty(), "all fits");
+        assert_eq!(keys(&jobs), [1, 2]);
+        let mut none = Vec::new();
+        assert!(within_budget(&mut none, 1_000).is_empty(), "no jobs at all");
+        // A deferred re-queue goes first next round: the keys it returns are what
+        // `sync_jobs_within` puts back into `unloaded`, which `keys_to_sync` heads with.
+        let unloaded: HashSet<usize> = [7, 8].into_iter().collect();
+        let dirty: HashSet<usize> = [9].into_iter().collect();
+        assert_eq!(keys_to_sync(&unloaded, &dirty), [7, 8, 9], "unloaded first");
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {

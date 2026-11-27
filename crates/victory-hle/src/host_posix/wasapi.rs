@@ -141,6 +141,21 @@ fn put<T>(out: *mut T, v: T) -> HRESULT {
 
 // The ring and what feeds it.
 
+/// Counts one render-client release by what it carried: the peak of its folded stereo
+/// (zero for a `SILENT`-flagged release, which carries nothing). A title flagging silence
+/// is behaving; one releasing zeros has a mix graph with nothing left in it — the two are
+/// what a silent prologue has to be told apart, so the per-second line counts both.
+fn classified(state: &Mutex<State>, peak: f32, flagged: bool) {
+    let mut state = lock(state);
+    if flagged {
+        state.flagged += 1;
+    } else if peak == 0.0 {
+        state.zeroed += 1;
+    } else {
+        state.carried += 1;
+    }
+}
+
 /// Frames of interleaved floats, in device channels.
 pub struct Ring {
     samples: VecDeque<f32>,
@@ -252,6 +267,13 @@ struct State {
     /// Frames the title released and their peak since the last log line.
     released: u64,
     peak: f32,
+    /// The render client's releases since the last log line, by what they carried: flagged
+    /// `SILENT`, data that is all zeros, and data (the title's own mix, this is what a silent
+    /// prologue has to be told apart: a title flagging silence is behaving, one releasing zeros
+    /// has a mix graph with nothing left in it).
+    flagged: u64,
+    zeroed: u64,
+    carried: u64,
     logged: Instant,
     wav: Option<Wav>,
 }
@@ -278,6 +300,9 @@ impl Shared {
                 position: 0,
                 released: 0,
                 peak: 0.0,
+                flagged: 0,
+                zeroed: 0,
+                carried: 0,
                 logged: Instant::now(),
                 wav: std::env::var("VICTORY_WASAPI_WAV").ok().and_then(|p| Wav::create(&p)),
             }),
@@ -315,12 +340,14 @@ impl Shared {
         }
         let f = self.format;
         let stereo = if flags & BUFFERFLAGS_SILENT != 0 {
+            classified(&self.state, 0.0, true);
             vec![0.0; frames * DEVICE_CHANNELS]
         } else {
             let bytes = &staging.0[..frames * f.frame_bytes()];
             let samples = mixer::decode(f, bytes).unwrap_or_else(|| vec![0.0; frames * f.channels]);
             let mut out = Vec::with_capacity(frames * DEVICE_CHANNELS);
             fold(&samples, f.channels, &mut out);
+            classified(&self.state, out.iter().fold(0.0f32, |p, s| p.max(s.abs())), false);
             out
         };
         drop(staging);
@@ -383,10 +410,14 @@ impl Shared {
                     frames = state.released,
                     peak = state.peak,
                     padding = state.ring.frames(),
+                    flagged = state.flagged,
+                    zeroed = state.zeroed,
+                    carried = state.carried,
                     "WASAPI: render client released frames in the last second"
                 );
             }
             (state.released, state.peak, state.logged) = (0, 0.0, Instant::now());
+            (state.flagged, state.zeroed, state.carried) = (0, 0, 0);
             if let Some(wav) = &mut state.wav {
                 let _ = wav.header();
             }

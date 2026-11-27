@@ -305,6 +305,18 @@ impl Mixer {
         }
         events
     }
+
+    /// The voices running with buffers queued, and the buffers waiting among them: what a
+    /// log line needs to say whether the graph is carrying anything.
+    pub fn running(&self) -> (usize, usize) {
+        (
+            self.sources.values().filter(|s| s.running && !s.queue.is_empty()).count(),
+            self.sources
+                .values()
+                .map(|s| if s.running { s.queue.len() } else { 0 })
+                .sum(),
+        )
+    }
 }
 
 /// The levels from `source` channels to `out` channels: an identity where

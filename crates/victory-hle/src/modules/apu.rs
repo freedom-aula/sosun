@@ -146,10 +146,65 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+    /// Per-second decode statistics for the log line, so a silent world can be told apart
+    /// from a busy one: packets decoded and their frames, refusals by cause, and the commands
+    /// seen, by kind. A title whose audio went silent with `decoded=0` stopped feeding the
+    /// decoder; `bad_packet=100` is feeding it data that is not Opus.
+    second: Second,
+}
+
+/// One second of decode activity.
+struct Second {
+    decoded: u64,
+    frames: u64,
+    bad_packet: u64,
+    invalid_stream: u64,
+    activated: u64,
+    commands: u64,
+    logged: Option<std::time::Instant>,
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
     c.state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Second {
+    fn new() -> Second {
+        Second {
+            decoded: 0,
+            frames: 0,
+            bad_packet: 0,
+            invalid_stream: 0,
+            activated: 0,
+            commands: 0,
+            logged: None,
+        }
+    }
+
+    /// Logs once a second, from the title's own thread (the lock is held: `XApuEnqueueCommand`
+    /// is the only writer).
+    fn log(&mut self) {
+        let now = match self.logged {
+            None => {
+                self.logged = Some(std::time::Instant::now());
+                return;
+            }
+            Some(at) if at.elapsed().as_secs() < 1 => return,
+            Some(_) => std::time::Instant::now(),
+        };
+        if self.commands > 0 {
+            tracing::info!(
+                commands = self.commands,
+                activated = self.activated,
+                decoded = self.decoded,
+                frames = self.frames,
+                bad_packet = self.bad_packet,
+                invalid_stream = self.invalid_stream,
+                "APU: Opus commands in the last second"
+            );
+        }
+        *self = Second { logged: Some(now), ..Second::new() };
+    }
 }
 
 pub extern "system" fn XApuConnect(
@@ -219,6 +274,7 @@ pub extern "system" fn XApuConnect(
             results: VecDeque::new(),
             commands: 0,
             dequeued: 0,
+            second: Second::new(),
         }),
     });
     // SAFETY: checked non-null.
@@ -278,12 +334,16 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
+    // One reborrow of the state, so the streams and the per-second statistics split it.
+    let state = &mut *state;
     let decoder = &mut state.streams[stream];
+    let second = &mut state.second;
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
             let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
             tracing::debug!(stream, channels, "Opus stream activated");
+            second.activated += 1;
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
             } else if !(1..=2).contains(&channels) {
@@ -309,14 +369,19 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
-                None => result.error = INVALID_STREAM,
+                Some(d) => process(d, connection.options, &command, &mut result, second),
+                None => {
+                    result.error = INVALID_STREAM;
+                    second.invalid_stream += 1;
+                }
             }
         }
         _ => return INVALID_COMMAND,
     }
     state.queued[stream] += 1;
     state.commands = state.commands.wrapping_add(1);
+    second.commands += 1;
+    let _ = second.log();
     state.results.push_back(result);
     if !total.is_null() {
         // SAFETY: optional out parameter.
@@ -331,7 +396,13 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+    second: &mut Second,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -340,6 +411,7 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.output = output;
     if input.is_null() || output.is_null() || input_length == 0 {
         result.error = E_INVALIDARG;
+        second.bad_packet += 1;
         return;
     }
     // SAFETY: the title's packet in its connection memory.
@@ -349,9 +421,12 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
+            second.bad_packet += 1;
             return;
         }
     };
+    second.decoded += 1;
+    second.frames += decoded as u64;
     let first = (command.first_frame as usize).min(decoded);
     let frames = (decoded - first)
         .min(command.frame_count as usize)

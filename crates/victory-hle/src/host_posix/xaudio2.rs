@@ -50,6 +50,47 @@ struct Inner {
     events: Sender<Event>,
     output: Mutex<OutputState>,
     opener: Opener,
+    /// The per-second log line's counters.
+    second: Mutex<Second>,
+}
+
+/// One second of the engine's mixing, for the log line.
+struct Second {
+    passes: u64,
+    voices: u64,
+    queued: u64,
+    peak: f32,
+    logged: Option<std::time::Instant>,
+}
+
+impl Second {
+    fn new() -> Second {
+        Second { passes: 0, voices: 0, queued: 0, peak: 0.0, logged: None }
+    }
+
+    /// Logs once a second, from the device's render thread.
+    fn log(&mut self) {
+        let now = match self.logged {
+            None => {
+                self.logged = Some(std::time::Instant::now());
+                return;
+            }
+            Some(at) if at.elapsed().as_secs() < 1 => return,
+            Some(_) => std::time::Instant::now(),
+        };
+        if self.passes > 0 {
+            let voices = if self.passes > 0 { self.voices / self.passes } else { 0 };
+            let queued = if self.passes > 0 { self.queued / self.passes } else { 0 };
+            tracing::info!(
+                passes = self.passes,
+                voices,
+                queued,
+                peak = self.peak,
+                "XAudio2: engine passes in the last second"
+            );
+        }
+        *self = Second { logged: Some(now), ..Second::new() };
+    }
 }
 
 enum OutputState {
@@ -209,6 +250,21 @@ impl Inner {
         for e in events {
             let _ = self.events.send(e);
         }
+        // The per-second line that says whether this engine is carrying anything: voices
+        // running with buffers queued, buffers waiting among them, and the mix's peak. A
+        // silent world with `voices=0` is a title whose XAudio2 graph emptied (or never
+        // filled); `voices=8 peak=0.0` is one whose sources play zeros.
+        {
+            let (voices, queued) = lock(&self.mixer).running();
+            let mut second = lock(&self.second);
+            second.passes += 1;
+            second.voices += voices as u64;
+            second.queued += queued as u64;
+            second.peak = second
+                .peak
+                .max(out.iter().fold(0.0f32, |p, s| p.max(s.abs())));
+            second.log();
+        }
         for (callback, _) in voices.values() {
             callback.call(1, None); // OnVoiceProcessingPassEnd
         }
@@ -334,6 +390,7 @@ fn new_engine(opener: Opener) -> *mut Engine {
         events,
         output: Mutex::new(OutputState::Closed),
         opener,
+        second: Mutex::new(Second::new()),
     });
     let weak = Arc::downgrade(&inner);
     // Ends with the last `Inner`, which holds the only sender.

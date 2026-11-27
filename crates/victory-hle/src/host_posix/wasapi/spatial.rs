@@ -223,6 +223,8 @@ struct Stream {
     updating: Arc<AtomicBool>,
     dynamic_used: Arc<AtomicU32>,
     max_dynamic: u32,
+    /// The per-second log line's counters.
+    stats: Mutex<Stats>,
 }
 
 /// The clock of the title's event (`Shared::tick`), stopped when dropped.
@@ -335,6 +337,7 @@ extern "win64" fn activate_stream(
         updating: Arc::new(AtomicBool::new(false)),
         dynamic_used: Arc::new(AtomicU32::new(0)),
         max_dynamic: max.min(MAX_DYNAMIC),
+        stats: Mutex::new(Stats::new()),
     });
     put(out, stream.cast())
 }
@@ -434,17 +437,54 @@ extern "win64" fn stream_begin(this: *mut Stream, available: *mut u32, frames: *
     put(frames, PERIOD as u32)
 }
 
+/// One stream's per-second statistics, for the log line that says whether the spatial path
+/// is alive: passes (the title's `BeginUpdatingAudioObjects`/`EndUpdatingAudioObjects` pairs),
+/// the objects that were mixed, how many of them carried data, and the peak of what the passes
+/// produced. A silent world with `passes=0` is a title that stopped updating its spatial
+/// stream; `passes=100 objects=0` is one whose objects all ended; `objects=12 with_data=0` is
+/// one whose objects' buffers are all zeros — its mix graph has nothing left in it.
+struct Stats {
+    passes: u64,
+    objects: u64,
+    with_data: u64,
+    peak: f32,
+    logged: Instant,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats { passes: 0, objects: 0, with_data: 0, peak: 0.0, logged: Instant::now() }
+    }
+
+    /// Logs once a second, from the title's own thread.
+    fn second(&mut self) {
+        if self.logged.elapsed().as_secs() < 1 {
+            return;
+        }
+        if self.passes > 0 || self.objects > 0 {
+            tracing::info!(
+                passes = self.passes,
+                objects = self.objects,
+                with_data = self.with_data,
+                peak = self.peak,
+                "WASAPI: spatial stream update passes in the last second"
+            );
+        }
+        *self = Stats { logged: Instant::now(), ..Stats::new() };
+    }
+}
+
 extern "win64" fn stream_end(this: *mut Stream) -> HRESULT {
     // SAFETY: the title's object.
     let s = unsafe { &*this };
     if !s.updating.swap(false, Ordering::AcqRel) {
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
-    let (mixed, ended_dynamic) = {
+    let (mixed, ended_dynamic, active, with_data, peak) = {
         let mut objects = lock(&s.objects);
-        let (mixed, ended_dynamic) = mix_pass(&objects);
+        let (mixed, ended_dynamic, active, with_data, peak) = mix_pass(&objects);
         objects.retain(|o| lock(&o.data).active);
-        (mixed, ended_dynamic)
+        (mixed, ended_dynamic, active, with_data, peak)
     };
     if ended_dynamic > 0 {
         s.dynamic_used.fetch_sub(ended_dynamic, Ordering::AcqRel);
@@ -453,6 +493,14 @@ extern "win64" fn stream_end(this: *mut Stream) -> HRESULT {
     // grow the queue without bound.
     if s.shared.padding() < PERIOD * 8 {
         s.shared.push(&mixed);
+    }
+    {
+        let mut stats = lock(&s.stats);
+        stats.passes += 1;
+        stats.objects += active;
+        stats.with_data += with_data;
+        stats.peak = stats.peak.max(peak);
+        stats.second();
     }
     S_OK
 }
@@ -517,27 +565,37 @@ fn gains(kind: u32, position: [f32; 3]) -> (f32, f32) {
 }
 
 /// One pass of stereo frames from every active object, plus the count of
-/// dynamic objects deactivated by end-of-stream during this pass.
-fn mix_pass(objects: &[Mix]) -> (Vec<f32>, u32) {
+/// dynamic objects deactivated by end-of-stream during this pass, the active
+/// objects mixed, how many of them carried data, and the pass's peak.
+fn mix_pass(objects: &[Mix]) -> (Vec<f32>, u32, u64, u64, f32) {
     let mut out = vec![0.0; PERIOD * DEVICE_CHANNELS];
     let mut ended_dynamic = 0u32;
+    let mut active = 0u64;
+    let mut with_data = 0u64;
     for o in objects {
         let mut d = lock(&o.data);
         if !d.active {
             continue;
         }
+        active += 1;
         let (l, r) = gains(o.kind, d.position);
         let (l, r) = (l * d.volume, r * d.volume);
         let n = d.last.map_or(PERIOD, |n| n.min(PERIOD));
+        let mut carried = false;
         for (frame, s) in out.chunks_exact_mut(2).zip(&d.samples[..n]) {
             frame[0] += s * l;
             frame[1] += s * r;
+            if *s != 0.0 {
+                carried = true;
+            }
         }
+        with_data += u64::from(carried);
         if d.last.is_some() && std::mem::replace(&mut d.active, false) && o.kind == DYNAMIC {
             ended_dynamic += 1;
         }
     }
-    (out, ended_dynamic)
+    let peak = out.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+    (out, ended_dynamic, active, with_data, peak)
 }
 
 #[cfg(test)]
@@ -664,6 +722,21 @@ mod tests {
         assert!((out[1] - 0.25).abs() < 0.05);
     }
 
+    /// The pass counts the objects that carried data, so a silent stream's log line can say
+    /// whether its objects hold zeros (the title's mix graph has nothing left in it).
+    #[test]
+    fn a_pass_counts_the_objects_that_carried_data() {
+        let objects = [
+            object(DYNAMIC, [0.0, 0.0, -1.0], 0.0),
+            object(DYNAMIC, [0.0, 0.0, -1.0], 0.5),
+        ];
+        let (out, _, active, with_data, peak) = mix_pass(&objects);
+        assert_eq!(active, 2, "both objects were mixed");
+        assert_eq!(with_data, 1, "one carried data, one was zeros");
+        assert!((peak - 0.5).abs() < 1e-6, "the pass's peak is the centre object's 0.5");
+        assert!(out.iter().step_by(2).all(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
     #[test]
     fn an_object_ends_after_its_last_frame() {
         let o = object(DYNAMIC, [0.0, 0.0, -1.0], 1.0);
@@ -689,6 +762,7 @@ mod tests {
             updating: Arc::new(AtomicBool::new(false)),
             dynamic_used: Arc::new(AtomicU32::new(0)),
             max_dynamic,
+            stats: Mutex::new(Stats::new()),
         })
     }
 
