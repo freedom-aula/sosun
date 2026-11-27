@@ -2635,3 +2635,14 @@ fn a_lane_read_behind_an_exec_branch_translates_in_lockstep() {
         panic!("{e}");
     }
 }
+
+#[test]
+fn divergent_readlane_in_a_two_wave_group_is_refused() {
+    // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;
+    // the second console wave skips the branch and cannot join a group-wide barrier.
+    let err = emit_wave64_cs(LOCKSTEP_READLANE, 128, false).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
+        "expected a divergent exchange refusal, got {err:?}",
+    );
+}
