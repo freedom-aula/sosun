@@ -3377,6 +3377,26 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Shl, byte, three)
     }
 
+    /// Whether constant mask data `lo` (and in wave64 the value `hi` of its
+    /// high dword) holds every lane (`Some(true)`) or none (`Some(false)`).
+    fn all_or_none(&self, lo: V, hi: Option<Value>) -> Option<bool> {
+        let k = |v: V| self.s.m.int_value(v).map(|x| x as u32);
+        let lo = k(lo)?;
+        let hi = if self.x.native.wave64 {
+            match self.vals.get(&hi?) {
+                Some(&Val::I32(h)) => k(h)?,
+                _ => return None,
+            }
+        } else {
+            lo
+        };
+        match (lo, hi) {
+            (0, 0) => Some(false),
+            (u32::MAX, u32::MAX) => Some(true),
+            _ => None,
+        }
+    }
+
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         if self.s.mesh.is_none() {
@@ -13944,6 +13964,13 @@ impl<'a> Lower<'a> {
                             }) =>
                     {
                         self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    }
+                    // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
+                    (None, Some(&Val::I32(word)))
+                        if !self.console_lanes
+                            && let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
+                    {
+                        self.s.m.bool(all)
                     }
                     (None, Some(Val::I32(_))) if !self.console_lanes => {
                         return Err(unsupported(offset, HOST_LANES));

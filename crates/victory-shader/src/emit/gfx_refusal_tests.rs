@@ -2576,6 +2576,37 @@ fn a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction() {
     }
 }
 
+/// A wave64 pixel program's loop carries a mask that is SCC's all-or-nothing on entry and
+/// `s_mov_b64 -1` on the way round. The structure cannot join it (it is not a function of fixed
+/// lane bits), and the host's lanes are not the console's, but data of every lane or none is that
+/// bit in any lane. Any other constant stays refused.
+#[test]
+fn a_pixel_program_joins_a_loop_mask_of_all_lanes_or_none_on_the_hosts_lanes() {
+    let program = |back: u32| {
+        [
+            0x7E08_0500, // v_readfirstlane_b32 s4, v0
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0x8586_80C1, // s_cselect_b64 s[6:7], -1, 0
+            0xBE88_0383, // s_mov_b32 s8, 3
+            0x7E02_0280, // v_mov_b32 v1, 0
+            // loop:
+            0x4A04_0281, // v_add_nc_u32 v2, 1, v1
+            0xD501_0001, 0x001A_0501, // v_cndmask_b32 v1, v1, v2, s[6:7]
+            0xBE86_0400 | back, // s_mov_b64 s[6:7], back
+            0x8088_8108, // s_sub_u32 s8, s8, 1
+            0xBF07_8008, // s_cmp_lg_u32 s8, 0
+            0xBF85_FFF9, // s_cbranch_scc1 loop
+            0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ]
+    };
+    let ps = |code: &[u32]| lower_ps(code, true, vec![], vec![], 0, 0, vec![], false);
+    ps(&program(0xC1)).unwrap_or_else(|e| panic!("-1: {e}"));
+    ps(&program(0x80)).unwrap_or_else(|e| panic!("0: {e}"));
+    let err = ps(&program(0x81)).err().expect("1 is some lanes").to_string();
+    assert!(err.contains("data, on the host's lanes"), "{err}");
+}
+
 /// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
 fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};

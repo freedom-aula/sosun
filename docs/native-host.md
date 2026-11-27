@@ -519,6 +519,13 @@ value on that edge". `addr_tests::a_wave64_mask_joined_with_data_takes_each_lane
 waves): lanes 32 to 35 take their bit from the high dword. The story-load log of issue #110
 (Series S) has three compute programs refused with the old message; whether they are this wave64
 form is not known.
+One kind of data is a lane bit on the host's lanes too: a constant of every lane or none
+(`s_mov_b64 s, -1` or `0`, both dwords in wave64), whose bit is the same in every lane
+(`Lower::all_or_none`). The G-buffer's pixel programs carry such a mask round a loop. It is
+SCC's all-or-nothing (`s_cselect_b64 s, -1, 0`) on entry and -1 on the way round, which the
+structure cannot join because it is no function of fixed lane bits. Of the 9,995 dumped pixel
+programs, 338 more translate (7,172 to 7,510), and none regress. Test:
+`emit::gfx_refusal_tests::a_pixel_program_joins_a_loop_mask_of_all_lanes_or_none_on_the_hosts_lanes`.
 
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
