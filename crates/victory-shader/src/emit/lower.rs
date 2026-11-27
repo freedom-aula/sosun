@@ -10624,8 +10624,9 @@ impl<'a> Lower<'a> {
 
     /// Every (join value, edge) whose incoming value no lane of that edge sees, as the greatest
     /// fixpoint: each instruction reading the join is an AND or NAND with EXEC (or an `s_orn2`
-    /// by EXEC) in the join's block, with no lane of the edge in that EXEC as the edge brings it
-    /// (those lanes' bits of the result are 0, or 1, whatever the join holds for them); and each
+    /// by EXEC) with no lane of the edge in that EXEC as the edge brings it, or an `s_andn2` by
+    /// EXEC with every lane of the edge in it (those lanes' bits of the result are 0, or 1,
+    /// whatever the join holds for them), in the join's block or where neither runs again; and each
     /// later join that takes it is on an edge those lanes do not take from the block, or is in
     /// the set itself (a register the console compiler reuses on a path those lanes skip, as a
     /// nested if's else part writes it again before any read; a loop passing it round).
@@ -10655,20 +10656,26 @@ impl<'a> Lower<'a> {
                             let inst = &p.blocks[bb].insts[i];
                             let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
                                 if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                            let masked = match inst.name() {
+                            // The lanes whose bits of the join the result keeps: EXEC's, or
+                            // (`s_andn2` by EXEC) the others.
+                            let keeps_exec = match inst.name() {
                                 "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
-                                "s_orn2_b32" | "s_orn2_b64" => by_exec,
-                                _ => false,
+                                "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
+                                "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
+                                _ => return false,
                             };
-                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| bb == b && masked)
-                            else {
+                            // In another block the edge's lanes are the same lanes only where
+                            // neither block runs again (the else part of an if, further down).
+                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| {
+                                bb == b || !self.on_cycle(b) && !self.on_cycle(bb)
+                            }) else {
                                 return false;
                             };
                             let joined = blk.phis.iter().find(|ph| ph.value == exec);
                             let exec = joined.map_or(exec, |ph| ph.args[n]);
                             let Some(&m) = st.masks.get(&exec) else { return false };
                             let mut lanes = self.lane_edge(blk.preds[n], b);
-                            lanes.push((m, true));
+                            lanes.push((m, keeps_exec));
                             !st.bools.meet(&lanes)
                         });
                         if off {
