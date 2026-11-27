@@ -1051,6 +1051,16 @@ impl<'a> Tracer<'a> {
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
+        // The compiler can mask the carry to the address width. Strip the AND only
+        // if it keeps every possible bit of its input (0 + 0 + SCC is at most 1).
+        let hi = match hi {
+            Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
+                Some((_, [t, Term::Const(mask)] | [Term::Const(mask), t]))
+                    if self.possible_bits(t, 1) & !mask == 0 => t,
+                _ => hi,
+            },
+            _ => hi,
+        };
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             // The high half cut to a 40-bit address (`s_bfe_u32 hi, hi, 8 bits from 0`).
@@ -1372,7 +1382,7 @@ impl<'a> Tracer<'a> {
         ))
     }
 
-    /// Bits that may be set in a built buffer descriptor's high dword.
+    /// Bits that may be set in a scalar term.
     // shortcut: prove bounds through short scalar ALU chains, extend the analysis if
     // a buffer descriptor's swizzle bits are cleared through other instructions.
     fn possible_bits(&self, term: Term, depth: u8) -> u32 {
@@ -2956,6 +2966,33 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn a_mask_that_preserves_a_heap_address_carry_keeps_the_table_offset() {
+        let run = |hi: u32, mask: u32| {
+            let words = [
+                0x8004_A004, // s_add_u32 s4, s4, 32
+                hi,
+                0x8705_FF05, mask, // s_and_b32 s5, s5, mask
+                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+                S_ENDPGM,
+            ];
+            let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        let carried = 0x8205_8080; // s_addc_u32 s5, 0, 0
+        assert_eq!(run(carried, 0xff).unwrap().scalar, [((0, 3), at(0, 32))]);
+        // Clearing the carry changes the address.
+        assert!(run(carried, 0xfe).is_err());
+        // A masked arbitrary input can still name memory outside the heap.
+        assert!(matches!(run(0xBE85_0300, 0xff), // s_mov_b32 s5, s0
+            Err(ShaderError::Unsupported {
+                what: "an address into a descriptor heap with an untracked high half", ..
+            })
+        ));
     }
 
     #[test]
