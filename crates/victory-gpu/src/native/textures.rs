@@ -966,13 +966,8 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
-        let mut todo: Vec<usize> = std::mem::take(&mut self.unloaded).into_iter().collect();
-        for key in dirty {
-            if !todo.contains(&key) {
-                todo.push(key);
-            }
-        }
-        self.jobs(todo)
+        dirty.extend(std::mem::take(&mut self.unloaded));
+        self.jobs(dirty.into_iter().collect())
     }
 
     fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
