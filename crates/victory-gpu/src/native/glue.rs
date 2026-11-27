@@ -622,6 +622,25 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
     t.host.trace_args(root, binding);
 }
 
+/// Notes a draw's colour targets as the frame's albedo candidates (`VICTORY_AMBIENT`): the
+/// targets beside the depth target, those the present fragment could sample — integer-packed
+/// G-buffer targets cannot be read as floats, so they do not candidate (the write twin is for
+/// writing, not reading back what the title packed).
+fn note_albedo(t: &MetalTitle, l: &MetalList) {
+    if super::ambient::level().is_none() {
+        return;
+    }
+    let keys = l
+        .target_keys
+        .iter()
+        .filter(|&&k| l.depth_key != Some(k))
+        .filter(|&&k| {
+            t.format_of(k).is_some_and(|f| !f.is_integer() && !f.is_depth())
+        })
+        .copied();
+    super::ambient::note_colors(keys);
+}
+
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
     if present_every().is_some() {
@@ -645,13 +664,14 @@ pub(crate) fn present(queue: This, resource: This) {
     if tracing_targets() {
         trace_present(resource);
     }
-    // VICTORY_AMBIENT: the presented picture shaded by the frame's most-drawn depth target, so
-    // the world shows while the lighting passes are still refused (native/ambient.rs). The choice
-    // is given to the surface before the present is queued; a frame that drew no depth clears it.
+    // VICTORY_AMBIENT: the presented picture shaded by the frame's most-drawn depth target, with
+    // the most-drawn colour target blended in as the albedo, so the world shows while the
+    // lighting passes are still refused (native/ambient.rs). The choice is given to the surface
+    // before the present is queued; a frame that drew no depth clears it.
     if let Some(k) = super::ambient::level() {
         let chosen = super::ambient::choose();
         with_title(|t| {
-            let depth = chosen.and_then(|(key, draws)| {
+            let depth = chosen.depth.and_then(|(key, draws)| {
                 let tex = t.texture_of(key)?;
                 static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
                 let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -663,8 +683,20 @@ pub(crate) fn present(queue: This, resource: This) {
                 }
                 Some(tex)
             });
+            let albedo = chosen.color.and_then(|(key, draws)| {
+                let tex = t.texture_of(key)?;
+                static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != Some((key, draws)) {
+                    *last = Some((key, draws));
+                    let i = crate::resource::texture_info(key as This)
+                        .map(|i| (i.format, i.width, i.height));
+                    tracing::info!(key, draws, info = ?i, level = k, "ambient fallback: blending this colour target in as the albedo");
+                }
+                Some(tex)
+            });
             if let Some(surface) = t.surface()
-                && let Err(e) = t.host.backend.set_ambient_fallback(surface, depth.as_deref(), k)
+                && let Err(e) = t.host.backend.set_ambient_fallback(surface, depth.as_deref(), albedo.as_deref(), k)
             {
                 tracing::warn!(error = %e, "the ambient fallback cannot shade this present");
             }
@@ -737,9 +769,13 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
         l.depth_key = depth_key;
         // A view the host cannot make keeps its slot: binding the rest would move every later
         // target down one, and `SV_TargetN` would write a surface this pass does not own.
+        // The draw's render pass binds `write_target_of`'s attachment: an integer target's
+        // same-size float twin, which the pipelines' Metal attachments also take (a float
+        // export on an integer attachment is refused and the pass draws nothing); the formats
+        // recorded below stay the texture's own.
         let made: Option<Vec<_>> = views
             .iter()
-            .map(|slot| slot.and_then(|r| t.target_of(r)))
+            .map(|slot| slot.and_then(|r| t.write_target_of(r)))
             .collect();
         let Some(made) = made else {
             l.targets_ready = false;
@@ -1142,7 +1178,7 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
 fn make_host_pipe(
     t: &mut MetalTitle,
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
-    graphics: Option<super::state::Graphics>,
+    graphics: Option<Graphics>,
 ) -> Pipe<Metal> {
     if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
         return Pipe::Skipped;
@@ -1528,6 +1564,7 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
                     trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                     super::ambient::note(l.depth_key);
+                    note_albedo(t, l);
                 }
                 Err(e) => tracing::warn!(error = %e, "draw"),
             }
@@ -1551,6 +1588,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
                     trace_present_draw(t, l);
                     l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
                     super::ambient::note(l.depth_key);
+                    note_albedo(t, l);
                 }
                 Err(e) => tracing::warn!(error = %e, "indexed draw"),
             }

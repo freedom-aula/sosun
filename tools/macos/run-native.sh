@@ -69,6 +69,15 @@ log="$run_dir/victory.log"
 } > "$log"
 
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
+# Shade near-black presents by the frame's depth target so the world shows while the
+# lighting compute passes are still refused (native/ambient.rs). 0.35 keeps the overlay
+# and movie readable while unlit geometry is clearly visible.
+export VICTORY_AMBIENT="${VICTORY_AMBIENT:-0.35}"
+# Per-encoder residency naming on small Macs: the world's heap residency set holds
+# 17-18 GB, which a 16 GB Mac cannot keep resident (metal.rs logs the choice).
+if (( ram_gb <= 16 )); then
+  export VICTORY_METAL_RESIDENCY_SETS="${VICTORY_METAL_RESIDENCY_SETS:-0}"
+fi
 # Press Enter (the pad's A) every 2 s from 4 s to 80 s unless VICTORY_KEYS is set.
 export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"
 echo "Running $exe (console=$console)"

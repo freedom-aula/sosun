@@ -272,6 +272,13 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.refuse(name, "a target format the host does not know".into());
             return Pipe::Refused;
         };
+        // The Metal attachments take the integer targets' float twins: the bound render pass
+        // binds the same twin (write_target_of), and the translated pixel shader's float
+        // exports write them as the console's colour block wrote the raw dwords into the
+        // integer target. A float output on an integer attachment is refused instead, and the
+        // whole pass draws nothing. Blending is already off for these (Graphics::color_state
+        // sees the original integer formats).
+        let color: Vec<_> = color.iter().map(|&f| f.float_write_twin().unwrap_or(f)).collect();
         if g.samples > 1 {
             self.shaders.refuse(name, "multisampled targets".into());
             return Pipe::Refused;

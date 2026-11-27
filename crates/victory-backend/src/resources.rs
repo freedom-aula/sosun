@@ -94,6 +94,28 @@ impl Format {
         matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
     }
 
+    /// The same-texel-size float format a pixel shader's float exports write an integer target
+    /// through instead: the console's exports are float dwords written raw into the target
+    /// (the colour block takes the bits; there is no float-to-integer conversion), which a float
+    /// Metal attachment reproduces exactly for 32-bit channels. Narrower channels have no
+    /// faithful float view, so they take a same-size float-family format the pass can at least
+    /// write (the value is converted, not bit-identical) — the alternative is the whole pass
+    /// being refused and nothing of it drawn. Formats without such a twin ([`Self::Rg8Uint`],
+    /// [`Self::Rg16Uint`]: no two-channel float format of the same texel size) return `None`
+    /// and keep the refusal.
+    pub fn float_write_twin(self) -> Option<Format> {
+        use Format::*;
+        Some(match self {
+            R32Uint => R32Float,
+            Rg32Uint => Rg32Float,
+            Rgba32Uint => Rgba32Float,
+            Rgba8Uint => Rgba8Unorm,
+            R8Uint => R8Unorm,
+            R16Uint => R16Float,
+            _ => return None,
+        })
+    }
+
     /// A depth or depth-stencil format.
     pub fn is_depth(self) -> bool {
         use Format::*;
@@ -711,12 +733,14 @@ pub trait PresentBackend: GraphicsBackend {
     ) -> Result<(), String>;
 
     /// `VICTORY_AMBIENT`: from now on, shade the surface's near-black presented pixels by `depth`
-    /// (`level` the constant ambient), so the world is visible while the title's lighting passes
-    /// are still refused. `None` presents plainly again. A debug aid that changes no other work.
+    /// (`level` the constant ambient) with `albedo` (the frame's most-drawn colour target)
+    /// blended in, so the world is visible while the title's lighting passes are still refused.
+    /// `None` presents plainly again (either argument). A debug aid that changes no other work.
     fn set_ambient_fallback(
         &self,
         _surface: &Self::Surface,
         _depth: Option<&Self::Texture>,
+        _albedo: Option<&Self::Texture>,
         _level: f32,
     ) -> Result<(), String> {
         Ok(())
@@ -763,6 +787,29 @@ pub fn depth_shades_ambient(f: HostDepthFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_write_twins_are_the_same_texel_size_and_bit_exact_where_channels_are_wide() {
+        use Format::*;
+        // The 32-bit channels: the console's raw float dwords land in the target unchanged.
+        for (from, to) in [(R32Uint, R32Float), (Rg32Uint, Rg32Float), (Rgba32Uint, Rgba32Float)] {
+            assert_eq!(from.float_write_twin(), Some(to));
+            assert_eq!(from.block(), to.block(), "{from:?} and its twin differ in texel size");
+        }
+        // Narrower integer channels: a same-size float-family format the pass can write, the
+        // value converted rather than bit-identical.
+        for (from, to) in [(Rgba8Uint, Rgba8Unorm), (R8Uint, R8Unorm), (R16Uint, R16Float)] {
+            assert_eq!(from.float_write_twin(), Some(to));
+            assert_eq!(from.block(), to.block(), "{from:?} and its twin differ in texel size");
+        }
+        // No two-channel float format of two or four bytes exists: no twin, the refusal stands.
+        assert_eq!(Rg8Uint.float_write_twin(), None);
+        assert_eq!(Rg16Uint.float_write_twin(), None);
+        // Only integer formats have twins.
+        for f in [Rgba8Unorm, R32Float, D32Float, Bc1, Rgba16Float] {
+            assert_eq!(f.float_write_twin(), None, "{f:?} is not an integer format");
+        }
+    }
 
     #[test]
     fn the_depth_formats_the_backend_makes_shade_the_ambient_present() {

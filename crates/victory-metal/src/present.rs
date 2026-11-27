@@ -24,12 +24,12 @@ use std::collections::HashMap;
 /// fragment shades the near-black pixels of the source by a depth target: the lighting compute
 /// passes can still be refused, and a fully drawn G-buffer would otherwise reach the screen as
 /// pitch black after tone-mapping. Guesses: the console's reversed Z (near 1, far 0, so nearer is
-/// brighter), and that all channels under 0.02 mean unlit rather than the title's own black.
+/// brighter), and that all channels under 0.005 mean unlit rather than the title's own black.
 const SHADER: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 struct Out { float4 position [[position]]; float2 uv; };
-struct Ambient { float level; };
+struct Ambient { float level; float has_albedo; };
 vertex Out present_vertex(uint i [[vertex_id]]) {
     float2 p = float2((i << 1) & 2, i & 2);
     Out o;
@@ -42,21 +42,31 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
     return source.sample(s, in.uv);
 }
 fragment float4 ambient_fragment(Out in [[stage_in]], texture2d<float> source [[texture(0)]],
-                                 texture2d<float> z [[texture(1)]], constant Ambient& a [[buffer(0)]]) {
+                                 texture2d<float> z [[texture(1)]], texture2d<float> g [[texture(2)]],
+                                 constant Ambient& a [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 c = source.sample(s, in.uv);
-    float shade = z.sample(s, in.uv).r;
-    float3 lit = float3(a.level * shade);
-    float black = step(max(c.r, max(c.g, c.b)), 0.02);
+    float d = z.sample(s, in.uv).r;
+    // The screen-space derivatives of the reversed-Z depth reconstruct the surface: they are
+    // zero on a surface parallel to the screen and grow at slants and silhouettes, so their
+    // complement is a facing term that separates surfaces from their edges.
+    float2 dd = float2(dfdx(d), dfdy(d));
+    float facing = 1.0 - clamp(length(dd) * 4.0, 0.0, 0.6);
+    // The G-buffer's own colour where a pass drew one (the frame's most-drawn colour
+    // target), over the depth's flat shade; without one the depth stands alone.
+    float3 albedo = g.sample(s, in.uv).rgb;
+    float3 lit = a.level * (0.35 + 0.65 * facing) * mix(float3(d), albedo, a.has_albedo);
+    float black = step(max(c.r, max(c.g, c.b)), 0.005);
     return float4(mix(c.rgb, lit, black), c.a);
 }
 "#;
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
-/// The `VICTORY_AMBIENT` state of one surface: the depth target its presents shade by, and the
+/// The `VICTORY_AMBIENT` state of one surface: the depth target its presents shade by, the
+/// colour target blended in as the albedo (none when the frame drew no readable one), and the
 /// constant ambient level.
-type Ambient = (Texture, f32);
+type Ambient = (Texture, Option<Texture>, f32);
 
 // CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
 // worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
@@ -83,8 +93,13 @@ pub struct Surface {
     pipelines: RefCell<HashMap<usize, Pipeline>>,
     /// The copy pipeline of the ambient fragment for each drawable format seen.
     ambient: RefCell<HashMap<usize, Pipeline>>,
-    /// `VICTORY_AMBIENT`: the depth target presents shade near-black pixels by, and its level.
+    /// `VICTORY_AMBIENT`: the depth target presents shade near-black pixels by, the albedo
+    /// blended in, and its level.
     shade: RefCell<Option<Ambient>>,
+    /// The 1x1 black texture bound in the ambient fragment's albedo slot when the frame drew
+    /// no colour target to blend in (the mix constant is zero, so it is never read; the slot
+    /// still needs a texture).
+    black: RefCell<Option<Retained<ProtocolObject<dyn MTLTexture>>>>,
     /// The texture of the last drawable presented, readable when the layer is not frame-buffer
     /// only (the tests read their pixels from it).
     last: RefCell<Option<Retained<ProtocolObject<dyn MTLTexture>>>>,
@@ -300,6 +315,7 @@ impl PresentBackend for Metal {
             pipelines: RefCell::default(),
             ambient: RefCell::default(),
             shade: RefCell::default(),
+            black: RefCell::default(),
             last: RefCell::default(),
             frames: Default::default(),
             green: Default::default(),
@@ -310,6 +326,7 @@ impl PresentBackend for Metal {
         &self,
         _surface: &Surface,
         depth: Option<&Texture>,
+        albedo: Option<&Texture>,
         level: f32,
     ) -> Result<(), String> {
         // The depth texture is bound as itself, never as a colour view. A colour view of a
@@ -330,8 +347,21 @@ impl PresentBackend for Metal {
                 }
                 ok
             })
-            .map(|t| (t.clone(), level));
-        *_surface.shade.borrow_mut() = depth;
+            .cloned();
+        // The albedo is sampled as floats: only a single-sampled colour format whose values
+        // read as floats can go into the fragment's `texture2d<float>` slot. An integer
+        // G-buffer target (the frame's packed floats) is skipped the same way, logged once
+        // per format; a depth target never candidated (the chooser filters those out).
+        let albedo = albedo
+            .filter(|t| {
+                let ok = colour_binds_as_float(t.tex.pixelFormat()) && t.tex.sampleCount() == 1;
+                if !ok {
+                    warn_skipped_ambient_colour(t.tex.pixelFormat(), t.tex.sampleCount());
+                }
+                ok
+            })
+            .cloned();
+        *_surface.shade.borrow_mut() = depth.map(|t| (t, albedo, level));
         Ok(())
     }
 
@@ -383,18 +413,33 @@ impl PresentBackend for Metal {
                 .renderCommandEncoderWithDescriptor(&pass)
                 .ok_or("no render encoder")?;
             // VICTORY_AMBIENT: shade near-black source pixels by the depth target the host chose,
-            // so the world is visible while the lighting passes are still refused.
+            // with the frame's colour target blended in as the albedo, so the world is visible
+            // while the lighting passes are still refused.
             let shade = surface.shade.borrow();
             let state = match shade.as_ref() {
-                Some((depth, level)) => {
+                Some((depth, albedo, level)) => {
                     let p = pipeline(self, surface, target.pixelFormat(), "ambient_fragment", &surface.ambient)?;
-                    // SAFETY: slot 1 of the fragment stage takes the depth texture, and the level
-                    // is four bytes set inline (setFragmentBytes copies them before returning).
+                    // The albedo slot always has a texture: the frame's colour target, or the
+                    // surface's 1x1 black one when the frame drew none (`has_albedo` is then 0,
+                    // so the black is never read).
+                    let black;
+                    let g = match albedo.as_ref() {
+                        Some(t) => &t.tex,
+                        None => {
+                            black = black_1x1(self, surface);
+                            &black
+                        }
+                    };
+                    let has = [*level, albedo.is_some() as u8 as f32];
+                    // SAFETY: slot 1 of the fragment stage takes the depth texture, slot 2 the
+                    // albedo, and the level and flag are eight bytes set inline (setFragmentBytes
+                    // copies them before returning).
                     unsafe {
                         e.setFragmentTexture_atIndex(Some(&depth.tex), 1);
+                        e.setFragmentTexture_atIndex(Some(g), 2);
                         e.setFragmentBytes_length_atIndex(
-                            std::ptr::NonNull::new((&raw const level).cast_mut().cast()).unwrap(),
-                            std::mem::size_of::<f32>(),
+                            std::ptr::NonNull::new((&raw const has).cast_mut().cast()).unwrap(),
+                            std::mem::size_of::<[f32; 2]>(),
                             0,
                         );
                     }
@@ -471,6 +516,79 @@ fn host_depth_format(f: MTLPixelFormat) -> HostDepthFormat {
     }
 }
 
+/// Whether a colour target can be sampled by the ambient present's `texture2d<float>` albedo
+/// slot: a format whose values read as floats (normalised, shared-exponent or float channels;
+/// the sRGB variants linearise on sample). Integer formats need a `texture2d<uint>` slot and
+/// hold the frame's packed floats anyway, so they are not bindable here. Every format the
+/// backend makes a render target of that this accepts is named (`pixel_format`'s renderable
+/// ones); `BGRA8Uint` and `BGRA8Sint` exist on no Apple GPU the backend runs on and have no
+/// constant in objc2-metal 0.3.2.
+fn colour_binds_as_float(f: MTLPixelFormat) -> bool {
+    matches!(
+        f,
+        MTLPixelFormat::RGBA8Unorm
+            | MTLPixelFormat::RGBA8Unorm_sRGB
+            | MTLPixelFormat::BGRA8Unorm
+            | MTLPixelFormat::BGRA8Unorm_sRGB
+            | MTLPixelFormat::RGBA16Float
+            | MTLPixelFormat::R32Float
+            | MTLPixelFormat::RG32Float
+            | MTLPixelFormat::RGBA32Float
+            | MTLPixelFormat::RG11B10Float
+            | MTLPixelFormat::RGB10A2Unorm
+            | MTLPixelFormat::RGB9E5Float
+            | MTLPixelFormat::RGBA16Unorm
+            | MTLPixelFormat::RGBA16Snorm
+            | MTLPixelFormat::RG16Float
+            | MTLPixelFormat::R16Float
+            | MTLPixelFormat::RG8Unorm
+            | MTLPixelFormat::R8Unorm
+            | MTLPixelFormat::A8Unorm
+            | MTLPixelFormat::BGR5A1Unorm
+            | MTLPixelFormat::ABGR4Unorm
+    )
+}
+
+/// A 1x1 black RGBA texture, made once a surface and kept; a `Retained` clone is handed out
+/// (a reference cannot live past the `RefCell` guard it was read through). Bound in the
+/// ambient fragment's albedo slot when the frame drew no colour target to blend in.
+fn black_1x1(m: &Metal, surface: &Surface) -> Retained<ProtocolObject<dyn MTLTexture>> {
+    surface
+        .black
+        .borrow_mut()
+        .get_or_insert_with(|| {
+            // SAFETY: a plain 2D descriptor for a 1x1 RGBA8 texture.
+            let td = unsafe {
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    MTLPixelFormat::RGBA8Unorm,
+                    1,
+                    1,
+                    false,
+                )
+            };
+            td.setUsage(MTLTextureUsage::ShaderRead);
+            td.setStorageMode(MTLStorageMode::Shared);
+            let tex = m
+                .dev
+                .newTextureWithDescriptor(&td)
+                .expect("a 1x1 texture");
+            // SAFETY: the region is the whole texture and the four bytes are its one texel.
+            unsafe {
+                tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                    MTLRegion {
+                        origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                        size: MTLSize { width: 1, height: 1, depth: 1 },
+                    },
+                    0,
+                    std::ptr::NonNull::new([0u8; 4].as_ptr().cast_mut().cast()).unwrap(),
+                    4,
+                )
+            };
+            tex
+        })
+        .clone()
+}
+
 /// A depth target the ambient present refused, logged once per format (and sample count), so a
 /// run log says which formats were skipped without repeating it every frame.
 fn warn_skipped_ambient_depth(f: MTLPixelFormat, samples: usize) {
@@ -482,6 +600,21 @@ fn warn_skipped_ambient_depth(f: MTLPixelFormat, samples: usize) {
             pixel_format = f.0,
             samples,
             "VICTORY_AMBIENT: this depth target's format cannot shade the present; shading skipped for it"
+        );
+    }
+}
+
+/// A colour target the ambient present refused as its albedo, logged once per format (and
+/// sample count): the same once-per-format discipline as the depth skips.
+fn warn_skipped_ambient_colour(f: MTLPixelFormat, samples: usize) {
+    static SEEN: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(f.0, samples)) {
+        seen.push((f.0, samples));
+        tracing::warn!(
+            pixel_format = f.0,
+            samples,
+            "VICTORY_AMBIENT: this colour target's format cannot be the albedo; blending skipped for it"
         );
     }
 }
@@ -550,5 +683,41 @@ mod tests {
         assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D16Unorm))));
         assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D32Float))));
         assert!(depth_shades_ambient(host_depth_format(pixel_format(Format::D32FloatS8))));
+    }
+
+    /// The colour formats the ambient present can sample as its albedo: every renderable
+    /// float-valued format the backend makes, never an integer one (the frame's packed floats;
+    /// a `texture2d<float>` slot cannot sample them) and never a depth one.
+    #[test]
+    fn colour_formats_bind_as_the_albedo_or_skip() {
+        for f in [
+            Format::Rgba8Unorm,
+            Format::Rgba8UnormSrgb,
+            Format::Bgra8Unorm,
+            Format::Bgra8UnormSrgb,
+            Format::Rgba16Float,
+            Format::R32Float,
+            Format::Rg32Float,
+            Format::Rgba32Float,
+            Format::Rg11b10Float,
+            Format::Rgb10a2Unorm,
+        ] {
+            assert!(colour_binds_as_float(pixel_format(f)), "{f:?} binds as float");
+        }
+        for f in [
+            Format::Rgba8Uint,
+            Format::R32Uint,
+            Format::R8Uint,
+            Format::Rgba32Uint,
+            Format::Rg32Uint,
+            Format::Rg16Uint,
+            Format::Rg8Uint,
+            Format::R16Uint,
+        ] {
+            assert!(!colour_binds_as_float(pixel_format(f)), "{f:?} is integer");
+        }
+        for f in [Format::D32Float, Format::D32FloatS8, Format::D16Unorm] {
+            assert!(!colour_binds_as_float(pixel_format(f)), "{f:?} is depth");
+        }
     }
 }

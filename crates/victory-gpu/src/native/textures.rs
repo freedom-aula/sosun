@@ -886,6 +886,40 @@ impl<B: PresentBackend> Title<B> {
         &mut self,
         record: crate::descriptor::RtvRecord,
     ) -> Option<(Rc<B::Texture>, Format)> {
+        let (view, format) = self.subresource_view(&record, false)?;
+        Some((view, format))
+    }
+
+    /// The attachment a draw's render pass binds for a render-target view: [`Self::target_of`]'s,
+    /// with the texture viewed in [`Format::float_write_twin`] of its format when it is an
+    /// integer one. The console's pixel exports are float dwords the colour block writes raw
+    /// into an integer target, which a float attachment reproduces (bit-identically for 32-bit
+    /// channels); a float output on an integer attachment is instead refused outright and the
+    /// whole pass draws nothing. The format returned (and recorded for the target) is the
+    /// original: pipelines are made against it (their blending disabled for it, as an integer
+    /// target cannot blend) and only their Metal attachments take the same twin this bound. A
+    /// clear keeps [`Self::target_of`]'s own view and converts its colour to the format, as
+    /// D3D12 does.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn write_target_of(
+        &mut self,
+        record: crate::descriptor::RtvRecord,
+    ) -> Option<(Rc<B::Texture>, Format)> {
+        let (view, _) = self.subresource_view(&record, true)?;
+        let own = self.format_of(record.resource as usize)?;
+        Some((view, own))
+    }
+
+    /// A render-target view's attachment: the texture itself for the base subresource, else a
+    /// cached view of the mip or slice, in `format` (the record's own when `twin` asks for it,
+    /// the sRGB twin the record may name, then the texture's own format as a fallback) — the
+    /// first that views. The format the caller records is the one that viewed.
+    #[cfg(target_os = "macos")]
+    fn subresource_view(
+        &mut self,
+        record: &crate::descriptor::RtvRecord,
+        twin: bool,
+    ) -> Option<(Rc<B::Texture>, Format)> {
         let key = record.resource as usize;
         self.realize(key);
         let t = self.textures.get_mut(&key)?;
@@ -898,10 +932,18 @@ impl<B: PresentBackend> Title<B> {
         )?;
         let base = (mip, slice) == (0, 0);
         let own = desc.format;
-        let twin = format(record.format()).filter(|&f| srgb_twin(own) == Some(f));
+        let srgb = format(record.format()).filter(|&f| srgb_twin(own) == Some(f));
         // A failed format reinterpretation can fall back to the resource format, but must
-        // keep the same mip and slice.
-        for format in twin.into_iter().chain([own]) {
+        // keep the same mip and slice. The write twin is of the effective format (the sRGB
+        // view the record names, else the texture's own); an sRGB format is never an
+        // integer one, so the twin only ever replaces the texture's own format.
+        let effective = srgb.unwrap_or(own);
+        let mut formats = srgb.into_iter().chain([own]).collect::<Vec<_>>();
+        if twin {
+            let twin = effective.float_write_twin().into_iter().chain(formats).collect::<Vec<_>>();
+            formats = twin;
+        }
+        for format in formats {
             if base && format == own {
                 return Some((t.texture.clone(), own));
             }

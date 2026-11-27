@@ -474,21 +474,29 @@ impl Graphics {
     }
 
     /// Blend and write mask of each colour target (target 0's description for all when the blend
-    /// description is not independent).
+    /// description is not independent). An integer target never blends — the console has no
+    /// blending for one — even though its Metal attachment is the float twin a float export
+    /// writes through; the format here is the target's own, whatever the host binds.
     pub fn color_state(&self) -> Vec<ColorState> {
-        let targets = self.bound.as_ref().map_or(self.rt_formats.len(), |b| b.0.len());
-        (0..targets.max(1))
+        let formats: Vec<Option<Format>> = match &self.bound {
+            Some((color, _)) => color.iter().map(|&f| Some(f)).collect(),
+            None => self.rt_formats.iter().map(|&f| format(f)).collect(),
+        };
+        (0..formats.len().max(1))
             .map(|i| {
                 let t = &self.blend[if self.independent { i } else { 0 }];
                 ColorState {
-                    blend: t.enable.then(|| Blend {
-                        src: blend_factor(t.src),
-                        dst: blend_factor(t.dst),
-                        op: blend_op(t.op),
-                        src_alpha: blend_factor(t.src_alpha),
-                        dst_alpha: blend_factor(t.dst_alpha),
-                        op_alpha: blend_op(t.op_alpha),
-                    }),
+                    blend: t
+                        .enable
+                        .then(|| Blend {
+                            src: blend_factor(t.src),
+                            dst: blend_factor(t.dst),
+                            op: blend_op(t.op),
+                            src_alpha: blend_factor(t.src_alpha),
+                            dst_alpha: blend_factor(t.dst_alpha),
+                            op_alpha: blend_op(t.op_alpha),
+                        })
+                        .filter(|_| !formats.get(i).copied().flatten().is_some_and(Format::is_integer)),
                     write_mask: t.mask & 0xf,
                 }
             })
@@ -973,6 +981,37 @@ mod tests {
         let r = g.raster();
         assert!(r.front_ccw && !r.wireframe && !r.depth_clip);
         assert_eq!(r.depth_bias, (5.0, 2.0, 0.5));
+    }
+
+    #[test]
+    fn an_integer_target_never_blends_whatever_its_metal_attachment() {
+        // The blend subobject of `blend_depth_stencil_and_raster_subobjects_are_read`,
+        // without the rest: target 0 blends.
+        let mut g = Graphics::default();
+        let mut blend = vec![0u32; 2 + 80];
+        blend[1] = 1;
+        blend[2..12].copy_from_slice(&[1, 0, 5, 6, 1, 2, 1, 1, 0, 0b0111]);
+        blend[12] = 1;
+        let s = sub(8, &blend);
+        // SAFETY: a whole subobject without pointers.
+        unsafe { g.read(8, s.as_ptr()) };
+        assert!(g.color_state()[0].blend.is_some(), "a float target blends");
+
+        // The same state bound to an integer target: no blending (the console has none for
+        // one), even though the host writes the target through its float Metal twin — the
+        // format here is the target's own. A float target beside it keeps its blending.
+        let g = g.with_targets(vec![Format::R32Uint, Format::Rgba8Unorm], None);
+        let state = g.color_state();
+        assert_eq!(state.len(), 2);
+        assert_eq!(state[0].blend, None, "an R32Uint target cannot blend");
+        assert!(state[1].blend.is_some(), "the Rgba8Unorm target beside it still blends");
+        assert_eq!(state[0].write_mask, 0b0111, "the write mask stands");
+
+        // The Metal attachments the host makes of them: the integer target's float twin.
+        assert_eq!(
+            g.color_formats().unwrap().iter().map(|&f| f.float_write_twin().unwrap_or(f)).collect::<Vec<_>>(),
+            vec![Format::R32Float, Format::Rgba8Unorm]
+        );
     }
 
     #[test]
