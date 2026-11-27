@@ -952,6 +952,37 @@ impl<B: GraphicsBackend> NativeHost<B> {
         out
     }
 
+    /// For `VICTORY_TRACE_RECORD_WRITERS`: what the first 64 entries from each of `root`'s tables
+    /// name: the title memory (start, size) of buffers viewed for unordered access, the textures
+    /// viewed as shader resources, and the textures viewed for unordered access. A table may be
+    /// shorter, so a neighbour's views can be counted in; views of memory without a resource
+    /// object are left out.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    pub(super) fn table_views(&self, root: &[Option<Root<B>>]) -> (Vec<(u64, u64)>, Vec<usize>, Vec<usize>) {
+        use crate::descriptor::View;
+        let (mut buffers, mut reads, mut writes) = (Vec::new(), Vec::new(), Vec::new());
+        for r in root.iter().flatten() {
+            let Root::Table(h, at) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            for k in 0..64u64 {
+                match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
+                    Some(View::Shader(r, _)) if texture_info_of(r).is_some() => reads.push(r),
+                    Some(View::Unordered(r, _, _)) if texture_info_of(r).is_some() => writes.push(r),
+                    Some(View::Unordered(r, _, _)) => {
+                        if let Some((p, n)) = crate::resource::buffer_bytes(r as crate::object::This) {
+                            buffers.push((p as u64, n));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (buffers, reads, writes)
+    }
+
     /// `VICTORY_TRACE_CONTENT=<dir>`: for the first draws into a depth target, every texture and
     /// constant buffer their descriptor tables hold: its view, the fraction of its title memory
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
