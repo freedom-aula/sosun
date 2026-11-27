@@ -16,7 +16,7 @@
 use super::descriptors::format;
 use super::host::NativeHost;
 use super::title::Title;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_formats::texture::{Dimension, Layout};
@@ -382,7 +382,9 @@ pub struct Tracked<B: ResourceBackend> {
     blank: bool,
     /// Render-target views already made, kept so the same attachment keeps its identity.
     #[cfg(target_os = "macos")]
-    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
+    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,    /// A GPU copy wrote it: its host texture holds what title memory does not, and is never
+    /// filled from that memory again.
+    gpu_written: bool,
 }
 
 /// The other format of an sRGB pair.
@@ -482,14 +484,14 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     }
 }
 
-/// Probes `keys` round-robin from `cursor`, each at most once, until `until` once
-/// `MIN_SYNC_HOT` were probed; those whose memory changed go to `dirty`. Hot textures that stay
+/// Probes `keys` round-robin from `cursor`, each at most once. An expired deadline stops the
+/// round after at least `MIN_SYNC_HOT` probes. Changed textures go to `dirty`. Hot textures that stay
 /// unchanged cool down and leave; blank ones (`blank`) stay until they are written.
 fn probe_round<B: ResourceBackend>(
     textures: &mut Textures<B>,
     keys: &mut Vec<usize>,
     cursor: &mut usize,
-    until: std::time::Instant,
+    until: Option<std::time::Instant>,
     blank: bool,
     scratch: &mut Vec<u8>,
     dirty: &mut std::collections::HashSet<usize>,
@@ -497,7 +499,7 @@ fn probe_round<B: ResourceBackend>(
     let mut left = keys.len();
     let mut probed = 0;
     while left > 0 && !keys.is_empty() {
-        if probed >= MIN_SYNC_HOT && std::time::Instant::now() >= until {
+        if probed >= MIN_SYNC_HOT && until.is_some_and(|until| std::time::Instant::now() >= until) {
             break;
         }
         left -= 1;
@@ -705,6 +707,7 @@ impl<B: PresentBackend> Title<B> {
                 blank: false,
                 #[cfg(target_os = "macos")]
                 target_views: Vec::new(),
+                gpu_written: false,
             },
         );
         true
@@ -765,6 +768,19 @@ impl<B: PresentBackend> Title<B> {
             }
         }
         None
+    }
+
+    /// A GPU copy writes title texture `key` (made already): from now on the host texture is the
+    /// GPU's, as a render target's is, and the CPU-side sync no longer fills it from title memory.
+    /// A sampled texture not uploaded yet still takes its first upload, at the submission and so
+    /// before the copy runs (a copy of a region keeps the rest).
+    /// shortcut: what the title writes into its memory afterwards is not seen; when a title is
+    /// found to refill a copy's destination from the CPU, upload a change again.
+    pub fn gpu_written(&mut self, key: usize) {
+        if let Some(t) = self.textures.get_mut(&key) {
+            t.gpu_written = true;
+            (t.hot, t.blank) = (0, false);
+        }
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -831,6 +847,15 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner or hot probe
     /// found changed since.
     pub fn sync_dirty(&mut self) {
+        self.sync_dirty_with_probe_budget(Some(PROBE_BUDGET));
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn sync_dirty_without_probe_deadline(&mut self) {
+        self.sync_dirty_with_probe_budget(None);
+    }
+
+    fn sync_dirty_with_probe_budget(&mut self, budget: Option<std::time::Duration>) {
         self.release_placed();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         for key in &dirty {
@@ -842,22 +867,16 @@ impl<B: PresentBackend> Title<B> {
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
         // the ones that changed lately first, then the blank ones.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let until = budget.map(|budget| std::time::Instant::now() + budget);
         probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
         // The blank ones get a budget of their own: a busy movie must not starve its next planes.
-        let until = std::time::Instant::now() + PROBE_BUDGET;
+        let until = budget.map(|budget| std::time::Instant::now() + budget);
         probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
         let unloaded = std::mem::take(&mut self.unloaded);
         if unloaded.is_empty() && dirty.is_empty() {
             return;
         }
-        let mut todo: Vec<usize> = unloaded.into_iter().collect();
-        for key in dirty {
-            if !todo.contains(&key) {
-                todo.push(key);
-            }
-        }
-        self.sync_keys(todo);
+        self.sync_keys(keys_to_sync(&unloaded, &dirty));
     }
 
     fn sync_keys(&mut self, keys: Vec<usize>) {
@@ -874,6 +893,9 @@ impl<B: PresentBackend> Title<B> {
                 continue;
             };
             if t.info.desc().is_some_and(|d| d.format.is_depth()) {
+                continue;
+            }
+            if t.gpu_written && (t.uploads > 0 || t.info.render_target()) {
                 continue;
             }
             let tiled = read_memory(t.info.memory, t.info.size);
@@ -910,12 +932,29 @@ impl<B: PresentBackend> Title<B> {
     }
 }
 
+fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize> {
+    unloaded.iter().chain(dirty.difference(unloaded)).copied().collect()
+}
+
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {
+        let unloaded = (0..20_000).collect();
+        let dirty = (10_000..30_000).collect();
+        let mut keys = keys_to_sync(&unloaded, &dirty);
+
+        let (first, rest) = keys.split_at_mut(unloaded.len());
+        first.sort_unstable();
+        rest.sort_unstable();
+        assert!(first.iter().copied().eq(0..20_000));
+        assert!(rest.iter().copied().eq(20_000..30_000));
+    }
 
     fn dirty_this_round(
         entries: &HashMap<usize, (usize, usize, bool)>,

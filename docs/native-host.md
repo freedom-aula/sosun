@@ -285,7 +285,7 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 **Threads.** `spawn_title_thread_with` sends `DLL_THREAD_ATTACH` before and `DLL_THREAD_DETACH` after the start routine to every image registered with `register_thread_callbacks` (`run_entry` registers the main image). `CREATE_SUSPENDED` holds the thread at a gate (the thread reads its suspension count and marks itself running under one lock, so a `SuspendThread` while it starts either parks it at the gate or finds it running); once running, `SuspendThread` is `thread_suspend` on the Mach port, retried briefly until the thread is in title code (so it holds no host lock), and `GetThreadContext` is `thread_get_state` (x86 state under Rosetta works). Waits on several objects use one epoch counter that every signal bumps (it wakes sleepers only while a thread is in such a wait, so a signal with none makes no system call); wait-all takes under a lock and gives back what it took if it cannot take all. Critical sections, SRW locks and condition variables live in the title's own structures over `wait_on_address`. Not done: mutexes (`CreateMutexW`), waitable timers, APCs, `SetThreadContext`, thread priorities.
 
-**Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Synchronous reads, writes, seeks and `SetEndOfFile` serialize access to the shared file position on each handle. Overlapped reads and writes complete before returning and leave that position unchanged. `TRUNCATE_EXISTING` requires `GENERIC_WRITE` or `GENERIC_ALL`. A request with neither bit returns `ERROR_INVALID_PARAMETER` and preserves the file contents. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
+**Files.** `host_posix/files.rs` mirrors the calls `modules/files.rs` hands to the host's kernel32 on Windows, on `std::fs`: drives are mounted folders (`mount`, `mount_at`), a drive path is resolved under its folder (`..` stops at the root), other paths just get `/` for `\`. The Windows path is untouched. Persistent storage (`storage.rs`) mounts its folder through it on macOS. Synchronous reads, writes, seeks and `SetEndOfFile` serialize access to the shared file position on each handle. Overlapped reads and writes complete before returning and leave that position unchanged. `OPEN_ALWAYS` with `GENERIC_READ` can create a file or open an existing read-only file. Read-only handles from `OPEN_ALWAYS`, `CREATE_NEW` and `CREATE_ALWAYS` reject `WriteFile` and `SetEndOfFile` with `ERROR_ACCESS_DENIED`. `TRUNCATE_EXISTING` requires `GENERIC_WRITE` or `GENERIC_ALL`. A request with neither bit returns `ERROR_INVALID_PARAMETER` and preserves the file contents. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes. A nonzero-length overlapped read starting at or past EOF completes with zero bytes, records `STATUS_END_OF_FILE`, and signals its event if present. Both `ReadFile` and `GetOverlappedResult` report `ERROR_HANDLE_EOF`. Partial reads succeed with the bytes available, and synchronous EOF reads and zero-length requests succeed with zero bytes. `TRUNCATE_EXISTING` requires `GENERIC_WRITE` or `GENERIC_ALL`. A request with neither bit returns `ERROR_INVALID_PARAMETER` and preserves the file contents. A handle opened with `FILE_APPEND_DATA` and no other write access writes at the end of the file whatever the offset, as Windows does. The C runtime's `fopen`/`_wopen`/`_stat64` are in `host_posix/ucrt` (below). Not done: `MoveFileEx`, `GetDiskFreeSpace`, `CreateFile2`, file mappings, share modes.
 
 **dstorage on files.** `open_for_reading` calls `host_posix::files::translate`. dstorage signals no Win32 events today (completion is the status array; the fence methods are not implemented), so nothing there needs `sync::signalled`; when fences are added, a host event set by them must be followed by `sync::signalled` so waits on several objects see it. Still open: `FileExt::read_at` on the worker pool, no `kernel_will_write` once the GPU shares memory, `mmap` paths through `victory-platform`.
 
@@ -943,6 +943,13 @@ story-load log of issue #110 (Series S) has three compute programs refused with 
 The simulator now follows a constant loaded by `s_mov_b32` inside the section. For example, a
 signed minimum can use `INT_MAX` from an SGPR as its inactive-lane identity. Whether the three
 logged programs use this pattern is unknown.
+Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR constants as lane
+selectors. A selector with a runtime value still produces the computed-lane-select refusal.
+
+The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
+`v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
+group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave
+reductions already have the same result in every lane and need no extra lane read.
 
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
@@ -1173,3 +1180,37 @@ validation). Previously all texture copy calls incremented `texture_copies` (`DR
 and left destination textures empty (tests: `victory-metal`
 `texture_blit_ops_copy_between_textures_and_buffers` and `victory-gpu`
 `native::texture_tests::copy_resource_and_copy_texture_region_run_on_the_gpu`).
+
+What the world needs on top of that (`fix/texture-copies-port`):
+
+* **Formats no view joins** but D3D12 copies between go through a scratch buffer of the host's
+  own, texture to buffer to texture: plain texels against compressed blocks of the same byte size
+  (one texel a 4x4 block; the world copies `R32G32B32A32_UINT` into BC3 and `R32G32_UINT` into
+  BC1, a GPU encoder's output), and a depth plane against a plain 4-byte format
+  (`victory_metal::gfx::direct_copy` decides; the region given is in source texels, the
+  destination's is scaled). The checks sit in `glue::copy_formats` and `glue::dest_size` too, so a
+  copy the host cannot do is refused at record time and counted, not skipped silently by the
+  encoder.
+* **Depth and stencil to and from buffer rows.** A `D32FloatS8` texture moves its 4-byte depth
+  plane (`MTLBlitOptionDepthFromDepthStencil`); `D32Float` and `D16Unorm` copy as they are. A
+  footprint naming both planes in one element (`D32_FLOAT_S8X24`) is still refused; the rows of
+  a depth plane come as `R32_TYPELESS` and the like. Rows and texture must have texels of one
+  size (`glue::rows_match`).
+* **`ResolveSubresource`.** Host textures have one sample, so a resolve copies what both
+  subresources hold (the console clips a larger source to the destination, as the D3D12 host
+  does).
+* **The destination is the GPU's** (`Title::gpu_written`), as a render target's is: the CPU-side
+  sync (`sync_keys`, fed by the scanner and the hot and blank probes) never fills it from title
+  memory again, which holds none of what the copy wrote. A sampled texture not uploaded yet still
+  takes its first upload at that submission, before the copy runs, so a region copy keeps the
+  rest. Guess, marked in `textures.rs`: a title does not refill a copy's destination from the CPU
+  later; if one does, that write is not seen.
+* **Counters.** "native draws so far" has `copies_recorded` next to `texture_copies` (refused);
+  with `VICTORY_TRACE_TARGETS=1` the frame line has `copies=` (since the last present) and each
+  kind is logged once ("a texture copy (first of its kind)"). A refused copy warns once per
+  operation and pair of title formats ("a texture copy refused (first of this kind)").
+
+Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resource_copies_a_texture_on_the_gpu`
+(and its destination keeps the copy when its title memory changes),
+`copy_texture_region_moves_plain_texels_into_compressed_blocks`,
+`resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.
