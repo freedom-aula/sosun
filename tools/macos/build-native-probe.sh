@@ -34,7 +34,7 @@ tools/macos/gnullvm-cc.sh -shared -O1 -ffreestanding -fno-builtin -fno-stack-pro
     -fms-extensions -fasynchronous-unwind-tables -fexceptions -Xclang -fasync-exceptions -fno-emulated-tls -nostdlib \
     -Wl,--entry,DllMain -Wl,--subsystem,console -Wl,--dynamicbase \
     -Wl,--image-base,0x150000000 \
-    -L"$WORK" "$SRC/probe_dll.c" -lkernel32 -o "$(dirname "$OUT")/victory-probe-dll.dll"
+    -L"$WORK" "$SRC/probe_dll.c" "$SRC/victory-probe-dll.def" -lkernel32 -o "$(dirname "$OUT")/victory-probe-dll.dll"
 # No CRT: the probe's entry point is probe_main, which the host calls itself.
 # --dynamicbase gives it base relocations; the preferred base is above 4 GiB
 # like a console title's.

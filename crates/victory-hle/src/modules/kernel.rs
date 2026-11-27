@@ -682,10 +682,20 @@ mod host {
                     name: super::narrow(_name),
                 }
             };
-            if let Some(address) =
-                victory_loader::native::dll::proc_address(_module as usize, &symbol)
-            {
-                return address as *mut c_void;
+            if let Some(dll) = victory_loader::native::dll::find_base(_module as usize) {
+                use victory_loader::{Provenance, Resolution};
+                let resolver = crate::runtime::NATIVE_TITLE_RESOLVER.get_or_init(Default::default);
+                return match dll.resolve_export(&symbol, resolver) {
+                    Resolution::Found {
+                        address,
+                        provenance: Provenance::Title,
+                    } => address as *mut c_void,
+                    Resolution::Found { address, .. } => super::title_callable(address),
+                    Resolution::Missing => {
+                        set_last_error(super::ERROR_PROC_NOT_FOUND);
+                        std::ptr::null_mut()
+                    }
+                };
             }
             #[cfg(target_arch = "x86_64")]
             if let Some(found) = crate::host_posix::fake_dll::proc_address(_module, symbol) {
