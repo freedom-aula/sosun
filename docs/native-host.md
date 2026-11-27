@@ -973,6 +973,12 @@ The simulator keeps the original source lane of a VGPR value through a shuffle. 
 `v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
 group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave
 reductions already have the same result in every lane and need no extra lane read.
+That also holds when the read comes after the section: the G-buffer's pixel programs
+end a whole-wave minimum by restoring EXEC, then read lane 31 of it in a second section or
+outside one. That read was refused as "v_readlane_b32 of a constant lane in a pixel program"
+(132 draws a frame in the G-buffer's warm log). A section's value shaped as a constant, a
+reduction or one lane's value is now that value at any lane (`Lower::section_uniform`).
+Test: `emit::gfx_refusal_tests::a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction`.
 
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two

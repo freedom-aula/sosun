@@ -1270,6 +1270,19 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether an earlier whole-wave section left `v` the same in every lane
+    /// (a reduction, a constant or one lane's value), so any lane read of it is `v`.
+    fn section_uniform(&self, v: Value) -> bool {
+        use super::wave::Shape;
+        self.section_out.contains(&v)
+            && self.sections.values().flat_map(|m| m.values()).any(|sec| {
+                matches!(
+                    sec.shapes.get(&v),
+                    Some(Shape::K(_) | Shape::Active(..) | Shape::Half(..) | Shape::ReadLane(..))
+                )
+            })
+    }
+
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         // Lockstep runs whole-wave code literally: every thread is there (`lockstep.rs`).
@@ -1345,6 +1358,7 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
             Shape::ReadLane(v, lane) => {
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
                 let x = self.i32_of(v)?;
@@ -8858,6 +8872,14 @@ impl<'a> Lower<'a> {
                     && self.spill_slot(x, lane, &mut Vec::new(), false).is_ok() =>
             {
                 let a = self.spill_slot(x, lane, &mut Vec::new(), true)?;
+                int(self, a)
+            }
+            "v_readlane_b32"
+                if let Some(Operand::Vector { reg, .. }) = v.src.first()
+                    && let Some(x) = inst.read(Reg::V(*reg))
+                    && self.section_uniform(x) =>
+            {
+                let a = self.i32_of(x)?;
                 int(self, a)
             }
             "v_readlane_b32" => {

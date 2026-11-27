@@ -2472,6 +2472,40 @@ fn a_cross_lane_operation_outside_compute_says_which_and_where() {
     }
 }
 
+/// A pixel program reads lane 31 of a whole-wave minimum in a second section: every lane of
+/// the first section's result holds the minimum, so the lane read is the reduction itself, with
+/// no read of a console lane (`WaveReadLaneAt`) in the host's wave. Outside a section too.
+#[test]
+fn a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction() {
+    let mut code = vec![
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001, 0x000A_00C1, // v_cndmask_b32 v1, -1, v0, s2
+    ];
+    // Each row of 16 reduces in four butterflies.
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        code.extend([0x2602_02FA, 0xFF00_0001 | ctrl << 8]); // v_min_u32_dpp v1, v1, v1
+    }
+    code.extend([
+        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x2602_0501, // v_min_u32 v1, v1, v2
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0xBE83_3DC1, // s_or_saveexec_b32 s3, -1
+        0xD760_0004, 0x0001_3F01, // v_readlane_b32 s4, v1, 31
+        0xBEFE_0303, // s_mov_b32 exec_lo, s3
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ]);
+    // The same read outside a section, under the program's EXEC.
+    let mut bare = code.clone();
+    bare.retain(|&w| w != 0xBE83_3DC1 && w != 0xBEFE_0303);
+    for code in [code, bare] {
+        let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
+        assert!(!l.wave_active_calls.is_empty());
+        assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
+    }
+}
+
 /// A WaveActiveProduct butterfly, followed by an optional step before restoring EXEC.
 fn whole_wave_product(step: &[u32]) -> Result<super::HostShader, ShaderError> {
     use crate::native::tests::{fspx, fspx_resource};
