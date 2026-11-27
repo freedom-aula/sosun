@@ -1332,6 +1332,47 @@ mod tests {
         }
     }
 
+    /// The vertex buffer table's address is only an address: a program that uses s0 as a number
+    /// (exports it, as it is, copied, or with an offset added) is refused, with and without
+    /// `zero_copy_memory`. No host has a value for it.
+    #[test]
+    fn the_vertex_tables_address_used_as_a_number_is_refused() {
+        let exported = [
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xF800_08CF,
+            0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let copied = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0xF800_08CF,
+            0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        let offset = [
+            0x8002_9000, // s_add_u32 s2, s0, 16
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0xF800_08CF,
+            0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+            ENDPGM,
+        ];
+        for (name, code) in [("exported", &exported[..]), ("copied", &copied[..]), ("offset", &offset[..])] {
+            let code = words(code);
+            let (p, _) = infer(HwStage::Vs, &code, &meta_with(&[])).unwrap();
+            assert!(p.layout.iter().any(|r| r.slot == VERTEX_TABLE && r.user_data == 0), "{name}");
+            let c = container(HwStage::Vs, &code, &meta_with(&[])).unwrap();
+            for zero_copy_memory in [false, true] {
+                let options = super::super::Options { wave32_host: true, zero_copy_memory, ..Default::default() };
+                let e = super::super::translate_with(&c, options).err().map(|e| e.to_string());
+                assert!(
+                    e.as_deref().is_some_and(|e| e.contains("a root descriptor")),
+                    "{name}, zero_copy_memory {zero_copy_memory}: {e:?}"
+                );
+            }
+        }
+    }
+
     /// Only parameters that may hold two f16 halves get `HALF` outputs, those that can hold
     /// nothing else first and their `TEXCOORD` last: param0 is a 32-bit float product (plain),
     /// param1 a literal of two f16s (either), param2 a `v_cvt_pkrtz_f16_f32` or 0 (halves).
