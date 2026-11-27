@@ -664,7 +664,13 @@ impl<'a> Lower<'a> {
             .scalar
             .iter()
             .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
-            || insts().any(|i| i.name().starts_with("image_bvh"));
+            || insts().any(|i| i.name().starts_with("image_bvh"))
+            // A view of the title's own memory from a root address on is linear in the pool past
+            // the title page it starts in, and the title maps the next pages anywhere in the pool
+            // (Grand Theft Auto VI's vertex fetch: a root SRV, vertex buffers in 64 KiB pages
+            // mapped in descending pool order). Through the page table every access lands where
+            // the title has it. Compute keeps the views: no case seen, and a lookup per access.
+            || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
         let mut split_barriers = Set::default();
