@@ -38,8 +38,10 @@ const ERROR_PATH_NOT_FOUND: u32 = 3;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NO_MORE_FILES: u32 = 18;
+const ERROR_HANDLE_EOF: u32 = 38;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_ALREADY_EXISTS: u32 = 183;
+const STATUS_END_OF_FILE: usize = 0xC000_0011;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
@@ -276,11 +278,11 @@ impl Overlapped {
         unsafe { self.0.add(16).cast::<u64>().read_unaligned() }
     }
 
-    fn complete(&self, bytes: usize) {
+    fn complete(&self, status: usize, bytes: usize) {
         // SAFETY: the title's OVERLAPPED: Internal and InternalHigh at 0 and 8.
         unsafe {
-            self.0.cast::<usize>().write(0);
             self.0.add(8).cast::<usize>().write(bytes);
+            self.0.cast::<usize>().write(status);
             let event = self.0.add(24).cast::<usize>().read() & !1;
             if let Some(Object::Event(e)) = lock(&HANDLES).get(&event) {
                 e.set();
@@ -315,7 +317,7 @@ impl<'a> IoPosition<'a> {
     fn complete(self, offset: u64, bytes: usize) {
         match self {
             Self::Synchronous(mut position) => *position = offset + bytes as u64,
-            Self::Overlapped(ov) => ov.complete(bytes),
+            Self::Overlapped(ov) => ov.complete(0, bytes),
         }
     }
 }
@@ -358,11 +360,19 @@ pub extern "system" fn ReadFile(
             }
         }
     }
-    position.complete(at, done);
     if !read.is_null() {
         // SAFETY: the title's out-pointer.
         unsafe { read.write(done as u32) };
     }
+    if len > 0
+        && done == 0
+        && let IoPosition::Overlapped(ov) = &position
+    {
+        ov.complete(STATUS_END_OF_FILE, 0);
+        set_error(ERROR_HANDLE_EOF);
+        return 0;
+    }
+    position.complete(at, done);
     1
 }
 
@@ -421,6 +431,11 @@ pub extern "system" fn GetOverlappedResult(
     if !bytes.is_null() {
         // SAFETY: the title's OVERLAPPED and out-pointer.
         unsafe { bytes.write(overlapped.add(8).cast::<usize>().read() as u32) };
+    }
+    // SAFETY: Internal is the first pointer-sized field of the title's OVERLAPPED.
+    if !overlapped.is_null() && unsafe { overlapped.cast::<usize>().read() } == STATUS_END_OF_FILE {
+        set_error(ERROR_HANDLE_EOF);
+        return 0;
     }
     1
 }
@@ -996,6 +1011,91 @@ mod tests {
                 "round {round} lost or corrupted a record"
             );
         }
+    }
+
+    #[test]
+    fn overlapped_reads_report_eof_only_when_a_nonempty_request_reads_nothing() {
+        use super::super::{
+            CloseHandle, CreateEventW, GetLastError, ResetEvent, WAIT_OBJECT_0, WaitForSingleObject,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read.bin");
+        std::fs::write(&path, b"1234tail").unwrap();
+        let handle = create(Some(path), GENERIC_READ, OPEN_EXISTING, 0);
+        assert_ne!(handle, invalid_handle());
+        let event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+        assert!(!event.is_null());
+        // OVERLAPPED: Internal, InternalHigh, Offset/OffsetHigh, hEvent.
+        let mut ov = [0, 0, 4, event as usize];
+        let ov_ptr = (&raw mut ov).cast();
+        let mut buffer = [0; 16];
+        let mut count = 99;
+        assert_eq!(
+            ReadFile(handle, buffer.as_mut_ptr(), 16, &mut count, ov_ptr),
+            1
+        );
+        assert_eq!(count, 4);
+        assert_eq!(&buffer[..4], b"tail");
+        count = 99;
+        assert_eq!(GetOverlappedResult(handle, ov_ptr, &mut count, 0), 1);
+        assert_eq!(count, 4);
+
+        for offset in [8, 9] {
+            assert_eq!(ResetEvent(event), 1);
+            ov[2] = offset;
+            count = 99;
+            assert_eq!(
+                ReadFile(handle, buffer.as_mut_ptr(), 16, &mut count, ov_ptr),
+                0,
+                "offset {offset}"
+            );
+            assert_eq!(GetLastError(), 38);
+            assert_eq!(count, 0);
+            assert_eq!(&ov[..2], &[0xC000_0011, 0]);
+            assert_eq!(WaitForSingleObject(event, 0), WAIT_OBJECT_0);
+
+            set_error(0);
+            count = 99;
+            assert_eq!(GetOverlappedResult(handle, ov_ptr, &mut count, 0), 0);
+            assert_eq!(GetLastError(), 38);
+            assert_eq!(count, 0);
+        }
+
+        ov[2] = 8;
+        count = 99;
+        assert_eq!(
+            ReadFile(handle, std::ptr::null_mut(), 0, &mut count, ov_ptr),
+            1
+        );
+        assert_eq!(count, 0);
+        assert_eq!(&ov[..2], &[0, 0]);
+        assert_eq!(CloseHandle(event), 1);
+        assert_eq!(CloseHandle(handle), 1);
+    }
+
+    #[test]
+    fn synchronous_read_at_eof_succeeds_with_zero_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let handle = create(Some(path), GENERIC_READ, OPEN_EXISTING, 0);
+        assert_ne!(handle, invalid_handle());
+        assert_eq!(SetFilePointer(handle, 0, std::ptr::null_mut(), 2), 4);
+        let mut buffer = [0; 4];
+        let mut count = 99;
+        assert_eq!(
+            ReadFile(
+                handle,
+                buffer.as_mut_ptr(),
+                4,
+                &mut count,
+                std::ptr::null_mut()
+            ),
+            1
+        );
+        assert_eq!(count, 0);
+        assert_eq!(super::super::CloseHandle(handle), 1);
     }
 
     #[test]
