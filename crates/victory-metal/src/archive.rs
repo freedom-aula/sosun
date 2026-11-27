@@ -1,15 +1,17 @@
 //! Compiled pipeline states kept across runs in an `MTLBinaryArchive` (one file in the library
 //! cache's folder, `disk::use_dir`). A pipeline is looked up in the archive first (failing on a
-//! miss); a miss is compiled as before and added. The archive is written back at most every few
-//! seconds while pipelines are being added, and when the backend is dropped, so a run that is
-//! killed loses at most the last few seconds' pipelines. A file Metal refuses (another GPU or OS)
-//! is replaced by an empty archive.
+//! miss); a miss is compiled as before and added. The archive is written back every few seconds
+//! while pipelines are being added (on a thread of its own: a write takes about half a second
+//! and the frame's thread used to wait for it), and when the backend is dropped, so a run that
+//! is killed loses at most the last few seconds' pipelines. A file Metal refuses (another GPU or
+//! OS) is replaced by an empty archive.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use objc2_metal::*;
-use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const SAVE_EVERY: Duration = Duration::from_secs(5);
@@ -18,19 +20,26 @@ pub(crate) struct Archive {
     archive: Retained<ProtocolObject<dyn MTLBinaryArchive>>,
     list: Retained<NSArray<ProtocolObject<dyn MTLBinaryArchive>>>,
     path: std::path::PathBuf,
-    added: Cell<u32>,
-    saved: Cell<Instant>,
+    added: AtomicU32,
+    /// Held for writing to add a pipeline, for reading to look one up or to write the file.
+    /// Guess: Apple does not say an archive may be added to while another thread uses it.
+    changing: RwLock<()>,
 }
+
+// SAFETY: Metal's devices and archives may be used from any thread; `changing` orders the adds.
+unsafe impl Send for Archive {}
+// SAFETY: as above.
+unsafe impl Sync for Archive {}
 
 type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 
 impl Archive {
     /// The archive for this GPU, if libraries are kept on disk.
-    pub(crate) fn open(dev: &Dev) -> Option<Archive> {
+    pub(crate) fn open(dev: &Dev) -> Option<Arc<Archive>> {
         Self::open_in(dev, crate::disk::dir()?)
     }
 
-    fn open_in(dev: &Dev, dir: &std::path::Path) -> Option<Archive> {
+    fn open_in(dev: &Dev, dir: &std::path::Path) -> Option<Arc<Archive>> {
         let gpu = blake3::hash(dev.name().to_string().as_bytes()).to_hex();
         let path = dir.join(format!("pipelines-{}.metalarchive", &gpu[..8]));
         let make = |load: bool| {
@@ -48,7 +57,30 @@ impl Archive {
             }
         };
         let list = NSArray::from_retained_slice(&[archive.clone()]);
-        Some(Archive { archive, list, path, added: Cell::new(0), saved: Cell::new(Instant::now()) })
+        let archive = Arc::new(Archive { archive, list, path, added: AtomicU32::new(0), changing: RwLock::new(()) });
+        let weak = Arc::downgrade(&archive);
+        let _ = std::thread::Builder::new().name("pipeline-archive".into()).spawn(move || {
+            loop {
+                std::thread::sleep(SAVE_EVERY);
+                let Some(a) = weak.upgrade() else { return };
+                a.save();
+            }
+        });
+        Some(archive)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.changing.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Counts a pipeline `add` put in the archive.
+    fn add(&self, what: &str, add: impl FnOnce() -> bool) {
+        let started = Instant::now();
+        let _changing = self.changing.write().unwrap_or_else(|e| e.into_inner());
+        if add() {
+            self.added.fetch_add(1, Ordering::Relaxed);
+        }
+        note(started, what);
     }
 
     /// The pipeline of `d`: from the archive, else compiled and added.
@@ -60,6 +92,7 @@ impl Archive {
     ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, String> {
         let started = Instant::now();
         d.setBinaryArchives(Some(&self.list));
+        let reading = self.read();
         if let Ok(p) = dev.newRenderPipelineStateWithDescriptor_options_reflection_error(
             d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
@@ -68,12 +101,14 @@ impl Archive {
             note(started, "render pipeline from the archive");
             return Ok(p);
         }
+        drop(reading);
+        // No archive to look in this time: the miss is known, and the compile would read the
+        // archive without holding `changing`.
+        d.setBinaryArchives(None);
         let p = compile_render(dev, d, crash_key)?;
-        let started = Instant::now();
-        if self.archive.addRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
-            self.added_one();
-        }
-        note(started, "render pipeline added to the archive");
+        self.add("render pipeline added to the archive", || {
+            self.archive.addRenderPipelineFunctionsWithDescriptor_error(d).is_ok()
+        });
         Ok(p)
     }
 
@@ -85,17 +120,17 @@ impl Archive {
             note(started, "mesh pipeline from the archive");
             return Ok(p);
         }
+        d.setBinaryArchives(None);
         let p = compile_mesh(dev, d)?;
-        let started = Instant::now();
-        if self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok() {
-            self.added_one();
-        }
-        note(started, "mesh pipeline added to the archive");
+        self.add("mesh pipeline added to the archive", || {
+            self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok()
+        });
         Ok(p)
     }
 
     fn archived_mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor) -> Option<RenderPso> {
         d.setBinaryArchives(Some(&self.list));
+        let _reading = self.read();
         dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
             d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
@@ -114,6 +149,7 @@ impl Archive {
         let d = MTLComputePipelineDescriptor::new();
         d.setComputeFunction(Some(f));
         d.setBinaryArchives(Some(&self.list));
+        let reading = self.read();
         if let Ok(p) = dev.newComputePipelineStateWithDescriptor_options_reflection_error(
             &d,
             MTLPipelineOption::FailOnBinaryArchiveMiss,
@@ -122,37 +158,34 @@ impl Archive {
             note(started, "compute pipeline from the archive");
             return Ok(p);
         }
+        drop(reading);
+        d.setBinaryArchives(None);
         let p = dev
             .newComputePipelineStateWithDescriptor_options_reflection_error(&d, MTLPipelineOption::None, None)
             .map_err(|e| e.localizedDescription().to_string());
         note(started, "compute pipeline compiled");
         let p = p?;
-        let started = Instant::now();
-        if self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok() {
-            self.added_one();
-        }
-        note(started, "compute pipeline added to the archive");
+        self.add("compute pipeline added to the archive", || {
+            self.archive.addComputePipelineFunctionsWithDescriptor_error(&d).is_ok()
+        });
         Ok(p)
-    }
-
-    fn added_one(&self) {
-        self.added.set(self.added.get() + 1);
-        if self.saved.get().elapsed() >= SAVE_EVERY {
-            self.save();
-        }
     }
 
     /// Writes the archive back (to a temporary name, then renamed) if pipelines were added.
     fn save(&self) {
-        if self.added.replace(0) == 0 {
+        // One writer at a time: the temporary name is the process's.
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if self.added.swap(0, Ordering::Relaxed) == 0 {
             return;
         }
-        self.saved.set(Instant::now());
+        let started = Instant::now();
+        let _reading = self.read();
         let tmp = self.path.with_extension(format!("{}.tmp", std::process::id()));
         if self.archive.serializeToURL_error(&url(&tmp)).is_err() || std::fs::rename(&tmp, &self.path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
-        note(self.saved.get(), "pipeline archive written");
+        note(started, "pipeline archive written");
     }
 }
 
@@ -173,7 +206,7 @@ type RenderPso = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
 /// Metal objects handed to the compile thread: Metal's devices, descriptors and pipeline states
 /// may be used from any thread.
-struct Sendable<T>(T);
+pub(crate) struct Sendable<T>(pub(crate) T);
 // SAFETY: as above; only the compile thread uses them once moved.
 unsafe impl<T> Send for Sendable<T> {}
 
@@ -335,6 +368,8 @@ mod tests {
         let first = Archive::open_in(&dev, dir.path()).unwrap();
         assert!(first.archived_mesh(&dev, &mesh_descriptor(&dev)).is_none());
         first.mesh(&dev, &mesh_descriptor(&dev)).unwrap();
+        // Written here, not left to the drop: the writing thread may hold the archive just then.
+        first.save();
         drop(first);
         let second = Archive::open_in(&dev, dir.path()).unwrap();
         assert!(second.archived_mesh(&dev, &mesh_descriptor(&dev)).is_some());

@@ -83,6 +83,22 @@ fn compute_pipelines_are_cached_by_the_content_of_their_dxil() {
     assert_eq!(t.shaders.pipelines, 2);
 }
 
+/// A compute pipeline Metal has not compiled within the frame's wait is put off, not refused: a
+/// later use picks it up, and each miss is counted.
+#[test]
+fn a_compute_pipeline_put_off_is_made_by_a_later_use() {
+    let Some(mut t) = title() else { return };
+    let cs = host_shader(HwStage::Cs, read("tests/affine.dxil"));
+    t.compile_wait = std::time::Duration::ZERO;
+    let mut asks = 0;
+    while !matches!(t.compute_pipe(&cs, "a"), Pipe::Compute(_)) {
+        asks += 1;
+        assert!(asks < 3000, "never made: {:?}", t.shaders);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!((t.shaders.put_off, t.shaders.pipelines, t.shaders.refusals()), (asks, 1, 0));
+}
+
 /// What the host cannot give a shader is refused, counted by reason, and logged once; nothing
 /// fails.
 #[test]

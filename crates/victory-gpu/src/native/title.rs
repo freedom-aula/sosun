@@ -200,6 +200,9 @@ pub struct Title<B: PresentBackend> {
     pub thread_pipes: HashMap<usize, Pipe<B>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
+    /// How long a new compute pipeline may hold the frame while Metal compiles it (the frame's
+    /// budget, `glue::pipe`); past it the pipeline is put off (`ShaderStats::put_off`).
+    pub compile_wait: std::time::Duration,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
     /// GPU-written textures waiting to be copied back into title memory.
@@ -244,6 +247,7 @@ impl<B: PresentBackend> Title<B> {
             console_pipes: HashMap::new(),
             thread_pipes: HashMap::new(),
             shaders: Default::default(),
+            compile_wait: std::time::Duration::MAX,
             libraries: Default::default(),
             textures: Default::default(),
             back: Default::default(),

@@ -113,6 +113,9 @@ pub struct ShaderStats {
     pub pipelines: u64,
     /// Pipelines served from the library cache.
     pub cached: u64,
+    /// Times a compute pipeline was not compiled within `Title::compile_wait`: its work is
+    /// dropped that time and nothing is cached, so a later use picks the pipeline up.
+    pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
 }
@@ -167,8 +170,11 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
+        let put_off = self.shaders.put_off;
         let made = self.make_compute(shader, name);
-        self.libraries.compute.insert(key, made.clone());
+        if self.shaders.put_off == put_off {
+            self.libraries.compute.insert(key, made.clone());
+        }
         made
     }
 
@@ -180,12 +186,16 @@ impl<B: PresentBackend> Title<B> {
         // Translator output carries no root signature: the argument buffer is laid out by the
         // binding the host fills it by.
         let binding = Binding { name: name.into(), ..Binding::of(shader) };
-        let made = match binding.layout() {
-            Some(l) => self.host.backend.create_compute_pipeline_with(&shader.dxil, &l),
-            None => self.host.backend.create_compute_pipeline(&shader.dxil),
-        };
+        let made = self.host.backend.create_compute_pipeline_within(&shader.dxil, binding.layout().as_ref(), self.compile_wait);
         match made {
-            Ok(pso) => {
+            Ok(None) => {
+                self.shaders.put_off += 1;
+                if self.shaders.put_off.is_power_of_two() {
+                    tracing::info!(put_off = self.shaders.put_off, "compute pipelines put off for their compiles so far");
+                }
+                Pipe::Refused
+            }
+            Ok(Some(pso)) => {
                 self.shaders.pipelines += 1;
                 self.host.backend.name_pipeline(&pso, name);
                 Pipe::Compute(Rc::new(ComputePso {

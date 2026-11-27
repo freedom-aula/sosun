@@ -805,8 +805,8 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     // not translated yet is put off: its work is dropped this time (not cached, so a later draw
     // makes it), and its shaders go to the front of the prewarm pool.
     let frame = crate::frame::current();
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
-    if spent
+    let left = frame_left();
+    if left.is_zero()
         && let Some((stages, _)) = crate::pipeline::native_stages(key as This)
         && stages.iter().any(|(_, s)| !s.native_ready())
     {
@@ -819,13 +819,24 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
         }
         return Pipe::Refused;
     }
+    // A compute pipeline Metal is still compiling when the budget ends is put off the same way.
+    t.compile_wait = left;
+    let put_off = t.shaders.put_off;
     let (made, console) = make_pipe(t, key, targets);
+    if t.shaders.put_off != put_off {
+        return made;
+    }
     if console {
         t.console_pipes.insert(console_key, made.clone());
     } else {
         t.pipelines.insert(key, made.clone());
     }
     made
+}
+
+/// What the current frame has left of its budget for new pipelines (zero: spent).
+fn frame_left() -> std::time::Duration {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -962,6 +973,8 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     }
     let (hash, shader) = crate::pipeline::native_threads(key as This);
     let name = format!("compute {hash} by thread counts");
+    t.compile_wait = frame_left();
+    let put_off = t.shaders.put_off;
     let made = match shader {
         Ok(cs) => t.compute_pipe(&cs, &name),
         Err(e) => {
@@ -969,7 +982,9 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
             Pipe::Refused
         }
     };
-    t.thread_pipes.insert(key, made.clone());
+    if t.shaders.put_off == put_off {
+        t.thread_pipes.insert(key, made.clone());
+    }
     made
 }
 
@@ -1183,7 +1198,7 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     // As in `pipe`: past the frame's budget, a translation not made yet goes to a worker and the
     // draw is dropped this time (nothing is cached; the worker's result is, on disk or in the
     // shader).
-    let spent = BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET);
+    let spent = frame_left().is_zero();
     if spent && rect && !g.vs_source.rect_ready() {
         let s = g.vs_source.clone();
         put_off(format!("{} rect", s.hash), move || drop(s.native_rect()));

@@ -16,7 +16,7 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 pub struct Metal {
     pub(crate) dev: Dev,
     /// Opened at creation when installed; shader compilation reports the error if absent.
-    pub(crate) msc: Result<Msc, String>,
+    pub(crate) msc: Result<std::sync::Arc<Msc>, String>,
     /// Heap residency by `MTLResidencySet` (macOS 15+); off = `useResource` per encoder.
     pub(crate) residency_sets: bool,
     /// The title's pool buffers in one set on every queue too (`VICTORY_METAL_RESIDENCY_SETS=1`);
@@ -27,7 +27,10 @@ pub struct Metal {
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
     /// Compiled pipelines kept across runs, opened at the first pipeline (when the cache folder is set).
-    pub(crate) archive: std::cell::OnceCell<Option<crate::archive::Archive>>,
+    pub(crate) archive: std::cell::OnceCell<Option<std::sync::Arc<crate::archive::Archive>>>,
+    /// Compute pipelines being made on threads of their own (`create_compute_pipeline_within`),
+    /// by their DXIL and layout.
+    compiling: std::cell::RefCell<std::collections::HashMap<[u8; 32], std::sync::mpsc::Receiver<Compiled>>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
     /// Pipeline state pointer to name, kept only when tracing.
@@ -43,6 +46,9 @@ pub struct Metal {
         Vec<(crate::resources::SamplerDesc, Retained<ProtocolObject<dyn MTLSamplerState>>)>,
     >,
 }
+
+type ComputeState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+type Compiled = crate::archive::Sendable<Result<ComputeState, String>>;
 
 /// Seconds since the first `Metal::new` (about process start), for the failure trace.
 pub(crate) fn since_start() -> f64 {
@@ -201,14 +207,20 @@ impl Metal {
                 "metal: residency of what descriptor heaps name (VICTORY_METAL_RESIDENCY_SETS: 0, heap or 1)"
             );
         });
+        // Pipelines put off past a frame's budget compile side by side
+        // (`create_compute_pipeline_within`); Metal's default is two at a time. macOS 13.3.
+        if dev.respondsToSelector(objc2::sel!(setShouldMaximizeConcurrentCompilation:)) {
+            dev.setShouldMaximizeConcurrentCompilation(true);
+        }
         Ok(Metal {
             dev,
-            msc: Msc::try_open_default(),
+            msc: Msc::try_open_default().map(std::sync::Arc::new),
             residency_sets,
             pool_sets,
             pool_set: Default::default(),
             counts: Default::default(),
             archive: Default::default(),
+            compiling: Default::default(),
             trace_fails: {
                 since_start();
                 std::env::var_os("VICTORY_TRACE_GPU_FAILS").is_some()
@@ -221,34 +233,16 @@ impl Metal {
     }
 
     pub(crate) fn msc(&self) -> Result<&Msc, String> {
-        self.msc.as_ref().map_err(Clone::clone)
+        self.msc.as_deref().map_err(Clone::clone)
     }
 
-    fn compute_from(
-        &self,
-        converted: Result<(i32, Vec<u8>), crate::msc::ConvError>,
-        layout: Option<&RootLayout>,
-    ) -> Result<Pipeline, String> {
-        let (_, lib) = converted.map_err(|e| e.to_string())?;
-        let l = self.load_library(&lib)?;
-        let name = l
-            .functionNames()
-            .iter()
-            .next()
-            .ok_or("converted library is empty")?;
-        let f = l.newFunctionWithName(&name).ok_or("no function")?;
-        let p = match self.archive() {
-            Some(a) => a.compute(&self.dev, &f)?,
-            None => self
-                .dev
-                .newComputePipelineStateWithFunction_error(&f)
-                .map_err(|e| e.localizedDescription().to_string())?,
-        };
-        Ok(Pipeline(p, self.static_samplers(layout)?))
+    /// What makes compute pipeline states: all of it may go to another thread.
+    fn compiler(&self) -> Result<Compiler, String> {
+        Ok(Compiler { dev: self.dev.clone(), msc: self.msc.clone()?, archive: self.archive().cloned() })
     }
 
     /// The pipeline archive, if the cache is on.
-    pub(crate) fn archive(&self) -> Option<&crate::archive::Archive> {
+    pub(crate) fn archive(&self) -> Option<&std::sync::Arc<crate::archive::Archive>> {
         self.archive.get_or_init(|| crate::archive::Archive::open(&self.dev)).as_ref()
     }
 
@@ -280,14 +274,58 @@ impl Metal {
         &self,
         lib: &[u8],
     ) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+        load_library(&self.dev, lib)
+    }
+}
+
+fn load_library(dev: &Dev, lib: &[u8]) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+    {
         let n = LIBRARIES.fetch_add(1, Ordering::Relaxed);
         let file =
             std::env::temp_dir().join(format!("victory-metal-{}-{n}.metallib", std::process::id()));
         std::fs::write(&file, lib).map_err(|e| e.to_string())?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(file.to_str().unwrap()));
-        let l = self.dev.newLibraryWithURL_error(&url);
+        let l = dev.newLibraryWithURL_error(&url);
         let _ = std::fs::remove_file(&file);
         l.map_err(|e| e.localizedDescription().to_string())
+    }
+}
+
+/// How long a frame waits for any compute pipeline it first asks for, its budget spent or not:
+/// enough for one the disk cache and the archive hold (a few ms), so a warm run puts none off.
+const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn compile_key(dxil: &[u8], layout: Option<&RootLayout>) -> [u8; 32] {
+    *blake3::Hasher::new().update(dxil).update(format!("{layout:?}").as_bytes()).finalize().as_bytes()
+}
+
+struct Compiler {
+    dev: Dev,
+    msc: std::sync::Arc<Msc>,
+    archive: Option<std::sync::Arc<crate::archive::Archive>>,
+}
+
+// SAFETY: Metal's devices may be used from any thread; the converter and the archive are `Sync`.
+unsafe impl Send for Compiler {}
+
+impl Compiler {
+    /// DXIL to a compute pipeline state: converted, loaded, then from the archive or compiled.
+    fn compute(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<ComputeState, String> {
+        let (_, lib) = self.msc.convert_with(dxil, None, layout, false).map_err(|e| e.to_string())?;
+        let l = load_library(&self.dev, &lib)?;
+        let name = l
+            .functionNames()
+            .iter()
+            .next()
+            .ok_or("converted library is empty")?;
+        let f = l.newFunctionWithName(&name).ok_or("no function")?;
+        match &self.archive {
+            Some(a) => a.compute(&self.dev, &f),
+            None => self
+                .dev
+                .newComputePipelineStateWithFunction_error(&f)
+                .map_err(|e| e.localizedDescription().to_string()),
+        }
     }
 }
 
@@ -394,7 +432,7 @@ impl ComputeBackend for Metal {
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {
-        self.compute_from(self.msc()?.convert(dxil, None), None)
+        Ok(Pipeline(self.compiler()?.compute(dxil, None)?, self.static_samplers(None)?))
     }
 
     fn create_compute_pipeline_with(
@@ -402,10 +440,45 @@ impl ComputeBackend for Metal {
         dxil: &[u8],
         layout: &RootLayout,
     ) -> Result<Pipeline, String> {
-        self.compute_from(
-            self.msc()?.convert_with(dxil, None, Some(layout), false),
-            Some(layout),
-        )
+        Ok(Pipeline(self.compiler()?.compute(dxil, Some(layout))?, self.static_samplers(Some(layout))?))
+    }
+
+    /// Converted and compiled on a thread of its own, so pipelines put off past `wait` are made
+    /// side by side while the frame goes on. shortcut: a thread a pipeline, as many at once as
+    /// are put off (about 200 at the first frame of the world); a pool if that ever costs.
+    fn create_compute_pipeline_within(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+        wait: std::time::Duration,
+    ) -> Result<Option<Pipeline>, String> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let key = compile_key(dxil, layout);
+        let started = self.compiling.borrow_mut().remove(&key);
+        // One already put off is only picked up, not waited for again: its dispatches come many
+        // times a frame, and frames after the first would stall on it in turn.
+        let (rx, wait) = match started {
+            Some(rx) => (rx, std::time::Duration::ZERO),
+            None => {
+                let (compiler, dxil, layout) = (self.compiler()?, dxil.to_vec(), layout.cloned());
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("pipeline-compile".into())
+                    .spawn(move || {
+                        let _ = tx.send(crate::archive::Sendable(compiler.compute(&dxil, layout.as_ref())));
+                    })
+                    .map_err(|e| e.to_string())?;
+                (rx, wait.max(ARCHIVED))
+            }
+        };
+        match rx.recv_timeout(wait) {
+            Ok(made) => Ok(Some(Pipeline(made.0?, self.static_samplers(layout)?))),
+            Err(RecvTimeoutError::Timeout) => {
+                self.compiling.borrow_mut().insert(key, rx);
+                Ok(None)
+            }
+            Err(RecvTimeoutError::Disconnected) => Err("the pipeline's compile thread ended without a result".into()),
+        }
     }
 
     fn submit(&self, queue: &Queue, work: &Submission<'_, Self>) -> Result<(), String> {
@@ -646,7 +719,7 @@ mod tests {
     #[test]
     fn missing_msc_returns_error_instead_of_panicking() {
         let mut m = Metal::new().expect("Metal device available on macOS");
-        m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib");
+        m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib").map(std::sync::Arc::new);
         // Non-shader operations still succeed without MSC.
         let q = m.create_queue().unwrap();
         let f = m.create_fence(0).unwrap();
@@ -661,5 +734,27 @@ mod tests {
     fn recommended_working_set_is_nonzero_on_real_hardware() {
         let m = Metal::new().expect("Metal device available on macOS");
         assert!(m.recommended_working_set() > 0);
+    }
+
+    /// A pipeline still compiling when the wait ends is not an error: the same call later picks
+    /// it up, and nothing is compiled twice.
+    #[test]
+    fn a_pipeline_still_compiling_is_picked_up_later() {
+        let Some(m) = backend() else { return };
+        let none = std::time::Duration::ZERO;
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.compiling.borrow_mut().insert(compile_key(AFFINE, None), rx);
+        assert!(m.create_compute_pipeline_within(AFFINE, None, none).unwrap().is_none());
+        // Not waited for again, whatever the frame has left.
+        let asked = std::time::Instant::now();
+        assert!(m.create_compute_pipeline_within(AFFINE, None, std::time::Duration::from_secs(30)).unwrap().is_none());
+        assert!(asked.elapsed() < std::time::Duration::from_secs(10));
+        tx.send(crate::archive::Sendable(m.compiler().unwrap().compute(AFFINE, None))).unwrap();
+        assert!(m.create_compute_pipeline_within(AFFINE, None, none).unwrap().is_some());
+        assert!(m.compiling.borrow().is_empty());
+        // One nothing has started is compiled on its own thread and waited for.
+        let other = include_bytes!("../tests/fixtures/heap_rw.dxil");
+        assert!(m.create_compute_pipeline_within(other, None, std::time::Duration::MAX).unwrap().is_some());
+        assert!(m.compiling.borrow().is_empty());
     }
 }
