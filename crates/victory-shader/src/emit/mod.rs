@@ -522,7 +522,7 @@ pub fn emit_with(
 ) -> Result<HostShader, ShaderError> {
     match emit_fast(c, native, p, st, io, res, options) {
         Err(ShaderError::Unsupported { .. }) if lockstep::fits(native, st, &options) => {
-            lockstep::retry(c, native, p, io, options)
+            lockstep::retry(c, native, p, io, res, options)
         }
         r => r,
     }
