@@ -202,6 +202,30 @@ fn mapped_root_view(mapping: Option<&Mapping>, pairs: &mut Pairs, first: u32, ad
     }
 }
 
+/// `VICTORY_TRACE_ROOT_SPAN`: how far from `address` the title's range stays linear in the pool the
+/// mapping holding it shows (the next mappings start where the last ended, in the same pool, at the
+/// pool offset that follows), up to `limit` bytes; the mapping holding `address`, and the one the
+/// title has at the end of the run (`None`: nothing mapped there). `None` if nothing holds `address`.
+/// `sorted`: indices of `maps` by address.
+pub fn linear_run(
+    maps: &[Mapping],
+    sorted: &[usize],
+    address: u64,
+    limit: u64,
+) -> Option<(u64, Mapping, Option<Mapping>)> {
+    let m = *maps.iter().find(|m| address >= m.at && address - m.at < m.len)?;
+    let (mut end, mut pool_end) = (m.at + m.len, m.offset + m.len);
+    loop {
+        let from = sorted.partition_point(|&i| maps[i].at < end);
+        let mut at_end = sorted[from..].iter().map(|&i| maps[i]).take_while(|n| n.at == end);
+        let first = at_end.clone().next();
+        match at_end.find(|n| n.pool == m.pool && n.offset == pool_end) {
+            Some(n) if end - address < limit => (end, pool_end) = (end + n.len, pool_end + n.len),
+            _ => return Some((end - address, m, first)),
+        }
+    }
+}
+
 /// What the translated shader does with `words` for the address `va` (the lookup of
 /// `emit::lower::memory_entry`): the heap index of the view and the offset in it, or `None` for the
 /// null view.
@@ -303,6 +327,28 @@ mod tests {
         let mut pairs = Pairs::default();
         assert_eq!(root_view(&maps, &mut pairs, FIRST, 13), (pair_index(FIRST, 1), 24));
         assert_eq!(pairs.keys[0].unwrap().pool, 1);
+    }
+
+    #[test]
+    fn a_linear_run_follows_mappings_that_continue_the_pool() {
+        // 64 KiB of pool 10 at its offset 0x10000, the next 64 KiB continuing it, then a 64 KiB
+        // that is pool 10 elsewhere (an alias), then pool 11.
+        let maps = [
+            map(0x8_0000_0000, PAGE, 10, 1 << 30, 0x1_0000),
+            map(0x8_0002_0000, PAGE, 10, 1 << 30, 0x9_0000),
+            map(0x8_0001_0000, PAGE, 10, 1 << 30, 0x2_0000),
+            map(0x8_0003_0000, PAGE, 11, PAGE, 0),
+        ];
+        let mut sorted: Vec<usize> = (0..maps.len()).collect();
+        sorted.sort_by_key(|&i| maps[i].at);
+        let (run, m, next) = linear_run(&maps, &sorted, 0x8_0000_0100, 1 << 20).unwrap();
+        assert_eq!((run, m.offset), (2 * PAGE - 0x100, 0x1_0000));
+        assert_eq!(next.map(|n| n.offset), Some(0x9_0000));
+        // Stops once the limit is reached; nothing mapped is None.
+        assert_eq!(linear_run(&maps, &sorted, 0x8_0000_0100, 0x100).unwrap().0, PAGE - 0x100);
+        let (run, _, next) = linear_run(&maps, &sorted, 0x8_0003_0000, 1 << 20).unwrap();
+        assert_eq!((run, next.is_none()), (PAGE, true));
+        assert!(linear_run(&maps, &sorted, 0x9_0000_0000, 1 << 20).is_none());
     }
 
     /// Where a heap of a thousand title entries has its pairs.
