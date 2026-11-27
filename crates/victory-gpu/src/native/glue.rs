@@ -1540,11 +1540,9 @@ fn footprint_span(
     if fmt == victory_backend::resources::Format::D32FloatS8 {
         return None;
     }
-    let (element, block) = crate::resource::element(fp.format)?;
+    let (_, block) = crate::resource::element(fp.format)?;
     let (base, buf_size) = crate::resource::buffer_bytes(res)?;
-    let rows = fp.rows(at, size)?;
-    let start = rows.first()?.0;
-    let end = rows.last().map_or(start, |&(o, n)| o + n);
+    let (start, end) = fp.span(at, size)?;
     let byte_end = fp.offset.checked_add(end)?;
     if byte_end > buf_size {
         return None;
@@ -1553,7 +1551,6 @@ fn footprint_span(
     let len = usize::try_from(end - start).ok()?;
     let row_pitch = fp.row_pitch as usize;
     let slice_pitch = row_pitch.checked_mul((fp.height as usize).div_ceil(block as usize))?;
-    let _ = element;
     Some((addr, len, row_pitch, slice_pitch))
 }
 
