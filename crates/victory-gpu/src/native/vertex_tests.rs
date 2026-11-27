@@ -20,7 +20,7 @@ fn a_draw_with_only_vertex_slot_two_submits_its_buffer() {
     host.memory().mapped(0x80000, pool.len, &pool, 0);
     let mut list = NativeList::default();
     list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
-    list.set_render_targets(&[Rc::new(())], None);
+    list.set_render_targets(&[Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 1, 1))], None);
     list.set_vertex_buffer(2, 0x80100);
     list.draw_instanced(3, 1, 0, 0).unwrap();
     host.execute(&(), &[&list], &[], &[]).unwrap();
@@ -68,7 +68,7 @@ impl ComputeBackend for Capture {
     type Fence = ();
     type Buffer = usize;
     type Pipeline = ();
-    type Heap = ();
+    type Heap = RefCell<Vec<Option<TextureDesc>>>;
 
     fn wrap_title_memory(&self, base: *mut u8, _: usize) -> Result<usize, String> {
         Ok(base as usize)
@@ -110,31 +110,31 @@ impl ComputeBackend for Capture {
 }
 
 impl ResourceBackend for Capture {
-    type Texture = ();
+    type Texture = TextureDesc;
     type Sampler = ();
 
-    fn create_heap(&self, _: HeapKind, _: usize) -> Result<(), String> {
-        Ok(())
+    fn create_heap(&self, _: HeapKind, count: usize) -> Result<Self::Heap, String> {
+        Ok(RefCell::new(vec![None; count]))
     }
-    fn heap_address(&self, _: &(), index: usize) -> u64 {
+    fn heap_address(&self, _: &Self::Heap, index: usize) -> u64 {
         (index * 32) as u64
     }
-    fn write_buffer(&self, _: &(), index: usize, base: &usize, address: *const u8, size: u32) {
+    fn write_buffer(&self, _: &Self::Heap, index: usize, base: &usize, address: *const u8, size: u32) {
         self.buffer_writes.borrow_mut().push((index, *base, address as usize, size));
     }
-    fn write_texture(&self, _: &(), _: usize, _: &(), _: f32) {
+    fn write_texture(&self, heap: &Self::Heap, slot: usize, tex: &TextureDesc, _: f32) {
+        heap.borrow_mut()[slot] = Some(*tex);
+    }
+    fn write_sampler(&self, _: &Self::Heap, _: usize, _: &(), _: f32) {
         unreachable!()
     }
-    fn write_sampler(&self, _: &(), _: usize, _: &(), _: f32) {
+    fn clear_entry(&self, _: &Self::Heap, _: usize) {
         unreachable!()
     }
-    fn clear_entry(&self, _: &(), _: usize) {
-        unreachable!()
+    fn create_texture(&self, desc: &TextureDesc) -> Result<TextureDesc, String> {
+        Ok(*desc)
     }
-    fn create_texture(&self, _: &TextureDesc) -> Result<(), String> {
-        unreachable!()
-    }
-    fn create_texture_view(&self, _: &(), _: &ViewDesc) -> Result<(), String> {
+    fn create_texture_view(&self, _: &TextureDesc, _: &ViewDesc) -> Result<TextureDesc, String> {
         unreachable!()
     }
     fn create_texture_over_memory(
@@ -143,16 +143,16 @@ impl ResourceBackend for Capture {
         _: *const u8,
         _: &TextureDesc,
         _: usize,
-    ) -> Result<(), String> {
+    ) -> Result<TextureDesc, String> {
         unreachable!()
     }
     fn linear_alignment(&self, _: Format) -> usize {
         unreachable!()
     }
-    fn upload_texture(&self, _: &(), _: usize, _: usize, _: &[u8], _: usize, _: usize) {
+    fn upload_texture(&self, _: &TextureDesc, _: usize, _: usize, _: &[u8], _: usize, _: usize) {
         unreachable!()
     }
-    fn read_texture(&self, _: &(), _: usize, _: usize, _: &mut [u8], _: usize, _: usize) {
+    fn read_texture(&self, _: &TextureDesc, _: usize, _: usize, _: &mut [u8], _: usize, _: usize) {
         unreachable!()
     }
     fn create_sampler(&self, _: &SamplerDesc) -> Result<(), String> {

@@ -792,6 +792,11 @@ slice 0 alone. `NativeHost::mirror` now asks for every slice; the Metal backend 
 the texture's (a texture that is not an array has one). Shortcut: the view's first slice and slice
 count are not read; a view of part of an array shows all of it.
 
+A shader resource view created with a null description binds the registered texture itself,
+including its native format, all mips and all slices. This also preserves the format chosen
+when a typeless texture is realized as a depth target. Reusing a slot for such a view replaces
+the previous texture.
+
 A 2D shader resource view with `MipLevels = UINT_MAX` exposes every mip from
 `MostDetailedMip` onward. The native decoder preserves that count for ordinary and placed
 views so Metal clamps it to the remaining levels. Previously the decoder returned zero and

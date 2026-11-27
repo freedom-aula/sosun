@@ -6,7 +6,7 @@
 //! per pool (see [`super::memory`]); nothing is copied to or from it.
 
 use super::addr::{self, Mapping, Pages, Pairs};
-use super::descriptors::{Decoded, decode};
+use super::descriptors::{Decoded, Res, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
 use std::cell::RefCell;
@@ -15,13 +15,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
 use victory_backend::resources::*;
-
-/// A title resource object the host knows by its key (the object's address on the title's side).
-enum Res<B: GraphicsBackend> {
-    /// A buffer: title address and size.
-    Buffer(u64, u64),
-    Texture(Rc<B::Texture>),
-}
 
 pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
@@ -32,7 +25,7 @@ pub struct NativeHost<B: GraphicsBackend> {
     maps: RefCell<Option<(u64, Rc<[Mapping]>)>>,
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
-    resources: RefCell<HashMap<usize, Res<B>>>,
+    resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -398,11 +391,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(false);
         };
         let resources = self.resources.borrow();
-        let buffer_of = |r: usize| match resources.get(&r) {
-            Some(Res::Buffer(a, n)) => Some((*a, *n)),
-            _ => None,
-        };
-        let Some(decoded) = decode(&view, &buffer_of) else {
+        let Some(decoded) = decode(&view, &resources) else {
             return Ok(false);
         };
         match decoded {

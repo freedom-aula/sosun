@@ -409,7 +409,10 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
 
     let mut list = NativeList::default();
     list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
-    list.set_render_targets(&[Rc::new(())], None);
+    list.set_render_targets(
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        None,
+    );
     list.set_heaps(Some(&heap), None);
     list.set_graphics_root_table(0, &heap, 0);
     list.draw_instanced(3, 1, 0, 0).unwrap();
