@@ -757,7 +757,17 @@ unsafe fn fill_find(out: *mut u8, e: &Entry, wide_name: bool, wide_size: bool) {
     }
 }
 
-fn find_first(path: Option<PathBuf>, out: *mut u8, wide_name: bool, wide_size: bool) -> isize {
+fn find_first(
+    path: Option<Option<PathBuf>>,
+    out: *mut u8,
+    wide_name: bool,
+    wide_size: bool,
+) -> isize {
+    // `None`: no file specification at all, which is an invalid parameter (EINVAL).
+    let Some(path) = path else {
+        bad_param(EINVAL);
+        return -1;
+    };
     if out.is_null() {
         bad_param(EINVAL);
         return -1;
@@ -794,7 +804,8 @@ fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i
         .and_then(|i| usize::try_from(i).ok())
         .and_then(|i| table.get_mut(i))
     else {
-        set_errno(super::EBADF);
+        // FindNextFile fails on a bad handle, an error the CRT reports as EINVAL.
+        set_errno(EINVAL);
         return -1;
     };
     let Some(e) = l.entries.get(l.next) else {
@@ -807,20 +818,29 @@ fn find_next(handle: isize, out: *mut u8, wide_name: bool, wide_size: bool) -> i
     0
 }
 
+/// A find's file specification: `None` when there is none (a null pointer).
+fn narrow_spec(path: *const u8) -> Option<Option<PathBuf>> {
+    (!path.is_null()).then(|| narrow_name(path).0)
+}
+
+fn wide_spec(path: *const u16) -> Option<Option<PathBuf>> {
+    (!path.is_null()).then(|| wide_name(path).0)
+}
+
 pub extern "system" fn _findfirst64i32(path: *const u8, out: *mut u8) -> isize {
-    find_first(narrow_name(path).0, out, false, false)
+    find_first(narrow_spec(path), out, false, false)
 }
 
 pub extern "system" fn _findfirst64(path: *const u8, out: *mut u8) -> isize {
-    find_first(narrow_name(path).0, out, false, true)
+    find_first(narrow_spec(path), out, false, true)
 }
 
 pub extern "system" fn _wfindfirst64i32(path: *const u16, out: *mut u8) -> isize {
-    find_first(wide_name(path).0, out, true, false)
+    find_first(wide_spec(path), out, true, false)
 }
 
 pub extern "system" fn _wfindfirst64(path: *const u16, out: *mut u8) -> isize {
-    find_first(wide_name(path).0, out, true, true)
+    find_first(wide_spec(path), out, true, true)
 }
 
 pub extern "system" fn _findnext64i32(handle: isize, out: *mut u8) -> i32 {
@@ -851,7 +871,8 @@ pub extern "system" fn _findclose(handle: isize) -> i32 {
             0
         }
         _ => {
-            set_errno(super::EBADF);
+            // As Microsoft documents for any failure of `_findclose`.
+            set_errno(ENOENT);
             -1
         }
     }
@@ -1092,6 +1113,27 @@ mod tests {
     }
 
     #[test]
+    fn find_calls_set_the_errno_microsoft_documents() {
+        // `_findfirst`: EINVAL for a null file specification; `_findnext`: EINVAL for an
+        // error other than "no more files" (a bad handle); `_findclose`: ENOENT on failure.
+        let mut data = [0u8; 304];
+        set_errno(0);
+        assert_eq!(_findfirst64i32(std::ptr::null(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_wfindfirst64(std::ptr::null(), data.as_mut_ptr()), -1);
+        assert_eq!(super::super::errno(), EINVAL);
+        for handle in [0, -1, 9999] {
+            set_errno(0);
+            assert_eq!(_findnext64i32(handle, data.as_mut_ptr()), -1, "{handle}");
+            assert_eq!(super::super::errno(), EINVAL, "{handle}");
+            set_errno(0);
+            assert_eq!(_findclose(handle), -1, "{handle}");
+            assert_eq!(super::super::errno(), ENOENT, "{handle}");
+        }
+    }
+
+    #[test]
     fn wide_paths_and_virtual_drives_work() {
         let dir = tempfile::tempdir().unwrap();
         files::mount_at('Q', dir.path());
@@ -1281,10 +1323,10 @@ mod tests {
 
         set_errno(0);
         assert_eq!(_findnext64i32(isize::MIN, data.as_mut_ptr()), -1);
-        assert_eq!(super::super::errno(), super::super::EBADF);
+        assert_eq!(super::super::errno(), EINVAL);
         set_errno(0);
         assert_eq!(_findclose(isize::MIN), -1);
-        assert_eq!(super::super::errno(), super::super::EBADF);
+        assert_eq!(super::super::errno(), ENOENT);
 
         // Missing metadata zeroes timestamp fields instead of keeping stale bytes.
         let mut stale = [0xFFu8; 304];
