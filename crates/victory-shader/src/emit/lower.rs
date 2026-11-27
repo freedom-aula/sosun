@@ -8015,7 +8015,7 @@ impl<'a> Lower<'a> {
                 None => self.compare(inst, rest),
                 // 16-bit compares read their halves elsewhere (`half_src`).
                 Some(_) if rest.ends_with("16") => Err("a 16-bit compare with DPP"),
-                Some(d) => match self.dpp(inst, d) {
+                Some(d) => match self.dpp(inst, d, self.x.st.guards[b][i]) {
                     // Lanes DPP leaves out keep their old bit: not modelled.
                     Ok((_, Some(_))) => Err("a compare with DPP row masks or bounds"),
                     Ok((x, None)) => {
@@ -8041,7 +8041,7 @@ impl<'a> Lower<'a> {
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, self.x.st.guards[b][i])?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8055,7 +8055,7 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<Bool>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8101,8 +8101,8 @@ impl<'a> Lower<'a> {
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
         // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
+        let (src, inside, masks, zero, fi) = match dpp {
+            Dpp::Lanes { sel, fi } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
                 let p = self.s.m.bin(c, Bin::And, lane, seven);
                 let sh = self.s.m.bin(c, Bin::Mul, p, three);
@@ -8110,14 +8110,14 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true, fi)
             }
             Dpp::Row {
                 ctrl,
                 row_mask,
                 bank_mask,
                 bound_ctrl,
-                ..
+                fi,
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
@@ -8166,13 +8166,64 @@ impl<'a> Lower<'a> {
                     _ => return Err("a DPP lane pattern"),
                 };
                 let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
+                (src, inside, masks, bound_ctrl, fi)
             }
         };
         let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_in_half(x, src)
+        };
+        // A partial group or a divergent block can leave source lanes out even
+        // when reaching this instruction is enough to enable a destination.
+        let group = match dpp {
+            Dpp::Lanes { .. } => 8,
+            _ if quad => 4,
+            _ => 16,
+        };
+        let partial = self.s.threads.is_some_and(|t| {
+            !t.iter().product::<u32>().is_multiple_of(group)
+        });
+        let reach = self.x.st.reach[self.cur_ir];
+        let divergent = !fi && reach != Bool::TRUE && self.x.st.bools.support(reach).into_iter()
+            .any(|a| !(self.uniform_atom(a) || quad && matches!(a, Atom::Quad(_))));
+        let inside = if !fi && (guard.is_some() || divergent || partial) {
+            let on = self.boolean(guard.unwrap_or(Bool::TRUE), c)?;
+            let active = if self.helpers_read(quad) {
+                // Wave ballots omit pixel helpers; quad reads include them,
+                // but only while the host quad executes together.
+                if divergent {
+                    return Err("a DPP quad read in divergent pixel control flow");
+                }
+                let on = self.s.m.cast(c, Cast::ZExt, on, self.s.t.i32);
+                let bit = self.quad_pick(on, src);
+                let z = k(self, 0);
+                self.s.m.cmp(c, pred::NE, bit, z)
+            } else {
+                // DPP never crosses a 32-lane half. On a split wave the
+                // local ballot word serves either half without an exchange.
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+                let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                let lo = self.s.m.extract(c, ballot, 0);
+                let hi = if self.host32 { lo } else { self.s.m.extract(c, ballot, 1) };
+                let at = if mesh_quad {
+                    // Only the quad-relative index is shared with the host.
+                    let host = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+                    let (not3, three) = (k(self, !3), k(self, 3));
+                    let base = self.s.m.bin(c, Bin::And, host, not3);
+                    let pick = self.s.m.bin(c, Bin::And, src, three);
+                    self.s.m.bin(c, Bin::Or, base, pick)
+                } else {
+                    src
+                };
+                self.lane_bit_of(c, at, lo, hi)
+            };
+            Some(match inside {
+                Some(bound) => self.s.m.bin(c, Bin::And, bound, active),
+                None => active,
+            })
+        } else {
+            inside
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -15519,6 +15570,29 @@ mod tests {
         w.push(S_ENDPGM);
         assert!(super::split_wave_barriers(&wave64(&w), &structure::structure(&wave64(&w)).unwrap()).is_none());
         assert_eq!(split_barriers(&w, 64, true), 0);
+    }
+
+    #[test]
+    fn dpp_inactive_source_modifiers_change_the_lowered_shader() {
+        let shader = |selector: u32, extension: u32| {
+            let words = [
+                V_LSHLREV_V1_2_V0,
+                0x4A06_0086, // v_add_nc_u32 v3, 6, v0
+                0x7E04_02FF, 99, // v_mov_b32 v2, 99
+                SAVE_EXEC,
+                CMPX_V0_EQ_0,
+                0x7E04_0200 | selector, extension | 3, // v_mov_b32_dpp v2, v3
+                RESTORE_EXEC,
+                0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+                S_ENDPGM,
+            ];
+            let shader = lowered(&words, 64, false, true);
+            assert!(!shader.exchanges);
+            shader.dxil
+        };
+        // Lane 0 selects lane 1 after EXEC has disabled it.
+        assert!(shader(0xE9, 0x100) != shader(0xEA, 0x100));
+        assert!(shader(0xFA, 0xFF00_0100) != shader(0xFA, 0xFF08_0100));
     }
 
     #[test]
