@@ -654,6 +654,214 @@ fn smem_dwords(name: &str) -> Option<u32> {
     }
 }
 
+enum InterpUse<'a> {
+    Phi(Value),
+    Read(Reg, &'a Inst),
+}
+
+struct InterpUses<'a> {
+    by_value: Map<Value, Vec<InterpUse<'a>>>,
+    #[cfg(test)]
+    visits: std::cell::Cell<usize>,
+}
+
+impl<'a> InterpUses<'a> {
+    fn new(program: &'a Program) -> Self {
+        let mut by_value: Map<_, Vec<_>> = Map::default();
+        for block in &program.blocks {
+            for phi in &block.phis {
+                for arg in &phi.args {
+                    by_value
+                        .entry(*arg)
+                        .or_default()
+                        .push(InterpUse::Phi(phi.value));
+                }
+            }
+            for inst in &block.insts {
+                for &(reg, val) in &inst.reads {
+                    by_value
+                        .entry(val)
+                        .or_default()
+                        .push(InterpUse::Read(reg, inst));
+                }
+            }
+        }
+        Self {
+            by_value,
+            #[cfg(test)]
+            visits: Default::default(),
+        }
+    }
+
+    /// Whether a pixel-shader live-in SGPR `start` flows exclusively (through
+    /// scalar copies, phis, and constant-lane VGPR spills) into `M0` for
+    /// `v_interp_*` instructions and nowhere else (e.g. `PRIM_MASK` in a
+    /// guessed pixel shader whose SGPR slot is not `initialized_sgprs - 2`).
+    fn is_interp_m0_only(&self, start: Value) -> bool {
+        let mut work = vec![(start, None::<u32>)];
+        let mut seen = HashSet::new();
+        seen.insert((start, None));
+        let mut used_by_interp = false;
+        while let Some((val, spilled)) = work.pop() {
+            for site in self.by_value.get(&val).into_iter().flatten() {
+                #[cfg(test)]
+                self.visits.set(self.visits.get() + 1);
+                let (reg, inst) = match *site {
+                    InterpUse::Phi(result) => {
+                        if seen.insert((result, spilled)) {
+                            work.push((result, spilled));
+                        }
+                        continue;
+                    }
+                    InterpUse::Read(reg, inst) => (reg, inst),
+                };
+                let name = inst.name();
+                match spilled {
+                    Some(lane) => match (&inst.fields, name) {
+                        (Fields::Valu(v), "v_writelane_b32") => {
+                            // `val` must be the old dst VGPR, not src0.
+                            let is_src0 = matches!(
+                                v.src.first(),
+                                Some(&Operand::Scalar { code, .. })
+                                    if reg == Reg::S(code)
+                            );
+                            let Some(other) =
+                                v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                            else {
+                                return false;
+                            };
+                            if is_src0 {
+                                return false;
+                            }
+                            if other != lane {
+                                let Some(Operand::Vector { reg: d, .. }) = v.dst else {
+                                    return false;
+                                };
+                                let Some(w) = inst.write(Reg::V(d)) else {
+                                    return false;
+                                };
+                                if seen.insert((w, Some(lane))) {
+                                    work.push((w, Some(lane)));
+                                }
+                            }
+                        }
+                        (Fields::Valu(v), "v_readlane_b32") => {
+                            let Some(rlane) =
+                                v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                            else {
+                                return false;
+                            };
+                            if rlane == lane {
+                                let Some(Operand::Scalar { code, .. }) = v.dst else {
+                                    return false;
+                                };
+                                let Some(w) = inst.write(Reg::S(code)) else {
+                                    return false;
+                                };
+                                if seen.insert((w, None)) {
+                                    work.push((w, None));
+                                }
+                            }
+                        }
+                        _ => return false,
+                    },
+                    None if reg == Reg::S(crate::ir::M0) => {
+                        if name.starts_with("v_interp_")
+                            || matches!(inst.fields, Fields::Vintrp { .. })
+                        {
+                            used_by_interp = true;
+                        } else if matches!(name, "s_sendmsg" | "s_sendmsghalt")
+                            && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == 7)
+                        {
+                            // `MSG_ORDERED_PS_DONE` ignores M0 in hardware, though
+                            // `ir::build` records an implicit M0 read on all `s_sendmsg`.
+                        } else if name == "s_mov_b32"
+                            && let Fields::Sop {
+                                dst: Some(Operand::Scalar { code, .. }),
+                                ..
+                            } = &inst.fields
+                            && let Some(w) = inst.write(Reg::S(*code))
+                        {
+                            if seen.insert((w, None)) {
+                                work.push((w, None));
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    None => match (&inst.fields, name) {
+                        (
+                            Fields::Sop {
+                                dst: Some(Operand::Scalar { code, .. }),
+                                ..
+                            },
+                            "s_mov_b32",
+                        ) => {
+                            let Some(w) = inst.write(Reg::S(*code)) else {
+                                return false;
+                            };
+                            if seen.insert((w, None)) {
+                                work.push((w, None));
+                            }
+                        }
+                        (
+                            Fields::Sop {
+                                dst: Some(Operand::Scalar { code: dcode, .. }),
+                                src,
+                                ..
+                            },
+                            "s_mov_b64",
+                        ) => {
+                            let Some(&Operand::Scalar { code: scode, .. }) = src.first() else {
+                                return false;
+                            };
+                            let half = if reg == Reg::S(scode) {
+                                0
+                            } else if reg == Reg::S(scode + 1) {
+                                1
+                            } else {
+                                return false;
+                            };
+                            let Some(w) = inst.write(Reg::S(dcode + half)) else {
+                                return false;
+                            };
+                            if seen.insert((w, None)) {
+                                work.push((w, None));
+                            }
+                        }
+                        (Fields::Valu(v), "v_writelane_b32") => {
+                            let is_src0 = matches!(
+                                v.src.first(),
+                                Some(&Operand::Scalar { code, .. })
+                                    if reg == Reg::S(code)
+                            );
+                            let Some(lane) =
+                                v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
+                            else {
+                                return false;
+                            };
+                            let Some(Operand::Vector { reg: d, .. }) = v.dst else {
+                                return false;
+                            };
+                            if !is_src0 {
+                                return false;
+                            }
+                            let Some(w) = inst.write(Reg::V(d)) else {
+                                return false;
+                            };
+                            if seen.insert((w, Some(lane))) {
+                                work.push((w, Some(lane)));
+                            }
+                        }
+                        _ => return false,
+                    },
+                }
+            }
+        }
+        used_by_interp
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, console: bool, guessed: bool) -> Self {
         let p = x.p;
@@ -1776,7 +1984,9 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
-        for &(reg, v) in &self.x.p.inputs {
+        let p = self.x.p;
+        let interp_uses = std::cell::LazyCell::new(|| InterpUses::new(p));
+        for &(reg, v) in &p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
@@ -1802,7 +2012,7 @@ impl<'a> Lower<'a> {
                     None if self.s.pixel
                         && ((self.x.io.initialized_sgprs == Some(n + 2)
                             && (!self.guessed || crate::io::is_prim_mask_only(self.x.p, v, true)))
-                            || self.is_interp_m0_only(v)) =>
+                            || interp_uses.is_interp_m0_only(v)) =>
                     {
                         Val::I32(self.s.m.i32(0))
                     }
@@ -1825,177 +2035,6 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
-    }
-
-    /// Whether a pixel-shader live-in SGPR `start` flows exclusively (through
-    /// scalar copies, phis, and constant-lane VGPR spills) into `M0` for
-    /// `v_interp_*` instructions and nowhere else (e.g. `PRIM_MASK` in a
-    /// guessed pixel shader whose SGPR slot is not `initialized_sgprs - 2`).
-    fn is_interp_m0_only(&self, start: Value) -> bool {
-        let mut work = vec![(start, None::<u32>)];
-        let mut seen = HashSet::new();
-        seen.insert((start, None));
-        let mut used_by_interp = false;
-        while let Some((val, spilled)) = work.pop() {
-            for block in &self.x.p.blocks {
-                for phi in &block.phis {
-                    if phi.args.contains(&val) && seen.insert((phi.value, spilled)) {
-                        work.push((phi.value, spilled));
-                    }
-                }
-                for inst in &block.insts {
-                    let mut reads = inst.reads.iter().filter(|&&(_, v)| v == val).peekable();
-                    if reads.peek().is_none() {
-                        continue;
-                    }
-                    let name = inst.name();
-                    for &(reg, _) in reads {
-                        match spilled {
-                            Some(lane) => match (&inst.fields, name) {
-                                (Fields::Valu(v), "v_writelane_b32") => {
-                                    // `val` must be the old dst VGPR, not src0.
-                                    let is_src0 = matches!(
-                                        v.src.first(),
-                                        Some(&Operand::Scalar { code, .. })
-                                            if reg == Reg::S(code)
-                                    );
-                                    let Some(other) =
-                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
-                                    else {
-                                        return false;
-                                    };
-                                    if is_src0 {
-                                        return false;
-                                    }
-                                    if other != lane {
-                                        let Some(Operand::Vector { reg: d, .. }) = v.dst else {
-                                            return false;
-                                        };
-                                        let Some(w) = inst.write(Reg::V(d)) else {
-                                            return false;
-                                        };
-                                        if seen.insert((w, Some(lane))) {
-                                            work.push((w, Some(lane)));
-                                        }
-                                    }
-                                }
-                                (Fields::Valu(v), "v_readlane_b32") => {
-                                    let Some(rlane) =
-                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
-                                    else {
-                                        return false;
-                                    };
-                                    if rlane == lane {
-                                        let Some(Operand::Scalar { code, .. }) = v.dst else {
-                                            return false;
-                                        };
-                                        let Some(w) = inst.write(Reg::S(code)) else {
-                                            return false;
-                                        };
-                                        if seen.insert((w, None)) {
-                                            work.push((w, None));
-                                        }
-                                    }
-                                }
-                                _ => return false,
-                            },
-                            None if reg == Reg::S(crate::ir::M0) => {
-                                if name.starts_with("v_interp_")
-                                    || matches!(inst.fields, Fields::Vintrp { .. })
-                                {
-                                    used_by_interp = true;
-                                } else if matches!(name, "s_sendmsg" | "s_sendmsghalt")
-                                    && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == 7)
-                                {
-                                    // `MSG_ORDERED_PS_DONE` ignores M0 in hardware, though
-                                    // `ir::build` records an implicit M0 read on all `s_sendmsg`.
-                                } else if name == "s_mov_b32"
-                                    && let Fields::Sop {
-                                        dst: Some(Operand::Scalar { code, .. }),
-                                        ..
-                                    } = &inst.fields
-                                    && let Some(w) = inst.write(Reg::S(*code))
-                                {
-                                    if seen.insert((w, None)) {
-                                        work.push((w, None));
-                                    }
-                                } else {
-                                    return false;
-                                }
-                            }
-                            None => match (&inst.fields, name) {
-                                (
-                                    Fields::Sop {
-                                        dst: Some(Operand::Scalar { code, .. }),
-                                        ..
-                                    },
-                                    "s_mov_b32",
-                                ) => {
-                                    let Some(w) = inst.write(Reg::S(*code)) else {
-                                        return false;
-                                    };
-                                    if seen.insert((w, None)) {
-                                        work.push((w, None));
-                                    }
-                                }
-                                (
-                                    Fields::Sop {
-                                        dst: Some(Operand::Scalar { code: dcode, .. }),
-                                        src,
-                                        ..
-                                    },
-                                    "s_mov_b64",
-                                ) => {
-                                    let Some(&Operand::Scalar { code: scode, .. }) = src.first()
-                                    else {
-                                        return false;
-                                    };
-                                    let half = if reg == Reg::S(scode) {
-                                        0
-                                    } else if reg == Reg::S(scode + 1) {
-                                        1
-                                    } else {
-                                        return false;
-                                    };
-                                    let Some(w) = inst.write(Reg::S(dcode + half)) else {
-                                        return false;
-                                    };
-                                    if seen.insert((w, None)) {
-                                        work.push((w, None));
-                                    }
-                                }
-                                (Fields::Valu(v), "v_writelane_b32") => {
-                                    let is_src0 = matches!(
-                                        v.src.first(),
-                                        Some(&Operand::Scalar { code, .. })
-                                            if reg == Reg::S(code)
-                                    );
-                                    let Some(lane) =
-                                        v.src.get(1).and_then(|&l| crate::resource::lane_of(l))
-                                    else {
-                                        return false;
-                                    };
-                                    let Some(Operand::Vector { reg: d, .. }) = v.dst else {
-                                        return false;
-                                    };
-                                    if !is_src0 {
-                                        return false;
-                                    }
-                                    let Some(w) = inst.write(Reg::V(d)) else {
-                                        return false;
-                                    };
-                                    if seen.insert((w, Some(lane))) {
-                                        work.push((w, Some(lane)));
-                                    }
-                                }
-                                _ => return false,
-                            },
-                        }
-                    }
-                }
-            }
-        }
-        used_by_interp
     }
 
     fn input(&mut self, input: Input) -> Val {
@@ -4654,19 +4693,27 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Each lane reads `data` of the lane its address plus the offset
-            // names in dwords (modulo the wave); 0 from a lane EXEC leaves out.
+            // names in its own 32-lane half; 0 from a lane EXEC leaves out.
             self.cross_lane(false, outside_compute!("ds_bpermute_b32"))?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.wave() - 1));
+            let (o, two, k31) = (k(self, offset), k(self, 2), k(self, 31));
             let at = self.s.m.bin(c, Bin::Add, a, o);
-            let lane = self.s.m.bin(c, Bin::LShr, at, two);
-            let lane = self.s.m.bin(c, Bin::And, lane, last);
-            let r = self.wide_read_lane(x, lane)?;
+            let dword = self.s.m.bin(c, Bin::LShr, at, two);
+            let local = self.s.m.bin(c, Bin::And, dword, k31);
+            let src = if self.x.native.wave64 && !self.host32 {
+                let lane = self.lane_index();
+                let k32 = k(self, 32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                self.s.m.bin(c, Bin::Or, half, local)
+            } else {
+                local
+            };
+            let r = self.read_lane(x, src);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let (lo, hi) = self.wide_ballot(c, self.cur_ir, on)?;
-            let running = self.lane_bit_of(c, lane, lo, hi);
+            let (lo, hi) = self.host_ballot(c, on);
+            let running = self.lane_bit_of(c, src, lo, hi);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;
@@ -5294,9 +5341,16 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_flbit_i32_b64" => {
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_flbit_i32_i64" {
+                        // Turn bits differing from bit 63 into set bits in both halves.
+                        let k31 = self.s.m.i32(31);
+                        let sign = self.s.m.bin(c, Bin::AShr, b, k31);
+                        a = self.s.m.bin(c, Bin::Xor, a, sign);
+                        b = self.s.m.bin(c, Bin::Xor, b, sign);
+                    }
                     // Leading zeros; -1 for none (DXIL's first bit high).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s
@@ -14160,6 +14214,41 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn interp_copy_chain(moves: usize, arithmetic: bool) -> (bool, usize) {
+        let mut words = Vec::new();
+        let mut src = 0u32;
+        for _ in 0..moves {
+            let dst = 1 - src;
+            words.push(0xBE80_0300 | dst << 16 | src); // s_mov_b32 between s0 and s1
+            src = dst;
+        }
+        words.push(0xBEFC_0300 | src); // s_mov_b32 m0, src
+        words.push(0xC81A_0002); // v_interp_mov_f32 v6, p0, attr0.x
+        if arithmetic {
+            words.push(0x8002_8100 | src); // s_add_u32 s2, src, 1
+        }
+        words.push(S_ENDPGM);
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 8).unwrap();
+        let &(_, start) = p.inputs.iter().find(|(r, _)| *r == ir::Reg::S(0)).unwrap();
+        let uses = super::InterpUses::new(&p);
+        (uses.is_interp_m0_only(start), uses.visits.get())
+    }
+
+    #[test]
+    fn interp_m0_only_visits_each_copy_and_interpolation_once() {
+        let chains = [128, 256];
+        assert_eq!(
+            chains.map(|moves| interp_copy_chain(moves, false)),
+            chains.map(|moves| (true, moves + 2))
+        );
+    }
+
+    #[test]
+    fn interp_m0_only_rejects_a_copy_also_read_by_arithmetic() {
+        assert!(!interp_copy_chain(256, true).0);
+    }
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {

@@ -65,6 +65,10 @@ fn program(whole: bool) -> Vec<u32> {
 }
 
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_wave(words, false)
+}
+
+fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -77,7 +81,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -94,7 +98,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -324,9 +328,23 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
 
 #[test]
 fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
-    // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
-    // (its address in dwords, offset 20 bytes) of 1000 + lane.
-    let shader = build(&[
+    check_permute(false);
+}
+
+#[test]
+fn wave64_permutes_read_and_test_exec_in_the_same_half() {
+    check_permute(true);
+}
+
+fn check_permute(wave64: bool) {
+    // Reading local lane (13 * lane + 5) mod 32 exercises both halves.
+    // In wave64 only lanes 56..63 are off, so EXEC differs between the halves.
+    let (lanes, active, save_exec, restore_exec) = if wave64 {
+        (64, 56, 0xBE94_246A, 0xBEFE_0414) // s_and_saveexec_b64, s_mov_b64 exec
+    } else {
+        (32, 24, 0xBE94_3C6A, 0xBEFE_0314) // s_and_saveexec_b32, s_mov_b32 exec_lo
+    };
+    let shader = build_wave(&[
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0A02,
@@ -337,25 +355,25 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         0x7E06_02FF,
         0x0000_DEAD, // v_mov_b32 v3, 0xdead
         0x3420_0082, // v_lshlrev_b32 v16, 2, v0
-        0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
-        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0x7D88_0080 | active, // v_cmp_gt_u32 vcc, active, v0
+        save_exec,
         0xDACC_0014,
         0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:20
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        restore_exec,
         0xE070_1000,
         0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
-    ])
+    ], wave64)
     .expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
     }
-    let want: Vec<u32> = (0..32)
-        .map(|l| match (13 * l + 5) % 32 {
-            _ if l >= 24 => 0xDEAD,
-            src if src < 24 => 1000 + src,
+    let want: Vec<u32> = (0..lanes)
+        .map(|l| match (l & 32) | ((13 * l + 5) % 32) {
+            _ if l >= active => 0xDEAD,
+            src if src < active => 1000 + src,
             _ => 0,
         })
         .collect();
@@ -365,7 +383,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             data: &[0; 4],
             stride: Stride::Structured(16),
         },
-        View::RawUav(32),
+        View::RawUav(lanes),
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -375,10 +393,28 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        // The program declares the console's wave of 32, which WARP refuses.
+        if wave64 {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+            };
+            let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the OPTIONS1 structure of the supplied size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+            }.expect("wave size capabilities");
+            if caps.WaveLaneCountMax < lanes {
+                eprintln!("{label}: wave64 unsupported; skipped");
+                continue;
+            }
+        }
+        // The program declares a fixed wave size, which WARP refuses.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
-            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+            assert!(warp, "{label}: no pipeline for a wave of {lanes}");
+            eprintln!("{label}: no pipeline for a wave of {lanes}; skipped");
             continue;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];

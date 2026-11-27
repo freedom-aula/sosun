@@ -189,7 +189,7 @@ fn load_late(
     file: &str,
     title_dir: &Path,
     policy: UnimplementedPolicy,
-    host: &HostPolicy,
+    hle: &HleResolver,
     lock: &LoaderLock,
 ) -> Result<Option<usize>> {
     use victory_hle::runtime::image_named;
@@ -198,8 +198,7 @@ fn load_late(
             return Ok(Some(base));
         }
         let new = dll::map_title_dll(file, title_dir, &title_dll)?;
-        let hle = HleResolver::new(host.clone());
-        let resolver = WithTitleDlls { inner: &hle };
+        let resolver = WithTitleDlls { inner: hle };
         for d in &new {
             note(d);
             if d.image.tls().is_some() {
@@ -254,7 +253,8 @@ pub fn run(
     } else {
         HostPolicy::default()
     };
-    let resolver = HleResolver::new(host.clone());
+    let resolver =
+        victory_hle::runtime::NATIVE_TITLE_RESOLVER.get_or_init(|| HleResolver::new(host));
     let policy = match unimplemented {
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,
@@ -267,7 +267,7 @@ pub fn run(
     for d in &dlls {
         note(d);
     }
-    let chain = WithTitleDlls { inner: &resolver };
+    let chain = WithTitleDlls { inner: resolver };
     let mut stubbed_from = Vec::new();
     for d in &dlls {
         let report = bind(&d.name, &d.image, &chain, policy, list_imports)?;
@@ -342,7 +342,7 @@ pub fn run(
     // DLLs the title loads itself (the FidelityFX loader's upscaler, ...).
     let (late_dir, lock): (PathBuf, LoaderLock) = (title_dir.to_owned(), LoaderLock::default());
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
-        load_late(file, &late_dir, policy, &host, &lock).map_err(|e| format!("{e:#}"))
+        load_late(file, &late_dir, policy, resolver, &lock).map_err(|e| format!("{e:#}"))
     }));
 
     // The image lives as long as the process: title threads outlive `run`.

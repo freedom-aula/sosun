@@ -971,6 +971,39 @@ u32 probe_dll(ptr unused)
     return ok;
 }
 
+/* The DLL forwards SetError to KERNEL32.SetLastError. Use distinct values to
+ * check both the static import and the address returned to the title. */
+IMPORT void SetError(u32);
+u32 probe_forwarders(ptr unused)
+{
+    (void)unused;
+    u32 ok = 0;
+    ptr module = GetModuleHandleA("victory-probe-dll.dll");
+    SetError(41);
+    if (GetLastError() == 41)
+        ok |= 1;
+    if (!module)
+        return ok;
+    void (*set_error)(u32) = (void (*)(u32))GetProcAddress(module, "SetError");
+    if (set_error) {
+        set_error(42);
+        if (GetLastError() == 42)
+            ok |= 2;
+    }
+    if (GetProcAddress(module, "AddAlias") == (ptr)DllProbeAdd)
+        ok |= 4;
+    SetLastError(0);
+    if (!GetProcAddress(module, "Loop") && GetLastError() == 127)
+        ok |= 8;
+    SetLastError(0);
+    if (!GetProcAddress(module, "Missing") && GetLastError() == 127)
+        ok |= 16;
+    int (*initialize)(void) = (int (*)(void))GetProcAddress(module, "Initialize");
+    if (initialize && initialize() == 0)
+        ok |= 32;
+    return ok;
+}
+
 /* ---- module handles of system DLLs -------------------------------------- */
 
 IMPORT ptr GetModuleHandleW(const u16 *);

@@ -55,6 +55,12 @@ pub fn image_named(file: &str) -> Option<usize> {
         .map(|(b, _)| *b)
 }
 
+/// The native title's import resolver, shared by the binder and forwarded
+/// `GetProcAddress` lookups so both use the launch's host pass-through policy.
+#[cfg(target_os = "macos")]
+pub static NATIVE_TITLE_RESOLVER: std::sync::OnceLock<crate::HleResolver> =
+    std::sync::OnceLock::new();
+
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
 /// base; `Ok(None)` if `file` is not one of the title's DLLs.
 pub type TitleDllLoader = Box<dyn Fn(&str) -> Result<Option<usize>, String> + Send + Sync>;

@@ -7,15 +7,15 @@
 //! thread's console lane is its group index modulo 64 (`console_flat`, which
 //! also makes the host lane the console's). What stays inside 32 lanes is
 //! the host's own: DPP rows and quads, `ds_swizzle` (its masks keep bit 5),
-//! `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
+//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
 //! `v_readfirstlane` (read per half: the console reads the first lane EXEC
 //! leaves on, and the translation has always read the first lane that runs,
 //! so a value that is not the same in both halves is where it differs).
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32`, `ds_bpermute_b32` and the
-//! reductions and prefixes of whole-wave sections. A ballot is each
+//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
+//! of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
 //! a reduction is each half's result, combined; a prefix combines the lower
 //! half's total with each upper lane's prefix. Lanes the group lacks (a group
@@ -82,19 +82,24 @@ impl Lower<'_> {
         Some(self.s.m.cmp(at, pred::IULT, first, n))
     }
 
-    /// The console's ballot of `on` in DXIL block `at` (IR block `ir`): the
-    /// low and high dwords.
-    pub(super) fn wide_ballot(&mut self, at: usize, ir: usize, on: V) -> Result<(V, V), Why> {
+    /// The low and high words of the current host wave's active ballot.
+    pub(super) fn host_ballot(&mut self, at: usize, on: V) -> (V, V) {
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let ballot = self
             .s
             .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
         self.s.flags |= flags::WAVE_OPS;
-        let (x, y) = (
+        (
             self.s.m.extract(at, ballot, 0),
             self.s.m.extract(at, ballot, 1),
-        );
+        )
+    }
+
+    /// The console's ballot of `on` in DXIL block `at` (IR block `ir`): the
+    /// low and high dwords.
+    pub(super) fn wide_ballot(&mut self, at: usize, ir: usize, on: V) -> Result<(V, V), Why> {
+        let (x, y) = self.host_ballot(at, on);
         if !self.halves {
             return Ok((x, y));
         }
