@@ -56,11 +56,19 @@ pub fn use_native_cache(dir: PathBuf) -> Option<PathBuf> {
         tracing::info!("native shader cache off (VICTORY_NO_SHADER_CACHE)");
         return None;
     }
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
+    let parent = dir;
+    let dir = parent.join(&blake3::Hash::from(*build()).to_hex()[..16]);
     match Cache::open(dir.join("translated")) {
         Ok(cache) => {
             tracing::info!(dir = %dir.display(), "native shader cache");
             let _ = NATIVE.set(cache);
+            let _ = FIRST_BINDS.set(parent.join(FIRST_BINDS_FILE));
+            let _ = std::fs::write(dir.join(LAST_USED), b"");
+            // Deleting a build's ~20,000 entries takes a while: not on the start-up path.
+            let (keep, current) = (parent.clone(), dir.clone());
+            let _ = std::thread::Builder::new()
+                .name("shader-cache-prune".into())
+                .spawn(move || prune(&keep, &current, KEEP_BUILDS));
             #[cfg(target_os = "macos")]
             victory_metal::disk::use_dir(dir.join("metal"));
             Some(dir)
@@ -69,6 +77,53 @@ pub fn use_native_cache(dir: PathBuf) -> Option<PathBuf> {
             tracing::warn!(error = %e, "no native shader cache");
             None
         }
+    }
+}
+
+/// The containers the native host bound, by their short hash, one per line, in the order of
+/// their first bind (`pipeline::prewarm` reads it to translate those first). Beside the build
+/// folders: it names containers, not translations, so it outlives a changed translator.
+static FIRST_BINDS: OnceLock<PathBuf> = OnceLock::new();
+const FIRST_BINDS_FILE: &str = "first-binds.txt";
+
+/// Where the native host keeps its list of first binds, if the cache is on.
+pub fn first_binds_file() -> Option<&'static std::path::Path> {
+    FIRST_BINDS.get().map(PathBuf::as_path)
+}
+
+/// Written into a build folder each time a run opens it: its time orders the folders for [`prune`].
+const LAST_USED: &str = "last-used";
+/// Build folders kept: this build's and the newest others (about 400 MB each).
+const KEEP_BUILDS: usize = 3;
+
+/// Deletes the build folders of `parent` (named by 16 hex digits) but the `keep` used last,
+/// `current` always among them. A folder never stamped counts by its own time.
+fn prune(parent: &std::path::Path, current: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    let mut builds: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .map(|p| {
+            let used = std::fs::metadata(p.join(LAST_USED)).or_else(|_| std::fs::metadata(&p)).and_then(|m| m.modified());
+            (used.unwrap_or(std::time::UNIX_EPOCH), p)
+        })
+        .collect();
+    builds.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let mut kept = usize::from(builds.iter().any(|(_, p)| p == current));
+    for (_, p) in builds {
+        if p == current {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
+            continue;
+        }
+        tracing::info!(dir = %p.display(), "deleting an old build's shader cache");
+        let _ = std::fs::remove_dir_all(&p);
     }
 }
 
@@ -680,6 +735,27 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
         assert_ne!(native_key(&settings()), native_key(&rect));
+    }
+
+    /// The current build and the two used last stay; older ones, by their stamp, go. Other
+    /// folders and files are left alone.
+    #[test]
+    fn old_build_folders_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = |s: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + s);
+        let builds: Vec<PathBuf> = (0..5).map(|n| dir.path().join(format!("{n:016x}"))).collect();
+        for (n, b) in builds.iter().enumerate() {
+            std::fs::create_dir_all(b.join("translated")).unwrap();
+            let f = std::fs::File::create(b.join(LAST_USED)).unwrap();
+            f.set_modified(t(n as u64)).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("not-a-build")).unwrap();
+        std::fs::write(dir.path().join(FIRST_BINDS_FILE), b"x").unwrap();
+        // The oldest is the one in use.
+        prune(dir.path(), &builds[0], 3);
+        let left: Vec<bool> = builds.iter().map(|b| b.exists()).collect();
+        assert_eq!(left, [true, false, false, true, true]);
+        assert!(dir.path().join("not-a-build").exists() && dir.path().join(FIRST_BINDS_FILE).exists());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

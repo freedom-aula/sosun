@@ -764,7 +764,27 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     if let Some(p) = t.console_pipes.get(&console_key) {
         return p.clone();
     }
+    // A cold first world frame binds ~1,300 pipelines; translating them all here holds the frame
+    // past the title's watchdog. Once the frame has spent its budget, a pipeline whose shaders are
+    // not translated yet is put off: its work is dropped this time (not cached, so a later draw
+    // makes it), and its shaders go to the front of the prewarm pool.
+    let frame = crate::frame::current();
+    if let Some((stages, _)) = crate::pipeline::native_stages(key as This)
+        && stages.iter().any(|(_, s)| !s.native_ready())
+        && BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent(frame, crate::prewarm::FIRST_BIND_BUDGET_MS)
+    {
+        for (_, s) in stages.iter().filter(|(_, s)| !s.native_ready()) {
+            crate::pipeline::prewarm_next(s);
+        }
+        let n = PUT_OFF.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(frame, put_off = n, "pipelines put off for their translations so far");
+        }
+        return Pipe::Refused;
+    }
+    let started = std::time::Instant::now();
     let (made, console) = make_pipe(t, key, targets);
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).add(frame, started.elapsed().as_millis() as u64);
     if console {
         t.console_pipes.insert(console_key, made.clone());
     } else {
@@ -772,6 +792,10 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     }
     made
 }
+
+/// Time this frame spent making pipelines, and pipelines put off for it ([`pipe`]).
+static BUDGET: Mutex<crate::prewarm::FrameBudget> = Mutex::new(crate::prewarm::FrameBudget::new());
+static PUT_OFF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

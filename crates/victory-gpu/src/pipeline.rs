@@ -116,26 +116,36 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 /// Translate `shader` ahead on a host worker, so the title's thread finds it done when it first
 /// binds it: ~1,300 first binds at the first world frame would otherwise translate inline, tens
 /// of seconds in all, past the title's own watchdog. `native()` is a `OnceLock`, so whoever gets
-/// there first does the work. `VICTORY_NO_SHADER_PREWARM=1` turns this off.
+/// there first does the work. Shaders earlier runs bound go first ([`crate::prewarm`]); the
+/// workers are all cores but two, below the title's threads. `VICTORY_NO_SHADER_PREWARM=1` turns
+/// this off.
+#[cfg(target_os = "macos")]
+static QUEUE: crate::prewarm::Queue<Arc<Shader>> = crate::prewarm::Queue::new();
+
+/// Puts `shader` at the front of the prewarm pool's work (a pipeline that was put off waits for it).
+#[cfg(target_os = "macos")]
+pub(crate) fn prewarm_next(shader: &Arc<Shader>) {
+    QUEUE.push(shader.clone(), true);
+}
+
 #[cfg(target_os = "macos")]
 fn prewarm(shader: &Arc<Shader>) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    static POOL: OnceLock<Option<std::sync::mpsc::Sender<Arc<Shader>>>> = OnceLock::new();
+    static POOL: OnceLock<bool> = OnceLock::new();
     static QUEUED: AtomicUsize = AtomicUsize::new(0);
     static DONE: AtomicUsize = AtomicUsize::new(0);
     static DXIL: AtomicUsize = AtomicUsize::new(0);
-    let pool = POOL.get_or_init(|| {
+    let on = *POOL.get_or_init(|| {
         if std::env::var_os("VICTORY_NO_SHADER_PREWARM").is_some_and(|v| !v.is_empty() && v != "0") {
-            return None;
+            return false;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<Arc<Shader>>();
-        let rx = Arc::new(Mutex::new(rx));
-        for i in 0..6 {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(move || {
+        let cores = std::thread::available_parallelism().map_or(8, usize::from);
+        let n = crate::prewarm::pool_size(cores);
+        for i in 0..n {
+            let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
+                crate::prewarm::lower_priority();
                 loop {
-                    let next = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                    let Ok(s) = next else { break };
+                    let s = QUEUE.pop();
                     let held = s.native().map_or(0, |h| h.dxil.len());
                     let dxil_mb = (DXIL.fetch_add(held, Relaxed) + held) >> 20;
                     let n = DONE.fetch_add(1, Relaxed) + 1;
@@ -145,13 +155,25 @@ fn prewarm(shader: &Arc<Shader>) {
                 }
             });
         }
-        tracing::info!("shader prewarm pool started (6 threads)");
-        Some(tx)
+        let first = with_first_binds(|l| l.len());
+        tracing::info!(threads = n, first_binds = first, "shader prewarm pool started");
+        true
     });
-    if let Some(tx) = pool {
+    if on {
         QUEUED.fetch_add(1, Relaxed);
-        let _ = tx.send(shader.clone());
+        QUEUE.push(shader.clone(), with_first_binds(|l| l.contains(&shader.hash)));
     }
+}
+
+/// The list of first binds ([`crate::prewarm::FirstBinds`]), read from the cache folder on first use.
+#[cfg(target_os = "macos")]
+fn with_first_binds<R>(f: impl FnOnce(&mut crate::prewarm::FirstBinds) -> R) -> R {
+    static LIST: Mutex<Option<crate::prewarm::FirstBinds>> = Mutex::new(None);
+    let mut list = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    f(list.get_or_insert_with(|| {
+        let text = crate::shader_cache::first_binds_file().and_then(|p| std::fs::read_to_string(p).ok());
+        crate::prewarm::FirstBinds::parse(text.as_deref().unwrap_or(""))
+    }))
 }
 
 impl Shader {
@@ -200,6 +222,11 @@ impl Shader {
 
 #[cfg(target_os = "macos")]
 impl Shader {
+    /// Whether the translation for the native host is made (or refused) already.
+    pub(crate) fn native_ready(&self) -> bool {
+        self.native.get().is_some()
+    }
+
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
     pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
@@ -390,6 +417,19 @@ pub(crate) fn bound(this: This) {
     }
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
+    }
+    // For the next run's prewarm: these first.
+    #[cfg(target_os = "macos")]
+    if let Some(path) = crate::shader_cache::first_binds_file() {
+        let due = with_first_binds(|l| {
+            for shader in &p.shaders {
+                l.add(&shader.hash);
+            }
+            l.due()
+        });
+        if let Some(text) = due {
+            crate::prewarm::write(path, &text);
+        }
     }
 }
 
