@@ -785,6 +785,67 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.trace_args(root, binding);
     }
 
+    /// `VICTORY_TRACE_ROOT_SPAN[=<bytes>]`: each root SRV or UAV a translated shader binds whose
+    /// title range stays linear in its pool for less than `<bytes>` (default 1 MiB) from its address:
+    /// what the shader reaches past that is not what the title has there when it reads the root
+    /// view through a pair view (`through = "pair"`), linear in the pool. Once per pipeline, root
+    /// parameter and mapping; at most 2000 lines of each kind.
+    /// Programs reading title memory (`through = "table"`) look each access up in the page table.
+    fn trace_root_span(&self, root: &[Option<Root<B>>], binding: Option<&Binding>, groups: &[usize; 3]) {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW};
+        static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let Some(limit) = *LIMIT.get_or_init(|| {
+            let v = std::env::var("VICTORY_TRACE_ROOT_SPAN").ok()?;
+            Some(v.parse().ok().filter(|&n| n > 1).unwrap_or(1 << 20))
+        }) else {
+            return;
+        };
+        type Seen = [std::collections::HashSet<(Rc<str>, u8, u64)>; 2];
+        thread_local! {
+            static SORTED: RefCell<(u64, Vec<usize>)> = RefCell::default();
+            static SEEN: RefCell<Seen> = RefCell::default();
+        }
+        let (generation, maps) = self.mapping_list();
+        for b in binding.into_iter().chain(binding.and_then(|b| b.ps.as_deref())) {
+            for u in &b.user_data {
+                let (through, k) = match u.dword {
+                    ROOT_SRV_VIEW | ROOT_UAV_VIEW => ("pair", 0),
+                    0 if b.memory && u.root == victory_shader::RootType::Descriptor => ("table", 1),
+                    _ => continue,
+                };
+                let Some(Some(Root::View(a))) = root.get(usize::from(u.slot)) else { continue };
+                let run = SORTED.with_borrow_mut(|(g, sorted)| {
+                    if *g != generation || sorted.len() != maps.len() {
+                        *sorted = (0..maps.len()).collect();
+                        sorted.sort_by_key(|&i| maps[i].at);
+                        *g = generation;
+                    }
+                    addr::linear_run(&maps, sorted, *a, limit)
+                });
+                let Some((run, m, next)) = run.filter(|r| r.0 < limit) else { continue };
+                if !SEEN.with_borrow_mut(|s| s[k].len() < 2000 && s[k].insert((b.name.clone(), u.slot, m.at))) {
+                    continue;
+                }
+                // Whose bytes the pool offsets past the run are: what a pair view reaches there.
+                let pool_end = m.offset + (a + run - m.at);
+                let linear = maps.iter().find(|n| n.pool == m.pool && pool_end >= n.offset && pool_end - n.offset < n.len);
+                tracing::info!(
+                    pipeline = &*b.name,
+                    slot = u.slot,
+                    uav = u.dword == ROOT_UAV_VIEW,
+                    through,
+                    ?groups,
+                    address = format!("{a:#x}"),
+                    run = format!("{run:#x}"),
+                    mapping = format!("{:#x}+{:#x} pool {} at {:#x}", m.at, m.len, m.pool, m.offset),
+                    title_next = ?next.map(|n| format!("pool {} at {:#x}", n.pool, n.offset)),
+                    pool_next_is = ?linear.map(|n| format!("{:#x}", n.at + (pool_end - n.offset))),
+                    "a root view's range leaves its pool's linear run"
+                );
+            }
+        }
+    }
+
     /// The root parameters and binding [`Self::trace_draw`] logs, for any one draw.
     pub(super) fn trace_args(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
         let read = |at: u64, n: usize| {
@@ -1053,6 +1114,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
+                self.trace_root_span(root, pso.binding.as_ref(), groups);
                 self.remirror_tables(root, pso.binding.as_ref());
                 self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
@@ -1089,6 +1151,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
                 self.remirror_tables(root, binding.as_deref());
+                self.trace_root_span(root, binding.as_deref(), &[0; 3]);
                 self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {

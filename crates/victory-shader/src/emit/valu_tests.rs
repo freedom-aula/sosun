@@ -267,6 +267,37 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
+/// `s_sext_i32_i8` and `s_sext_i32_i16` leave SCC as it was (RDNA2 ISA, SOP1;
+/// neither sets SCC). Their values: `victory-gpu`'s
+/// `addr_tests::scalar_sign_extensions_on_the_gpu`.
+#[test]
+fn scalar_sign_extensions_keep_scc() {
+    // SCC = (s1 == 0), then the extension of s0 into s16, then SCC into v0.
+    let body = |opcode: u32| {
+        [
+            0xBF06_8001,               // s_cmp_eq_u32 s1, 0
+            0xBE90_0000 | opcode << 8, // s_sext_i32_i8/i16 s16, s0
+            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
+            vop1(1, 0, sgpr(18)),      // v_mov_b32 v0, s18
+        ]
+    };
+    // (s0, s1), then SCC after. Non-zero results with SCC 0, and zero ones
+    // with SCC 1 (the last case, in both forms), catch an extension that sets it.
+    let cases = [
+        ([0x0000_007F, 1, 0, 0], 0),
+        ([0x0000_0080, 0, 0, 0], 1),
+        ([0x1234_80FF, 1, 0, 0], 0),
+        ([0xFFFF_0000, 0, 0, 0], 1),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for opcode in [0x19, 0x1a] {
+        let shader = build_valu_cs(&body(opcode));
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1, "{backend}, opcode {opcode:#x}, case {i}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
