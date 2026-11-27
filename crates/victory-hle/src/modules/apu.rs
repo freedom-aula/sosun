@@ -381,7 +381,7 @@ pub extern "system" fn XApuEnqueueCommand(
     state.queued[stream] += 1;
     state.commands = state.commands.wrapping_add(1);
     second.commands += 1;
-    let _ = second.log();
+    second.log();
     state.results.push_back(result);
     if !total.is_null() {
         // SAFETY: optional out parameter.
