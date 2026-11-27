@@ -1087,10 +1087,8 @@ impl GraphicsBackend for Metal {
                     md.setStencilAttachmentPixelFormat(pixel_format(f));
                 }
             }
-            let pso = self
-                .dev
-                .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(&md, MTLPipelineOption::None, None)
-                .map_err(|e| e.localizedDescription().to_string())?;
+            let crash_key = crash_key(d);
+            let pso = crate::archive::compile_mesh(&self.dev, &md, &crash_key)?;
             (pso, Some(size([x as usize, y as usize, z as usize])))
         } else {
             (self.vertex_pipeline(d, &vf, ff.as_deref())?, None)
@@ -1253,6 +1251,9 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
+        if let Some(a) = self.archive() {
+            a.flush_due();
+        }
         match refused {
             Some(e) => Err(e),
             None => Ok(()),
@@ -2274,6 +2275,8 @@ impl Metal {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
         }
         let mut named = Vec::new();
+        let mut depth_set = false;
+        let mut default_depth = None;
         for (k, d) in rp.draws.iter().enumerate() {
             // The stage that reads the draw's buffers before the pixel shader.
             let first = match (d.pipeline.mesh, d.call) {
@@ -2310,8 +2313,20 @@ impl Metal {
                 MTLDepthClipMode::Clamp
             });
             e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            // Passing nil restores Metal's default depth and stencil state for this draw.
-            e.setDepthStencilState(d.pipeline.depth.as_deref());
+            // Metal validation forbids passing nil to `setDepthStencilState:`: bind a default
+            // state object when returning from a depth/stencil pipeline to one without.
+            if let Some(depth) = d.pipeline.depth.as_deref() {
+                e.setDepthStencilState(Some(depth));
+                depth_set = true;
+            } else if depth_set {
+                let depth = default_depth.get_or_insert_with(|| {
+                    self.dev
+                        .newDepthStencilStateWithDescriptor(&MTLDepthStencilDescriptor::new())
+                        .expect("default depth state")
+                });
+                e.setDepthStencilState(Some(depth));
+                depth_set = false;
+            }
             if d.pipeline.stencil {
                 e.setStencilReferenceValue(d.state.stencil_ref);
             }

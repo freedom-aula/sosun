@@ -253,6 +253,37 @@ fn comparison_gathers_at_level_0_compare_red() {
     assert_eq!(args[6..], [k(0), TWO]);
 }
 
+/// The culling shaders' sampler (black border, levels 0-12, linear filters) as an immediate in
+/// s[16:19], over the one the prefix loads: a gather at a level takes only an immediate one.
+const IMMEDIATE_SAMPLER: [u32; 6] = [
+    0xB010_01B6, // s_movk_i32 s16, 0x1b6
+    0xBE91_03FF,
+    0x00C0_0000, // s_mov_b32 s17, 0xc00000
+    0xBE92_03FF,
+    0x1850_0000, // s_mov_b32 s18, 0x18500000
+    0xBE93_0380, // s_mov_b32 s19, 0
+];
+
+#[test]
+fn gathers_at_a_level_whole_in_the_lanes_that_gather_translate() {
+    // image_gather4_l v[10:13], v[3:5], s[8:15], s[16:19] dmask:0x1 dim:2D: the level is v5,
+    // 0.5 from the prefix, made 2.0 by a write only lanes below 16 run, and only they gather
+    // (the G-buffer culling shaders' `v_cmpx` before their level, #182).
+    let gather = [0xF110_0108, 0x0082_0A03];
+    let mut before = IMMEDIATE_SAMPLER.to_vec();
+    before.extend([
+        0x7DA8_0090, // v_cmpx_gt_u32 exec_lo, 16, v0
+        0x7E0A_02F4, // v_mov_b32 v5, 2.0
+    ]);
+    if let Err(e) = lower(CS, &before, gather) {
+        panic!("a level whole in every lane that gathers was refused: {e}");
+    }
+    // Every lane gathers: those from 16 up at 0.5, so which level is not known.
+    before.push(0xBEFE_03C1); // s_mov_b32 exec_lo, -1
+    let refused = refusal(CS, &before, gather);
+    assert!(refused.contains("a gather at a level that may not be whole"), "{refused}");
+}
+
 #[test]
 fn what_dxil_cannot_express_stays_refused() {
     // A comparison gather of green: DXIL's compares red.
