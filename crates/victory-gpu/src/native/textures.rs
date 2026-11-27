@@ -357,6 +357,17 @@ struct Watch {
     seen: HashMap<usize, blake3::Hash>,
 }
 
+impl Watch {
+    /// Texture `key` is gone. Its hash goes with it: the key (an object's address, a placement)
+    /// names another texture later, and a render target compared with the old one's hash had
+    /// its memory uploaded over what was drawn into it.
+    fn released(&mut self, key: usize) {
+        self.entries.remove(&key);
+        self.dirty.remove(&key);
+        self.seen.remove(&key);
+    }
+}
+
 type Watched = std::sync::Mutex<Option<Watch>>;
 
 static WATCH: Watched = std::sync::Mutex::new(None);
@@ -864,11 +875,7 @@ impl<B: PresentBackend> Title<B> {
         self.unloaded.remove(&key);
         self.hot_keys.retain(|&k| k != key);
         self.blank_keys.retain(|&k| k != key);
-        watch(|w| {
-            w.entries.remove(&key);
-            w.dirty.remove(&key);
-            w.seen.remove(&key);
-        });
+        watch(|w| w.released(key));
     }
 
     /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
@@ -1294,27 +1301,42 @@ mod tests {
     }
 
     /// What a submission read whole is what the scanner compares with: it reports the write after
-    /// it, not that content once more. A texture made anew under a key starts over (a render
-    /// target's first sight is its baseline again, not a change to upload over what was drawn).
+    /// it, not that content once more.
     #[test]
-    fn scanner_compares_with_what_a_submission_read_and_starts_over_for_a_new_texture() {
+    fn scanner_compares_with_what_a_submission_read() {
         let mut bytes = [3u8];
-        let entry = (bytes.as_ptr() as usize, bytes.len(), true, 0);
-        let w = watched([(1, entry)]);
-        assert!(dirty_this_round(&w).is_empty());
+        let w = watched([(1, (bytes.as_ptr() as usize, bytes.len(), false, 0))]);
+        assert_eq!(dirty_this_round(&w), [1].into());
         bytes[0] = 4;
         // A submission read it meanwhile (`sync_apply`).
         watch_in(&w, |w| w.seen.insert(1, blake3::hash(&bytes)));
         assert!(dirty_this_round(&w).is_empty());
         bytes[0] = 5;
         assert_eq!(dirty_this_round(&w), [1].into());
-        // Released and made again under the same key, with other content (`texture_released`).
+    }
+
+    /// A render target released and made again under the same key (an object's address is used
+    /// again) starts over: its first sight is its baseline. Compared with the old texture's hash
+    /// it counted as written, and its memory was uploaded over what the GPU had drawn into it.
+    #[test]
+    fn scanner_starts_over_for_a_render_target_made_again_under_a_released_key() {
+        let mut bytes = [3u8];
+        let entry = |serial| (bytes.as_ptr() as usize, bytes.len(), true, serial);
+        let (old, new) = (entry(0), entry(1));
+        let w = watched([(1, old)]);
+        assert!(dirty_this_round(&w).is_empty());
+        assert_eq!(seen(&w)[&1], blake3::hash(&bytes));
+
+        // Released and made again between two rounds, its memory holding something else by then.
         watch_in(&w, |w| {
-            w.seen.remove(&1);
-            w.entries.insert(1, (entry.0, entry.1, true, 1));
+            w.released(1);
+            w.entries.insert(1, new);
         });
         bytes[0] = 6;
-        assert!(dirty_this_round(&w).is_empty());
+        assert!(dirty_this_round(&w).is_empty(), "the new texture's first sight is not a change");
+        assert_eq!(seen(&w)[&1], blake3::hash(&bytes));
+        bytes[0] = 7;
+        assert_eq!(dirty_this_round(&w), [1].into(), "a write into it after that is");
     }
 
     /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
