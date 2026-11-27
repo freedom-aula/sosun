@@ -5,6 +5,7 @@
 //! Title addresses are kept as addresses: they resolve to GPU buffers when the list is submitted, by
 //! which time the pool observer has told us about every mapping the title made.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use victory_backend::backend::{RootLayout, RootParam};
 use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
@@ -23,6 +24,56 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    pub images: std::cell::RefCell<Shown>,
+}
+
+/// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those
+/// may be stale: an entry counts only while `of` still names the texture).
+#[derive(Default)]
+pub struct Shown {
+    of: std::collections::HashMap<usize, usize>,
+    entries: std::collections::HashMap<usize, Vec<usize>>,
+    /// The entries cleared when a texture was released, by its object's address.
+    gone: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+impl<B: GraphicsBackend> NativeHeap<B> {
+    /// Entry `index` now shows title texture `resource` (`None`: a buffer or a sampler).
+    pub fn shows(&self, index: usize, resource: Option<usize>) {
+        let Shown { of, entries, .. } = &mut *self.images.borrow_mut();
+        match resource {
+            Some(r) => {
+                if of.insert(index, r) != Some(r) {
+                    entries.entry(r).or_default().push(index);
+                }
+            }
+            None => {
+                of.remove(&index);
+            }
+        }
+    }
+
+    /// The entries that show title texture `resource`, which they stop showing.
+    pub fn take_entries(&self, resource: usize) -> Vec<usize> {
+        let Shown { of, entries, gone } = &mut *self.images.borrow_mut();
+        let mut listed = entries.remove(&resource).unwrap_or_default();
+        listed.retain(|i| of.get(i) == Some(&resource));
+        listed.sort_unstable();
+        listed.dedup();
+        listed.iter().for_each(|i| {
+            of.remove(i);
+        });
+        if !listed.is_empty() {
+            gone.insert(resource, listed.clone());
+        }
+        listed
+    }
+
+    /// The entries [`Self::take_entries`] took when the texture last at `resource` was released,
+    /// once: the title has made a texture at that address again.
+    pub fn take_gone(&self, resource: usize) -> Vec<usize> {
+        self.images.borrow_mut().gone.remove(&resource).unwrap_or_default()
+    }
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
@@ -217,6 +268,39 @@ pub enum Cmd<B: GraphicsBackend> {
         len: usize,
         value: u8,
     },
+    CopyTexture {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyBufferToTexture {
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    },
+    CopyTextureToBuffer {
+        src: Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
         depth: Option<DepthClear<B::Texture>>,
@@ -228,7 +312,7 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         targets: Targets<B>,
-        vertex: Vec<u64>,
+        vertex: Vec<(usize, u64)>,
         index: Option<(u64, bool)>,
         state: DrawState,
         call: DrawCall,
@@ -269,6 +353,69 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 dst: *dst,
                 len: *len,
                 value: *value,
+            },
+            Cmd::CopyTexture {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyTexture {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyBufferToTexture {
+                src,
+                len,
+                row_pitch,
+                slice_pitch,
+                size,
+                dst,
+                dst_mip,
+                dst_slice,
+                dst_origin,
+            } => Cmd::CopyBufferToTexture {
+                src: *src,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
+                size: *size,
+                dst: dst.clone(),
+                dst_mip: *dst_mip,
+                dst_slice: *dst_slice,
+                dst_origin: *dst_origin,
+            },
+            Cmd::CopyTextureToBuffer {
+                src,
+                src_mip,
+                src_slice,
+                src_origin,
+                size,
+                dst,
+                len,
+                row_pitch,
+                slice_pitch,
+            } => Cmd::CopyTextureToBuffer {
+                src: src.clone(),
+                src_mip: *src_mip,
+                src_slice: *src_slice,
+                src_origin: *src_origin,
+                size: *size,
+                dst: *dst,
+                len: *len,
+                row_pitch: *row_pitch,
+                slice_pitch: *slice_pitch,
             },
             Cmd::Clear { color, depth } => Cmd::Clear {
                 color: color.clone(),
@@ -314,7 +461,7 @@ struct State<B: GraphicsBackend> {
     graphics_root: Vec<Option<Root<B>>>,
     heaps: Heaps<B>,
     targets: Targets<B>,
-    vertex: Vec<u64>,
+    vertex: BTreeMap<usize, u64>,
     index: Option<(u64, bool)>,
     draw: DrawState,
 }
@@ -346,7 +493,7 @@ impl<B: GraphicsBackend> Default for NativeList<B> {
                     color: Vec::new(),
                     depth: None,
                 },
-                vertex: Vec::new(),
+                vertex: BTreeMap::new(),
                 index: None,
                 draw: DrawState::default(),
             },
@@ -359,6 +506,12 @@ impl<B: GraphicsBackend> NativeList<B> {
     #[cfg(target_os = "macos")]
     pub(super) fn graphics_args(&self) -> (&[Option<Root<B>>], Option<&Binding>) {
         (&self.state.graphics_root, self.state.graphics_binding.as_deref())
+    }
+
+    /// The compute root parameters the next dispatch takes (for traces).
+    #[cfg(target_os = "macos")]
+    pub(super) fn compute_args(&self) -> &[Option<Root<B>>] {
+        &self.state.compute_root
     }
 
     /// `Reset`: forget everything recorded and set.
@@ -523,6 +676,9 @@ impl<B: GraphicsBackend> NativeList<B> {
             .compute
             .clone()
             .ok_or("dispatch without a compute pipeline")?;
+        if indirect.is_none() && groups.contains(&0) {
+            return Ok(());
+        }
         self.cmds.push(Cmd::Dispatch {
             pso,
             root: self.state.compute_root.clone(),
@@ -537,12 +693,106 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `CopyBufferRegion` between title addresses. Runs on the GPU, in order with the rest.
     pub fn copy_buffer_region(&mut self, dst: u64, src: u64, len: usize) {
-        self.cmds.push(Cmd::Copy { dst, src, len });
+        if len > 0 {
+            self.cmds.push(Cmd::Copy { dst, src, len });
+        }
     }
 
     /// A byte fill of title memory (the console's `FillMemoryX`).
     pub fn fill(&mut self, dst: u64, len: usize, value: u8) {
-        self.cmds.push(Cmd::Fill { dst, len, value });
+        if len > 0 {
+            self.cmds.push(Cmd::Fill { dst, len, value });
+        }
+    }
+
+    /// Texture-to-texture region copy, ordered on the GPU with the rest of the list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_region(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTexture {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Linear buffer footprint to texture region copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        src: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+        size: [usize; 3],
+        dst: &Rc<B::Texture>,
+        dst_mip: usize,
+        dst_slice: usize,
+        dst_origin: [usize; 3],
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyBufferToTexture {
+            src,
+            len,
+            row_pitch,
+            slice_pitch,
+            size,
+            dst: dst.clone(),
+            dst_mip,
+            dst_slice,
+            dst_origin,
+        });
+    }
+
+    /// Texture region to linear buffer footprint copy, ordered on the GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_texture_to_buffer(
+        &mut self,
+        src: &Rc<B::Texture>,
+        src_mip: usize,
+        src_slice: usize,
+        src_origin: [usize; 3],
+        size: [usize; 3],
+        dst: u64,
+        len: usize,
+        row_pitch: usize,
+        slice_pitch: usize,
+    ) {
+        if len == 0 || size.contains(&0) {
+            return;
+        }
+        self.cmds.push(Cmd::CopyTextureToBuffer {
+            src: src.clone(),
+            src_mip,
+            src_slice,
+            src_origin,
+            size,
+            dst,
+            len,
+            row_pitch,
+            slice_pitch,
+        });
     }
 
     /// `OMSetRenderTargets`.
@@ -551,6 +801,11 @@ impl<B: GraphicsBackend> NativeList<B> {
             color: color.to_vec(),
             depth: depth.cloned(),
         };
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn color_targets(&self) -> &[Rc<B::Texture>] {
+        &self.state.targets.color
     }
 
     /// `ClearRenderTargetView`. shortcut: each clear is a render pass of its own (load action
@@ -603,15 +858,16 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// `IASetVertexBuffers` for one slot: the title address of its data (the stride is the pipeline's).
     pub fn set_vertex_buffer(&mut self, slot: usize, address: u64) {
-        if self.state.vertex.len() <= slot {
-            self.state.vertex.resize(slot + 1, 0);
+        if address == 0 {
+            self.state.vertex.remove(&slot);
+        } else {
+            self.state.vertex.insert(slot, address);
         }
-        self.state.vertex[slot] = address;
     }
 
     /// The address bound as vertex buffer `slot`, if any (for the target trace).
     pub fn vertex_buffer_address(&self, slot: usize) -> Option<u64> {
-        self.state.vertex.get(slot).copied()
+        self.state.vertex.get(&slot).copied()
     }
 
     pub fn set_index_buffer(&mut self, address: u64, wide: bool) {
@@ -623,6 +879,22 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     fn draw_call(&mut self, call: DrawCall) -> Result<(), String> {
+        let empty = match call {
+            DrawCall::Arrays { vertex_count, instance_count, .. } => {
+                vertex_count == 0 || instance_count == 0
+            }
+            DrawCall::Indexed { index_count, instance_count, .. } => {
+                index_count == 0 || instance_count == 0
+            }
+            DrawCall::Mesh { groups } => groups.contains(&0),
+        };
+        if empty {
+            self.state
+                .graphics
+                .as_ref()
+                .ok_or("draw without a graphics pipeline")?;
+            return Ok(());
+        }
         self.draw_from(call, None, None)
     }
 
@@ -692,7 +964,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.clone(),
+            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
             index: self.state.index,
             state: self.state.draw,
             call,

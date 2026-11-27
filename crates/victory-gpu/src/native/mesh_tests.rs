@@ -164,3 +164,171 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
         assert!(pixels(&t, &color).iter().all(|p| *p == want), "record {i}: {:?}", pixels(&t, &color));
     }
 }
+
+/// 16-bit parameters across guessed stages (`graphics::HALF`): the triangle program exports
+/// param0 as two packed dwords (x: 1.0 high, 0.5 low; y: 0.25 high, 0.75 low), and the pixel
+/// program interpolates each half with `v_interp_p1ll_f16`/`v_interp_p2_f16` (low and `high`)
+/// and writes them to mrt0 as (x.lo, x.hi, y.lo, y.hi). Without a cross-stage convention the
+/// pixel program is refused.
+#[test]
+fn packed_half_parameters_reach_the_pixel_program() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x7E10_02FF, 0x3C00_3800, // v_mov_b32 v8, 0x3c003800 (1.0, 0.5)
+        0x7E12_02FF, 0x3400_3A00, // v_mov_b32 v9, 0x34003a00 (0.25, 0.75)
+        0xF800_0203, 0x0000_0908, // exp param0 v8, v9
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0xD742_0002, 0x0202_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
+        0xD75A_0004, 0x040A_0300, // v_interp_p2_f16 v4, v1, attr0.x high, v2
+        0xD742_0002, 0x0202_0040, // v_interp_p1ll_f16 v2, v0, attr0.y
+        0xD75A_0005, 0x040A_0240, // v_interp_p2_f16 v5, v1, attr0.y, v2
+        0xD742_0002, 0x0202_0140, // v_interp_p1ll_f16 v2, v0, attr0.y high
+        0xD75A_0006, 0x040A_0340, // v_interp_p2_f16 v6, v1, attr0.y high, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0x7E0A_1705, // v_cvt_f32_f16 v5, v5
+        0x7E0C_1706, // v_cvt_f32_f16 v6, v6
+        0xF800_180F, 0x0605_0403, // exp mrt0 v3, v4, v5, v6 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 191, 64]), "{:?}", pixels(&t, &color));
+}
+
+/// The uniform-mask SCC rule on the GPU (`Lower::uniform_and_exec`): inside an EXEC region of
+/// lanes 0-2 (`v_cmpx`), the triangle program compares the root constant (s8) with 0, ANDs the
+/// mask with EXEC and keeps SCC in s20; only when it is set does it keep the triangle's size
+/// (else it scales the corners by 0 and draws nothing). s8 = 1.0 colours the target, -1.0
+/// leaves it black.
+#[test]
+fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x7E1A_0280, // v_mov_b32 v13, 0
+        0x7DA8_0283, // v_cmpx_gt_u32 3, v1
+        0xBF88_0007, // s_cbranch_execz 7
+        0xD406_006A, 0x0001_0008, // v_cmp_ge_f32 vcc, s8, 0
+        0x8796_7E6A, // s_and_b64 s[22:23], vcc, exec
+        0xBE94_03FD, // s_mov_b32 s20, src_scc
+        0xBF01_8014, // s_cmp_lg_i32 s20, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x1004_050D, // v_mul_f32 v2, v13, v2
+        0x1006_070D, // v_mul_f32 v3, v13, v3
+    ]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0, user data dword 0.
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders);
+    };
+    for (s8, want) in [(1.0f32, [255, 128, 128, 255]), (-1.0, [0; 4])] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_root_constants(0, &[s8.to_bits()]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(pixels(&t, &color).iter().all(|p| *p == want), "s8 = {s8}: {:?}", pixels(&t, &color));
+    }
+}
+
+/// A pixel program reading the halves of fewer channels than the vertex side exports still links
+/// (parameter elements are four channels on both sides, those the export leaves out written a
+/// copy of one it has): only x's low half, of a parameter of x and y. Before, the converter
+/// refused such pairs as mismatching types, and crashed when the channels were left unwritten.
+#[test]
+fn halves_of_some_channels_link() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x7E10_02FF, 0x3C00_3800, // v_mov_b32 v8, 0x3c003800 (1.0, 0.5)
+        0x7E12_02FF, 0x3400_3A00, // v_mov_b32 v9, 0x34003a00 (0.25, 0.75)
+        0xF800_0203, 0x0000_0908, // exp param0 v8, v9
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128; 4]), "{:?}", pixels(&t, &color));
+}
+
+/// The halves fit the converter's mesh size (32 KiB of outputs): ten parameters a literal fills
+/// (so each may hold halves) still make a mesh pipeline, those past the room left without them.
+#[test]
+fn halves_of_many_parameters_stay_within_the_mesh_size() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0x7E10_02FF, 0x3C00_3800]); // v_mov_b32 v8, 0x3c003800
+    let at = at + 2;
+    // exp param<n> v8, v8, v8, v8
+    words.splice(at..at, (0..10u32).flat_map(|n| [0xF800_020F | n << 4, 0x0808_0808]));
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(..) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+}
+
+/// A parameter only a packing instruction makes (`v_cvt_pkrtz_f16_f32`: 0.5 low, 1.0 high) is
+/// exported as its halves alone, and the pixel program's f16 interpolations of both halves of
+/// x read them.
+#[test]
+fn a_parameter_of_halves_only_reaches_the_pixel_program() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [
+        0x5E10_0CF0, // v_cvt_pkrtz_f16_f32 v8, 0.5, v6 (1.0)
+        0xF800_0201, 0x0000_0008, // exp param0 v8
+    ]);
+    let ps_words = [
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0xD742_0002, 0x0202_0100, // v_interp_p1ll_f16 v2, v0, attr0.x high
+        0xD75A_0004, 0x040A_0300, // v_interp_p2_f16 v4, v1, attr0.x high, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0x7E08_1704, // v_cvt_f32_f16 v4, v4
+        0xF800_180F, 0x0403_0403, // exp mrt0 v3, v4, v3, v4 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128, 255, 128, 255]), "{:?}", pixels(&t, &color));
+}

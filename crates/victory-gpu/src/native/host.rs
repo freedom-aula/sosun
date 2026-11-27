@@ -41,10 +41,28 @@ pub struct NativeHost<B: GraphicsBackend> {
     no_targets: std::cell::Cell<u64>,
     /// Commands dropped because they name title memory outside every mapped pool.
     unmapped: std::cell::Cell<u64>,
+    /// Heap entries cleared because the texture they showed was released.
+    cleared: std::cell::Cell<u64>,
     /// Commands dropped because the host could not prepare them for another reason.
     failed: std::cell::Cell<u64>,
     /// Passes handed to the backend.
     passes: std::cell::Cell<u64>,
+    /// With texture copy-back on: the keys dispatches had bound for unordered access, not yet
+    /// taken by [`Self::take_written`].
+    written: RefCell<Option<std::collections::HashSet<usize>>>,
+}
+
+/// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
+/// list (or this queue's next segment) may wait for with no other way to go on.
+fn lost_fill<B: GraphicsBackend>(c: &Cmd<B>, why: &str) {
+    // Once per page: a title writes the same unmapped words every frame.
+    static PAGES: std::sync::Mutex<std::collections::BTreeSet<u64>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if let Cmd::Fill { dst, len, value } = c {
+        let mut pages = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pages.len() < 50 && pages.insert(dst >> 12) {
+            tracing::warn!("native host drops a value write: byte {value:#x} x{len} at {dst:#x}: {why}");
+        }
+    }
 }
 
 /// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
@@ -81,7 +99,7 @@ struct Prep<B: GraphicsBackend> {
     /// The pixel stage's own arguments.
     ps_root: Option<RootArgs>,
     bufs: Vec<Rc<B::Buffer>>,
-    vertex: Vec<(Rc<B::Buffer>, *const u8)>,
+    vertex: Vec<(usize, Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
     /// The `ExecuteIndirect` argument record.
@@ -134,8 +152,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             unset_roots: std::cell::Cell::new(0),
             no_targets: std::cell::Cell::new(0),
             unmapped: std::cell::Cell::new(0),
+            cleared: std::cell::Cell::new(0),
             failed: std::cell::Cell::new(0),
             passes: std::cell::Cell::new(0),
+            written: Default::default(),
         }
     }
 
@@ -247,6 +267,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
+        // The entries cleared when the texture last at this address was released are checked
+        // again: the record the title writes for the new one may equal the old one's.
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_gone(key) {
+                heap.mirrored.borrow_mut().remove(&index);
+            }
+        }
     }
 
     /// A shader-visible heap over the title's descriptor memory at `start` (zeroed memory the title
@@ -278,6 +305,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -313,6 +341,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
         self.resources.borrow_mut().remove(&key);
+    }
+
+    /// The title released texture `key` for good (its object's last reference, or the pool it was
+    /// placed in): besides [`Self::forget_resource`], the heap entries that show it are cleared.
+    /// Left as they were, they kept the host texture alive and resident until the title happened
+    /// to write another view there, so the memory the GPU holds wired grew with play time.
+    /// A cleared entry is written again when the title writes another record there, or makes a
+    /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
+    /// name the next object at this address, of a format the view cannot be made over.
+    pub fn release_resource(&self, key: usize) {
+        let texture = matches!(self.resources.borrow_mut().remove(&key), Some(Res::Texture(_)));
+        if !texture {
+            return;
+        }
+        for heap in self.heaps.borrow().iter() {
+            for index in heap.take_entries(key) {
+                self.backend.clear_entry(&heap.heap, index);
+                self.cleared.set(self.cleared.get() + 1);
+            }
+        }
+    }
+
+    /// Heap entries cleared so far because the texture they showed was released.
+    pub fn cleared(&self) -> u64 {
+        self.cleared.get()
     }
 
     /// Whether resource object `key` is registered (as a buffer or a texture).
@@ -370,6 +423,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 };
                 self.backend
                     .write_buffer(&heap.heap, index, &buf, ptr, size);
+                heap.shows(index, None);
             }
             Decoded::Image {
                 resource,
@@ -395,10 +449,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                heap.shows(index, Some(resource));
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
+                heap.shows(index, None);
             }
         }
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
@@ -408,6 +464,49 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// Minimum entries of each bound table checked at submission when a shader has no
     /// metadata for that table (or declares fewer entries).
     const TABLE_CHECK: usize = 16;
+
+    /// Turns the collection of GPU-written texture keys on or off.
+    pub(super) fn collect_written(&self, on: bool) {
+        *self.written.borrow_mut() = on.then(Default::default);
+    }
+
+    pub(super) fn collecting_written(&self) -> bool {
+        self.written.borrow().is_some()
+    }
+
+    /// The keys collected since the last call.
+    pub(super) fn take_written(&self) -> Vec<usize> {
+        self.written.borrow_mut().as_mut().map_or_else(Vec::new, |w| w.drain().collect())
+    }
+
+    /// Notes the textures the tables `root` binds hold unordered access views of: what a dispatch
+    /// may write. More than it does write (the shader may not use every entry).
+    ///
+    /// shortcut: a shader that indexes the descriptor heap itself, and pixel shader writes, are
+    /// not seen; add them when a title texture needs it.
+    fn note_written(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        let mut written = self.written.borrow_mut();
+        let Some(written) = written.as_mut() else { return };
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            if h.kind != HeapKind::Resource {
+                continue;
+            }
+            let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
+            for index in *at..end {
+                match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
+                    Some(crate::descriptor::View::Unordered(r, ..)) => {
+                        written.insert(r);
+                    }
+                    Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
+                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                        written.insert(super::textures::placed_key(address, &res));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
@@ -588,10 +687,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
         let (_, maps) = self.mapping_list();
-        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
+        addr::sorted_root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
     }
 
-    /// The pool table as the page table builder reads it, and its generation: made again only
+    /// The pool table in title-address order, and its generation: made again only
     /// when the pool table changed.
     fn mapping_list(&self) -> (u64, Rc<[Mapping]>) {
         if let Some((g, maps)) = &*self.maps.borrow()
@@ -648,6 +747,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            images: Default::default(),
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -742,12 +842,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// The textures the first 32 entries from each of `root`'s tables name as unordered-access
+    /// views (for traces of work whose program is not known: a table may be shorter).
+    #[cfg(target_os = "macos")]
+    pub(super) fn table_uav_textures(&self, root: &[Option<Root<B>>]) -> Vec<usize> {
+        let handles = root.iter().flatten().filter_map(|r| match r {
+            Root::Table(h, at) if h.kind == HeapKind::Resource => Some((h.start, *at as u64)),
+            _ => None,
+        });
+        let mut out: Vec<usize> = handles
+            .flat_map(|(start, at)| (0..32).map(move |k| start + (at + k) * Self::step(HeapKind::Resource)))
+            .filter_map(|handle| match crate::descriptor::view(handle) {
+                Some(crate::descriptor::View::Unordered(r, _, _)) if texture_info_of(r).is_some() => Some(r),
+                _ => None,
+            })
+            .collect();
+        out.dedup();
+        out
+    }
+
     /// `VICTORY_TRACE_CONTENT=<dir>`: for the first draws into a depth target, every texture and
     /// constant buffer their descriptor tables hold: its view, the fraction of its title memory
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -817,7 +936,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 None => "unset".into(),
             })
             .collect();
-        let head = vertex.first().map(|&a| {
+        let head = vertex.first().map(|&(_, a)| {
             let mut b = [0u8; 32];
             super::safe_read(a as *const u8, &mut b);
             b
@@ -935,6 +1054,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
                 self.remirror_tables(root, pso.binding.as_ref());
+                self.note_written(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), *threads, &mut p)?;
@@ -992,8 +1112,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     None => self.root_args(root, &mut p)?,
                 }
-                for a in vertex {
-                    p.vertex.push(self.resolve(*a, 1)?);
+                for &(slot, address) in vertex {
+                    let (buffer, ptr) = self.resolve(address, 1)?;
+                    p.vertex.push((slot, buffer, ptr));
                 }
                 if let Some((a, _)) = index {
                     p.index = Some(self.resolve(*a, 1)?);
@@ -1004,7 +1125,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 p.blit.push(self.resolve(*dst, *len as u64)?);
             }
             Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
-            Cmd::Clear { .. } => {}
+            Cmd::CopyBufferToTexture { src, len, .. } => {
+                p.blit.push(self.resolve(*src, *len as u64)?);
+            }
+            Cmd::CopyTextureToBuffer { dst, len, .. } => {
+                p.blit.push(self.resolve(*dst, *len as u64)?);
+            }
+            Cmd::CopyTexture { .. } | Cmd::Clear { .. } => {}
         }
         Ok(p)
     }
@@ -1029,7 +1156,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
         let same = |a: &Cmd<B>, b: &Cmd<B>| match (a, b) {
             (Cmd::Dispatch { .. }, Cmd::Dispatch { .. }) => true,
-            (Cmd::Copy { .. } | Cmd::Fill { .. }, Cmd::Copy { .. } | Cmd::Fill { .. }) => true,
+            (
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. },
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. },
+            ) => true,
             (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
             _ => false,
         };
@@ -1090,6 +1228,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command names title memory outside every mapped pool (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command at unmapped title memory");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
                 // Anything else the host cannot give one command (arguments that are not what the
@@ -1102,6 +1241,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         tracing::warn!(error = %e, "native host drops work: a command the host could not prepare (first time; each at debug level)");
                     });
                     tracing::debug!(error = %e, "native host drops a command it could not prepare");
+                    lost_fill(c, &e);
                     dropped.push(c);
                 }
             }
@@ -1116,7 +1256,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             groups.push(match cmds[i] {
                 Cmd::Dispatch { .. } => Group::Compute(i, j),
-                Cmd::Copy { .. } | Cmd::Fill { .. } => Group::Blit(i, j),
+                Cmd::Copy { .. }
+                | Cmd::Fill { .. }
+                | Cmd::CopyTexture { .. }
+                | Cmd::CopyBufferToTexture { .. }
+                | Cmd::CopyTextureToBuffer { .. } => Group::Blit(i, j),
                 Cmd::Draw { .. } => Group::Render(i, j),
                 Cmd::Clear { .. } => {
                     j = i + 1;
@@ -1130,7 +1274,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let mut buffers: Vec<&B::Buffer> = Vec::new();
         for p in &preps {
             buffers.extend(p.bufs.iter().map(|b| &**b));
-            buffers.extend(p.vertex.iter().map(|b| &*b.0));
+            buffers.extend(p.vertex.iter().map(|(_, buffer, _)| &**buffer));
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
             buffers.extend(p.indirect.iter().map(|b| &*b.0));
@@ -1197,6 +1341,75 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     dst: (&*p.0, p.1),
                                     len: *len,
                                     value: *value,
+                                }
+                            }
+                            Cmd::CopyTexture {
+                                src,
+                                src_mip,
+                                src_slice,
+                                src_origin,
+                                size,
+                                dst,
+                                dst_mip,
+                                dst_slice,
+                                dst_origin,
+                            } => BlitOp::CopyTexture {
+                                src: &**src,
+                                src_mip: *src_mip,
+                                src_slice: *src_slice,
+                                src_origin: *src_origin,
+                                size: *size,
+                                dst: &**dst,
+                                dst_mip: *dst_mip,
+                                dst_slice: *dst_slice,
+                                dst_origin: *dst_origin,
+                            },
+                            Cmd::CopyBufferToTexture {
+                                len,
+                                row_pitch,
+                                slice_pitch,
+                                size,
+                                dst,
+                                dst_mip,
+                                dst_slice,
+                                dst_origin,
+                                ..
+                            } => {
+                                let p = &preps[k].blit[0];
+                                BlitOp::CopyBufferToTexture {
+                                    src: (&*p.0, p.1),
+                                    len: *len,
+                                    row_pitch: *row_pitch,
+                                    slice_pitch: *slice_pitch,
+                                    size: *size,
+                                    dst: &**dst,
+                                    dst_mip: *dst_mip,
+                                    dst_slice: *dst_slice,
+                                    dst_origin: *dst_origin,
+                                }
+                            }
+                            Cmd::CopyTextureToBuffer {
+                                src,
+                                src_mip,
+                                src_slice,
+                                src_origin,
+                                size,
+                                len,
+                                row_pitch,
+                                slice_pitch,
+                                ..
+                            } => {
+                                let p = &preps[k].blit[0];
+                                BlitOp::CopyTextureToBuffer {
+                                    src: &**src,
+                                    src_mip: *src_mip,
+                                    src_slice: *src_slice,
+                                    src_origin: *src_origin,
+                                    size: *size,
+                                    dst: (&*p.0, p.1),
+                                    len: *len,
+                                    row_pitch: *row_pitch,
+                                    slice_pitch: *slice_pitch,
                                 }
                             }
                             _ => unreachable!(),
@@ -1274,7 +1487,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                     vertex_buffers: preps[k]
                                         .vertex
                                         .iter()
-                                        .map(|(b, p)| (&**b, *p))
+                                        .map(|(slot, b, p)| (*slot, &**b, *p))
                                         .collect(),
                                     index_buffer: preps[k].index.as_ref().map(|(b, p)| (&**b, *p)),
                                     call: *call,

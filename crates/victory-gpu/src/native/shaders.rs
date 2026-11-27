@@ -100,6 +100,26 @@ pub fn threads_of(dxil: &[u8]) -> Option<[usize; 3]> {
     Some([n(0), n(1), n(2)]).filter(|t| t.iter().all(|&n| n > 0))
 }
 
+/// Whether Metal's compiler crashed on the pipeline `key` names on an earlier run (`victory_metal::disk::crashed`).
+fn compiler_crashed(key: &[u8; 32]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        victory_metal::disk::crashed(key)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = key;
+        false
+    }
+}
+
+fn remember_compiler_crash(key: &[u8; 32]) {
+    #[cfg(target_os = "macos")]
+    victory_metal::disk::remember_crash(key);
+    #[cfg(not(target_os = "macos"))]
+    let _ = key;
+}
+
 /// Counts of what the shader path did, and why it refused what it did.
 #[derive(Default, Debug, Clone)]
 pub struct ShaderStats {
@@ -150,10 +170,9 @@ impl<B: PresentBackend> Title<B> {
     /// The compute pipeline of a translated shader: from the cache when its DXIL was converted
     /// before, else converted now. [`Pipe::Refused`] (counted) when the host cannot run it.
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
-        // shortcut: compute shaders indexing the heap itself stay refused (graphics ones run);
-        // lift it once a compute value test reads a heap-indexed view.
-        let why = unsupported(shader, true).or(shader.heap.then_some("indexes the descriptor heap itself"));
-        if let Some(why) = why {
+        // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
+        // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
+        if let Some(why) = unsupported(shader, true) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -219,7 +238,13 @@ impl<B: PresentBackend> Title<B> {
             self.shaders.cached += 1;
             return p.clone();
         }
-        let made = self.make_render(vs, ps, graphics, name);
+        // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
+        if compiler_crashed(&key) {
+            self.shaders.refuse(name, "conversion: Metal's compiler crashed on it on an earlier run".into());
+            self.libraries.render.insert(key, Pipe::Refused);
+            return Pipe::Refused;
+        }
+        let made = self.make_render(vs, ps, graphics, name, &key);
         self.libraries.render.insert(key, made.clone());
         made
     }
@@ -230,6 +255,7 @@ impl<B: PresentBackend> Title<B> {
         ps: Option<&HostShader>,
         g: &Graphics,
         name: &str,
+        key: &[u8; 32],
     ) -> Pipe<B> {
         let Some(reads) = state::vertex_inputs(&vs.dxil) else {
             self.shaders.refuse(name, "no input signature".into());
@@ -292,6 +318,9 @@ impl<B: PresentBackend> Title<B> {
                 })))
             }
             Err(e) => {
+                if e.contains("XPC_ERROR_CONNECTION_INTERRUPTED") {
+                    remember_compiler_crash(key);
+                }
                 self.shaders.refuse(name, format!("conversion: {e}"));
                 Pipe::Refused
             }

@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Md, Module, Ty, Uses, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -608,9 +608,20 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The instruction graph is final. Adding metadata below can still retain globals.
+        let plan = self.m.plan();
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
-        let uses = self.m.uses();
+        let uses = self.m.uses_with_plan(&plan);
+        self.finish_with_metadata(ud_size, uses, |m| m.write_with_plan(plan))
+    }
+
+    fn finish_with_metadata(
+        mut self,
+        ud_size: u32,
+        uses: Uses,
+        write_bitcode: impl FnOnce(&Module) -> Vec<u8>,
+    ) -> Vec<u8> {
         for (flag, used) in [
             (flags::RESOURCE_HEAP, uses.heap),
             (flags::SAMPLER_HEAP, uses.sampler_heap),
@@ -952,7 +963,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        let bitcode = write_bitcode(&self.m);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -1074,7 +1085,7 @@ impl Shader {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::super::bitcode::Term;
     use super::*;
@@ -1082,7 +1093,7 @@ mod tests {
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no
     /// thread-group size), pixel or compute program.
-    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+    fn marked(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Shader {
         let mut s = Shader::new(pixel);
         s.threads = threads;
         let b = s.entry;
@@ -1097,7 +1108,21 @@ mod tests {
         let i32t = s.t.i32;
         s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
         s.m.terminate(b, Term::Ret);
-        s.finish()
+        s
+    }
+
+    #[test]
+    fn shared_plan_matches_standalone_dxil_container() {
+        for heap in [false, true] {
+            let shader = || marked(false, None, heap);
+            let mut reference = shader();
+            let ud_size = (reference.user_data * 4).next_multiple_of(16);
+            reference.fix_user_data_size(ud_size);
+            let uses = reference.m.uses();
+            assert_eq!(uses.heap, heap);
+            let expected = reference.finish_with_metadata(ud_size, uses, Module::write);
+            assert_eq!(shader().finish(), expected);
+        }
     }
 
     /// A vertex program writing a declared UAV declares UAVs at every stage
@@ -1105,6 +1130,7 @@ mod tests {
     /// 5,046 programs of the title's list); pixel and compute programs need
     /// not, nor a vertex program whose UAVs all come from the heap (the
     /// validator counts declared ranges only: 26 mesh and vertex programs).
+    #[cfg(windows)]
     #[test]
     fn uavs_outside_pixel_and_compute_programs_are_declared() {
         let mut validator = super::super::validator::Validator::load(
@@ -1117,7 +1143,7 @@ mod tests {
             ("compute", false, Some([1, 1, 1]), false),
             ("vertex, heap", false, None, true),
         ] {
-            let mut dxil = marked(pixel, threads, heap);
+            let mut dxil = marked(pixel, threads, heap).finish();
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));

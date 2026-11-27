@@ -221,6 +221,47 @@ fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
     assert_eq!(got[64..], [(64..96).sum::<u32>() - 1; 32]);
 }
 
+/// A whole-wave product (`WaveActiveProduct`): lanes 0..34 hold 2.0, the rest 1.0, so both
+/// halves contribute and every lane must see 2^35.
+#[test]
+fn a_whole_wave_product_multiplies_both_halves() {
+    let mut w = vec![
+        0x7D88_00A3, // v_cmp_gt_u32 vcc, 35, v0
+        0xD501_0004,
+        0x01A9_E8F2, // v_cndmask_b32_e64 v4, 1.0, 2.0, vcc
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_08F2, // v_cndmask_b32_e64 v1, 1.0, v4, s[8:9]
+        0x1002_02FA,
+        0xFF00_B101, // v_mul_f32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x1002_02FA,
+        0xFF00_4E01, // v_mul_f32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x1002_02FA,
+        0xFF01_4101, // v_mul_f32_dpp v1, v1, v1 row_half_mirror
+        0x1002_02FA,
+        0xFF01_4001, // v_mul_f32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x1002_0501, // v_mul_f32_e32 v1, v1, v2
+        0xD760_0004,
+        0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005,
+        0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD508_0003,
+        0x0200_0A04, // v_mul_f32_e64 v3, s4, s5
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+    ];
+    w.push(S_ENDPGM);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, [2f32.powi(35).to_bits(); 64]);
+}
+
 /// A dispatch of thread counts (`DispatchX` with thread dimensions, `Options::thread_counts`) of
 /// `count` threads in x, in groups of `per` lanes of 64-lane waves (`wave64`) or 32: the first
 /// `slots` dwords of `dst`. `s5` is the group id.
@@ -325,4 +366,166 @@ fn a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them() {
     }
     assert_eq!(got[..45], [(0..45).sum::<u32>(); 45]);
     assert_eq!(got[45..], [CANARY; 19]);
+}
+
+#[test]
+fn a_mask_moved_to_every_lane_before_a_branch_to_a_join_holds_their_lanes() {
+    // A join of a lane mask where lanes arrive from two places (per lane, as the translation
+    // follows the console's EXEC regions): lanes 0..39 set `s[8:9]` to -1 and branch to it, lanes
+    // 40..63 skip that region and compare themselves against 50. Each reads its own path's bit:
+    // 1 below 50, 0 from 50 (was refused: "data, at a join of several edges").
+    let w = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0x8A86_7E04, // s_andn2_b64 s[6:7], s[4:5], exec
+        skip_execz(2),
+        0xBE88_04C1, // s_mov_b64 s[8:9], -1
+        0xBF82_0003, // s_branch to the join
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xBEFE_0404, // join: s_mov_b64 exec, s[4:5]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..50], [1; 50]);
+    assert_eq!(got[50..], [0; 14]);
+}
+
+#[test]
+fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
+    // `s[8:9]` holds an address (data) until lanes 0..39 make it the lanes below 10 or outside
+    // EXEC (`s_orn2`, which sets lanes 40..63); lanes 40..63 skip that and join holding the
+    // address, but the join's only read is an AND with an EXEC they are not in, so each reads a 0
+    // there (was refused: "data, ...").
+    let w = [
+        0xBE88_0402, // s_mov_b64 s[8:9], s[2:3]
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(2),
+        0x7D88_008A, // v_cmp_gt_u32 vcc, 10, v0
+        0x8B88_7E6A, // s_orn2_b64 s[8:9], vcc, exec: lanes 40..63 set too
+        0x8788_7E08, // join: s_and_b64 s[8:9], s[8:9], exec
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..], [0; 54]);
+}
+
+#[test]
+fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
+    // `s[8:9]` holds a mask (the lanes below 50) that lanes 0..39 replace with loaded data; the
+    // first join (data for lanes 0..39) is read only by a second join, where lanes 20..63 skip in holding it and
+    // the only read is an AND with an EXEC they are not in. No lane sees the first join's bits
+    // (the title's 1280x720 compute pass; was refused: "data, ...").
+    let w = [
+        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(3),
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        0x8788_7E08, // second join: s_and_b64 s[8:9], s[8:9], exec
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..5], [1; 5]);
+    assert_eq!(got[5..], [0; 59]);
+}
+
+#[test]
+fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed() {
+    // `s[8:9]` holds the lanes below 50, then loaded data for lanes 0..59 (a first join of data
+    // and a mask). An if/else on the lanes below 40 follows: the then part makes a new mask, and
+    // the lanes that skip it (40..63, holding the first join) run the else part, which writes
+    // the register again before any read. They never take the edge that brings the first join
+    // to the end, so no lane sees it (the title's 1280x720 compute pass; was refused: "data,
+    // ...").
+    let w = [
+        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0x7D88_00BC, // v_cmp_gt_u32 vcc, 60, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(3),
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_008A, // then: v_cmp_gt_u32 s[8:9], 10, v0
+        0x8AFE_7E06, // s_andn2_b64 exec, s[6:7], exec
+        skip_execz(2),
+        0xD4C4_0008, 0x0202_00B2, // else: v_cmp_gt_u32 s[8:9], 50, v0
+        0xBEFE_0406, // end: s_mov_b64 exec, s[6:7]
+        0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..40], [0; 30]);
+    assert_eq!(got[40..50], [1; 10]);
+    assert_eq!(got[50..], [0; 14]);
+}
+
+#[test]
+fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() {
+    // `s[8:9]` holds loaded data; lanes 0..39 make it -1 or 0 by SCC (here -1). At the join
+    // the only read is an `s_nand` with EXEC: lanes 40..63 skipped in with the data and are not
+    // in that EXEC, so their bits are 1 whatever it holds; lanes 0..39 read SCC's bit, giving
+    // 0 (a small compute pass of the title's that holds the HDR scene colour; was refused:
+    // "data, ...").
+    let w = [
+        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        S_WAITCNT_LGKM,
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(2),
+        0xBF07_8004, // s_cmp_lg_u32 s4, 0
+        0x8588_80C1, // s_cselect_b64 s[8:9], -1, 0
+        0x8C88_7E08, // join: s_nand_b64 s[8:9], s[8:9], exec
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [0; 40]);
+    assert_eq!(got[40..], [1; 24]);
 }

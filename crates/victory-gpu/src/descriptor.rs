@@ -352,6 +352,48 @@ impl RtvRecord {
         self.described == 0 || (matches!(self.desc[1], 1 | 3) && self.desc[3] == 0)
     }
 
+    /// The format the view names (0: the resource's own).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn format(&self) -> u32 {
+        if self.described == 0 { 0 } else { self.desc[0] }
+    }
+
+    /// The mip and slice a native color attachment can represent. A null description keeps
+    /// the existing base attachment. Explicit views must select a single supported subresource.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn native_rtv_subresource(
+        &self,
+        dimension: victory_formats::texture::Dimension,
+        layers: u32,
+        mips: usize,
+        samples: u32,
+    ) -> Option<(usize, usize)> {
+        use victory_formats::texture::Dimension::{Tex1d, Tex2d, Tex3d};
+
+        if self.described == 0 {
+            return Some((0, 0));
+        }
+        if samples != 1 {
+            return None;
+        }
+        let (mip, slice) = match self.desc {
+            // D3D12_RTV_DIMENSION_TEXTURE1D / TEXTURE1DARRAY.
+            [_, 2, mip, ..] if dimension == Tex1d => (mip, 0),
+            [_, 3, mip, slice, 1, _] if dimension == Tex1d => (mip, slice),
+            // TEXTURE2D / TEXTURE2DARRAY. The native attachment uses plane zero.
+            [_, 4, mip, 0, ..] if dimension == Tex2d => (mip, 0),
+            [_, 5, mip, slice, 1, 0] if dimension == Tex2d => (mip, slice),
+            // A 3D RTV based at mip 0 and W slice 0 keeps the existing base-plane attachment.
+            [_, 8, 0, 0, size, _]
+                if dimension == Tex3d && (size == u32::MAX || (1..=layers).contains(&size)) =>
+            {
+                (0, 0)
+            }
+            _ => return None,
+        };
+        (slice < layers && (mip as usize) < mips).then_some((mip as usize, slice as usize))
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -881,6 +923,33 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_rtv_preserves_base_3d_views_and_checks_explicit_shapes() {
+        use super::{RTV_TAG, RtvRecord};
+        use victory_formats::texture::Dimension::{Tex1d, Tex2d, Tex3d};
+
+        let explicit = |desc| RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc,
+        };
+        let whole_volume = explicit([28, 8, 0, 0, u32::MAX, 0]);
+        assert_eq!(whole_volume.native_rtv_subresource(Tex3d, 4, 2, 1), Some((0, 0)));
+        let base_volume = explicit([28, 8, 0, 0, 4, 0]);
+        assert_eq!(base_volume.native_rtv_subresource(Tex3d, 4, 2, 1), Some((0, 0)));
+        assert_eq!(base_volume.native_rtv_subresource(Tex3d, 3, 2, 1), None);
+        let nonbase_volume = explicit([28, 8, 0, 1, 1, 0]);
+        assert_eq!(nonbase_volume.native_rtv_subresource(Tex3d, 4, 2, 1), None);
+        let array_1d = explicit([28, 3, 1, 1, 1, 0]);
+        assert_eq!(array_1d.native_rtv_subresource(Tex1d, 2, 2, 1), Some((1, 1)));
+        assert_eq!(array_1d.native_rtv_subresource(Tex2d, 2, 2, 1), None);
+        let texture_2d = explicit([28, 4, 1, 0, 0, 0]);
+        assert_eq!(texture_2d.native_rtv_subresource(Tex2d, 1, 2, 4), None);
+        assert_eq!(texture_2d.native_rtv_subresource(Tex2d, 2, 2, 1), Some((1, 0)));
+    }
+
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
     pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);

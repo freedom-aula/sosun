@@ -9,11 +9,19 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! The transforms themselves are not computed from the title's own impulse
+//! response: the hardware takes it already in its own partitioned
+//! frequency-domain layout, which is not known, so `StreamDesc::ir` is not
+//! read. With `VICTORY_GUESS_DSP=1`, a convolution stream instead gets a
+//! short synthetic decaying-noise tail (see `synthetic_ir`), carried across
+//! blocks so it does not reset at every block boundary; this is a CPU
+//! fallback approximation of reverb coloration, not the title's actual
+//! effect, and without the variable set the output is silence as before.
+//! Other block transforms stay silent either way: their shape is unknown.
+// shortcut: convolution streams get one fixed synthetic decay instead of the
+// title's impulse response, behind VICTORY_GUESS_DSP=1 since it is unverified
+// against a real run; other transform kinds stay silent regardless. Upgrade
+// once the hardware's partitioned IR layout is documented.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -61,7 +69,68 @@ pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    kind: u32,
+    ir: Vec<f32>,
+    /// The last `ir.len() - 1` frames of input, interleaved, carried into the
+    /// next block so the synthetic tail does not restart at every boundary.
+    history: Vec<f32>,
+    /// Reused across `XDspSubmitCommand` calls to merge `history` and the
+    /// title's input without allocating on the audio path each block.
+    scratch: Vec<f32>,
     status: Box<Status>,
+}
+
+/// Taps of the synthetic reverb tail: a fixed decaying-noise burst,
+/// deterministic so the same stream always gets the same tail. About 100 ms
+/// at 48 kHz: an early-reflection-length coloration, well short of a real
+/// room's decay, but as far as a per-sample scalar convolution goes without
+/// ballooning into an FFT-based engine.
+const TAPS: usize = 4800;
+
+fn synthetic_ir(len: usize) -> Vec<f32> {
+    let mut seed = 0x9E37_79B9_u32;
+    (0..len)
+        .map(|k| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
+            let decay = (-(k as f32) / (len as f32 / 5.0)).exp();
+            noise * decay
+        })
+        .collect()
+}
+
+/// Convolves one interleaved block against `ir` per channel, scaled by that
+/// channel's gain (a guess: as likely to be `[dry, wet]`, in which case a
+/// mono stream's second gain is never read). `merged` is `hist_frames`
+/// frames of history (zero for the first block of a stream) followed by
+/// the current block's `frames` frames, so the tail is continuous across
+/// block boundaries rather than truncated at each one; `out` holds only
+/// the current block's `frames` frames.
+fn convolve_merged(
+    merged: &[f32],
+    hist_frames: usize,
+    channels: usize,
+    ir: &[f32],
+    gains: [f32; 2],
+    out: &mut [f32],
+) {
+    let frames = out.len() / channels;
+    for c in 0..channels {
+        let gain = gains[c];
+        for n in 0..frames {
+            let base = hist_frames + n;
+            let mut acc = 0.0f32;
+            for (k, &h) in ir.iter().enumerate() {
+                if k > base {
+                    break;
+                }
+                acc += merged[(base - k) * channels + c] * h;
+            }
+            out[n * channels + c] = acc * gain;
+        }
+    }
 }
 
 /// One block of work.
@@ -118,6 +187,32 @@ pub extern "system" fn XDspDisconnect(dsp: *mut Dsp) -> HRESULT {
     S_OK
 }
 
+/// Whether the synthetic convolution tail (module docs) is turned on; off by
+/// default since it is unverified against a real run, leaving the title's
+/// reverb silent as before. Checked fresh each call, not cached, so tests
+/// can toggle it.
+fn guess_dsp() -> bool {
+    std::env::var_os("VICTORY_GUESS_DSP").is_some()
+}
+
+/// Logs the leading floats of a convolution stream's own impulse response at
+/// activation, to help settle what format `StreamDesc::ir` is actually in
+/// (see native-host.md). Off by default; reads at most 8 floats, bounded by
+/// `ir_floats`.
+fn trace_ir(desc: &StreamDesc) {
+    if desc.kind != CONVOLUTION
+        || desc.ir.is_null()
+        || std::env::var_os("VICTORY_TRACE_DSP").is_none()
+    {
+        return;
+    }
+    let ir_floats = desc.ir_floats;
+    let len = (ir_floats as usize).min(8);
+    // SAFETY: `len` is bounded by the title's own `ir_floats` count.
+    let head = unsafe { std::slice::from_raw_parts(desc.ir, len) };
+    tracing::info!(ir_floats, ?head, "audio DSP stream's own impulse response");
+}
+
 fn valid(desc: &StreamDesc) -> bool {
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
     let shape = if kind == CONVOLUTION {
@@ -155,6 +250,7 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    trace_ir(desc);
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -164,10 +260,20 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
+    let ir = if kind == CONVOLUTION {
+        synthetic_ir(TAPS)
+    } else {
+        Vec::new()
+    };
+    let history = vec![0.0; ir.len().saturating_sub(1) * channels as usize];
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        kind,
+        ir,
+        history,
+        scratch: Vec::new(),
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -195,7 +301,9 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Completes the command at once: a convolution stream with an input gets
+/// the synthetic reverb tail (see module docs); everything else stays
+/// silence.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -208,8 +316,35 @@ pub extern "system" fn XDspSubmitCommand(
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if guess_dsp() && stream.kind == CONVOLUTION && !command.input.is_null() {
+            let hist_frames = stream.history.len() / stream.channels as usize;
+            stream.scratch.clear();
+            stream.scratch.extend_from_slice(&stream.history);
+            // SAFETY: the title's input buffer holds one block of the
+            // stream. This borrow ends with `extend_from_slice`, before
+            // `out` below, in case the two pointers alias.
+            stream
+                .scratch
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(command.input, samples) });
+            // SAFETY: the title's output buffer holds one block of the stream.
+            let out = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+            convolve_merged(
+                &stream.scratch,
+                hist_frames,
+                stream.channels as usize,
+                &stream.ir,
+                command.gains,
+                out,
+            );
+            let keep = stream.history.len();
+            let tail_start = stream.scratch.len() - keep;
+            stream
+                .history
+                .copy_from_slice(&stream.scratch[tail_start..]);
+        } else {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -246,6 +381,8 @@ mod tests {
 
     #[test]
     fn convolution_stream_as_the_title_drives_it() {
+        // SAFETY: no other test reads VICTORY_GUESS_DSP.
+        unsafe { std::env::set_var("VICTORY_GUESS_DSP", "1") };
         let mut base = vec![0u8; 0x10_0000];
         let mut dsp = std::ptr::null_mut();
         assert_eq!(
@@ -284,7 +421,10 @@ mod tests {
         // SAFETY: the stream's status block.
         let (completed, result) = unsafe { ((*status).completed, (*status).result) };
         assert_eq!((completed, result), (ticket, S_OK));
-        assert!(output.iter().all(|&s| s == 0.0));
+        // A convolution stream with real input no longer returns digital
+        // silence: it gets the synthetic reverb tail.
+        assert!(output.iter().any(|&s| s != 0.0));
+        assert_ne!(output, vec![1f32; 0x800]);
         assert_eq!(XDspDeactivate(stream), S_OK);
 
         // Mono streams refuse stereo options; transforms are mono only.
@@ -310,5 +450,78 @@ mod tests {
         );
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
+        // SAFETY: set at the top of this test; nothing else reads it.
+        unsafe { std::env::remove_var("VICTORY_GUESS_DSP") };
+    }
+
+    #[test]
+    fn convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain() {
+        // Stereo, no history (hist_frames 0), 3 frames/channel: interleaved
+        // L0 R0 L1 R1 L2 R2.
+        let merged = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0];
+        let ir = [1.0, 0.5, 0.25];
+        let mut out = [0.0; 6];
+        convolve_merged(&merged, 0, 2, &ir, [2.0, 3.0], &mut out);
+        // Left channel is [1,0,0] convolved with ir, times gain 2: [1, 0.5, 0.25] * 2.
+        // Right channel is [2,0,0] convolved with ir, times gain 3: [2, 1, 0.5] * 3.
+        assert_eq!(out, [2.0, 6.0, 1.0, 3.0, 0.5, 1.5]);
+    }
+
+    #[test]
+    fn convolve_merged_reads_history_as_the_frames_before_the_block() {
+        // Mono, one frame of history (5.0), then the block [0.0, 0.0].
+        let merged = [5.0, 0.0, 0.0];
+        let ir = [1.0, 0.5, 0.25];
+        let mut out = [0.0; 2];
+        convolve_merged(&merged, 1, 1, &ir, [1.0, 0.0], &mut out);
+        // n=0 reaches one frame back into history: 0*1 + 5*0.5 = 2.5.
+        // n=1 reaches two frames back: 0*1 + 0*0.5 + 5*0.25 = 1.25.
+        assert_eq!(out, [2.5, 1.25]);
+    }
+
+    #[test]
+    fn a_block_split_matches_one_convolution_over_the_whole_signal() {
+        // The point of carrying history across calls: splitting one signal
+        // into two blocks and convolving them in sequence, carrying the
+        // tail, must give the same result as convolving it in one go. This
+        // is the property that stops a reverb tail from clicking at every
+        // block boundary.
+        let ir = synthetic_ir(5);
+        let channels = 1;
+        let whole = [1.0, 0.3, -0.2, 0.0, 0.5, 0.1, -0.4, 0.2];
+        let gains = [1.0, 0.0];
+
+        let mut reference = [0.0; 8];
+        convolve_merged(&whole, 0, channels, &ir, gains, &mut reference);
+
+        let (first, second) = whole.split_at(4);
+        let mut history = vec![0.0; ir.len() - 1];
+        let mut out1 = [0.0; 4];
+        let mut scratch: Vec<f32> = history.clone();
+        scratch.extend_from_slice(first);
+        convolve_merged(&scratch, history.len(), channels, &ir, gains, &mut out1);
+        let keep = history.len();
+        history.copy_from_slice(&scratch[scratch.len() - keep..]);
+
+        let mut out2 = [0.0; 4];
+        scratch.clear();
+        scratch.extend_from_slice(&history);
+        scratch.extend_from_slice(second);
+        convolve_merged(&scratch, history.len(), channels, &ir, gains, &mut out2);
+
+        let streamed: Vec<f32> = out1.iter().chain(out2.iter()).copied().collect();
+        assert_eq!(streamed, reference);
+    }
+
+    #[test]
+    fn synthetic_ir_is_deterministic_and_decays() {
+        let a = synthetic_ir(16);
+        let b = synthetic_ir(16);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+        // The tail dies out: the back half carries much less energy than the front half.
+        let front: f32 = a[..8].iter().map(|s| s * s).sum();
+        let back: f32 = a[8..].iter().map(|s| s * s).sum();
+        assert!(back < front);
     }
 }

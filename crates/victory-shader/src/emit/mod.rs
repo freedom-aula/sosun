@@ -480,11 +480,12 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (mut p, mut st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
-    if options.thread_counts && native.stage == HwStage::Cs {
-        p.thread_counts = true;
-        st = structure::structure(&p);
-    }
+    let (p, st) = crate::range::build_with_thread_counts(
+        &native.patched_code(),
+        native.wave64,
+        native.vgprs,
+        options.thread_counts && native.stage == HwStage::Cs,
+    )?;
     let guessed = graphics::is_guessed(&c);
     let computed_buffers =
         (guessed || native.stage == HwStage::Cs) && options.zero_copy_memory;
@@ -530,7 +531,8 @@ pub fn emit_with(
     if !pixel && options.extra_params != 0 {
         let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
         for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
-            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+            // By name: a `HALF` element (`graphics::HALF`) of another parameter may have index n.
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n && e.name == "TEXCOORD") {
                 continue;
             }
             outputs.push(container::SigElement {
@@ -784,6 +786,107 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    // The original compute path built relative-move ranges with full entry EXEC,
+    // then structured the resulting program again for a thread-count dispatch.
+    fn translate_compute_before(
+        container: &[u8],
+        options: Options,
+    ) -> Result<HostShader, ShaderError> {
+        let c = Container::parse(container)?;
+        let native = crate::native_programs(c.part(FourCC::ACCC).unwrap().data)?.remove(0);
+        let (mut p, mut st) =
+            crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        if options.thread_counts {
+            p.thread_counts = true;
+            st = structure::structure(&p);
+        }
+        let res =
+            resource::track_graphics(&p, &native.layout, native.stage, st.as_ref().ok(), false)?;
+        let io = io::raise_graphics(&p, &native, false)?;
+        emit_with(&c, &native, &p, &st?, &io, &res, options)
+    }
+
+    fn branching_compute(wave32: bool, tail: &[u32]) -> Vec<u8> {
+        use crate::native::tests::{fspx, fspx_resource};
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0 (root constant)
+            0xBF85_0002, // s_cbranch_scc1 to second add
+            0x4A00_0081, // v_add_nc_u32 v0, 1, v0
+            0xBF82_0001, // s_branch join
+            0x4A00_0082, // v_add_nc_u32 v0, 2, v0
+        ];
+        words.extend_from_slice(tail);
+        words.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let records = [
+            fspx_resource(2, 0, 0, 0, 2, 0),
+            fspx_resource(3, 3, 0, 0, 4, 1),
+        ];
+        let part = fspx(&code, 5 << 1, [64, 1, 1], wave32, &records);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    }
+
+    #[test]
+    fn thread_count_translation_matches_the_original_compute_path() {
+        let relative = [
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0x3604_0081, // v_and_b32 v2, 1, v0
+            0x7E02_0502, // v_readfirstlane_b32 s1, v2
+            0xBEFC_0301, // s_mov_b32 m0, s1
+            0x7E00_8700, // v_movrels_b32 v0, v0 (index 0 or 1)
+        ];
+        for wave32 in [true, false] {
+            for tail in [&[][..], &relative[..]] {
+                let c = branching_compute(wave32, tail);
+                for thread_counts in [false, true] {
+                    let options = Options {
+                        thread_counts,
+                        ..Options::default()
+                    };
+                    let expected = translate_compute_before(&c, options).unwrap();
+                    let actual = translate_with(&c, options).unwrap();
+                    assert_eq!(actual, expected); // DXIL and all host binding metadata
+                    assert_eq!(
+                        actual.user_data.iter().any(|u| u.slot == DISPATCH_THREADS),
+                        thread_counts
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thread_count_translation_preserves_compute_refusals() {
+        for wave32 in [true, false] {
+            let c = branching_compute(wave32, &[0x7E00_0208]); // v_mov_b32 v0, s8 (UAV address)
+            for thread_counts in [false, true] {
+                let options = Options {
+                    thread_counts,
+                    ..Options::default()
+                };
+                let expected = translate_compute_before(&c, options).unwrap_err();
+                assert!(
+                    matches!(
+                        expected,
+                        ShaderError::Unsupported {
+                            what: "a descriptor's address or format read as data: a buffer's base address (dword 0)",
+                            ..
+                        }
+                    ),
+                    "{expected}"
+                );
+                assert_eq!(translate_with(&c, options).unwrap_err(), expected);
+            }
+        }
+    }
 
     #[test]
     fn indexed_move_initializes_an_input_before_its_first_use() {

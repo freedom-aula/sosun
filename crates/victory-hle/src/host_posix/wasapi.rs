@@ -22,7 +22,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use victory_gpu::clock;
 
@@ -336,6 +336,30 @@ impl Shared {
         state.ring.push(stereo);
     }
 
+    /// One tick of the clock of a title's event: the event to set, if the
+    /// queue has room for a period, and the time to the next tick.
+    ///
+    /// The device cannot be that clock. CoreAudio takes frames in cycles of
+    /// its own (512 on the Mac this was measured on), so it asks for 10 ms
+    /// buffers 10.7 ms apart, with two back to back every 160 ms. An event
+    /// set from the device gave a title one signal for those two periods,
+    /// and one for any stretch it slept through, so the queue ran dry and
+    /// those periods played as silence. Ticks come a period apart, as on
+    /// Windows, and half a period apart while the queue is short: a title
+    /// that fell behind catches up, and is never given two passes back to
+    /// back (the second of two such passes came back silent when a sound
+    /// was starting).
+    pub fn tick(&self) -> (Option<usize>, Duration) {
+        let state = lock(&self.state);
+        let frames = state.ring.frames();
+        let event = (state.running && state.event != 0 && frames < self.buffer_frames)
+            .then_some(state.event);
+        let period =
+            Duration::from_micros(self.period as u64 * 1_000_000 / u64::from(self.format.rate));
+        let short = frames + 2 * self.period < self.buffer_frames;
+        (event, if short { period / 2 } else { period })
+    }
+
     /// CoreAudio wants `out` (stereo floats). Returns the title's event
     /// handle if a period has passed.
     pub fn render(&self, out: &mut [f32]) -> Option<usize> {
@@ -430,6 +454,15 @@ static COLLECTION: LazyLock<Vec<usize>> = LazyLock::new(|| {
         collection_item
     ])
 });
+static EMPTY_COLLECTION: LazyLock<Vec<usize>> = LazyLock::new(|| {
+    table(&methods![
+        simple_query,
+        simple_add_ref,
+        simple_release,
+        empty_collection_count,
+        empty_collection_item
+    ])
+});
 static PROPERTIES: LazyLock<Vec<usize>> = LazyLock::new(|| {
     table(&methods![
         simple_query,
@@ -497,18 +530,37 @@ extern "win64" fn simple_release(this: *mut Simple) -> u32 {
     unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel).saturating_sub(1) }
 }
 
-/// Writes a new object at `out`.
-fn give(out: *mut *mut c_void, object: *mut Simple) -> HRESULT {
-    put(out, object.cast())
+/// Writes a new object at `out`, allocating only if `out` is non-null.
+fn give(out: *mut *mut c_void, make: impl FnOnce() -> *mut Simple) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    put(out, make().cast())
 }
+
+const DATA_FLOW_CAPTURE: u32 = 1;
+const DATA_FLOW_ALL: u32 = 2;
+const DEVICE_STATE_ACTIVE: u32 = 1;
 
 extern "win64" fn enum_endpoints(
     _this: *mut Simple,
-    _flow: u32,
-    _mask: u32,
+    flow: u32,
+    mask: u32,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&COLLECTION, IID_COLLECTION))
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if flow > DATA_FLOW_ALL {
+        put(out, std::ptr::null_mut());
+        return E_INVALIDARG;
+    }
+    let vtable = if flow == DATA_FLOW_CAPTURE || mask & DEVICE_STATE_ACTIVE == 0 {
+        &EMPTY_COLLECTION
+    } else {
+        &COLLECTION
+    };
+    give(out, || simple(vtable, IID_COLLECTION))
 }
 
 extern "win64" fn default_endpoint(
@@ -522,7 +574,7 @@ extern "win64" fn default_endpoint(
         put(out, std::ptr::null_mut());
         return E_NOTFOUND;
     }
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
 }
 
 extern "win64" fn get_device(
@@ -530,7 +582,7 @@ extern "win64" fn get_device(
     _id: *const u16,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
 }
 
 extern "win64" fn register_notification(_this: *mut Simple, _callback: *mut c_void) -> HRESULT {
@@ -549,7 +601,19 @@ extern "win64" fn collection_item(
     if index != 0 {
         return E_INVALIDARG;
     }
-    give(out, simple(&DEVICE, IID_DEVICE))
+    give(out, || simple(&DEVICE, IID_DEVICE))
+}
+
+extern "win64" fn empty_collection_count(_this: *mut Simple, count: *mut u32) -> HRESULT {
+    put(count, 0)
+}
+
+extern "win64" fn empty_collection_item(
+    _this: *mut Simple,
+    _index: u32,
+    _out: *mut *mut c_void,
+) -> HRESULT {
+    E_INVALIDARG
 }
 
 extern "win64" fn device_activate(
@@ -584,7 +648,7 @@ extern "win64" fn device_properties(
     _access: u32,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    give(out, simple(&PROPERTIES, IID_PROPERTY_STORE))
+    give(out, || simple(&PROPERTIES, IID_PROPERTY_STORE))
 }
 
 extern "win64" fn device_id(_this: *mut Simple, out: *mut *mut u16) -> HRESULT {
@@ -964,6 +1028,9 @@ extern "win64" fn client_service(
     iid: *const c_void,
     out: *mut *mut c_void,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
     let iid = read_guid(iid);
     let shared = match shared_of(this) {
         Ok(s) => s,
@@ -975,6 +1042,7 @@ extern "win64" fn client_service(
         CLOCK.as_ptr()
     } else {
         warn_once(format!("IAudioClient::GetService of {iid:02x?}"));
+        put(out, std::ptr::null_mut());
         return E_NOINTERFACE;
     };
     let sub = leak(Sub { vtable, refs: AtomicU32::new(1), iid, shared });
@@ -1017,9 +1085,13 @@ extern "win64" fn client_engine_period(
 
 extern "win64" fn client_current_period(
     _this: *mut Client,
-    _wave: *mut *mut u8,
+    wave: *mut *mut u8,
     period: *mut u32,
 ) -> HRESULT {
+    if wave.is_null() || period.is_null() {
+        return E_POINTER;
+    }
+    put(wave, mix_format());
     put(period, MIX_RATE / 100)
 }
 
@@ -1070,6 +1142,9 @@ extern "win64" fn sub_release(this: *mut Sub) -> u32 {
 }
 
 extern "win64" fn render_get_buffer(this: *mut Sub, frames: u32, out: *mut *mut u8) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     match unsafe { &*this }.shared.get_buffer(frames as usize) {
         Ok(p) => put(out, p),
@@ -1088,6 +1163,9 @@ extern "win64" fn clock_frequency(this: *mut Sub, out: *mut u64) -> HRESULT {
 }
 
 extern "win64" fn clock_position(this: *mut Sub, position: *mut u64, qpc: *mut u64) -> HRESULT {
+    if position.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     let played = lock(&unsafe { &*this }.shared.state).position;
     if !qpc.is_null() {
@@ -1148,6 +1226,65 @@ mod tests {
         assert!(out.iter().all(|&s| s == 0.0));
     }
 
+    /// The spatial stream's loop, on a clock of microseconds: the device takes
+    /// frames in cycles of 512 and the title adds a period each time it finds
+    /// its event set. Returns the frames of silence played and the shortest
+    /// time between two passes.
+    fn play(oversleeps: bool) -> (usize, u64) {
+        const PERIOD: usize = 480;
+        let shared = Shared::new(STEREO_F32, 5 * PERIOD, PERIOD);
+        {
+            let mut state = lock(&shared.state);
+            state.running = true;
+            state.event = 7;
+        }
+        let (mut tick, mut cycle) = (0, 0);
+        let (mut set, mut owed, mut silent) = (false, 0, 0);
+        let (mut last, mut closest) = (None, u64::MAX);
+        while tick.min(cycle) < 10_000_000_u64 {
+            let now = tick.min(cycle);
+            if now == tick {
+                let (event, wait) = shared.tick();
+                set |= event.is_some();
+                tick += wait.as_micros() as u64;
+            }
+            // 15 ms asleep in every second.
+            let asleep = oversleeps && now % 1_000_000 < 15_000;
+            if set && !asleep {
+                set = false;
+                shared.push(&[0.25; 2 * PERIOD]);
+                closest = closest.min(last.map_or(u64::MAX, |l| now - l));
+                last = Some(now);
+            }
+            if now == cycle {
+                owed += 512;
+                while owed >= PERIOD {
+                    owed -= PERIOD;
+                    let mut out = vec![0.0; 2 * PERIOD];
+                    shared.render(&mut out);
+                    if now >= 100_000 {
+                        silent += out.iter().filter(|&&s| s == 0.0).count() / 2;
+                    }
+                }
+                cycle += 10_667;
+            }
+            assert!(shared.padding() <= 5 * PERIOD);
+        }
+        (silent, closest)
+    }
+
+    #[test]
+    fn the_event_clock_feeds_a_device_that_takes_frames_in_its_own_cycles() {
+        let (silent, closest) = play(false);
+        assert_eq!(silent, 0, "frames of silence played");
+        assert!(closest >= 5_000, "two passes {closest} microseconds apart");
+    }
+
+    #[test]
+    fn a_title_that_wakes_late_catches_up_instead_of_leaving_silence() {
+        assert_eq!(play(true).0, 0, "frames of silence played");
+    }
+
     #[test]
     fn the_buffer_limits_what_the_title_may_write() {
         let shared = Shared::new(STEREO_F32, 100, 48);
@@ -1191,5 +1328,81 @@ mod tests {
         assert_eq!(ring.pull(&mut out), 2);
         assert_eq!(out, [0.1, 0.2, 0.3, 0.4, 0.0, 0.0]);
         assert_eq!(ring.frames(), 0);
+    }
+
+    #[test]
+    fn enum_endpoints_respects_data_flow_and_state_mask() {
+        let mut col = std::ptr::null_mut();
+        assert_eq!(enum_endpoints(std::ptr::null_mut(), 0, DEVICE_STATE_ACTIVE, &mut col), S_OK);
+        let mut count = 99u32;
+        // SAFETY: `col` is a `Simple` whose vtable is `COLLECTION`.
+        let vt = unsafe { (*(col as *const Simple)).vtable };
+        // SAFETY: slot 3 of `COLLECTION` is `collection_count`.
+        let get_count: extern "win64" fn(*mut Simple, *mut u32) -> HRESULT =
+            unsafe { std::mem::transmute(*vt.add(3)) };
+        assert_eq!(get_count(col.cast(), &mut count), S_OK);
+        assert_eq!(count, 1);
+
+        // Capture endpoints and inactive masks produce an empty collection.
+        for (flow, mask) in [(DATA_FLOW_CAPTURE, DEVICE_STATE_ACTIVE), (0, 0x2)] {
+            let mut empty = std::ptr::null_mut();
+            assert_eq!(enum_endpoints(std::ptr::null_mut(), flow, mask, &mut empty), S_OK);
+            // SAFETY: `empty` is a `Simple` whose vtable is `EMPTY_COLLECTION`.
+            let vt = unsafe { (*(empty as *const Simple)).vtable };
+            // SAFETY: slot 3 of `EMPTY_COLLECTION` is `empty_collection_count`.
+            let get_count: extern "win64" fn(*mut Simple, *mut u32) -> HRESULT =
+                unsafe { std::mem::transmute(*vt.add(3)) };
+            // SAFETY: slot 4 of `EMPTY_COLLECTION` is `empty_collection_item`.
+            let get_item: extern "win64" fn(*mut Simple, u32, *mut *mut c_void) -> HRESULT =
+                unsafe { std::mem::transmute(*vt.add(4)) };
+            let mut n = 99u32;
+            let mut dev = std::ptr::null_mut();
+            assert_eq!(get_count(empty.cast(), &mut n), S_OK);
+            assert_eq!(n, 0);
+            assert_eq!(get_item(empty.cast(), 0, &mut dev), E_INVALIDARG);
+        }
+        assert_eq!(
+            enum_endpoints(std::ptr::null_mut(), 3, DEVICE_STATE_ACTIVE, &mut col),
+            E_INVALIDARG
+        );
+        assert!(col.is_null());
+        assert_eq!(
+            enum_endpoints(std::ptr::null_mut(), 0, DEVICE_STATE_ACTIVE, std::ptr::null_mut()),
+            E_POINTER
+        );
+    }
+
+    #[test]
+    fn current_period_populates_format_and_render_get_buffer_guards_null_out() {
+        let mut wave = std::ptr::null_mut();
+        let mut period = 0u32;
+        assert_eq!(
+            client_current_period(std::ptr::null_mut(), std::ptr::null_mut(), &mut period),
+            E_POINTER
+        );
+        assert_eq!(
+            client_current_period(std::ptr::null_mut(), &mut wave, std::ptr::null_mut()),
+            E_POINTER
+        );
+        assert_eq!(client_current_period(std::ptr::null_mut(), &mut wave, &mut period), S_OK);
+        assert!(!wave.is_null());
+        assert_eq!(period, MIX_RATE / 100);
+        let fmt = parse_format(wave).expect("valid mix format");
+        assert_eq!((fmt.channels, fmt.rate, fmt.bits, fmt.float), (2, MIX_RATE, 32, true));
+
+        // A null out pointer on GetBuffer must not leave staging locked.
+        let shared = Shared::new(STEREO_F32, 100, 48);
+        let sub = leak(Sub {
+            vtable: RENDER.as_ptr(),
+            refs: AtomicU32::new(1),
+            iid: IID_RENDER,
+            shared,
+        });
+        assert_eq!(render_get_buffer(sub, 10, std::ptr::null_mut()), E_POINTER);
+        let mut ptr = std::ptr::null_mut();
+        assert_eq!(render_get_buffer(sub, 10, &mut ptr), S_OK);
+        assert!(!ptr.is_null());
+        assert_eq!(render_release_buffer(sub, 10, 0), S_OK);
+        assert_eq!(sub_release(sub), 0);
     }
 }

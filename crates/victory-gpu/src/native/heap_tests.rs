@@ -1,6 +1,7 @@
 //! Guessed graphics shaders that take descriptors from the resource heap themselves (an SGPR the
 //! translator infers as a `ResourceHeap` base, not a table): hand-assembled GFX10 drawn on Metal,
-//! with the title's heap bound for the vertex, mesh and pixel stages.
+//! with the title's heap bound for the vertex, mesh and pixel stages; and a compute program with
+//! no heap record whose user SGPR the translator infers as the heap (`native::infer_heaps`).
 
 use super::addr_tests::title;
 use crate::native::list::{NativeHeap, NativeList};
@@ -22,7 +23,8 @@ fn translate(stage: HwStage, words: &[u32]) -> HostShader {
 }
 
 /// A title resource heap of two 1x1 RGBA8 textures: entry 0 red, entry 1 green. A shader that
-/// reads entry 1 sees green; one that read entry 0 (or nothing) would not.
+/// reads entry 1 sees green; one that read entry 0 (or nothing) would not. Entry 2 is left for a
+/// test's own view.
 struct Heap {
     heap: Rc<NativeHeap<Metal>>,
     _records: Vec<u32>,
@@ -30,9 +32,9 @@ struct Heap {
 
 impl Heap {
     fn new(t: &Title<Metal>) -> Heap {
-        let records = vec![0u32; 8 * 2];
+        let records = vec![0u32; 8 * 3];
         let start = records.as_ptr() as u64;
-        let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+        let heap = t.host.heap(HeapKind::Resource, start, 3).unwrap();
         for (i, texel) in [[255, 0, 0, 255], [0, 255, 0, 255]].into_iter().enumerate() {
             let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
             t.host.backend.upload_texture(&tex, 0, 0, &texel, 4, 0);
@@ -175,4 +177,83 @@ fn a_mesh_shader_loads_a_texture_by_heap_index() {
     let heap = Heap::new(&t);
     let pixels = draw(&mut t, &heap, &ms, &ps, |l| l.dispatch_mesh(1, 1, 1).unwrap());
     assert!(pixels.iter().all(|p| *p == [255, 128, 128, 255]), "{pixels:?}");
+}
+
+/// A texture the title releases leaves the heap: the entries showing it are cleared, where they
+/// used to keep the host texture alive and resident until the title wrote another view there.
+/// Entries of other textures stay, and a texture only forgotten (another description placed at
+/// its address) keeps its entries.
+#[test]
+fn a_released_texture_leaves_the_heap() {
+    let Some(t) = title() else { return };
+    let heap = Heap::new(&t);
+    let (red, green) = (0x4EA9_0000, 0x4EA9_0001);
+    t.host.forget_resource(red);
+    assert_eq!(t.host.cleared(), 0, "forgetting a texture leaves its entries");
+    t.host.register_texture(red, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
+    t.host.release_resource(green);
+    assert_eq!(t.host.cleared(), 1);
+    assert!(!t.host.knows(green) && t.host.knows(red));
+    assert!(heap.heap.mirrored.borrow().contains_key(&1), "its old record is not mirrored again");
+    assert!(heap.heap.take_entries(green).is_empty() && heap.heap.take_entries(red) == [0]);
+    // Released again, or a buffer: nothing to clear.
+    t.host.release_resource(green);
+    assert_eq!(t.host.cleared(), 1);
+    // A texture at the released one's address: the entry is checked again, the other is not.
+    t.host.register_texture(green, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
+    assert!(!heap.heap.mirrored.borrow().contains_key(&1) && heap.heap.mirrored.borrow().contains_key(&0));
+}
+
+/// A compute program of the title's shape: a raw UAV in the table at user data 4, and the
+/// resource heap's base in s6, which no metadata record names. It loads the image descriptor at
+/// heap entry 1 and stores its texel's green channel (1.0; 0.0 for entry 0) through the UAV.
+const CS_HEAP: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF40C_0400, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// A compute program that indexes the heap through an undeclared user SGPR is translated with
+/// that SGPR as the heap, is not refused, and reads the entry it names.
+#[test]
+fn a_compute_shader_loads_a_texture_by_heap_index() {
+    // A raw UAV (kind 3) in a table (root type 3) at user data 4, slot 0.
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.heap);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }

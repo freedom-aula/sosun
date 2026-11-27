@@ -244,16 +244,10 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     drop(slots);
 }
 
-/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
-/// naming each entry at each draw made frame time grow with the entries the title fills. Two
-/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
-#[test]
-fn a_heap_is_named_once_per_encoder() {
-    let Some(h) = host() else { return };
-    if h.backend.residency_sets() {
-        return;
-    }
-    let pool = Pool::new(&h, 4);
+/// What one encoder is named for a heap (two entries naming one pool buffer: one allocation), for
+/// one dispatch through the heap and then for five; the dispatches' results are checked.
+fn named_for_a_heap(h: &Host) -> [u64; 2] {
+    let pool = Pool::new(h, 4);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..64u32).collect::<Vec<_>>());
     let slots = vec![0u32; 8 * 8];
@@ -285,13 +279,48 @@ fn a_heap_is_named_once_per_encoder() {
         for _ in 0..dispatches {
             l.dispatch(1, 1, 1).unwrap();
         }
-        run(&h, &[&l]);
+        run(h, &[&l]);
         h.backend.residency_counts().heap_resources - before
     };
-    assert_eq!(named(1), 2, "the heap buffer and the one pool buffer");
-    assert_eq!(named(5), 2, "five dispatches in one encoder");
+    let named = [named(1), named(5)];
     assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
     drop(slots);
+    named
+}
+
+/// Without residency sets, a heap's resources are named to an encoder once, not at every dispatch:
+/// naming each entry at each draw made frame time grow with the entries the title fills. Two
+/// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
+#[test]
+fn a_heap_is_named_once_per_encoder() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(false));
+    // The heap buffer and the one pool buffer, for one dispatch as for five in one encoder.
+    assert_eq!(named_for_a_heap(&h), [2, 2]);
+}
+
+/// With the heaps' sets (the default on a Mac with 32 GiB or more) what a heap names is resident
+/// through the heap's own set, given to the command buffer: nothing is named to the encoders for
+/// it (in GTA VI's world that was 37,000 allocations for every pass, about 155 ms of kernel time
+/// per drawing render pass), and the title's pools are in no set of their own (all of title
+/// memory would stay resident).
+#[test]
+fn a_heap_is_resident_through_its_set() {
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_heap_sets());
+    if !h.backend.residency_sets() {
+        eprintln!("skipped: no residency sets on this system");
+        return;
+    }
+    assert_eq!(named_for_a_heap(&h), [0, 0]);
+    let c = h.backend.residency_counts();
+    assert_eq!((c.heap_allocations, c.added, c.queues), (1, 0, 0), "{c:?}");
+    // The heap buffer and the pool buffer its entries name.
+    assert!(c.heap_set_bytes >= 4 * 16384, "{c:?}");
 }
 
 type Vertex = [f32; 8];
@@ -854,7 +883,10 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
 /// names every buffer on every dispatch, and gives the same results.
 #[test]
 fn pool_buffers_are_resident_through_one_set_per_queue() {
-    let Some(on) = host() else { return };
+    if host().is_none() {
+        return;
+    }
+    let on = Host::new(Metal::new().unwrap().with_residency_sets(true));
     if !on.backend.residency_sets() {
         eprintln!("skipped: no residency sets on this system");
         return;
@@ -900,7 +932,10 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
 /// A pool that goes away takes its buffer out of the set (and does not break the next work).
 #[test]
 fn a_released_pool_leaves_the_residency_set() {
-    let Some(h) = host() else { return };
+    if host().is_none() {
+        return;
+    }
+    let h = Host::new(Metal::new().unwrap().with_residency_sets(true));
     if !h.backend.residency_sets() {
         return;
     }
@@ -942,4 +977,56 @@ fn a_released_pool_leaves_the_residency_set() {
     dispatch(&second);
     assert_eq!(h.backend.residency_counts().added, 2);
     assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
+}
+
+#[test]
+fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
+    let Some(h) = host() else { return };
+    let mut l = NativeList::default();
+    assert!(l.dispatch(0, 1, 1).is_err());
+    assert!(l.dispatch_threads([0, 1, 1]).is_err());
+    assert!(l.draw_instanced(0, 1, 0, 0).is_err());
+    assert!(l.dispatch_mesh(0, 1, 1).is_err());
+
+    let cs = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    l.set_compute_pipeline(&cs);
+    l.dispatch(0, 1, 1).unwrap();
+    l.dispatch(1, 0, 1).unwrap();
+    l.dispatch(1, 1, 0).unwrap();
+    l.dispatch_threads([0, 1, 1]).unwrap();
+    l.dispatch_threads([64, 0, 1]).unwrap();
+    l.copy_buffer_region(0x1000, 0x2000, 0);
+    l.fill(0x1000, 0, 0xAB);
+
+    let gfx = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &[
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+            ],
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    l.set_graphics_pipeline(&gfx, Topology::Triangles);
+    l.set_index_buffer(0x1000, false);
+    l.draw_instanced(0, 1, 0, 0).unwrap();
+    l.draw_instanced(3, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(0, 1, 0, 0, 0).unwrap();
+    l.draw_indexed_instanced(3, 0, 0, 0, 0).unwrap();
+    l.dispatch_mesh(0, 1, 1).unwrap();
+    assert!(l.is_empty());
 }

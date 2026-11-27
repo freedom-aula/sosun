@@ -86,6 +86,7 @@ impl Grid<'_> {
                 min_mag: self.filter,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
+                border_color: BorderColor::TransparentBlack,
                 max_anisotropy: 1,
             })
             .unwrap();
@@ -407,6 +408,19 @@ fn texture_views_and_sampler_filters() {
     assert!(g.run(&t).iter().all(|c| near(c[0], 0.502)));
     assert!(g.run(&srgb).iter().all(|c| near(c[0], 0.2158)));
 
+    // A format Metal cannot cast the texture to is an error, not Metal's assertion (a title view
+    // left over a resource object the title made anew); one of the same texel size is a view.
+    let view = |format| m.create_texture_view(&t, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    for format in [Format::R8Unorm, Format::Bc1, Format::Rgba16Float, Format::D32Float] {
+        assert!(view(format).is_err(), "{format:?}");
+    }
+    for format in [Format::R32Uint, Format::Rgb10a2Unorm, Format::Bgra8Unorm] {
+        assert!(view(format).is_ok(), "{format:?}");
+    }
+    let bc = m.create_texture(&d2(Format::Bc7, 4, 4)).unwrap();
+    let view = |format| m.create_texture_view(&bc, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    assert!(view(Format::Bc7Srgb).is_ok() && view(Format::Bc3).is_err() && view(Format::Rgba32Float).is_err());
+
     // Filters: a 2x2 texture, red 0 | 255 (both rows), sampled on a 4x4 grid. Nearest only ever
     // returns the two texel values; linear blends between the texel centres.
     let t = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
@@ -520,11 +534,15 @@ fn heap_overwrite_detaches_replaced_residency_allocations() {
     }
 }
 
+/// The indirect tests' arena: the source at 0, the records after it, the destination at half.
+/// In bytes, not pages: 4 KiB pages (x86_64 under Rosetta) would leave 3 pages too small.
+const INDIRECT_ARENA: usize = 48 * 1024;
+
 #[test]
 fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, 3);
+        let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
         let (dst, record) = (a.region.len / 2, N * 4);
         a.write(0, &(0..N as u32).collect::<Vec<_>>());
         // `D3D12_DISPATCH_ARGUMENTS`: half the groups.
@@ -560,7 +578,7 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         // Three records of 2, 4 and 8 groups of 64: what ran shows in how much was written.
         for (count, written) in [(2u32, 256), (0, 0), (5, 512)] {
-            let a = Arena::new(&m, 3);
+            let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
             let (dst, records, counter) = (a.region.len / 2, N * 4, N * 4 + 64);
             a.write(0, &(0..N as u32).collect::<Vec<_>>());
             a.write(records, &[2u32, 1, 1, 4, 1, 1, 8, 1, 1]);
@@ -591,6 +609,128 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
                 .map(|i| if (i as usize) < written { i * 5 + 7 } else { 0 })
                 .collect();
             assert_eq!(out, want, "count {count}");
+        }
+    }
+}
+
+#[test]
+fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
+    for m in backends() {
+        let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
+        let a = Arena::new(&m, 1);
+        let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
+        m.write_buffer(&heap, 5, &a.buf, a.at(0), 64);
+        m.write_buffer(&heap, 6, &a.buf, a.at(64), 64);
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let dispatches = [Dispatch {
+            pipeline: &p,
+            root: RootArgs::default()
+                .constants(&[5, 7])
+                .address(m.heap_address(&heap, 5)),
+            resources: vec![],
+            heaps: victory_metal::backend::Heaps {
+                resource: Some(&heap),
+                sampler: None,
+            },
+            groups: [0, 1, 1],
+            threads_per_group: [64, 1, 1],
+            indirect: None,
+            count: None,
+        }];
+        let blits = vec![
+            BlitOp::Fill { dst: (&a.buf, a.at(0) as *const u8), len: 0, value: 0xaa },
+            BlitOp::Copy { src: (&a.buf, a.at(0) as *const u8), dst: (&a.buf, a.at(64) as *const u8), len: 0 },
+        ];
+        let passes = [Pass::Compute(&dispatches), Pass::Blit(blits)];
+        let signals = [(&fence, 1)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        assert!(m.wait(&fence, 1, 5000));
+    }
+}
+
+#[test]
+fn texture_blit_ops_copy_between_textures_and_buffers() {
+    let Ok(m) = Metal::new() else { return };
+    let q = m.create_queue().unwrap();
+    let f = m.create_fence(0).unwrap();
+    let a = Arena::new(&m, 0x20000);
+
+    let (w, h) = (8usize, 8usize);
+    let pitch = 256usize;
+    let src_data: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).flat_map(move |x| [x as u8 * 17, y as u8 * 29, 99, 255]))
+        .collect();
+    let mut staged = vec![0u8; (h - 1) * pitch + w * 4];
+    for y in 0..h {
+        staged[y * pitch..y * pitch + w * 4].copy_from_slice(&src_data[y * w * 4..(y + 1) * w * 4]);
+    }
+    a.write(0, &staged);
+
+    let desc = TextureDesc {
+        dim: TexDim::D2,
+        format: Format::Rgba8Unorm,
+        width: w,
+        height: h,
+        depth_or_layers: 1,
+        mips: 1,
+        render_target: false,
+        unordered_access: false,
+    };
+    let tex_a = m.create_texture(&desc).unwrap();
+    let mut srgb_desc = desc.clone();
+    srgb_desc.format = Format::Rgba8UnormSrgb;
+    let tex_b = m.create_texture(&srgb_desc).unwrap();
+    let dst_off = 0x10000;
+
+    let passes = [Pass::Blit(vec![
+        BlitOp::CopyBufferToTexture {
+            src: (&a.buf, a.at(0) as *const u8),
+            len: staged.len(),
+            row_pitch: pitch,
+            slice_pitch: pitch * h,
+            size: [w, h, 1],
+            dst: &tex_a,
+            dst_mip: 0,
+            dst_slice: 0,
+            dst_origin: [0, 0, 0],
+        },
+        BlitOp::CopyTexture {
+            src: &tex_a,
+            src_mip: 0,
+            src_slice: 0,
+            src_origin: [2, 1, 0],
+            size: [4, 4, 1],
+            dst: &tex_b,
+            dst_mip: 0,
+            dst_slice: 0,
+            dst_origin: [1, 2, 0],
+        },
+        BlitOp::CopyTextureToBuffer {
+            src: &tex_b,
+            src_mip: 0,
+            src_slice: 0,
+            src_origin: [1, 2, 0],
+            size: [4, 4, 1],
+            dst: (&a.buf, a.at(dst_off) as *const u8),
+            len: 3 * pitch + 16,
+            row_pitch: pitch,
+            slice_pitch: pitch * 4,
+        },
+    ])];
+    m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] })
+        .unwrap();
+    assert!(m.wait(&f, 1, 5000));
+
+    let out: Vec<u8> = a.read(dst_off, 3 * pitch + 16);
+    for row in 0..4 {
+        for col in 0..4 {
+            let at = row * pitch + col * 4;
+            assert_eq!(
+                &out[at..at + 4],
+                &[(col as u8 + 2) * 17, (row as u8 + 1) * 29, 99, 255],
+                "texel ({col}, {row})"
+            );
         }
     }
 }

@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use super::{
     DEVICE_CHANNELS, E_INVALIDARG, E_NOINTERFACE, E_POINTER, HRESULT, IID_UNKNOWN,
@@ -132,6 +133,9 @@ extern "win64" fn static_position(
     y: *mut f32,
     z: *mut f32,
 ) -> HRESULT {
+    if x.is_null() || y.is_null() || z.is_null() {
+        return E_POINTER;
+    }
     let p = static_xyz(kind);
     put(x, p[0]);
     put(y, p[1]);
@@ -214,10 +218,49 @@ struct Stream {
     refs: AtomicU32,
     shared: Arc<Shared>,
     _output: Box<dyn Output>,
+    _clock: Clock,
     objects: Mutex<Vec<Mix>>,
     updating: Arc<AtomicBool>,
     dynamic_used: Arc<AtomicU32>,
     max_dynamic: u32,
+}
+
+/// The clock of the title's event (`Shared::tick`), stopped when dropped.
+struct Clock {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Clock {
+    fn start(shared: Arc<Shared>) -> Clock {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut next = Instant::now();
+            while !flag.load(Ordering::Acquire) {
+                let (event, wait) = shared.tick();
+                if let Some(event) = event {
+                    signal(event);
+                }
+                // A late tick does not bring the next one closer than half a wait.
+                next = (next + wait).max(Instant::now() + wait / 2);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        });
+        Clock {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// `ActivateSpatialAudioStream(PROPVARIANT*, REFIID, void**)`: the variant
@@ -256,18 +299,15 @@ extern "win64" fn activate_stream(
         warn_once("spatial stream with an object format other than mono float".into());
         return super::AUDCLNT_E_UNSUPPORTED_FORMAT;
     }
-    let shared = Shared::new(STEREO, PERIOD * 4, PERIOD);
+    let shared = Shared::new(STEREO, PERIOD * 5, PERIOD);
     lock(&shared.state).event = event;
     let render = shared.clone();
     let output = coreaudio::open_default(
         MIX_RATE,
         DEVICE_CHANNELS as u32,
         Box::new(move |out| match out {
-            Ok(out) => {
-                if let Some(event) = render.render(out) {
-                    signal(event);
-                }
-            }
+            // The event has a clock of its own.
+            Ok(out) => drop(render.render(out)),
             Err(e) => warn_once(format!("the output failed: {e}")),
         }),
     );
@@ -288,6 +328,7 @@ extern "win64" fn activate_stream(
     let stream = leak(Stream {
         vtable: STREAM.as_ptr(),
         refs: AtomicU32::new(1),
+        _clock: Clock::start(shared.clone()),
         shared,
         _output: output,
         objects: Mutex::new(Vec::new()),
@@ -378,6 +419,9 @@ extern "win64" fn stream_reset(this: *mut Stream) -> HRESULT {
 }
 
 extern "win64" fn stream_begin(this: *mut Stream, available: *mut u32, frames: *mut u32) -> HRESULT {
+    if available.is_null() || frames.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     let s = unsafe { &*this };
     if s.updating.swap(true, Ordering::AcqRel) {
@@ -396,12 +440,15 @@ extern "win64" fn stream_end(this: *mut Stream) -> HRESULT {
     if !s.updating.swap(false, Ordering::AcqRel) {
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
-    let mixed = {
+    let (mixed, ended_dynamic) = {
         let mut objects = lock(&s.objects);
-        let mixed = mix(&objects);
+        let (mixed, ended_dynamic) = mix_pass(&objects);
         objects.retain(|o| lock(&o.data).active);
-        mixed
+        (mixed, ended_dynamic)
     };
+    if ended_dynamic > 0 {
+        s.dynamic_used.fetch_sub(ended_dynamic, Ordering::AcqRel);
+    }
     // The title's passes are paced by our event; a stray extra one must not
     // grow the queue without bound.
     if s.shared.padding() < PERIOD * 8 {
@@ -411,13 +458,19 @@ extern "win64" fn stream_end(this: *mut Stream) -> HRESULT {
 }
 
 extern "win64" fn stream_activate_object(this: *mut Stream, kind: u32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     let s = unsafe { &*this };
-    if kind == DYNAMIC {
-        if s.dynamic_used.load(Ordering::Acquire) >= s.max_dynamic {
-            return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
-        }
-        s.dynamic_used.fetch_add(1, Ordering::AcqRel);
+    if kind == DYNAMIC
+        && s.dynamic_used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < s.max_dynamic).then_some(used + 1)
+            })
+            .is_err()
+    {
+        return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
     }
     let data = Arc::new(Mutex::new(ObjectData {
         samples: vec![0.0; PERIOD],
@@ -463,9 +516,11 @@ fn gains(kind: u32, position: [f32; 3]) -> (f32, f32) {
     }
 }
 
-/// One pass of stereo frames from every active object.
-fn mix(objects: &[Mix]) -> Vec<f32> {
+/// One pass of stereo frames from every active object, plus the count of
+/// dynamic objects deactivated by end-of-stream during this pass.
+fn mix_pass(objects: &[Mix]) -> (Vec<f32>, u32) {
     let mut out = vec![0.0; PERIOD * DEVICE_CHANNELS];
+    let mut ended_dynamic = 0u32;
     for o in objects {
         let mut d = lock(&o.data);
         if !d.active {
@@ -478,11 +533,16 @@ fn mix(objects: &[Mix]) -> Vec<f32> {
             frame[0] += s * l;
             frame[1] += s * r;
         }
-        if d.last.is_some() {
-            d.active = false;
+        if d.last.is_some() && std::mem::replace(&mut d.active, false) && o.kind == DYNAMIC {
+            ended_dynamic += 1;
         }
     }
-    out
+    (out, ended_dynamic)
+}
+
+#[cfg(test)]
+fn mix(objects: &[Mix]) -> Vec<f32> {
+    mix_pass(objects).0
 }
 
 // Objects.
@@ -532,6 +592,9 @@ extern "win64" fn object_release(this: *mut Object) -> u32 {
 }
 
 extern "win64" fn object_buffer(this: *mut Object, buffer: *mut *mut u8, bytes: *mut u32) -> HRESULT {
+    if buffer.is_null() || bytes.is_null() {
+        return E_POINTER;
+    }
     // SAFETY: the title's object.
     let o = unsafe { &*this };
     if !o.updating.load(Ordering::Acquire) {
@@ -607,5 +670,102 @@ mod tests {
         lock(&o.data).last = Some(10);
         let out = mix(&[o]);
         assert!(out[2 * 9] > 0.0 && out[2 * 10] == 0.0);
+    }
+
+    struct DummyOutput;
+    impl Output for DummyOutput {}
+
+    fn test_stream(max_dynamic: u32) -> *mut Stream {
+        leak(Stream {
+            vtable: STREAM.as_ptr(),
+            refs: AtomicU32::new(1),
+            shared: Shared::new(STEREO, PERIOD * 5, PERIOD),
+            _output: Box::new(DummyOutput),
+            _clock: Clock {
+                stop: Arc::new(AtomicBool::new(true)),
+                thread: None,
+            },
+            objects: Mutex::new(Vec::new()),
+            updating: Arc::new(AtomicBool::new(false)),
+            dynamic_used: Arc::new(AtomicU32::new(0)),
+            max_dynamic,
+        })
+    }
+
+    #[test]
+    fn end_of_stream_reclaims_dynamic_slots_without_double_decrement() {
+        let stream = test_stream(2);
+        let mut avail = 0u32;
+        let mut frames = 0u32;
+
+        // Activate two dynamic objects up to the limit; a third must fail.
+        let mut o1 = std::ptr::null_mut();
+        let mut o2 = std::ptr::null_mut();
+        let mut o3 = std::ptr::null_mut();
+        assert_eq!(stream_activate_object(stream, DYNAMIC, &mut o1), S_OK);
+        assert_eq!(stream_activate_object(stream, DYNAMIC, &mut o2), S_OK);
+        assert_eq!(
+            stream_activate_object(stream, DYNAMIC, &mut o3),
+            SPTLAUDCLNT_E_NO_MORE_OBJECTS
+        );
+        assert_eq!(stream_available_objects(stream, &mut avail), S_OK);
+        assert_eq!(avail, 0);
+
+        // End o1 through SetEndOfStream + Begin/End pass; its slot must be reclaimed.
+        assert_eq!(stream_begin(stream, &mut avail, &mut frames), S_OK);
+        assert_eq!(object_end_of_stream(o1.cast(), 4), S_OK);
+        assert_eq!(stream_end(stream), S_OK);
+        assert_eq!(stream_available_objects(stream, &mut avail), S_OK);
+        assert_eq!(avail, 1);
+
+        // Releasing o1 after SetEndOfStream must not decrement dynamic_used a second time.
+        assert_eq!(object_release(o1.cast()), 0);
+        assert_eq!(stream_available_objects(stream, &mut avail), S_OK);
+        assert_eq!(avail, 1);
+
+        // Releasing o2 without SetEndOfStream reclaims its slot once.
+        assert_eq!(object_release(o2.cast()), 0);
+        assert_eq!(stream_available_objects(stream, &mut avail), S_OK);
+        assert_eq!(avail, 2);
+
+        // A new dynamic object can now be activated again.
+        assert_eq!(stream_activate_object(stream, DYNAMIC, &mut o3), S_OK);
+        assert_eq!(object_release(o3.cast()), 0);
+        assert_eq!(stream_release(stream), 0);
+    }
+
+    #[test]
+    fn null_out_pointers_fail_without_mutating_state() {
+        let stream = test_stream(1);
+        let mut avail = 0u32;
+        let mut frames = 0u32;
+        assert_eq!(stream_begin(stream, std::ptr::null_mut(), &mut frames), E_POINTER);
+        assert_eq!(stream_begin(stream, &mut avail, std::ptr::null_mut()), E_POINTER);
+        // The stream must not be stuck in the updating state after a failed Begin.
+        assert_eq!(stream_begin(stream, &mut avail, &mut frames), S_OK);
+        assert_eq!(stream_activate_object(stream, DYNAMIC, std::ptr::null_mut()), E_POINTER);
+        assert_eq!(stream_available_objects(stream, &mut avail), S_OK);
+        assert_eq!(avail, 1);
+
+        let mut obj = std::ptr::null_mut();
+        assert_eq!(stream_activate_object(stream, DYNAMIC, &mut obj), S_OK);
+        let mut buf = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        assert_eq!(object_buffer(obj.cast(), std::ptr::null_mut(), &mut bytes), E_POINTER);
+        assert_eq!(object_buffer(obj.cast(), &mut buf, std::ptr::null_mut()), E_POINTER);
+        assert_eq!(object_buffer(obj.cast(), &mut buf, &mut bytes), S_OK);
+        assert_eq!(stream_end(stream), S_OK);
+
+        let mut f = 0.0f32;
+        assert_eq!(
+            static_position(std::ptr::null_mut(), 0x2, std::ptr::null_mut(), &mut f, &mut f),
+            E_POINTER
+        );
+        assert_eq!(
+            static_position(std::ptr::null_mut(), 0x2, &mut f, std::ptr::null_mut(), &mut f),
+            E_POINTER
+        );
+        assert_eq!(object_release(obj.cast()), 0);
+        assert_eq!(stream_release(stream), 0);
     }
 }

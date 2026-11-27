@@ -85,8 +85,16 @@ unsafe fn units<'a, T: Copy + Default + PartialEq>(p: *const T, n: i32) -> &'a [
 /// needed if `size` is 0, else the count written, 0 with
 /// `ERROR_INSUFFICIENT_BUFFER` if it does not fit.
 fn copy_out<T: Copy>(text: &[T], out: *mut T, size: i32) -> i32 {
+    if size < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     if size == 0 {
         return text.len() as i32;
+    }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
     }
     if text.len() > size as usize {
         set_error(ERROR_INSUFFICIENT_BUFFER);
@@ -131,7 +139,7 @@ pub extern "system" fn WideCharToMultiByte(
     src_len: i32,
     out: *mut u8,
     size: i32,
-    _default: *const u8,
+    default: *const u8,
     used_default: *mut i32,
 ) -> i32 {
     if src.is_null() {
@@ -145,13 +153,30 @@ pub extern "system" fn WideCharToMultiByte(
     // SAFETY: see above.
     let text =
         String::from_utf16_lossy(unsafe { units(src, if src_len < 0 { -1 } else { src_len }) });
+    let mut replaced = false;
+    let fallback = if default.is_null() {
+        b'?'
+    } else {
+        // SAFETY: the title passes a pointer to a single default byte.
+        unsafe { default.read() }
+    };
     let mut bytes: Vec<u8> = if matches!(code_page, 1252 | 28591) {
         text.chars()
-            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .map(|c| match u8::try_from(u32::from(c)) {
+                Ok(b) => b,
+                Err(_) => {
+                    replaced = true;
+                    fallback
+                }
+            })
             .collect()
     } else {
         text.into_bytes()
     };
+    if replaced && !used_default.is_null() {
+        // SAFETY: see above.
+        unsafe { used_default.write(1) };
+    }
     if src_len < 0 {
         bytes.push(0);
     }
@@ -275,6 +300,10 @@ pub extern "system" fn LCMapStringEx(
     _reserved: *const c_void,
     _param: isize,
 ) -> i32 {
+    if src.is_null() || len == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: see above.
     let mut text = unsafe { units(src, len) }.to_vec();
     for unit in &mut text {
@@ -291,6 +320,9 @@ pub extern "system" fn LCMapStringEx(
         if let Some(m) = mapped.filter(|m| (*m as u32) < 0x1_0000) {
             *unit = m as u32 as u16;
         }
+    }
+    if len < 0 {
+        text.push(0);
     }
     copy_out(&text, out, size)
 }
@@ -361,6 +393,169 @@ pub extern "system" fn FormatMessageA(
     // SAFETY: the title's buffer of `size` bytes.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
     (text.len() - 1) as u32
+}
+
+/// `FormatMessageW`, the part a library uses (Microsoft Learn): `FROM_SYSTEM`, `FROM_STRING`
+/// with `%1`..`%99` inserts, `IGNORE_INSERTS`, `ARGUMENT_ARRAY`, `ALLOCATE_BUFFER` and
+/// `MAX_WIDTH_MASK` (other widths do not wrap: guess, `docs/native-host.md`). Other sources
+/// (`FROM_HMODULE`) or flags fail with `ERROR_INVALID_PARAMETER`.
+pub extern "system" fn FormatMessageW(
+    flags: u32,
+    source: *const c_void,
+    id: u32,
+    _language: u32,
+    out: *mut u16,
+    size: u32,
+    args: *const c_void,
+) -> u32 {
+    const ALLOCATE_BUFFER: u32 = 0x100;
+    const IGNORE_INSERTS: u32 = 0x200;
+    const FROM_STRING: u32 = 0x400;
+    const FROM_SYSTEM: u32 = 0x1000;
+    const ARGUMENT_ARRAY: u32 = 0x2000;
+    const MAX_WIDTH_MASK: u32 = 0xFF;
+    let known = ALLOCATE_BUFFER | IGNORE_INSERTS | FROM_STRING | FROM_SYSTEM | ARGUMENT_ARRAY;
+    let text = match flags & (FROM_STRING | FROM_SYSTEM) {
+        _ if flags & !(known | MAX_WIDTH_MASK) != 0 || out.is_null() => None,
+        FROM_SYSTEM => {
+            let text = system_message(id);
+            Some(if flags & MAX_WIDTH_MASK == MAX_WIDTH_MASK {
+                text.trim_end_matches("\r\n").to_owned()
+            } else {
+                text
+            })
+        }
+        FROM_STRING if !source.is_null() => {
+            let format = files::wide_str(source.cast());
+            let args = match () {
+                () if flags & IGNORE_INSERTS != 0 => None,
+                () if flags & ARGUMENT_ARRAY != 0 => Some(args.cast::<u64>()),
+                // SAFETY: without `ARGUMENT_ARRAY`, `args` is a `va_list *`.
+                () if !args.is_null() => Some(unsafe { args.cast::<*const u64>().read() }),
+                () => Some(std::ptr::null()),
+            };
+            expand(&format, args)
+        }
+        _ => None,
+    };
+    let Some(text) = text else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let len = (units.len() - 1) as u32;
+    if flags & ALLOCATE_BUFFER != 0 {
+        // shortcut: leaked, as `FormatMessageA`'s, since `LocalFree` keeps nothing to free; give
+        // them a heap if a title formats many messages.
+        let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
+        // SAFETY: with ALLOCATE_BUFFER `out` is a `wchar_t **`.
+        unsafe { out.cast::<*mut u16>().write(leaked.as_mut_ptr()) };
+        return len;
+    }
+    if units.len() > size as usize {
+        set_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    // SAFETY: the title's buffer of `size` UTF-16 units.
+    unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), out, units.len()) };
+    len
+}
+
+/// `FROM_SYSTEM`'s text for `id`, a Win32 error or the `HRESULT` of one, ending in "\r\n" as
+/// Windows' do: its English text for common errors, else "Error 0x%08X". Guess: Windows fails
+/// with `ERROR_MR_MID_NOT_FOUND` for an id it has no text for; a title that logs it is better
+/// served by the number.
+fn system_message(id: u32) -> String {
+    let code = if id & 0xFFFF_0000 == 0x8007_0000 {
+        id & 0xFFFF
+    } else {
+        id
+    };
+    let text = match code {
+        0 => "The operation completed successfully.",
+        1 => "Incorrect function.",
+        2 => "The system cannot find the file specified.",
+        3 => "The system cannot find the path specified.",
+        4 => "The system cannot open the file.",
+        5 => "Access is denied.",
+        6 => "The handle is invalid.",
+        8 => "Not enough memory resources are available to process this command.",
+        14 => "Not enough memory resources are available to complete this operation.",
+        50 => "The request is not supported.",
+        87 => "The parameter is incorrect.",
+        120 => "This function is not supported on this system.",
+        122 => "The data area passed to a system call is too small.",
+        0x8000_4001 => "Not implemented",
+        0x8000_4002 => "No such interface supported",
+        0x8000_4003 => "Invalid pointer",
+        0x8000_4005 => "Unspecified error",
+        _ => return format!("Error 0x{id:08X}\r\n"),
+    };
+    format!("{text}\r\n")
+}
+
+/// Expands a `FROM_STRING` message: `%1`..`%99` with an optional `!printf!` of `s`, `ls`, `ws`,
+/// `d`, `i`, `u`, `x` or `X` (`!s!` when absent), and the escapes `%0` (ends the text), `%n`,
+/// `%t`, `%%`, `%.`, `%!` and `% `. Arguments are 64-bit slots from `args`; `None` passes the
+/// inserts through (`IGNORE_INSERTS`). `None` back for another `printf` or no arguments.
+fn expand(format: &[u16], args: Option<*const u64>) -> Option<String> {
+    let chars: Vec<char> = String::from_utf16_lossy(format).chars().collect();
+    let mut text = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '%' {
+            text.push(c);
+            continue;
+        }
+        let Some(&next) = chars.get(i) else {
+            text.push('%');
+            break;
+        };
+        i += 1;
+        match next {
+            '0' => return Some(text),
+            'n' => text.push_str("\r\n"),
+            't' => text.push('\t'),
+            '1'..='9' => {
+                let start = i - 2;
+                let mut n = next as usize - '0' as usize;
+                if let Some(d) = chars.get(i).and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d as usize;
+                    i += 1;
+                }
+                let mut spec = String::from("s");
+                if chars.get(i) == Some(&'!') {
+                    let end = chars[i + 1..].iter().position(|&c| c == '!')? + i + 1;
+                    spec = chars[i + 1..end].iter().collect();
+                    i = end + 1;
+                }
+                let Some(args) = args else {
+                    text.extend(&chars[start..i]);
+                    continue;
+                };
+                if args.is_null() {
+                    return None;
+                }
+                // SAFETY: the title passes an argument for each insert it uses.
+                let arg = unsafe { args.add(n - 1).read_unaligned() };
+                match spec.as_str() {
+                    "s" | "ls" | "ws" if arg == 0 => return None,
+                    "s" | "ls" | "ws" => {
+                        text.push_str(&String::from_utf16_lossy(&files::wide_str(arg as _)));
+                    }
+                    "d" | "i" => text.push_str(&(arg as u32 as i32).to_string()),
+                    "u" => text.push_str(&(arg as u32).to_string()),
+                    "x" => text.push_str(&format!("{:x}", arg as u32)),
+                    "X" => text.push_str(&format!("{:X}", arg as u32)),
+                    _ => return None,
+                }
+            }
+            other => text.push(other),
+        }
+    }
+    Some(text)
 }
 
 pub extern "system" fn LocalFree(memory: *mut c_void) -> *mut c_void {
@@ -439,14 +634,36 @@ fn to_system_time(ticks: u64) -> SystemTimeFields {
     ]
 }
 
+fn days_in_month(year: u16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 fn from_system_time(t: &SystemTimeFields) -> Option<u64> {
     let [y, m, _, d, h, mi, s, ms] = *t;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 59 || ms > 999 {
+    if !(1601..=30827).contains(&y)
+        || !(1..=12).contains(&m)
+        || d == 0
+        || d > days_in_month(y, m)
+        || h > 23
+        || mi > 59
+        || s > 59
+        || ms > 999
+    {
         return None;
     }
     let days = days_from_civil(i64::from(y), u32::from(m), u32::from(d)) + DAYS_1601_TO_1970;
+    let days = u64::try_from(days).ok()?;
     let seconds = u64::from(h) * 3600 + u64::from(mi) * 60 + u64::from(s);
-    Some(days as u64 * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
+    Some(days * TICKS_PER_DAY + seconds * TICKS_PER_SECOND + u64::from(ms) * 10_000)
 }
 
 pub extern "system" fn GetSystemTimeAsFileTime(out: *mut u64) {
@@ -470,12 +687,20 @@ pub extern "system" fn GetLocalTime(out: *mut SystemTimeFields) {
 }
 
 pub extern "system" fn FileTimeToSystemTime(ft: *const u64, out: *mut SystemTimeFields) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a FILETIME and a SYSTEMTIME.
     unsafe { out.write_unaligned(to_system_time(ft.read_unaligned())) };
     1
 }
 
 pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *mut u64) -> i32 {
+    if st.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: a SYSTEMTIME and a FILETIME.
     let fields = unsafe { st.read_unaligned() };
     match from_system_time(&fields) {
@@ -492,6 +717,10 @@ pub extern "system" fn SystemTimeToFileTime(st: *const SystemTimeFields, out: *m
 }
 
 pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -503,6 +732,10 @@ pub extern "system" fn FileTimeToLocalFileTime(ft: *const u64, out: *mut u64) ->
 }
 
 pub extern "system" fn LocalFileTimeToFileTime(ft: *const u64, out: *mut u64) -> i32 {
+    if ft.is_null() || out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: two FILETIMEs.
     unsafe {
         out.write_unaligned(
@@ -605,13 +838,17 @@ pub extern "system" fn GlobalMemoryStatusEx(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn GetLogicalProcessorInformation(out: *mut u8, length: *mut u32) -> i32 {
+    if length.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SYSTEM_LOGICAL_PROCESSOR_INFORMATION is 32 bytes: one entry per
     // core, and one for the package.
     let n = cpus().min(64);
     let needed = (n + 1) * 32;
     // SAFETY: the title's length word and buffer.
     unsafe {
-        if length.read_unaligned() < needed {
+        if out.is_null() || length.read_unaligned() < needed {
             length.write_unaligned(needed);
             set_error(ERROR_INSUFFICIENT_BUFFER);
             return 0;
@@ -1627,6 +1864,10 @@ pub extern "system" fn GetTempPathW(size: u32, out: *mut u16) -> u32 {
     if (size as usize) < text.len() {
         return text.len() as u32;
     }
+    if out.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     // SAFETY: the title's buffer of `size` units.
     unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len()) };
     (text.len() - 1) as u32
@@ -1794,6 +2035,9 @@ pub extern "system" fn CoCreateGuid(out: *mut u8) -> i32 {
 }
 
 pub extern "system" fn StringFromGUID2(guid: *const u8, out: *mut u16, size: i32) -> i32 {
+    if guid.is_null() || out.is_null() || size <= 0 {
+        return 0;
+    }
     // SAFETY: a 16-byte GUID.
     let g = unsafe { std::slice::from_raw_parts(guid, 16) };
     let text = format!(
@@ -2089,6 +2333,7 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             LocaleNameToLCID,
             GetLocaleInfoEx,
             FormatMessageA,
+            FormatMessageW,
             LocalFree,
             GlobalFree,
             EncodePointer,
@@ -2242,6 +2487,115 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `amd_fidelityfx_upscaler_xbox.dll` imports by these names resolves (#123's run).
+    #[test]
+    fn the_upscaler_dll_finds_its_debug_localization_and_math_imports() {
+        for (dll, name) in [
+            ("api-ms-win-core-debug-l1-1-0.dll", "DebugBreak"),
+            ("api-ms-win-core-localization-l1-2-0.dll", "FormatMessageW"),
+            ("api-ms-win-crt-math-l1-1-0.dll", "_ldsign"),
+        ] {
+            assert!(super::super::lookup(dll, name).is_some(), "{dll}!{name}");
+        }
+    }
+
+    /// `FormatMessageW` as a library logs with it: system texts (from an `HRESULT` too), the
+    /// inserts of a string with an argument array or a `va_list`, an allocated buffer, and the
+    /// documented failures.
+    #[test]
+    fn format_message_w_formats_system_errors_and_inserts() {
+        const SYSTEM: u32 = 0x1000 | 0x200; // FROM_SYSTEM | IGNORE_INSERTS
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let format = |flags, source: &[u16], id, args: *const c_void| {
+            let mut out = [0u16; 128];
+            let n = FormatMessageW(
+                flags,
+                source.as_ptr().cast(),
+                id,
+                0,
+                out.as_mut_ptr(),
+                128,
+                args,
+            );
+            (n, String::from_utf16_lossy(&out[..n as usize]))
+        };
+        assert_eq!(
+            format(SYSTEM, &[0], 5, std::ptr::null()),
+            (19, "Access is denied.\r\n".into())
+        );
+        let missing = format(SYSTEM, &[0], 0x8007_0002, std::ptr::null()).1;
+        assert_eq!(missing, "The system cannot find the file specified.\r\n");
+        assert_eq!(
+            format(SYSTEM, &[0], 0xDEAD, std::ptr::null()).1,
+            "Error 0x0000DEAD\r\n"
+        );
+        assert_eq!(
+            format(SYSTEM | 0xFF, &[0], 5, std::ptr::null()).1,
+            "Access is denied."
+        );
+
+        // %1 is a wide string by default, %2!d! an int; %n, %t, %% and %0 are escapes.
+        let name = wide("dll");
+        let args = [name.as_ptr() as u64, u64::from(-3i32 as u32)];
+        let source = wide("%1%t%2!d!%n100%%%0 never");
+        let expanded = "dll\t-3\r\n100%";
+        assert_eq!(
+            format(0x400 | 0x2000, &source, 0, args.as_ptr().cast()).1,
+            expanded
+        );
+        let list = args.as_ptr();
+        assert_eq!(
+            format(0x400, &source, 0, (&raw const list).cast()).1,
+            expanded,
+            "va_list"
+        );
+        let kept = format(0x400 | 0x200, &wide("%1!x! %n"), 0, std::ptr::null()).1;
+        assert_eq!(kept, "%1!x! \r\n", "IGNORE_INSERTS keeps the inserts");
+
+        let mut allocated: *mut u16 = std::ptr::null_mut();
+        let n = FormatMessageW(
+            SYSTEM | 0x100,
+            std::ptr::null(),
+            6,
+            0,
+            (&raw mut allocated).cast(),
+            0,
+            std::ptr::null(),
+        );
+        // SAFETY: `n` units and a NUL, leaked for good.
+        let text = unsafe { std::slice::from_raw_parts(allocated, n as usize + 1) };
+        assert_eq!(
+            String::from_utf16_lossy(text),
+            "The handle is invalid.\r\n\0"
+        );
+
+        let mut small = [0u16; 4];
+        assert_eq!(
+            FormatMessageW(
+                SYSTEM,
+                std::ptr::null(),
+                5,
+                0,
+                small.as_mut_ptr(),
+                4,
+                std::ptr::null()
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert_eq!(
+            format(0x800, &[0], 5, std::ptr::null()).0,
+            0,
+            "FROM_HMODULE"
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            format(0x400 | 0x2000, &wide("%1!f!"), 0, args.as_ptr().cast()).0,
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
 
     #[test]
     fn environment_variables_are_set_read_and_removed_ignoring_case() {
@@ -2424,6 +2778,91 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(CancelWaitableTimer(timer), 1);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn system_time_rejects_pre_1601_and_invalid_calendar_dates() {
+        let mut ft = 0u64;
+        for bad in [
+            [1600, 12, 0, 31, 0, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 0],
+            [2023, 2, 0, 29, 0, 0, 0, 0],
+            [1900, 2, 0, 29, 0, 0, 0, 0],
+            [2024, 4, 0, 31, 0, 0, 0, 0],
+            [30828, 1, 0, 1, 0, 0, 0, 0],
+        ] {
+            assert_eq!(SystemTimeToFileTime(&bad, &mut ft), 0, "accepted {bad:?}");
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+        // Leap-year 2000-02-29 and epoch 1601-01-01 are valid.
+        assert_eq!(SystemTimeToFileTime(&[1601, 1, 0, 1, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(ft, 0);
+        assert_eq!(SystemTimeToFileTime(&[2000, 2, 0, 29, 0, 0, 0, 0], &mut ft), 1);
+        assert_eq!(SystemTimeToFileTime(std::ptr::null(), &mut ft), 0);
+        assert_eq!(FileTimeToSystemTime(&ft, std::ptr::null_mut()), 0);
+    }
+
+    #[test]
+    fn string_guid_and_processor_helpers_guard_edge_cases() {
+        // LCMapStringEx with len < 0 includes the terminating NUL.
+        let src: Vec<u16> = "AbC\0".encode_utf16().collect();
+        let mut out = [0xFFFFu16; 8];
+        let n = LCMapStringEx(
+            std::ptr::null(),
+            LCMAP_LOWERCASE,
+            src.as_ptr(),
+            -1,
+            out.as_mut_ptr(),
+            8,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], &[b'a' as u16, b'b' as u16, b'c' as u16, 0]);
+        assert_eq!(
+            LCMapStringEx(
+                std::ptr::null(),
+                LCMAP_LOWERCASE,
+                src.as_ptr(),
+                -1,
+                out.as_mut_ptr(),
+                -1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // WideCharToMultiByte reports used_default and honors a custom default byte.
+        let wide: Vec<u16> = "A\u{20AC}B".encode_utf16().collect();
+        let mut mb = [0u8; 8];
+        let mut used = 0i32;
+        let def = b'#';
+        assert_eq!(
+            WideCharToMultiByte(1252, 0, wide.as_ptr(), 3, mb.as_mut_ptr(), 8, &def, &mut used),
+            3
+        );
+        assert_eq!((&mb[..3], used), (&b"A#B"[..], 1));
+
+        // Negative buffer size in copy_out / StringFromGUID2 and null buffer in GetLogicalProcessorInformation.
+        assert_eq!(
+            MultiByteToWideChar(65001, 0, c"hi".as_ptr().cast(), -1, out.as_mut_ptr(), -1),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        let guid = [0u8; 16];
+        assert_eq!(StringFromGUID2(guid.as_ptr(), out.as_mut_ptr(), -1), 0);
+        assert_eq!(StringFromGUID2(std::ptr::null(), out.as_mut_ptr(), 64), 0);
+
+        let mut len = 1024u32;
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INSUFFICIENT_BUFFER);
+        assert!(len >= 64);
+        assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), std::ptr::null_mut()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
     }
 }
 

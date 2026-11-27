@@ -5,7 +5,8 @@
 //! Apple's own. Each texture the host samples is detiled into a linear staging buffer and uploaded,
 //! mip by mip and slice by slice, when the memory's content changed since the last time (a hash of
 //! the memory, taken when work is submitted). Render targets and depth targets are the GPU's: they
-//! start empty and are not read from memory.
+//! start empty and are not read from memory. With `VICTORY_TEXTURE_BACK=1`, textures compute writes
+//! are retiled back into title memory ([`Back`]).
 //!
 //! shortcut: the detile runs on the CPU (`Layout::detile`, the code the D3D12 host uses too) and
 //! a thread hashes the memory of every sampled texture round after round (see `Watch`); a compute detile that reads the
@@ -13,6 +14,7 @@
 //! next step. A change detiles the whole texture.
 
 use super::descriptors::format;
+use super::host::NativeHost;
 use super::title::Title;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -75,15 +77,88 @@ impl TextureInfo {
     }
 }
 
+/// Uploads and change probes must see the same bytes, including across holes in title memory.
+fn read_texture_bytes(at: *const u8, out: &mut [u8]) {
+    #[cfg(target_os = "macos")]
+    read_texture_chunk(
+        at,
+        out,
+        super::safe_read,
+        victory_platform::mem::next_region,
+    );
+    #[cfg(not(target_os = "macos"))]
+    if !super::safe_read(at, out) {
+        out.fill(0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_texture_chunk(
+    at: *const u8,
+    out: &mut [u8],
+    mut read: impl FnMut(*const u8, &mut [u8]) -> bool,
+    mut next_region: impl FnMut(usize) -> Option<victory_platform::mem::Region>,
+) {
+    use victory_platform::mem::{Protect, page_size};
+
+    if read(at, out) {
+        return;
+    }
+    // A failed read can leave partial data in a reused probe buffer.
+    out.fill(0);
+    let base = at.addr();
+    let page = page_size();
+    if out.len() <= page - base % page {
+        return;
+    }
+    let Some(end) = base.checked_add(out.len()) else {
+        return;
+    };
+    let mut cur = base;
+    while cur < end {
+        let Some(region) = next_region(cur) else {
+            break;
+        };
+        let start = cur.max(region.base);
+        let stop = end.min(region.base.saturating_add(region.len));
+        if start >= stop {
+            break;
+        }
+        if region.protect.0 & Protect::READ.0 != 0
+            && !read(start as *const u8, &mut out[start - base..stop - base])
+        {
+            // The mapping may have changed after the query. Salvage this span page by page.
+            let mut pos = start;
+            while pos < stop {
+                let n = (page - pos % page).min(stop - pos);
+                let part = &mut out[pos - base..pos - base + n];
+                if !read(pos as *const u8, part) {
+                    part.fill(0);
+                }
+                pos += n;
+            }
+        }
+        cur = stop;
+    }
+}
+
 /// Reads `len` bytes of title memory (zeros where it cannot be read: a page the title never mapped).
 pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     const CHUNK: usize = 1 << 20;
     let mut out = vec![0u8; len];
     for (i, chunk) in out.chunks_mut(CHUNK).enumerate() {
-        // Only an address, checked by the kernel when read.
-        let _ = super::safe_read(at.wrapping_add(i * CHUNK), chunk);
+        read_texture_bytes(at.wrapping_add(i * CHUNK), chunk);
     }
     out
+}
+
+/// Host texels as title memory holds them: the reverse of [`to_host`].
+fn from_host(format: u32, texels: &mut [u8]) {
+    if format == 115 {
+        for t in texels.as_chunks_mut::<2>().0 {
+            *t = u16::from_le_bytes(*t).rotate_right(4).to_le_bytes();
+        }
+    }
 }
 
 /// Title texels as the host format holds them: DXGI `B4G4R4A4_UNORM` (115) has blue in the low
@@ -128,6 +203,100 @@ pub fn upload<B: ResourceBackend>(
     Ok(())
 }
 
+/// The reverse of [`upload`]: every mip of every slice of `tex`, retiled into `tiled` (the
+/// texture's whole memory; bytes between subresources stay as they are).
+fn download<B: ResourceBackend>(
+    backend: &B,
+    tex: &B::Texture,
+    info: &TextureInfo,
+    tiled: &mut [u8],
+) -> Result<(), String> {
+    let layout = &info.layout;
+    let slices = if info.dimension == Dimension::Tex3d {
+        1
+    } else {
+        layout.slices
+    };
+    let n = layout.desc.element_bytes as usize;
+    for mip in 0..layout.mips.len() as u32 {
+        let m = &layout.mips[mip as usize];
+        let row = m.width as usize * n;
+        let slice_pitch = row * m.height as usize;
+        let depth = layout.subresource_depth(mip).max(1) as usize;
+        let mut linear = vec![0u8; slice_pitch * depth];
+        for slice in 0..slices {
+            backend.read_texture(tex, mip as usize, slice as usize, &mut linear, row, slice_pitch);
+            from_host(info.format, &mut linear);
+            layout
+                .tile(tiled, mip, slice, &linear, row, slice_pitch)
+                .map_err(|e| format!("tile mip {mip} slice {slice}: {e:?}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The largest texture copied back (the ocean maps are small; a guess until a world run's
+/// "copied back" lines show what is written).
+const BACK_LIMIT: usize = 4 << 20;
+
+/// Textures compute work wrote, to be copied back into title memory once it completes
+/// (`VICTORY_TEXTURE_BACK=1`). Host textures are the GPU's own, so without this the title's CPU
+/// reads what was there before (VIctory-macOS issue #46: boats sink).
+///
+/// shortcut: copied back before a fence value is shown to the title; a title that instead polls a
+/// label the GPU writes into memory may read a frame late.
+pub(super) struct Back<B: PresentBackend> {
+    /// A fence of ours per title queue, and the last value queued on it.
+    fences: HashMap<usize, (Rc<B::Fence>, u64)>,
+    /// Submissions not yet copied back: reached when the fence has the value.
+    pending: Vec<(Rc<B::Fence>, u64, Vec<usize>)>,
+    /// Textures already logged.
+    logged: std::collections::HashSet<usize>,
+}
+
+impl<B: PresentBackend> Default for Back<B> {
+    fn default() -> Self {
+        Back {
+            fences: HashMap::new(),
+            pending: Vec::new(),
+            logged: Default::default(),
+        }
+    }
+}
+
+impl<B: PresentBackend> Back<B> {
+    /// The signal the next work of title queue `key` carries (`None` with copy-back off): in the
+    /// work's own command buffer, so it does not hang on the order command buffers complete in.
+    pub(super) fn next(&mut self, host: &NativeHost<B>, key: usize) -> Option<(Rc<B::Fence>, u64)> {
+        if !host.collecting_written() {
+            return None;
+        }
+        let (fence, value) = match self.fences.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => match host.backend.create_fence(0) {
+                Ok(f) => e.insert((Rc::new(f), 0)),
+                Err(error) => {
+                    tracing::warn!(%error, "no fence to copy textures back by");
+                    return None;
+                }
+            },
+        };
+        *value += 1;
+        Some((fence.clone(), *value))
+    }
+
+    /// That work went to the GPU: if it wrote textures, they are copied back once `signal` is
+    /// reached.
+    pub(super) fn submitted(&mut self, host: &NativeHost<B>, signal: Option<(Rc<B::Fence>, u64)>) {
+        let written = host.take_written();
+        if let Some((fence, value)) = signal
+            && !written.is_empty()
+        {
+            self.pending.push((fence, value, written));
+        }
+    }
+}
+
 /// Textures whose memory the scanner thread watches, and those it found changed.
 ///
 /// Hashing every sampled texture's memory on every submission (150 ms at 170 MiB, under the
@@ -151,6 +320,28 @@ fn watch<R>(f: impl FnOnce(&mut Watch) -> R) -> R {
     f(WATCH.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
+fn scan_round(
+    snapshot: &HashMap<usize, (usize, usize, bool)>,
+    seen: &mut HashMap<usize, blake3::Hash>,
+    buf: &mut [u8],
+    mut mark_dirty: impl FnMut(usize),
+) {
+    seen.retain(|k, _| snapshot.contains_key(k));
+    for (&key, &(at, size, target)) in snapshot {
+        let mut h = blake3::Hasher::new();
+        for off in (0..size).step_by(buf.len()) {
+            let n = buf.len().min(size - off);
+            read_texture_bytes((at + off) as *const u8, &mut buf[..n]);
+            h.update(&buf[..n]);
+        }
+        let h = h.finalize();
+        let before = seen.insert(key, h);
+        if before != Some(h) && !(target && before.is_none()) {
+            mark_dirty(key);
+        }
+    }
+}
+
 fn start_scanner() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -158,23 +349,10 @@ fn start_scanner() {
             let mut seen: HashMap<usize, blake3::Hash> = HashMap::new();
             let mut buf = vec![0u8; 1 << 20];
             loop {
-                let list: Vec<(usize, (usize, usize, bool))> =
-                    watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
-                seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for &(key, (at, size, target)) in &list {
-                    let mut h = blake3::Hasher::new();
-                    for off in (0..size).step_by(buf.len()) {
-                        let n = buf.len().min(size - off);
-                        buf[..n].fill(0);
-                        let _ = super::safe_read((at + off) as *const u8, &mut buf[..n]);
-                        h.update(&buf[..n]);
-                    }
-                    let h = h.finalize();
-                    let before = seen.insert(key, h);
-                    if before != Some(h) && !(target && before.is_none()) {
-                        watch(|w| w.dirty.insert(key));
-                    }
-                }
+                let snapshot = watch(|w| w.entries.clone());
+                scan_round(&snapshot, &mut seen, &mut buf, |key| {
+                    watch(|w| w.dirty.insert(key));
+                });
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
@@ -202,6 +380,21 @@ pub struct Tracked<B: ResourceBackend> {
     /// long that takes (a movie's planes are made blank about 40 s before the movie decodes into
     /// them; once left to the scanner, their first frames showed green for a second or two).
     blank: bool,
+    /// Render-target views already made, kept so the same attachment keeps its identity.
+    #[cfg(target_os = "macos")]
+    target_views: Vec<(ViewDesc, Rc<B::Texture>)>,
+}
+
+/// The other format of an sRGB pair.
+#[cfg(target_os = "macos")]
+fn srgb_twin(f: Format) -> Option<Format> {
+    Some(match f {
+        Format::Rgba8Unorm => Format::Rgba8UnormSrgb,
+        Format::Rgba8UnormSrgb => Format::Rgba8Unorm,
+        Format::Bgra8Unorm => Format::Bgra8UnormSrgb,
+        Format::Bgra8UnormSrgb => Format::Bgra8Unorm,
+        _ => return None,
+    })
 }
 
 /// Submissions a texture whose memory changed stays hot without a further change.
@@ -253,8 +446,7 @@ fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
     if scratch.len() < n {
         scratch.resize(n, 0);
     }
-    scratch[..n].fill(0);
-    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+    read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
     scratch[..n].iter().any(|&b| b != 0)
 }
 
@@ -272,8 +464,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
         }
         for off in (0..size).step_by(CHUNK) {
             let n = CHUNK.min(size - off);
-            scratch[..n].fill(0);
-            let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+            read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
             seen(&scratch[..n]);
         }
         return;
@@ -286,8 +477,7 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
     for k in 0..PROBE_PAGES {
         let off = k * pages / PROBE_PAGES * PAGE;
         let n = PROBE_SAMPLE.min(size - off);
-        scratch[..n].fill(0);
-        let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
+        read_texture_bytes((at + off) as *const u8, &mut scratch[..n]);
         seen(&scratch[..n]);
     }
 }
@@ -379,6 +569,72 @@ pub fn placed_key(address: u64, description: &[u32; 14]) -> usize {
 }
 
 impl<B: PresentBackend> Title<B> {
+    /// Turns copying GPU-written textures back into title memory on or off.
+    pub fn set_texture_back(&mut self, on: bool) {
+        self.host.collect_written(on);
+    }
+
+    /// Copies back what completed submissions wrote.
+    pub(super) fn copy_back(&mut self) {
+        let mut done = Vec::new();
+        let backend = &self.host.backend;
+        self.back.pending.retain(|(fence, value, keys)| {
+            let reached = backend.completed(fence) >= *value;
+            if reached {
+                done.extend(keys.iter().copied());
+            }
+            !reached
+        });
+        done.sort_unstable();
+        done.dedup();
+        for key in done {
+            self.write_back(key);
+        }
+    }
+
+    /// Retiles the host texture of `key` into its title memory.
+    fn write_back(&mut self, key: usize) {
+        // Not a texture (a buffer view), or released since: nothing to copy.
+        let Some(t) = self.textures.get_mut(&key) else { return };
+        let info = &t.info;
+        // Render and depth targets are left out: nothing says the title reads one.
+        if info.flags & UNORDERED_ACCESS == 0 || info.render_target() {
+            return;
+        }
+        let described = (info.format, info.width, info.height, info.depth_or_layers, info.size);
+        if info.size > BACK_LIMIT {
+            if self.back.logged.insert(key) {
+                tracing::info!(texture = key, ?described, "a GPU-written texture is too large to copy back");
+            }
+            return;
+        }
+        let mut tiled = read_memory(info.memory, info.size);
+        // The title wrote the memory since the host texture was filled from it: its bytes stay,
+        // and the next submission uploads them.
+        if t.last != Some(blake3::hash(&tiled)) {
+            return;
+        }
+        if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
+            if self.back.logged.insert(key) {
+                tracing::warn!(texture = key, ?described, %error, "a GPU-written texture was not copied back");
+            }
+            return;
+        }
+        let hash = blake3::hash(&tiled);
+        if t.last == Some(hash) {
+            return;
+        }
+        // Through the pool's own mapping; `None` when the title unmapped the memory meanwhile.
+        let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else { return };
+        // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
+        unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
+        // What the host texture holds, so the scanner's sighting of this write uploads nothing.
+        t.last = Some(hash);
+        if self.back.logged.insert(key) {
+            tracing::info!(texture = key, ?described, layout = ?info.layout.desc, "a GPU-written texture is copied back into title memory");
+        }
+    }
+
     /// A title texture exists. Its host texture is made when a view, a render target or a clear
     /// first names it (most of a title's textures are never used), and filled from title memory
     /// when work next goes to the GPU.
@@ -413,22 +669,27 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.host.register_texture(key, &tex);
-        // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded when
-        // it changes, as it is not otherwise seen (a GPU write never changes title memory).
-        watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
-        start_scanner();
-        // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
-        // was never drawn into, and a black one was drawn black.
-        if info.render_target() && env_set!("VICTORY_MAGENTA") {
-            let m = &info.layout.mips[0];
-            let n = info.layout.desc.element_bytes as usize;
-            let row = m.width as usize * n;
-            let pixel = [0xffu8, 0, 0xff, 0xff];
-            let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
-            self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
-        }
-        if !info.render_target() {
-            self.unloaded.insert(key);
+        // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
+        // 4-byte or 2-byte plane 0) does not match Metal's combined depth-stencil texel layout,
+        // so watching or uploading CPU memory cannot produce valid replaceRegion transfers.
+        if !desc.format.is_depth() {
+            // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded
+            // when it changes, as it is not otherwise seen (a GPU write never changes title memory).
+            watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target())));
+            start_scanner();
+            // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
+            // was never drawn into, and a black one was drawn black.
+            if info.render_target() && env_set!("VICTORY_MAGENTA") {
+                let m = &info.layout.mips[0];
+                let n = info.layout.desc.element_bytes as usize;
+                let row = m.width as usize * n;
+                let pixel = [0xffu8, 0, 0xff, 0xff];
+                let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
+                self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
+            }
+            if !info.render_target() {
+                self.unloaded.insert(key);
+            }
         }
         self.textures.insert(
             key,
@@ -442,6 +703,8 @@ impl<B: PresentBackend> Title<B> {
                 sampled_sees_writes: false,
                 skipped: 0,
                 blank: false,
+                #[cfg(target_os = "macos")]
+                target_views: Vec::new(),
             },
         );
         true
@@ -456,6 +719,52 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
         self.textures.get(&key).map(|t| t.texture.clone())
+    }
+
+    /// Resolves a render-target view to its attachment and its effective format. The base
+    /// attachment can use the texture itself. A narrowed view also supplies the mip's extent.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn target_of(
+        &mut self,
+        record: crate::descriptor::RtvRecord,
+    ) -> Option<(Rc<B::Texture>, Format)> {
+        let key = record.resource as usize;
+        self.realize(key);
+        let t = self.textures.get_mut(&key)?;
+        let desc = t.info.desc()?;
+        let (mip, slice) = record.native_rtv_subresource(
+            t.info.dimension,
+            t.info.depth_or_layers,
+            desc.mips,
+            t.info.layout.desc.samples,
+        )?;
+        let base = (mip, slice) == (0, 0);
+        let own = desc.format;
+        let twin = format(record.format()).filter(|&f| srgb_twin(own) == Some(f));
+        // A failed format reinterpretation can fall back to the resource format, but must
+        // keep the same mip and slice.
+        for format in twin.into_iter().chain([own]) {
+            if base && format == own {
+                return Some((t.texture.clone(), own));
+            }
+            let view = ViewDesc {
+                format,
+                mips: if base { (0, usize::MAX) } else { (mip, 1) },
+                slices: if base { (0, usize::MAX) } else { (slice, 1) },
+            };
+            if let Some((_, texture)) = t.target_views.iter().find(|(cached, _)| *cached == view) {
+                return Some((texture.clone(), format));
+            }
+            match self.host.backend.create_texture_view(&t.texture, &view) {
+                Ok(texture) => {
+                    let texture = Rc::new(texture);
+                    t.target_views.push((view, texture.clone()));
+                    return Some((texture, format));
+                }
+                Err(e) => tracing::warn!(error = %e, ?view, "no host view for a render target view"),
+            }
+        }
+        None
     }
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
@@ -502,7 +811,7 @@ impl<B: PresentBackend> Title<B> {
             .collect();
         for a in dead {
             let (key, _) = self.placed.remove(&a).expect("listed above");
-            self.host.forget_resource(key);
+            self.host.release_resource(key);
             self.texture_released(key);
         }
     }
@@ -564,6 +873,9 @@ impl<B: PresentBackend> Title<B> {
             let Some(t) = textures.get_mut(&key) else {
                 continue;
             };
+            if t.info.desc().is_some_and(|d| d.format.is_depth()) {
+                continue;
+            }
             let tiled = read_memory(t.info.memory, t.info.size);
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
@@ -604,6 +916,211 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    fn dirty_this_round(
+        entries: &HashMap<usize, (usize, usize, bool)>,
+        seen: &mut HashMap<usize, blake3::Hash>,
+    ) -> std::collections::HashSet<usize> {
+        let mut dirty = std::collections::HashSet::new();
+        scan_round(entries, seen, &mut [0; 2], |key| {
+            dirty.insert(key);
+        });
+        dirty
+    }
+
+    #[test]
+    fn scanner_forgets_removed_keys_and_reports_them_when_they_reappear() {
+        let bytes = [1u8, 2, 3];
+        let entry = (bytes.as_ptr() as usize, bytes.len(), false);
+        let mut entries = HashMap::from([(1, entry), (2, entry)]);
+        let mut seen = HashMap::new();
+
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1, 2].into());
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+
+        entries.remove(&1);
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+        assert_eq!(seen, HashMap::from([(2, blake3::hash(&bytes))]));
+
+        entries.insert(1, entry);
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1].into());
+    }
+
+    #[test]
+    fn scanner_uses_the_first_render_target_hash_as_its_baseline() {
+        let mut bytes = [3u8];
+        let entries = HashMap::from([(1, (bytes.as_ptr() as usize, bytes.len(), true))]);
+        let mut seen = HashMap::new();
+        assert!(dirty_this_round(&entries, &mut seen).is_empty());
+        assert_eq!(seen[&1], blake3::hash(&bytes));
+
+        bytes[0] = 4;
+        assert_eq!(dirty_this_round(&entries, &mut seen), [1].into());
+        assert_eq!(seen[&1], blake3::hash(&bytes));
+    }
+
+    /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
+    /// element sizes 1 to 8, the shapes a world run names (#46).
+    #[test]
+    fn download_undoes_upload_for_every_mip_and_slice() {
+        use victory_formats::texture::{Desc, Swizzle};
+        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        use Dimension::{Tex1d, Tex2d, Tex3d};
+        // (dimension, DXGI format, element bytes, width, height, depth or layers, mips)
+        let shapes = [
+            (Tex1d, 28, 4, 256, 1, 1, 1),
+            (Tex2d, 61, 1, 128, 64, 1, 5),
+            (Tex2d, 10, 8, 256, 256, 1, 9),
+            (Tex2d, 41, 4, 64, 64, 4, 6),
+            (Tex3d, 41, 4, 256, 256, 16, 1),
+            (Tex3d, 17, 8, 64, 64, 64, 1),
+            (Tex3d, 28, 4, 32, 32, 32, 6),
+        ];
+        let mut ran = 0;
+        for (dimension, format, element_bytes, width, height, depth, mips) in shapes {
+            for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D_X] {
+                let what = format!("{dimension:?} {format} {width}x{height}x{depth} mips {mips} {swizzle:?}");
+                let desc = Desc { dimension, width, height, depth, mips, element_bytes, block: 1, samples: 1, swizzle };
+                // Not every mode exists for every shape.
+                let Ok(layout) = Layout::new(&desc) else { continue };
+                let mut want = vec![0u8; layout.size as usize];
+                let slices = if dimension == Tex3d { 1 } else { layout.slices };
+                let tiled = (0..layout.mips.len() as u32).all(|mip| {
+                    let m = &layout.mips[mip as usize];
+                    let row = (m.width * element_bytes) as usize;
+                    let pitch = row * m.height as usize;
+                    (0..slices).all(|slice| {
+                        let n = pitch * layout.subresource_depth(mip).max(1) as usize;
+                        let linear: Vec<u8> = (0..n).map(|i| (i % 251) as u8 ^ (mip * 37 + slice * 11) as u8).collect();
+                        layout.tile(&mut want, mip, slice, &linear, row, pitch).is_ok()
+                    })
+                });
+                if !tiled {
+                    continue;
+                }
+                let info = TextureInfo {
+                    dimension,
+                    format,
+                    width,
+                    height,
+                    depth_or_layers: depth,
+                    flags: UNORDERED_ACCESS,
+                    size: want.len(),
+                    layout,
+                    memory: std::ptr::null(),
+                };
+                let tex = metal.create_texture(&info.desc().unwrap()).unwrap();
+                upload(&metal, &tex, &info, &want).unwrap();
+                let mut got = vec![0u8; want.len()];
+                download(&metal, &tex, &info, &mut got).unwrap();
+                let at = got.iter().zip(&want).position(|(a, b)| a != b);
+                assert!(at.is_none(), "{what}: differs first at byte {at:?}");
+                eprintln!("round trip: {what}");
+                ran += 1;
+            }
+        }
+        // Linear at least, for each shape.
+        assert!(ran >= shapes.len(), "{ran}");
+    }
+
+    #[test]
+    fn from_host_undoes_to_host() {
+        let title: Vec<u8> = (0..=255).collect();
+        for format in [28, 115] {
+            let mut texels = title.clone();
+            to_host(format, &mut texels);
+            from_host(format, &mut texels);
+            assert_eq!(texels, title, "{format}");
+        }
+    }
+
+    #[test]
+    fn an_inaccessible_megabyte_takes_one_failed_read_and_one_region_query() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, protect};
+
+        let len = 1 << 20;
+        let memory = Region::new(len, None).unwrap();
+        // SAFETY: the test owns this entire mapping until the reader finishes.
+        unsafe { protect(memory.ptr, len, Protect::NO_ACCESS) }.unwrap();
+        let mut out = vec![0xff; len];
+        let (mut reads, mut queries) = (0, 0);
+        read_texture_chunk(
+            memory.ptr,
+            &mut out,
+            |at, out| {
+                reads += 1;
+                crate::native::safe_read(at, out)
+            },
+            |at| {
+                queries += 1;
+                next_region(at)
+            },
+        );
+        assert!(out.iter().all(|&b| b == 0));
+        assert_eq!((reads, queries), (1, 1));
+    }
+
+    #[test]
+    fn a_region_that_changes_after_the_query_still_preserves_readable_pages() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(4 * page, None).unwrap();
+        // SAFETY: the test owns all four pages and writes them before changing protection.
+        unsafe {
+            memory.ptr.write_bytes(0x72, 4 * page);
+            protect(memory.ptr, page, Protect::NO_ACCESS).unwrap();
+        }
+        let mut out = vec![0xff; 4 * page - 2];
+        read_texture_chunk(
+            memory.ptr.wrapping_add(1),
+            &mut out,
+            crate::native::safe_read,
+            |at| {
+                let region = next_region(at);
+                if at == memory.ptr.addr() + page {
+                    // SAFETY: the third page is ours. Revoke access just after querying the span.
+                    unsafe { protect(memory.ptr.add(2 * page), page, Protect::NO_ACCESS) }.unwrap();
+                }
+                region
+            },
+        );
+        for (offset, &byte) in out.iter().enumerate() {
+            let readable = matches!((offset + 1) / page, 1 | 3);
+            assert_eq!(byte, if readable { 0x72 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn a_texture_read_preserves_texels_on_both_sides_of_an_unreadable_page() {
+        use victory_metal::mem::Region;
+        use victory_platform::mem::{Protect, page_size, protect};
+
+        let page = page_size();
+        let memory = Region::new(3 * page, None).unwrap();
+        // SAFETY: all three pages belong to this test. Protect only the middle one after filling it.
+        unsafe {
+            memory.ptr.write_bytes(0x31, 2 * page);
+            memory.ptr.add(2 * page).write_bytes(0x72, page);
+            protect(memory.ptr.add(page), page, Protect::NO_ACCESS).unwrap();
+        }
+        let start = memory.ptr.wrapping_add(page - 7);
+        let mut expected = vec![0; 7 + page + 11];
+        expected[..7].fill(0x31);
+        expected[7 + page..].fill(0x72);
+
+        let bytes = read_memory(start, expected.len());
+        assert_eq!(&bytes[..7], &expected[..7]);
+        assert!(bytes[7..7 + page].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[7 + page..], &expected[7 + page..]);
+        let mut scratch = vec![0xff; expected.len()];
+        assert_eq!(
+            probe_hash(start as usize, expected.len(), true, &mut scratch),
+            blake3::hash(&expected)
+        );
+    }
 
     #[test]
     fn probe_hash_detects_writes_in_sampled_and_whole_modes() {

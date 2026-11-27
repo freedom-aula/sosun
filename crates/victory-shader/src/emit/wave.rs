@@ -21,6 +21,7 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    MulF,
     MinU,
     MaxU,
     MinI,
@@ -40,6 +41,7 @@ impl Op {
             // The low dwords of a 64-bit sum (the carry is not followed).
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_mul_f32" => Op::MulF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -58,6 +60,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::MulF => k == 0x3F80_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -69,7 +72,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
+        matches!(self, Op::AddU | Op::AddF | Op::MulF | Op::Xor | Op::AddH)
     }
 }
 
@@ -148,6 +151,18 @@ const PERMLANE: &str = unfollowed!("a v_permlane with computed lane selects");
 const VALU: &str = unfollowed!("a VALU operation it does not model");
 /// Every step modelled, but the value is no single reduction or prefix.
 pub(crate) const NO_SHAPE: &str = unfollowed!("a value that is no reduction or prefix");
+
+/// Section lowering can replace register results, but cannot replay effects on
+/// lanes the host is not executing. Admit register operations conservatively.
+pub(super) fn register_only(inst: &Inst) -> bool {
+    match &inst.fields {
+        Fields::Valu(v) => v.dst.is_some(),
+        Fields::Sop { .. } => {
+            matches!(inst.name(), "s_mov_b32" | "s_mov_b64" | "s_and_b32" | "s_and_b64")
+        }
+        _ => false,
+    }
+}
 
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
@@ -381,6 +396,14 @@ fn simulate(
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            // A reduction can load its inactive-lane identity into an SGPR.
+            if name == "s_mov_b32"
+                && let Some(k) = constant(inst)
+                && let [(Reg::S(_), dst)] = inst.writes.as_slice()
+            {
+                uni.insert(*dst, Sym::K(k as u32));
+                continue;
+            }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))

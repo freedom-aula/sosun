@@ -73,6 +73,43 @@ reject_launch() {
 }
 
 test_default() { launch "$default"; }
+test_invalid_run_options() {
+  printf 'native_binary() { touch "$RECORD"; return 1; }\n' > "$repo/tools/macos/native-binary.sh"
+  local value option
+  for value in abc -1 '' 18446744073709551616; do
+    run_script run-native.sh --seconds "$value" "$input"
+    [[ "$rc" == 2 ]] || fail "expected status 2 for --seconds=$value, got $rc"
+    contains '--seconds '
+  done
+  for option in --seconds --console; do
+    run_script run-native.sh "$option"
+    [[ "$rc" == 2 ]] || fail "expected status 2 for missing $option value, got $rc"
+    contains "$option"
+  done
+  [[ ! -e "$RECORD" && ! -e "$repo/runs" ]] || fail "invalid option reached launcher setup"
+}
+test_decimal_seconds() {
+  fixture "$default"
+  # Give the timer a bounded child to stop and record its requested duration.
+  printf '#!/bin/bash\nexec /bin/sleep 2\n' > "$default/x86_64-apple-darwin/release/victory"
+  printf '#!/bin/bash\necho "$1" > "$RECORD"\n' > "$bin_dir/sleep"
+  chmod +x "$bin_dir/sleep"
+  run_script run-native.sh --seconds 08 "$input"
+  [[ "$rc" == 143 && -f "$RECORD" && $(cat "$RECORD") == 8 ]] || fail "expected an 8-second timer"
+  run_script run-native.sh --seconds=09 "$input"
+  [[ "$rc" == 143 && $(cat "$RECORD") == 9 ]] || fail "expected a 9-second timer"
+}
+test_same_second_logs() {
+  printf '#!/bin/bash\necho 20260101-120000\n' > "$bin_dir/date"
+  chmod +x "$bin_dir/date"
+  launch "$default"
+  local first=("$repo"/runs/*/victory.log)
+  echo 'first run marker' >> "${first[0]}"
+  launch "$default"
+  local logs=("$repo"/runs/*/victory.log)
+  [[ ${#logs[@]} == 2 ]] || fail "two runs in the same second shared a log"
+  grep -Fxq 'first run marker' "${first[0]}" || fail "first log was overwritten"
+}
 test_global() { configure "$CARGO_HOME" "$shared"; launch "$shared"; }
 test_home_global() { configure "$CARGO_HOME" "$shared"; unset CARGO_HOME; launch "$shared"; }
 test_global_without_default() {
@@ -162,6 +199,13 @@ test_setup() {
   cmp "$RECORD" "$root/expected" || fail "build arguments changed"
   launch "$shared"
 }
+test_setup_sysroot_failure() {
+  prepare_setup
+  printf '#!/bin/bash\nif [[ "$1" == run ]]; then exit 47; fi\n' > "$bin_dir/rustup"
+  cp "$TEST_SYSROOT/bin/cargo" "$bin_dir/cargo"
+  run_script native-setup.sh
+  [[ "$rc" == 47 && ! -e "$RECORD" ]] || fail "setup continued after sysroot lookup failed (status $rc)"
+}
 test_setup_metadata_failure() {
   prepare_setup
   printf '[build\n' > "$CARGO_HOME/config.toml"
@@ -222,9 +266,9 @@ test_launch_without_cargo() {
 
 # Optional names allow the central regression to be checked against old scripts.
 if [[ $# == 0 ]]; then
-  set -- default global home_global global_without_default environment \
+  set -- default invalid_run_options decimal_seconds same_second_logs global home_global global_without_default environment \
     build_environment relative_environment project missing not_executable invalid_config \
-    bad_metadata setup setup_metadata_failure setup_build_failure \
+    bad_metadata setup setup_sysroot_failure setup_metadata_failure setup_build_failure \
     setup_rustup_in_cargo_home setup_rustup_in_homebrew setup_without_rustup \
     launch_rustup_in_cargo_home launch_without_cargo
 fi

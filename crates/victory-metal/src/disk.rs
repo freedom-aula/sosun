@@ -6,11 +6,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Names the file format: part of every key, and the start of every file.
 const MAGIC: &[u8; 4] = b"VML1";
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+static HITS: AtomicU64 = AtomicU64::new(0);
+static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps converted libraries in `dir` from now on.
 pub fn use_dir(dir: PathBuf) {
@@ -38,12 +41,22 @@ pub fn key(parts: &[&[u8]]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The payload stored under `key` in `dir`; `None` if there is none or it is damaged.
+/// The payload stored under `key` in `dir`; `None` if there is none or it is damaged. Counted
+/// in [`counts`].
 pub fn read(dir: &Path, key: &str) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(dir.join(key)).ok()?;
-    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
-    let (sum, payload) = rest.split_at_checked(32)?;
-    (blake3::hash(payload).as_bytes() == sum).then(|| payload.to_vec())
+    let found = std::fs::read(dir.join(key)).ok().and_then(|bytes| {
+        let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+        let (sum, payload) = rest.split_at_checked(32)?;
+        (blake3::hash(payload).as_bytes() == sum).then(|| payload.to_vec())
+    });
+    (if found.is_some() { &HITS } else { &MISSES }).fetch_add(1, Ordering::Relaxed);
+    found
+}
+
+/// Lookups since the start that found their entry, and those that did not: the slow-conversion
+/// log line shows only conversions of 20 ms or more, which a hit never is.
+pub fn counts() -> (u64, u64) {
+    (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
 /// Stores `payload` under `key` in `dir`, atomically. Failures are not fatal: the next run converts again.
@@ -55,9 +68,59 @@ pub fn write(dir: &Path, key: &str, payload: &[u8]) {
     }
 }
 
+/// Whether compiling the pipeline `key` names crashed Metal's compiler service on an earlier run
+/// on this OS build ([`remember_crash`]).
+pub fn crashed(key: &[u8]) -> bool {
+    dir().is_some_and(|d| d.join(crash_name(key)).exists())
+}
+
+/// Remembers that compiling the pipeline `key` names crashed Metal's compiler service
+/// (`XPC_ERROR_CONNECTION_INTERRUPTED`), so later runs refuse it at once instead of waiting through
+/// Metal's retries again (about 30 s a pipeline on macOS 15). An OS update forgets it.
+pub fn remember_crash(key: &[u8]) {
+    if let Some(d) = dir() {
+        write(d, &crash_name(key), b"");
+    }
+}
+
+fn crash_name(k: &[u8]) -> String {
+    format!("crash-{}", &key(&[b"compiler crash", os_build().as_bytes(), k])[..32])
+}
+
+/// The OS build (`kern.osversion`), empty if it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn os_build() -> String {
+    String::new()
+}
+
+/// The OS build (`kern.osversion`), empty if it cannot be read.
+#[cfg(target_os = "macos")]
+fn os_build() -> String {
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: the name is NUL-terminated and `buf` holds `len` bytes.
+    let ok = unsafe {
+        libc::sysctlbyname(c"kern.osversion".as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    } == 0;
+    let s = if ok { &buf[..len.min(buf.len())] } else { &[][..] };
+    String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compiler_crash_is_remembered_for_its_pipeline_only() {
+        let d = tempfile::tempdir().unwrap();
+        // The folder is set once per process; this test is the only one that sets it.
+        use_dir(d.path().to_path_buf());
+        assert!(cfg!(not(target_os = "macos")) || !os_build().is_empty());
+        assert!(!crashed(b"pipeline a"));
+        remember_crash(b"pipeline a");
+        assert!(crashed(b"pipeline a"));
+        assert!(!crashed(b"pipeline b"));
+    }
 
     #[test]
     fn payloads_round_trip() {
@@ -68,6 +131,19 @@ mod tests {
         assert_eq!(read(d.path(), &k).as_deref(), Some(&b"metallib bytes"[..]));
         // No temporary file is left behind.
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn lookups_are_counted() {
+        let d = tempfile::tempdir().unwrap();
+        let k = key(&[b"counted"]);
+        let (hits, misses) = counts();
+        assert_eq!(read(d.path(), &k), None);
+        write(d.path(), &k, b"payload");
+        assert!(read(d.path(), &k).is_some());
+        // Other tests read too, at the same time: at least these two.
+        let (h, m) = counts();
+        assert!(h > hits && m > misses);
     }
 
     #[test]

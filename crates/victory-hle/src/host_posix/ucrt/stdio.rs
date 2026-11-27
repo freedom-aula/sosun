@@ -190,7 +190,8 @@ impl Stream {
         self.drop_readahead();
         self.eof = false;
         match &mut self.io {
-            Io::File(f) => f.seek(to).ok(),
+            // A position before the start is `InvalidInput`, so `EINVAL`.
+            Io::File(f) => f.seek(to).map_err(|e| set_errno(win_errno(&e))).ok(),
             _ => None,
         }
     }
@@ -476,11 +477,19 @@ pub extern "system" fn _wfopen_s(out: *mut *mut c_void, path: *const u16, mode: 
 }
 
 pub extern "system" fn _fdopen(fd: i32, mode: *const u8) -> *mut c_void {
+    if mode.is_null() {
+        bad_param(EINVAL);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: checked non-null, NUL-terminated mode string.
+    if parse_mode(unsafe { super::bytes(mode) }).is_none() {
+        bad_param(EINVAL);
+        return std::ptr::null_mut();
+    }
     let Some(s) = fd_of(fd) else {
         set_errno(EBADF);
         return std::ptr::null_mut();
     };
-    let _ = mode;
     new_file(s)
 }
 
@@ -557,11 +566,20 @@ pub extern "system" fn fread(buf: *mut u8, size: usize, count: usize, file: *mut
     if size == 0 || count == 0 {
         return 0;
     }
+    if buf.is_null() {
+        bad_param(EINVAL);
+        return 0;
+    }
     let Some(total) = size.checked_mul(count) else {
         bad_param(EINVAL);
         return 0;
     };
     with(file, 0, |s| {
+        if !s.readable {
+            s.err = true;
+            set_errno(EBADF);
+            return 0;
+        }
         let mut done = 0;
         while done < total {
             if !s.text && s.rpos == s.rbuf.len() && total - done >= 4096 {
@@ -579,8 +597,10 @@ pub extern "system" fn fread(buf: *mut u8, size: usize, count: usize, file: *mut
                             done += n;
                             continue;
                         }
-                        Err(_) => {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
                             s.err = true;
+                            set_errno(win_errno(&e));
                             break;
                         }
                     }
@@ -604,6 +624,10 @@ pub extern "system" fn fwrite(
     file: *mut c_void,
 ) -> usize {
     if size == 0 || count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        bad_param(EINVAL);
         return 0;
     }
     let Some(total) = size.checked_mul(count) else {
@@ -634,6 +658,9 @@ pub extern "system" fn ungetc(c: i32, file: *mut c_void) -> i32 {
         return EOF;
     }
     with(file, EOF, |s| {
+        if !s.readable {
+            return EOF;
+        }
         s.unget(c as u8);
         i32::from(c as u8)
     })
@@ -670,6 +697,9 @@ pub extern "system" fn fgets(buf: *mut u8, n: i32, file: *mut c_void) -> *mut u8
 }
 
 pub extern "system" fn fputs(text: *const u8, file: *mut c_void) -> i32 {
+    if text.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: a NUL-terminated string.
     let b = unsafe { super::bytes(text) };
     with(file, EOF, |s| if s.put(b) { 0 } else { EOF })
@@ -680,6 +710,9 @@ fn std_file(i: usize) -> *mut c_void {
 }
 
 pub extern "system" fn puts(text: *const u8) -> i32 {
+    if text.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: a NUL-terminated string.
     let mut b = unsafe { super::bytes(text) }.to_vec();
     b.push(b'\n');
@@ -748,6 +781,9 @@ pub extern "system" fn fgetwc(file: *mut c_void) -> u32 {
 }
 
 pub extern "system" fn fputws(text: *const u16, file: *mut c_void) -> i32 {
+    if text.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: a NUL-terminated string.
     let b = String::from_utf16_lossy(unsafe { super::wide(text) });
     with(file, EOF, |s| if s.put(b.as_bytes()) { 0 } else { EOF })
@@ -802,8 +838,11 @@ pub extern "system" fn rewind(file: *mut c_void) {
 }
 
 pub extern "system" fn fgetpos(file: *mut c_void, pos: *mut i64) -> i32 {
+    if pos.is_null() {
+        return bad(EINVAL);
+    }
     let p = _ftelli64(file);
-    if p < 0 || pos.is_null() {
+    if p < 0 {
         return -1;
     }
     // SAFETY: the title's pointer.
@@ -983,6 +1022,16 @@ pub extern "system" fn _read(fd: i32, buf: *mut u8, count: u32) -> i32 {
         return err(EBADF);
     };
     let mut s = lock(&s);
+    if !s.readable {
+        // Not open for reading: -1, not the 0 of an end of file.
+        return err(EBADF);
+    }
+    if count == 0 {
+        return 0;
+    }
+    if buf.is_null() {
+        return bad(EINVAL);
+    }
     let mut n = 0;
     while n < count as usize {
         match s.get() {
@@ -999,14 +1048,23 @@ pub extern "system" fn _write(fd: i32, buf: *const u8, count: u32) -> i32 {
     let Some(s) = fd_of(fd) else {
         return err(EBADF);
     };
+    if count == 0 {
+        return if lock(&s).writable { 0 } else { err(EBADF) };
+    }
+    if buf.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: the title's buffer.
     let data = unsafe { std::slice::from_raw_parts(buf, count as usize) };
     if lock(&s).put(data) { count as i32 } else { -1 }
 }
 
 pub extern "system" fn _lseeki64(fd: i32, offset: i64, origin: i32) -> i64 {
-    let (Some(s), Some(to)) = (fd_of(fd), seek_from(offset, origin)) else {
+    let Some(s) = fd_of(fd) else {
         return i64::from(err(EBADF));
+    };
+    let Some(to) = seek_from(offset, origin) else {
+        return i64::from(err(EINVAL));
     };
     let mut s = lock(&s);
     s.seek(to).map_or(-1, |p| p as i64)
@@ -1017,7 +1075,10 @@ pub extern "system" fn _lseek(fd: i32, offset: i32, origin: i32) -> i32 {
 }
 
 pub extern "system" fn _telli64(fd: i32) -> i64 {
-    fd_of(fd).map_or(-1, |s| lock(&s).tell().map_or(-1, |p| p as i64))
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
+    lock(&s).tell().map_or(-1, |p| p as i64)
 }
 
 pub extern "system" fn _tell(fd: i32) -> i32 {
@@ -1025,7 +1086,9 @@ pub extern "system" fn _tell(fd: i32) -> i32 {
 }
 
 pub extern "system" fn _filelengthi64(fd: i32) -> i64 {
-    let Some(s) = fd_of(fd) else { return -1 };
+    let Some(s) = fd_of(fd) else {
+        return i64::from(err(EBADF));
+    };
     match &lock(&s).io {
         Io::File(f) => f.metadata().map_or(-1, |m| m.len() as i64),
         _ => -1,
@@ -1076,8 +1139,16 @@ pub extern "system" fn _chsize_s(fd: i32, size: i64) -> i32 {
     let Some(s) = fd_of(fd) else {
         return fail(EBADF);
     };
-    match &lock(&s).io {
-        Io::File(f) => match f.set_len(size.max(0) as u64) {
+    if size < 0 {
+        return bad_param(EINVAL);
+    }
+    let mut s = lock(&s);
+    if !s.writable {
+        return fail(EACCES);
+    }
+    s.drop_readahead();
+    match &s.io {
+        Io::File(f) => match f.set_len(size as u64) {
             Ok(()) => 0,
             Err(e) => fail(win_errno(&e)),
         },
@@ -1094,6 +1165,9 @@ pub extern "system" fn _dup(fd: i32) -> i32 {
 
 /// `_fstat64` and `_fstat64i32`.
 pub(super) fn fstat(fd: i32, out: *mut u8, wide_size: bool) -> i32 {
+    if out.is_null() {
+        return bad(EINVAL);
+    }
     let Some(s) = fd_of(fd) else {
         return err(EBADF);
     };
@@ -1179,6 +1253,10 @@ unsafe fn deliver<C: super::Ch>(out: &[u32], buf: *mut C, count: usize, options:
 }
 
 fn format_units(fmt: *const u8, wide: bool, options: u64, va: *const u64) -> Option<Vec<u32>> {
+    if fmt.is_null() {
+        bad_param(EINVAL);
+        return None;
+    }
     let f: Vec<u32> = if wide {
         // SAFETY: a NUL-terminated format.
         unsafe { super::wide(fmt.cast()) }
@@ -1426,6 +1504,9 @@ impl Drop for StreamInput<'_> {
 }
 
 fn scan_units(options: u64, input: &[u32], fmt: *const u8, wide: bool, va: *const u64) -> i32 {
+    if fmt.is_null() {
+        return bad(EINVAL);
+    }
     let f: Vec<u32> = if wide {
         // SAFETY: a NUL-terminated format.
         unsafe { super::wide(fmt.cast()) }
@@ -1454,6 +1535,9 @@ pub extern "system" fn __stdio_common_vsscanf(
     _locale: usize,
     va: *const u64,
 ) -> i32 {
+    if input.is_null() || fmt.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: the title's input, NUL-terminated or `length` long.
     let u: Vec<u32> = unsafe {
         (0..length)
@@ -1471,6 +1555,9 @@ pub extern "system" fn __stdio_common_vswscanf(
     _locale: usize,
     va: *const u64,
 ) -> i32 {
+    if input.is_null() || fmt.is_null() {
+        return bad(EINVAL);
+    }
     // SAFETY: the title's input, NUL-terminated or `length` long.
     let u: Vec<u32> = unsafe {
         (0..length)
@@ -1481,6 +1568,9 @@ pub extern "system" fn __stdio_common_vswscanf(
 }
 
 fn vfscanf(options: u64, file: *mut c_void, fmt: *const u8, wide: bool, va: *const u64) -> i32 {
+    if fmt.is_null() {
+        return bad(EINVAL);
+    }
     let f: Vec<u32> = if wide {
         // SAFETY: a NUL-terminated format.
         unsafe { super::wide(fmt.cast()) }
@@ -1717,6 +1807,87 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_descriptor_sets_ebadf_for_its_length_and_position() {
+        // Microsoft documents -1 with EBADF for an invalid descriptor in `_filelength`,
+        // `_tell` and `_eof` (and their 64-bit forms).
+        let fd = 9999;
+        for name in ["_filelengthi64", "_filelength", "_telli64", "_tell", "_eof"] {
+            set_errno(0);
+            let r = match name {
+                "_filelengthi64" => _filelengthi64(fd),
+                "_filelength" => i64::from(_filelength(fd)),
+                "_telli64" => _telli64(fd),
+                "_tell" => i64::from(_tell(fd)),
+                _ => i64::from(_eof(fd)),
+            };
+            assert_eq!(r, -1, "{name}");
+            assert_eq!(errno(), EBADF, "{name}");
+        }
+    }
+
+    #[test]
+    fn reading_a_write_only_descriptor_fails_with_ebadf() {
+        // Microsoft documents `_read` on a descriptor not open for reading as -1 with EBADF;
+        // 0 would tell the title it is at the end of the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let fd = _open(
+            cstr(path.to_str().unwrap()).as_ptr(),
+            O_WRONLY | O_BINARY,
+            0,
+        );
+        assert!(fd >= 3);
+        let mut b = [0xEEu8; 4];
+        set_errno(0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(b, [0xEE; 4]);
+        // An empty read of a readable descriptor is still 0.
+        assert_eq!(_close(fd), 0);
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 0), 0);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 3);
+        assert_eq!(_read(fd, b.as_mut_ptr(), 4), 0);
+        assert_eq!(_close(fd), 0);
+    }
+
+    #[test]
+    fn a_bad_seek_sets_einval_and_keeps_the_position() {
+        // Microsoft documents `_lseek`'s errno as EBADF for a bad descriptor and EINVAL for a
+        // bad origin or a position before the start of the file; `fseek` fails the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert!(fd >= 3);
+        assert_eq!(_lseeki64(fd, 2, SEEK_SET), 2);
+        for (offset, origin) in [(-1, SEEK_SET), (-3, SEEK_CUR), (-7, SEEK_END), (0, 3)] {
+            set_errno(0);
+            assert_eq!(_lseeki64(fd, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+            set_errno(0);
+            assert_eq!(_lseek(fd, offset as i32, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(_telli64(fd), 2);
+        set_errno(0);
+        assert_eq!(_lseeki64(9999, 0, SEEK_SET), -1);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(_close(fd), 0);
+
+        let f = open(&path, "rb");
+        assert_eq!(fseek(f, 4, SEEK_SET), 0);
+        for (offset, origin) in [(-5, SEEK_CUR), (-7, SEEK_END)] {
+            set_errno(0);
+            assert_eq!(fseek(f, offset, origin), -1, "{offset} {origin}");
+            assert_eq!(errno(), EINVAL, "{offset} {origin}");
+        }
+        assert_eq!(ftell(f), 4);
+        assert_eq!(fclose(f), 0);
+    }
+
+    #[test]
     fn standard_streams_exist() {
         let (i, o, e) = (__acrt_iob_func(0), __acrt_iob_func(1), __acrt_iob_func(2));
         assert!(!i.is_null() && !o.is_null() && !e.is_null() && i != o && o != e);
@@ -1911,5 +2082,114 @@ mod tests {
         assert_eq!((n, v), (1, 12));
         assert_eq!(fgetc(f), i32::from(b' '));
         fclose(f);
+    }
+
+    #[test]
+    fn large_binary_fread_on_write_only_stream_and_ungetc_fail_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        std::fs::write(&path, vec![0x42u8; 8192]).unwrap();
+        let f = open(&path, "wb");
+        assert!(!f.is_null());
+        let mut buf = vec![0xAAu8; 4096];
+        set_errno(0);
+        assert_eq!(fread(buf.as_mut_ptr(), 1, 4096, f), 0);
+        assert_eq!(errno(), EBADF);
+        assert_eq!(ferror(f), 1);
+        assert_eq!(ungetc(i32::from(b'x'), f), EOF);
+        assert_eq!(fclose(f), 0);
+    }
+
+    #[test]
+    fn chsize_rejects_negative_sizes_and_read_only_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resize.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_RDWR | O_BINARY, 0);
+        assert!(fd >= 3);
+        set_errno(0);
+        assert_eq!(_chsize_s(fd, -5), EINVAL);
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+        assert_eq!(_close(fd), 0);
+
+        let ro = _open(cstr(path.to_str().unwrap()).as_ptr(), O_BINARY, 0);
+        assert!(ro >= 3);
+        set_errno(0);
+        assert_eq!(_chsize_s(ro, 2), EACCES);
+        assert_eq!(errno(), EACCES);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+        assert_eq!(_close(ro), 0);
+    }
+
+    #[test]
+    fn null_pointers_and_bad_fdopen_modes_set_einval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nulls.bin");
+        std::fs::write(&path, b"abcd").unwrap();
+        let f = open(&path, "r+b");
+        assert!(!f.is_null());
+
+        set_errno(0);
+        assert_eq!(fread(std::ptr::null_mut(), 1, 4, f), 0);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(fwrite(std::ptr::null(), 1, 4, f), 0);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(fputs(std::ptr::null(), f), EOF);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(puts(std::ptr::null()), EOF);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(fputws(std::ptr::null(), f), EOF);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(fgetpos(f, std::ptr::null_mut()), -1);
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(fclose(f), 0);
+
+        let fd = _open(cstr(path.to_str().unwrap()).as_ptr(), O_RDWR | O_BINARY, 0);
+        assert!(fd >= 3);
+        set_errno(0);
+        assert_eq!(_read(fd, std::ptr::null_mut(), 4), -1);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(_write(fd, std::ptr::null(), 4), -1);
+        assert_eq!(errno(), EINVAL);
+        // Zero-length _write with a null pointer is a no-op without UB.
+        assert_eq!(_write(fd, std::ptr::null(), 0), 0);
+        set_errno(0);
+        assert_eq!(fstat(fd, std::ptr::null_mut(), true), -1);
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert!(_fdopen(fd, std::ptr::null()).is_null());
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert!(_fdopen(fd, c"invalid".as_ptr().cast()).is_null());
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(_close(fd), 0);
+
+        let mut buf = [0u8; 8];
+        set_errno(0);
+        assert_eq!(
+            __stdio_common_vsprintf(0, buf.as_mut_ptr(), 8, std::ptr::null(), 0, std::ptr::null()),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(
+            __stdio_common_vsscanf(0, std::ptr::null(), 4, c"%d".as_ptr().cast(), 0, std::ptr::null()),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+        set_errno(0);
+        assert_eq!(
+            __stdio_common_vswscanf(0, std::ptr::null(), 4, std::ptr::null(), 0, std::ptr::null()),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
     }
 }

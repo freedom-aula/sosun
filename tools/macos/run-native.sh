@@ -2,7 +2,7 @@
 # Runs the game natively and keeps a log you can attach to a tester report.
 # Usage: tools/macos/run-native.sh [--headless] [--seconds N] [--console series-x|series-s] <game folder or .exe>
 #   --headless            no window; frames go to an offscreen layer
-#   --seconds N           stop the run after N seconds (default: run until you close it)
+#   --seconds N, --seconds=N stop the run after N decimal seconds (default: run until you close it)
 #   --console MODEL       console model reported to the game (default: series-s on <=16 GB Macs, else series-x)
 # Extra VICTORY_* variables in your environment are passed through
 # (see docs/native-host.md, "Bring-up diagnostics").
@@ -14,13 +14,23 @@ console=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --headless) headless=(--headless); shift ;;
-    --seconds) seconds="$2"; shift 2 ;;
-    --console) console="$2"; shift 2 ;;
+    --seconds)
+      [[ $# -ge 2 ]] || { echo "--seconds requires a non-negative decimal integer" >&2; exit 2; }
+      seconds="$2"; shift 2 ;;
+    --seconds=*) seconds="${1#--seconds=}"; shift ;;
+    --console)
+      [[ -n "${2:-}" && "$2" != -* ]] || { echo "--console requires a model" >&2; exit 2; }
+      console="$2"; shift 2 ;;
+    --console=) echo "--console requires a model" >&2; exit 2 ;;
     --console=*) console="${1#--console=}"; shift ;;
     -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) break ;;
   esac
 done
+[[ "$seconds" =~ ^[0-9]+$ ]] || { echo "--seconds requires a non-negative decimal integer" >&2; exit 2; }
+decimal_seconds=$((10#$seconds))
+# Bash silently wraps overflowing integers, which could disable or shorten the timer.
+[[ "$seconds" =~ ^0*$decimal_seconds$ ]] || { echo "--seconds exceeds the timer range" >&2; exit 2; }
 [[ $# -eq 1 ]] || { sed -n 2,9p "$0"; exit 2; }
 
 ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
@@ -50,8 +60,8 @@ source tools/macos/native-binary.sh
 bin=$(native_binary) || exit 2
 [[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
 
-run_dir="runs/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$run_dir"
+mkdir -p runs || exit 1
+run_dir=$(mktemp -d "runs/$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
 log="$run_dir/victory.log"
 {
   echo "# $(sw_vers -productName) $(sw_vers -productVersion), $(sysctl -n machdep.cpu.brand_string), ${ram_gb} GB, console=${console}"
@@ -67,8 +77,8 @@ echo "Log: $log"
 "$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
 timer=""
-if (( seconds > 0 )); then
-  ( sleep "$seconds"; kill "$pid" 2>/dev/null ) &
+if (( decimal_seconds > 0 )); then
+  ( sleep "$decimal_seconds"; kill "$pid" 2>/dev/null ) &
   timer=$!
 fi
 # A background job ignores Ctrl-C in a script, so pass it on: stop the game, its

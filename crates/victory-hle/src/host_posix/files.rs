@@ -11,7 +11,7 @@
 //! `GetFileSize(Ex)`, `SetEndOfFile`, `FlushFileBuffers`,
 //! `GetFileAttributes(W|A|ExW)`, `FindFirstFile(W|ExW)`, `FindNextFileW`,
 //! `FindClose`, `DeleteFileW`, `CreateDirectoryW`, `RemoveDirectoryW`,
-//! `GetOverlappedResult`. Overlapped reads complete before the call
+//! `GetOverlappedResult`. Overlapped reads and writes complete before the call
 //! returns, which is a legal outcome.
 //!
 //! Not done: the C runtime's file functions (`fopen`, `_wopen`, `_stat64`,
@@ -25,7 +25,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -163,7 +162,7 @@ pub(crate) fn win32_error(e: &io::Error, path: &Path) -> u32 {
 /// An open file and its file pointer.
 pub(crate) struct FileObject {
     file: File,
-    position: AtomicU64,
+    position: Mutex<u64>,
     /// Opened for `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write goes to the end.
     append: bool,
 }
@@ -211,8 +210,8 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
         OPEN_ALWAYS => {
             options.create(true).write(true);
         }
-        TRUNCATE_EXISTING => {
-            options.truncate(true).write(true);
+        TRUNCATE_EXISTING if access & (GENERIC_WRITE | GENERIC_ALL) != 0 => {
+            options.truncate(true);
         }
         _ => {
             set_error(ERROR_INVALID_PARAMETER);
@@ -233,7 +232,7 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
             let _ = flags;
             new_handle(Object::File(Arc::new(FileObject {
                 file,
-                position: AtomicU64::new(0),
+                position: Mutex::new(0),
                 append,
             })))
         }
@@ -291,6 +290,36 @@ impl Overlapped {
     }
 }
 
+/// Synchronous I/O holds the file position lock from offset selection through completion.
+enum IoPosition<'a> {
+    Synchronous(MutexGuard<'a, u64>),
+    Overlapped(Overlapped),
+}
+
+impl<'a> IoPosition<'a> {
+    fn new(file: &'a FileObject, overlapped: *mut u8) -> Self {
+        if overlapped.is_null() {
+            Self::Synchronous(lock(&file.position))
+        } else {
+            Self::Overlapped(Overlapped(overlapped))
+        }
+    }
+
+    fn offset(&self) -> u64 {
+        match self {
+            Self::Synchronous(position) => **position,
+            Self::Overlapped(ov) => ov.offset(),
+        }
+    }
+
+    fn complete(self, offset: u64, bytes: usize) {
+        match self {
+            Self::Synchronous(mut position) => *position = offset + bytes as u64,
+            Self::Overlapped(ov) => ov.complete(bytes),
+        }
+    }
+}
+
 pub extern "system" fn ReadFile(
     handle: *mut c_void,
     buffer: *mut u8,
@@ -315,10 +344,8 @@ pub extern "system" fn ReadFile(
         // SAFETY: the title's buffer of `len` bytes.
         unsafe { std::slice::from_raw_parts_mut(buffer, len as usize) }
     };
-    let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
-    let at = ov
-        .as_ref()
-        .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset);
+    let position = IoPosition::new(&f, overlapped);
+    let at = position.offset();
     let mut done = 0;
     while done < out.len() {
         match f.file.read_at(&mut out[done..], at + done as u64) {
@@ -331,12 +358,7 @@ pub extern "system" fn ReadFile(
             }
         }
     }
-    match &ov {
-        Some(ov) => ov.complete(done),
-        None => {
-            f.position.fetch_add(done as u64, Ordering::Relaxed);
-        }
-    }
+    position.complete(at, done);
     if !read.is_null() {
         // SAFETY: the title's out-pointer.
         unsafe { read.write(done as u32) };
@@ -365,7 +387,7 @@ pub extern "system" fn WriteFile(
         // SAFETY: the title's buffer of `len` bytes.
         unsafe { std::slice::from_raw_parts(buffer, len as usize) }
     };
-    let ov = (!overlapped.is_null()).then(|| Overlapped(overlapped));
+    let position = IoPosition::new(&f, overlapped);
     let at = if f.append {
         // Append-only access writes at the end whatever the offset, as Windows does.
         match f.file.metadata() {
@@ -376,20 +398,13 @@ pub extern "system" fn WriteFile(
             }
         }
     } else {
-        ov.as_ref()
-            .map_or_else(|| f.position.load(Ordering::Relaxed), Overlapped::offset)
+        position.offset()
     };
     if f.file.write_all_at(data, at).is_err() {
         set_error(ERROR_ACCESS_DENIED);
         return 0;
     }
-    match &ov {
-        Some(ov) => ov.complete(data.len()),
-        None if f.append => f.position.store(at + data.len() as u64, Ordering::Relaxed),
-        None => {
-            f.position.fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
-    }
+    position.complete(at, data.len());
     if !written.is_null() {
         // SAFETY: the title's out-pointer.
         unsafe { written.write(len) };
@@ -411,14 +426,15 @@ pub extern "system" fn GetOverlappedResult(
 }
 
 fn seek(f: &FileObject, distance: i64, method: u32) -> Option<u64> {
+    let mut position = lock(&f.position);
     let base = match method {
         0 => 0,
-        1 => f.position.load(Ordering::Relaxed) as i64,
+        1 => *position as i64,
         2 => f.file.metadata().ok()?.len() as i64,
         _ => return None,
     };
     let to = u64::try_from(base.checked_add(distance)?).ok()?;
-    f.position.store(to, Ordering::Relaxed);
+    *position = to;
     Some(to)
 }
 
@@ -503,7 +519,8 @@ pub extern "system" fn SetEndOfFile(handle: *mut c_void) -> i32 {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
-    i32::from(f.file.set_len(f.position.load(Ordering::Relaxed)).is_ok())
+    let position = lock(&f.position);
+    i32::from(f.file.set_len(*position).is_ok())
 }
 
 pub extern "system" fn FlushFileBuffers(handle: *mut c_void) -> i32 {
@@ -880,6 +897,33 @@ mod tests {
         assert!(!m("*.bin", "a.txt"));
     }
 
+    #[test]
+    fn truncate_existing_requires_generic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.dat");
+        std::fs::write(&path, b"save").unwrap();
+        let name = wide(path.to_str().unwrap());
+        let truncate = |access| {
+            let null = std::ptr::null_mut();
+            CreateFileW(name.as_ptr(), access, 0, null, TRUNCATE_EXISTING, 0, null)
+        };
+
+        for access in [GENERIC_READ, 0, FILE_WRITE_DATA, FILE_APPEND_DATA] {
+            let handle = truncate(access);
+            assert_eq!(std::fs::read(&path).unwrap(), b"save");
+            assert_eq!(handle, invalid_handle());
+            assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+        }
+
+        for access in [GENERIC_WRITE, GENERIC_ALL] {
+            std::fs::write(&path, b"save").unwrap();
+            let handle = truncate(access);
+            assert_ne!(handle, invalid_handle(), "access {access:#x}");
+            assert_eq!(super::super::CloseHandle(handle), 1);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        }
+    }
+
     /// `FILE_APPEND_DATA` alone writes at the end of the file, whatever the file pointer says.
     #[test]
     fn append_only_access_writes_at_the_end() {
@@ -904,6 +948,54 @@ mod tests {
         assert_eq!(WriteFile(h, b"X".as_ptr(), 1, &mut count, null), 1);
         assert_eq!(super::super::CloseHandle(h), 1);
         assert_eq!(std::fs::read(dir.path().join("log.txt")).unwrap(), b"Xbcdef");
+    }
+
+    #[test]
+    fn concurrent_synchronous_writes_keep_both_records() {
+        const RECORD_LEN: usize = 4096;
+        const ROUNDS: usize = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.bin");
+        let handle = create(Some(path.clone()), GENERIC_WRITE, CREATE_ALWAYS, 0);
+        assert_ne!(handle, invalid_handle());
+        let handle_id = handle as usize;
+        let start = std::sync::Barrier::new(2);
+        let first = [b'A'; RECORD_LEN];
+        let second = [b'B'; RECORD_LEN];
+
+        let write_records = |record: &[u8; RECORD_LEN]| {
+            let mut all_written = true;
+            for _ in 0..ROUNDS {
+                start.wait();
+                let mut count = 0;
+                let result = WriteFile(
+                    handle_id as *mut c_void,
+                    record.as_ptr(),
+                    RECORD_LEN as u32,
+                    &mut count,
+                    std::ptr::null_mut(),
+                );
+                all_written &= result == 1 && count == RECORD_LEN as u32;
+            }
+            all_written
+        };
+        std::thread::scope(|scope| {
+            let writer_a = scope.spawn(|| write_records(&first));
+            let writer_b = scope.spawn(|| write_records(&second));
+            assert!(writer_a.join().unwrap());
+            assert!(writer_b.join().unwrap());
+        });
+
+        assert_eq!(super::super::CloseHandle(handle), 1);
+        let data = std::fs::read(path).unwrap();
+        assert_eq!(data.len(), ROUNDS * 2 * RECORD_LEN);
+        for (round, pair) in data.chunks_exact(2 * RECORD_LEN).enumerate() {
+            let (left, right) = pair.split_at(RECORD_LEN);
+            assert!(
+                (left == first && right == second) || (left == second && right == first),
+                "round {round} lost or corrupted a record"
+            );
+        }
     }
 
     #[test]

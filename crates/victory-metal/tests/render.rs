@@ -34,7 +34,10 @@ const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
 
 impl<'a> Scene<'a> {
-    fn new(m: &'a Metal, depth_test: Option<(bool, Compare)>) -> Scene<'a> {
+    fn pipeline(
+        m: &Metal,
+        depth_test: Option<(bool, Compare)>,
+    ) -> <Metal as GraphicsBackend>::RenderPipeline {
         let attrs = [
             VertexAttr {
                 format: VertexFormat::Float2,
@@ -52,25 +55,28 @@ impl<'a> Scene<'a> {
                 offset: 16,
             },
         ];
-        let pipe = m
-            .create_render_pipeline(&RenderPipelineDesc {
-                vs: &fixture("tri_vs"),
-                ps: Some(&fixture("tri_ps")),
-                vs_layout: None,
-                ps_layout: None,
-                attributes: &attrs,
-                streams: &[VertexStream {
-                    slot: 0,
-                    stride: 32,
-                    per_instance: false,
-                }],
-                color: &[Format::Rgba8Unorm],
-                depth: Some(Format::D32Float),
-                depth_test,
-                cull: Cull::None,
-                ..Default::default()
-            })
-            .unwrap();
+        m.create_render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: Some(Format::D32Float),
+            depth_test,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn new(m: &'a Metal, depth_test: Option<(bool, Compare)>) -> Scene<'a> {
+        let pipe = Self::pipeline(m, depth_test);
         let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
         rt.render_target = true;
         let color = m.create_texture(&rt).unwrap();
@@ -86,6 +92,7 @@ impl<'a> Scene<'a> {
                 min_mag: Filter::Nearest,
                 mip: Filter::Nearest,
                 address: [Address::Clamp; 3],
+                border_color: BorderColor::TransparentBlack,
                 max_anisotropy: 1,
             })
             .unwrap();
@@ -123,7 +130,7 @@ impl<'a> Scene<'a> {
                 sampler: Some(&self.smp),
             },
             resources: vec![],
-            vertex_buffers: vec![(&self.arena.buf, self.arena.at(verts))],
+            vertex_buffers: vec![(0, &self.arena.buf, self.arena.at(verts))],
             index_buffer: idx.then(|| (&self.arena.buf, self.arena.at(4096) as *const u8)),
             call,
             indirect: None,
@@ -266,6 +273,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
             min_mag: Filter::Nearest,
             mip: Filter::Nearest,
             address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
             max_anisotropy: 1,
         })
         .unwrap();
@@ -330,6 +338,50 @@ fn depth_test_rejects_a_draw_behind() {
     let (a, b) = (s.draw(0.25, call, 0, false), s.draw(0.75, call, 512, false));
     s.submit(&[s.pass(vec![a, b], [0.0, 0.0, 0.0, 1.0])]);
     assert!(s.pixels().iter().all(|p| *p == [0, 255, 0, 255]));
+}
+
+#[test]
+fn switching_to_disabled_depth_clears_the_previous_test() {
+    let Some(m) = backend() else { return };
+    let s = Scene::new(&m, Some((true, Compare::Never)));
+    let disabled = Scene::pipeline(&m, None);
+    s.arena.write(
+        0,
+        &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)],
+    );
+    let call = DrawCall::Arrays {
+        vertex_count: 3,
+        instance_count: 1,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    let first = s.draw(0.5, call, 0, false);
+    let mut second = s.draw(0.5, call, 0, false);
+    second.pipeline = &disabled;
+    second.state.scissor = Some([0, 0, 8, 16]);
+    s.submit(&[s.pass(vec![first, second], [0.0, 0.0, 0.0, 1.0])]);
+
+    let p = s.pixels();
+    assert_eq!(
+        px(&p, 12, 8),
+        [0, 0, 0, 255],
+        "Compare::Never rejects the first draw"
+    );
+    assert_eq!(
+        px(&p, 4, 8),
+        [255, 0, 0, 255],
+        "the depth-disabled draw reaches the target"
+    );
+    let mut depth = [0u8; W * W * 4];
+    m.read_texture(&s.depth, 0, 0, &mut depth, W * 4, 0);
+    assert!(
+        depth
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|d| f32::from_ne_bytes(*d) == 1.0),
+        "the depth-disabled draw preserves the clear depth"
+    );
 }
 
 #[test]
@@ -576,7 +628,7 @@ fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
                 sampler: Some(&s.smp),
             },
             resources: vec![],
-            vertex_buffers: vec![(&s.arena.buf, s.arena.at(512))],
+            vertex_buffers: vec![(0, &s.arena.buf, s.arena.at(512))],
             index_buffer: None,
             call,
             indirect: None,
@@ -693,7 +745,7 @@ fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4
             sampler: Some(&s.smp),
         },
         resources: vec![],
-        vertex_buffers: vec![(&s.arena.buf, s.arena.at(512))],
+        vertex_buffers: vec![(0, &s.arena.buf, s.arena.at(512))],
         index_buffer: None,
         call,
         indirect: None,
@@ -781,5 +833,80 @@ fn the_static_sampler_table_follows_the_root_parameters() {
             .into_iter()
             .find(|r| r.0 == 0 && r.1 == u32::MAX);
         assert_eq!(table.map(|r| (r.3, r.4)), Some((at, 8)), "{:?}", l.params);
+    }
+}
+
+#[test]
+fn zero_count_draws_do_not_fail_validation() {
+    for m in backends() {
+        let s = Scene::new(&m, None);
+        let d1 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 0,
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        let d2 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 3,
+                instance_count: 0,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        let d3 = s.draw(
+            0.5,
+            DrawCall::Indexed {
+                index_count: 0,
+                instance_count: 1,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                wide: false,
+            },
+            0,
+            true,
+        );
+        let d4 = s.draw(
+            0.5,
+            DrawCall::Indexed {
+                index_count: 3,
+                instance_count: 0,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+                wide: false,
+            },
+            0,
+            true,
+        );
+        let mut d5 = s.draw(
+            0.5,
+            DrawCall::Arrays {
+                vertex_count: 3,
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            0,
+            false,
+        );
+        d5.state.viewport = Some(Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 16.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        });
+        s.submit(&[s.pass(vec![d1, d2, d3, d4, d5], [0.0; 4])]);
     }
 }

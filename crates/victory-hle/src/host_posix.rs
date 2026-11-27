@@ -212,8 +212,11 @@ fn reserve_granular(at: Option<usize>, len: usize) -> std::io::Result<*mut u8> {
         // SAFETY: fresh address space; a fixed address fails if taken.
         return unsafe { mem::reserve(at, len) };
     }
+    let Some(padded) = len.checked_add(GRANULARITY) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
     // SAFETY: fresh address space.
-    let p = unsafe { mem::reserve(None, len + GRANULARITY) }? as usize;
+    let p = unsafe { mem::reserve(None, padded) }? as usize;
     let start = p.next_multiple_of(GRANULARITY);
     // SAFETY: the ends of the reservation just made.
     unsafe {
@@ -221,8 +224,8 @@ fn reserve_granular(at: Option<usize>, len: usize) -> std::io::Result<*mut u8> {
             mem::release(p as *mut u8, start - p)?;
         }
         let end = start + len;
-        if p + len + GRANULARITY > end {
-            mem::release(end as *mut u8, p + len + GRANULARITY - end)?;
+        if p + padded > end {
+            mem::release(end as *mut u8, p + padded - end)?;
         }
     }
     Ok(start as *mut u8)
@@ -240,11 +243,13 @@ pub extern "system" fn VirtualAlloc(
     };
     let _call = enter("VirtualAlloc");
     let page = mem::page_size();
-    let len = size.next_multiple_of(page);
     let at = address as usize;
     // A commit with no address reserves too, as on Windows.
     let result = if kind & MEM_RESERVE != 0 || at == 0 {
-        let len = size.next_multiple_of(GRANULARITY);
+        let Some(len) = size.checked_next_multiple_of(GRANULARITY) else {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            return std::ptr::null_mut();
+        };
         let at = (at != 0).then_some(at & !(GRANULARITY - 1));
         reserve_granular(at, len).and_then(|p| {
             if kind & MEM_COMMIT != 0 {
@@ -261,9 +266,15 @@ pub extern "system" fn VirtualAlloc(
         })
     } else if kind & MEM_COMMIT != 0 && at != 0 {
         let start = at & !(page - 1);
+        let Some(end) = at
+            .checked_add(size)
+            .and_then(|e| e.checked_next_multiple_of(page))
+        else {
+            set_error(ERROR_NOT_ENOUGH_MEMORY);
+            return std::ptr::null_mut();
+        };
         // SAFETY: the title commits inside a reservation of its own.
-        unsafe { mem::commit(start as *mut u8, (at + len) - start, prot) }
-            .map(|()| start as *mut u8)
+        unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| start as *mut u8)
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -344,13 +355,21 @@ pub extern "system" fn VirtualProtect(
     protect: u32,
     old: *mut u32,
 ) -> i32 {
-    let Some(prot) = protection(protect) else {
+    let (Some(prot), true) = (protection(protect), size > 0) else {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     };
     let page = mem::page_size();
-    let start = address as usize & !(page - 1);
-    let len = (address as usize + size).next_multiple_of(page) - start;
+    let at = address as usize;
+    let start = at & !(page - 1);
+    let Some(end) = at
+        .checked_add(size)
+        .and_then(|e| e.checked_next_multiple_of(page))
+    else {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    let len = end - start;
     // SAFETY: the title protects its own memory.
     match unsafe { mem::protect(start as *mut u8, len, prot) } {
         Ok(previous) => {
@@ -529,6 +548,10 @@ pub extern "system" fn CreateSemaphoreW(
     max: i32,
     _name: *const u16,
 ) -> *mut c_void {
+    if initial < 0 || max <= 0 || initial > max {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
     match Semaphore::new(initial as u32, max as u32) {
         Ok(s) => {
             let h = new_handle(Object::Semaphore(Arc::new(s)));
@@ -559,6 +582,10 @@ pub extern "system" fn ReleaseSemaphore(
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    if count <= 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     match s.release(count as u32) {
         Some(before) => {
             sync::signalled();
@@ -685,6 +712,15 @@ pub extern "system" fn WaitForMultipleObjects(
     }
     // SAFETY: the title passes `count` handles.
     let handles = unsafe { std::slice::from_raw_parts(handles, count as usize) };
+    if wait_all != 0
+        && handles
+            .iter()
+            .enumerate()
+            .any(|(i, h)| handles[i + 1..].contains(h))
+    {
+        set_error(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
     let objects: Option<Vec<Waitable>> = handles.iter().map(|&h| Waitable::of(h)).collect();
     let Some(objects) = objects else {
         set_error(ERROR_INVALID_HANDLE);
@@ -986,6 +1022,7 @@ fn exceptions(name: &str) -> Option<usize> {
     match name {
         "RtlCaptureContext" => direct(api::capture_context_address()),
         "RaiseException" => direct(api::raise_exception_address()),
+        "DebugBreak" => direct(api::debug_break_address()),
         "RtlLookupFunctionEntry" => Some(api::lookup_function_entry as *const () as usize),
         "RtlVirtualUnwind" => Some(api::virtual_unwind as *const () as usize),
         "RtlAddFunctionTable" => Some(api::add_function_table as *const () as usize),
@@ -1349,5 +1386,59 @@ mod memory_tests {
         unsafe { mem::release(host, 2 * GRANULARITY) }.expect("released");
         assert_eq!(VirtualFree(r, 0, MEM_RELEASE), 1);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn unaligned_commit_stays_within_reservation_and_overflow_does_not_panic() {
+        let base = VirtualAlloc(std::ptr::null_mut(), GRANULARITY, MEM_RESERVE, 0x01);
+        assert!(!base.is_null());
+        // Committing the final 256 bytes of a reservation must not spill past the reservation end.
+        let tail = base.cast::<u8>().wrapping_add(GRANULARITY - 256).cast();
+        let committed = VirtualAlloc(tail, 256, MEM_COMMIT, 0x04);
+        let page = mem::page_size();
+        assert_eq!(committed as usize, (tail as usize) & !(page - 1));
+        // SAFETY: the tail page was committed read-write.
+        unsafe {
+            tail.cast::<u8>().write(0x5A);
+            assert_eq!(tail.cast::<u8>().read(), 0x5A);
+        }
+
+        // Overflowing sizes fail cleanly without panicking; zero-size VirtualProtect fails.
+        assert!(VirtualAlloc(std::ptr::null_mut(), usize::MAX, MEM_RESERVE, 0x04).is_null());
+        assert_eq!(GetLastError(), ERROR_NOT_ENOUGH_MEMORY);
+        let mut old = 0u32;
+        assert_eq!(VirtualProtect(base, 0, 0x02, &mut old), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(VirtualProtect(base, usize::MAX, 0x02, &mut old), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+        assert_eq!(VirtualFree(base, 0, MEM_RELEASE), 1);
+    }
+
+    #[test]
+    fn semaphore_bounds_and_wait_all_duplicates_are_rejected() {
+        assert!(CreateSemaphoreW(std::ptr::null(), -1, -1, std::ptr::null()).is_null());
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert!(CreateSemaphoreW(std::ptr::null(), 0, -5, std::ptr::null()).is_null());
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+
+        let sem = CreateSemaphoreW(std::ptr::null(), 0, 2, std::ptr::null());
+        assert!(!sem.is_null());
+        let mut prev = -1;
+        assert_eq!(ReleaseSemaphore(sem, 0, &mut prev), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(ReleaseSemaphore(sem, -1, &mut prev), 0);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(ReleaseSemaphore(sem, 1, &mut prev), 1);
+        assert_eq!(prev, 0);
+        assert_eq!(CloseHandle(sem), 1);
+
+        let ev = CreateEventW(std::ptr::null(), 1, 1, std::ptr::null());
+        assert!(!ev.is_null());
+        let dup = [ev, ev];
+        assert_eq!(WaitForMultipleObjects(2, dup.as_ptr(), 1, 0), WAIT_FAILED);
+        assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
+        assert_eq!(WaitForMultipleObjects(2, dup.as_ptr(), 0, 0), WAIT_OBJECT_0);
+        assert_eq!(CloseHandle(ev), 1);
     }
 }

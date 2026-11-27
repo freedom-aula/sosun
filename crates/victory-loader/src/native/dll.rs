@@ -93,8 +93,8 @@ fn map_imports(
 }
 
 /// The file called `name` in `dir`, whatever its case (volumes can be case
-/// sensitive; imports are not).
-fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+/// sensitive; imports and the title's manifest name are not).
+pub fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let direct = dir.join(name);
     if direct.is_file() {
         return Some(direct);
@@ -124,13 +124,17 @@ fn map_dll(
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let image = NativeImage::map(&bytes, None).with_context(|| format!("mapping {name}"))?;
     drop(bytes);
+    // Its own imports first, so it is initialised after them.
+    if let Err(err) = map_imports(image.info(), dir, wanted, seen, mapped) {
+        // SAFETY: not registered in TLS or exposed to title code yet.
+        unsafe { image.unmap() };
+        return Err(err);
+    }
     // Before any thread runs title code, and while its index word is writable.
     #[cfg(target_arch = "x86_64")]
     if let Some(tls) = image.tls() {
         super::teb::register_tls(tls);
     }
-    // Its own imports first, so it is initialised after them.
-    map_imports(image.info(), dir, wanted, seen, mapped)?;
     let dll: &'static TitleDll = Box::leak(Box::new(TitleDll { name, path, image }));
     registry().push(dll);
     mapped.push(dll);
@@ -163,6 +167,9 @@ impl TitleDll {
 /// `"dll.name"` or `"dll.#7"`, as an export forwards to it.
 fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
     let (dll, name) = forward.rsplit_once('.')?;
+    if dll.is_empty() || name.is_empty() {
+        return None;
+    }
     let symbol = match name.strip_prefix('#') {
         Some(ordinal) => ImportSymbol::Ordinal(ordinal.parse().ok()?),
         None => ImportSymbol::Name {
@@ -226,5 +233,48 @@ impl ImportResolver for WithTitleDlls<'_> {
             Resolution::Missing => self.lookup_in_dlls(dll, symbol, 0),
             found => found,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_found_whatever_its_case_and_only_if_it_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MSVCP140.DLL"), b"").unwrap();
+        std::fs::write(dir.path().join("microsoftgame.config"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("bink2scarlett.dll")).unwrap();
+
+        let found = find_file(dir.path(), "msvcp140.dll").unwrap();
+        assert!(found.is_file());
+        let config = find_file(dir.path(), "MicrosoftGame.config").unwrap();
+        assert!(config.is_file());
+        assert_eq!(find_file(dir.path(), "vcruntime140.dll"), None);
+        // A folder of that name is not the DLL.
+        assert_eq!(find_file(dir.path(), "bink2scarlett.dll"), None);
+    }
+
+    #[test]
+    fn forward_target_rejects_empty_dll_or_symbol() {
+        assert_eq!(forward_target(".Func"), None);
+        assert_eq!(forward_target("kernel32."), None);
+        assert_eq!(forward_target("kernel32.#"), None);
+        assert_eq!(forward_target("plain"), None);
+        assert_eq!(
+            forward_target("api-ms-win-crt-runtime-l1-1-0.exit"),
+            Some((
+                "api-ms-win-crt-runtime-l1-1-0.dll".into(),
+                ImportSymbol::Name {
+                    hint: 0,
+                    name: "exit".into(),
+                }
+            ))
+        );
+        assert_eq!(
+            forward_target("ws2_32.#7"),
+            Some(("ws2_32.dll".into(), ImportSymbol::Ordinal(7)))
+        );
     }
 }
