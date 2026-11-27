@@ -134,6 +134,25 @@ impl PoolTable {
         self.lock().generation
     }
 
+    /// The mapping containing title address `addr`, if any, without copying the table.
+    pub(super) fn mapping_at(&self, addr: u64) -> Option<super::addr::Mapping> {
+        let addr_usize = usize::try_from(addr).ok()?;
+        let g = self.lock();
+        let (&at, m) = g.maps.range(..=addr_usize).next_back()?;
+        if addr_usize - at >= m.len {
+            return None;
+        }
+        let pool = g.pools.get(&m.pool)?;
+        Some(super::addr::Mapping {
+            at: at as u64,
+            len: m.len as u64,
+            pool: pool.id,
+            base: pool.base,
+            pool_len: pool.len as u64,
+            offset: m.offset as u64,
+        })
+    }
+
     /// Every mapping, by title address: `(at, len, pool, offset in the pool)`.
     pub fn mappings(&self) -> (u64, Vec<(usize, usize, PoolInfo, usize)>) {
         let g = self.lock();
@@ -282,5 +301,21 @@ mod tests {
             assert!(t.resolve(addr, 1).is_none());
         }
         assert_eq!(t.resolve(0x7000, 1).unwrap().1 as usize, p.base + 0x9000);
+    }
+
+    #[test]
+    fn mapping_at_finds_single_address_without_snapshot() {
+        let t = PoolTable::default();
+        let (p, q) = (pool(1), pool(2));
+        t.mapped(0x2000, 0x1000, &p, 0x400);
+        t.mapped(0x5000, 0x2000, &q, 0x800);
+        assert!(t.mapping_at(0x1fff).is_none());
+        let first = t.mapping_at(0x2000).unwrap();
+        assert_eq!((first.at, first.len, first.pool, first.offset), (0x2000, 0x1000, 1, 0x400));
+        assert!(t.mapping_at(0x2fff).is_some());
+        assert!(t.mapping_at(0x3000).is_none());
+        let second = t.mapping_at(0x6fff).unwrap();
+        assert_eq!((second.at, second.len, second.pool, second.offset), (0x5000, 0x2000, 2, 0x800));
+        assert!(t.mapping_at(0x7000).is_none());
     }
 }
