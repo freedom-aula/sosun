@@ -1306,6 +1306,33 @@ mod tests {
     }
 
     #[test]
+    fn clobbered_far_jumps_stay_indirect() {
+        const CARRY: u32 = 0x8209_8009; // s_addc_u32 s9, s9, 0
+        const CLEAR_LOW: u32 = 0xBE88_0380; // s_mov_b32 s8, 0
+        const CLEAR_HIGH: u32 = 0xBE89_0380; // s_mov_b32 s9, 0
+        const COMPARE: u32 = 0xBF06_8000; // s_cmp_eq_u32 s0, 0 (writes SCC)
+
+        for middle in [
+            &[CLEAR_LOW][..],
+            &[CARRY, CLEAR_HIGH],
+            &[COMPARE, CARRY],
+            &[0x8289_8009], // s_subb_u32 instead of s_addc_u32
+            &[0x8209_C109], // high offset -1 instead of 0
+            &[0x8209_800A], // carry reads s10 instead of s9
+        ] {
+            let mut words = vec![0xBE88_1F00, 0x8008_FF08, 28]; // getpc + 28 -> 32
+            words.extend_from_slice(middle);
+            words.push(0xBE80_2008); // s_setpc_b64 s[8:9]
+            words.resize(8, 0xFFFF_FFFF);
+            words.push(S_ENDPGM); // stale target at byte 32
+
+            let p = build_words(&words, false);
+            assert_eq!(p.blocks[0].exit, Exit::Indirect, "{middle:x?}");
+            assert_eq!(p.blocks.len(), 1, "decoded stale target for {middle:x?}");
+        }
+    }
+
+    #[test]
     fn reports_what_it_cannot_express() {
         let code: Vec<u8> = [0xBE80_2E01_u32, S_ENDPGM] // s_movrels_b32 s0, s1
             .iter()
