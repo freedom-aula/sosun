@@ -4620,19 +4620,27 @@ impl<'a> Lower<'a> {
         }
         if name == "ds_bpermute_b32" {
             // Each lane reads `data` of the lane its address plus the offset
-            // names in dwords (modulo the wave); 0 from a lane EXEC leaves out.
+            // names in its own 32-lane half; 0 from a lane EXEC leaves out.
             self.cross_lane(false, outside_compute!("ds_bpermute_b32"))?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.wave() - 1));
+            let (o, two, k31) = (k(self, offset), k(self, 2), k(self, 31));
             let at = self.s.m.bin(c, Bin::Add, a, o);
-            let lane = self.s.m.bin(c, Bin::LShr, at, two);
-            let lane = self.s.m.bin(c, Bin::And, lane, last);
-            let r = self.wide_read_lane(x, lane)?;
+            let dword = self.s.m.bin(c, Bin::LShr, at, two);
+            let local = self.s.m.bin(c, Bin::And, dword, k31);
+            let src = if self.x.native.wave64 && !self.host32 {
+                let lane = self.lane_index();
+                let k32 = k(self, 32);
+                let half = self.s.m.bin(c, Bin::And, lane, k32);
+                self.s.m.bin(c, Bin::Or, half, local)
+            } else {
+                local
+            };
+            let r = self.read_lane(x, src);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-            let (lo, hi) = self.wide_ballot(c, self.cur_ir, on)?;
-            let running = self.lane_bit_of(c, lane, lo, hi);
+            let (lo, hi) = self.host_ballot(c, on);
+            let running = self.lane_bit_of(c, src, lo, hi);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;
