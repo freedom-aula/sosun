@@ -163,6 +163,7 @@ pub(crate) fn win32_error(e: &io::Error, path: &Path) -> u32 {
 pub(crate) struct FileObject {
     file: File,
     position: Mutex<u64>,
+    writable: bool,
     /// Opened for `FILE_APPEND_DATA` without `FILE_WRITE_DATA`: every write goes to the end.
     append: bool,
 }
@@ -208,7 +209,9 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
         }
         OPEN_EXISTING => {}
         OPEN_ALWAYS => {
-            options.create(true).write(true);
+            // Darwin permits O_RDONLY | O_CREAT, including when the file already exists.
+            const O_CREAT: i32 = 0x0200;
+            options.custom_flags(O_CREAT);
         }
         TRUNCATE_EXISTING if access & (GENERIC_WRITE | GENERIC_ALL) != 0 => {
             options.truncate(true);
@@ -218,8 +221,6 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
             return invalid_handle();
         }
     }
-    // A directory opens for reading (FILE_FLAG_BACKUP_SEMANTICS).
-    options.custom_flags(0);
     match options.open(&path) {
         Ok(file) => {
             set_error(
@@ -233,6 +234,7 @@ fn create(path: Option<PathBuf>, access: u32, disposition: u32, flags: u32) -> *
             new_handle(Object::File(Arc::new(FileObject {
                 file,
                 position: Mutex::new(0),
+                writable: write,
                 append,
             })))
         }
@@ -373,10 +375,18 @@ pub extern "system" fn WriteFile(
     written: *mut u32,
     overlapped: *mut u8,
 ) -> i32 {
+    if !written.is_null() {
+        // SAFETY: the title's byte-count out-pointer.
+        unsafe { written.write(0) };
+    }
     let Some(f) = file_of(handle) else {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    if !f.writable {
+        set_error(ERROR_ACCESS_DENIED);
+        return 0;
+    }
     if len > 0 && buffer.is_null() {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
@@ -519,6 +529,10 @@ pub extern "system" fn SetEndOfFile(handle: *mut c_void) -> i32 {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
+    if !f.writable || f.append {
+        set_error(ERROR_ACCESS_DENIED);
+        return 0;
+    }
     let position = lock(&f.position);
     i32::from(f.file.set_len(*position).is_ok())
 }
@@ -898,6 +912,61 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_read_only_handle_does_not_grant_write_access() {
+        for disposition in [OPEN_ALWAYS, CREATE_NEW, CREATE_ALWAYS] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("save.dat");
+            let name = wide(path.to_str().unwrap());
+            let null = std::ptr::null_mut();
+            let h = CreateFileW(name.as_ptr(), GENERIC_READ, 0, null, disposition, 0, null);
+            assert_ne!(h, invalid_handle());
+            assert_eq!(super::super::GetLastError(), 0);
+            let mut count = 99;
+            assert_eq!(WriteFile(h, b"x".as_ptr(), 1, &mut count, null.cast()), 0);
+            assert_eq!(super::super::GetLastError(), ERROR_ACCESS_DENIED);
+            assert_eq!(count, 0);
+            assert_eq!(SetFilePointerEx(h, 3, std::ptr::null_mut(), 0), 1);
+            set_error(0);
+            assert_eq!(SetEndOfFile(h), 0);
+            assert_eq!(super::super::GetLastError(), ERROR_ACCESS_DENIED);
+            assert_eq!(super::super::CloseHandle(h), 1);
+            assert!(std::fs::read(path).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn open_always_respects_access_when_reopening_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("save.dat");
+        let name = wide(path.to_str().unwrap());
+        let null = std::ptr::null_mut();
+        let open = |access| CreateFileW(name.as_ptr(), access, 0, null, OPEN_ALWAYS, 0, null);
+
+        let h = open(GENERIC_READ | GENERIC_WRITE);
+        assert_ne!(h, invalid_handle());
+        let mut count = 0;
+        assert_eq!(WriteFile(h, b"save".as_ptr(), 4, &mut count, null.cast()), 1);
+        assert_eq!(count, 4);
+        assert_eq!(super::super::CloseHandle(h), 1);
+
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let h = open(GENERIC_READ);
+        assert_ne!(h, invalid_handle());
+        assert_eq!(super::super::GetLastError(), ERROR_ALREADY_EXISTS);
+        let mut data = [0; 4];
+        assert_eq!(ReadFile(h, data.as_mut_ptr(), 4, &mut count, null.cast()), 1);
+        assert_eq!(count, 4);
+        assert_eq!(&data, b"save");
+        assert_eq!(WriteFile(h, b"!".as_ptr(), 1, &mut count, null.cast()), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_ACCESS_DENIED);
+        assert_eq!(count, 0);
+        assert_eq!(super::super::CloseHandle(h), 1);
+        assert_eq!(std::fs::read(path).unwrap(), b"save");
+    }
+
+    #[test]
     fn truncate_existing_requires_generic_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("save.dat");
@@ -939,6 +1008,8 @@ mod tests {
         assert_ne!(h, invalid_handle());
         let mut count = 0u32;
         let null = std::ptr::null_mut();
+        assert_eq!(SetEndOfFile(h), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_ACCESS_DENIED);
         assert_eq!(WriteFile(h, b"de".as_ptr(), 2, &mut count, null), 1);
         assert_eq!(WriteFile(h, b"f".as_ptr(), 1, &mut count, null), 1);
         assert_eq!(super::super::CloseHandle(h), 1);
