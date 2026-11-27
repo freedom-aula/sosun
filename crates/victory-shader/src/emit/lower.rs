@@ -13740,10 +13740,11 @@ impl<'a> Lower<'a> {
     fn live_edges(&self) -> Set<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
         let (p, st) = (self.x.p, &self.x.st);
+        type Visit = (Value, Vec<(Bool, bool)>);
         // Visits waiting, by how many conditions they know: those that know least go first,
         // so that what knows more finds them done and stops (in any other order one join was
         // gone through for tens of thousands of sets of conditions).
-        let mut work: [Vec<(Value, Vec<(Bool, bool)>)>; MAX_KNOWN + 1] = Default::default();
+        let mut work: [Vec<Visit>; MAX_KNOWN + 1] = Default::default();
         work[0] = self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         let mut live = Set::default();
         // By join, what was known each time it was gone through, sorted: a set, so finding
