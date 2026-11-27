@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use victory_backend::backend::{RootLayout, RootParam};
-use victory_backend::resources::{DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport};
+use victory_backend::resources::{
+    ClearRect, DrawCall, DrawState, GraphicsBackend, HeapKind, Topology, Viewport,
+};
 
 /// A heap the title wrote views into: `start` is its descriptor memory (title addresses).
 pub struct NativeHeap<B: GraphicsBackend> {
@@ -307,6 +309,7 @@ pub enum Cmd<B: GraphicsBackend> {
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
         depth: Option<DepthClear<B::Texture>>,
+        rects: Option<Rc<[ClearRect]>>,
     },
     Draw {
         pso: Rc<B::RenderPipeline>,
@@ -420,9 +423,10 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 row_pitch: *row_pitch,
                 slice_pitch: *slice_pitch,
             },
-            Cmd::Clear { color, depth } => Cmd::Clear {
+            Cmd::Clear { color, depth, rects } => Cmd::Clear {
                 color: color.clone(),
                 depth: depth.clone(),
+                rects: rects.clone(),
             },
             Cmd::Draw {
                 pso,
@@ -817,6 +821,20 @@ impl<B: GraphicsBackend> NativeList<B> {
         self.cmds.push(Cmd::Clear {
             color: Some((target.clone(), color)),
             depth: None,
+            rects: None,
+        });
+    }
+
+    pub fn clear_render_target_rects(
+        &mut self,
+        target: &Rc<B::Texture>,
+        color: [f32; 4],
+        rects: &[ClearRect],
+    ) {
+        self.cmds.push(Cmd::Clear {
+            color: Some((target.clone(), color)),
+            depth: None,
+            rects: Some(Rc::from(rects)),
         });
     }
 
@@ -835,6 +853,7 @@ impl<B: GraphicsBackend> NativeList<B> {
             self.cmds.push(Cmd::Clear {
                 color: None,
                 depth: Some((target.clone(), depth, stencil)),
+                rects: None,
             });
         }
     }

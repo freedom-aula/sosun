@@ -572,6 +572,16 @@ pub struct RenderPass<'a, B: GraphicsBackend + ?Sized> {
     pub draws: Vec<Draw<'a, B>>,
 }
 
+/// Signed view-relative bounds, with exclusive right and bottom edges.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ClearRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
 /// A GPU-side copy or fill operation, ordered with the passes around it.
 pub enum BlitOp<'a, B: ResourceBackend + ?Sized> {
     Copy {
@@ -623,6 +633,11 @@ pub enum Pass<'a, B: GraphicsBackend + ?Sized> {
     Compute(&'a [Dispatch<'a, B>]),
     Render(RenderPass<'a, B>),
     Blit(Vec<BlitOp<'a, B>>),
+    ClearColorRects {
+        target: &'a B::Texture,
+        color: [f32; 4],
+        rects: &'a [ClearRect],
+    },
 }
 
 /// Like `Submission`, with render passes among the dispatches, run in order.
