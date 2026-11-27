@@ -1305,6 +1305,33 @@ mod tests {
         assert_eq!(h.stage, HwStage::Ms);
     }
 
+    /// The vertex buffer table (s0/s1) is no root argument: where root views are title memory
+    /// (a vertex program with `zero_copy_memory`), its address is not read from user data, which
+    /// no host could fill (the fetch then read from address 0, and nothing was drawn).
+    #[test]
+    fn the_vertex_table_is_not_read_from_user_data_where_root_views_are_title_memory() {
+        let code = words(&[
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0301, // s_mov_b32 s3, s1
+            0xF408_0201,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], 0x0
+            0xEA52_2000,
+            0x8002_0100, // tbuffer_load_format_xyz v[1:3], v0, s[8:11], 0 format:32_32_32_FLOAT idxen
+            0xF800_08CF,
+            0x0303_0201, // exp pos0 v1, v2, v3, v3 done
+            ENDPGM,
+        ]);
+        let (p, _) = infer(HwStage::Vs, &code, &meta_with(&[])).unwrap();
+        assert!(p.layout.iter().any(|r| r.slot == VERTEX_TABLE && r.user_data == 0));
+        let c = container(HwStage::Vs, &code, &meta_with(&[])).unwrap();
+        for zero_copy_memory in [false, true] {
+            let options = super::super::Options { wave32_host: true, zero_copy_memory, ..Default::default() };
+            let h = super::super::translate_with(&c, options).unwrap();
+            assert!(h.user_data.iter().all(|u| u.slot != VERTEX_TABLE), "{zero_copy_memory}: {:?}", h.user_data);
+            assert!(!h.memory);
+        }
+    }
+
     /// Only parameters that may hold two f16 halves get `HALF` outputs, those that can hold
     /// nothing else first and their `TEXCOORD` last: param0 is a 32-bit float product (plain),
     /// param1 a literal of two f16s (either), param2 a `v_cvt_pkrtz_f16_f32` or 0 (halves).
