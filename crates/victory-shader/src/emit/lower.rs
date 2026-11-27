@@ -1986,6 +1986,7 @@ impl<'a> Lower<'a> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         let p = self.x.p;
         let interp_uses = std::cell::LazyCell::new(|| InterpUses::new(p));
+        let prim_uses = std::cell::LazyCell::new(|| crate::io::PrimMaskUses::new(p));
         for &(reg, v) in &p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2011,7 +2012,7 @@ impl<'a> Lower<'a> {
                     // value goes unread.
                     None if self.s.pixel
                         && ((self.x.io.initialized_sgprs == Some(n + 2)
-                            && (!self.guessed || crate::io::is_prim_mask_only(self.x.p, v, true)))
+                            && (!self.guessed || prim_uses.is_prim_mask_only(v, true)))
                             || interp_uses.is_interp_m0_only(v)) =>
                     {
                         Val::I32(self.s.m.i32(0))
@@ -10752,31 +10753,49 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
+            let mut cycle_cache: Vec<Option<bool>> = vec![None; p.blocks.len()];
+            let mut on_cycle = |x: usize| -> bool {
+                *cycle_cache[x].get_or_insert_with(|| self.on_cycle(x))
+            };
             let mut set = Set::default();
+            let mut read_execs = Vec::new();
             for (b, blk) in p.blocks.iter().enumerate() {
                 for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
                     let reads = reads.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    read_execs.clear();
+                    let eligible = reads.iter().all(|&(bb, i)| {
+                        let inst = &p.blocks[bb].insts[i];
+                        let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
+                            if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+                        // The lanes whose bits of the join the result keeps: EXEC's, or
+                        // (`s_andn2` by EXEC) the others.
+                        let keeps_exec = match inst.name() {
+                            "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
+                            "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
+                            "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
+                            _ => return false,
+                        };
+                        // In another block the edge's lanes are the same lanes only where
+                        // neither block runs again (the else part of an if, further down).
+                        let Some(exec) = inst
+                            .read(Reg::S(EXEC))
+                            .filter(|_| bb == b || !on_cycle(b) && !on_cycle(bb))
+                        else {
+                            return false;
+                        };
+                        read_execs.push((exec, keeps_exec));
+                        true
+                    });
+                    if !eligible {
+                        continue;
+                    }
                     for n in 0..blk.preds.len() {
-                        let off = reads.iter().all(|&(bb, i)| {
-                            let inst = &p.blocks[bb].insts[i];
-                            let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
-                                if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
-                            // The lanes whose bits of the join the result keeps: EXEC's, or
-                            // (`s_andn2` by EXEC) the others.
-                            let keeps_exec = match inst.name() {
-                                "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => true,
-                                "s_orn2_b32" | "s_orn2_b64" if by_exec => true,
-                                "s_andn2_b32" | "s_andn2_b64" if by_exec => false,
-                                _ => return false,
-                            };
-                            // In another block the edge's lanes are the same lanes only where
-                            // neither block runs again (the else part of an if, further down).
-                            let Some(exec) = inst.read(Reg::S(EXEC)).filter(|_| {
-                                bb == b || !self.on_cycle(b) && !self.on_cycle(bb)
-                            }) else {
-                                return false;
-                            };
-                            let joined = blk.phis.iter().find(|ph| ph.value == exec);
+                        let off = read_execs.iter().all(|&(exec, keeps_exec)| {
+                            let joined = self
+                                .phi_at
+                                .get(&exec)
+                                .filter(|&&(pb, _)| pb == b)
+                                .map(|&(_, pi)| &blk.phis[pi]);
                             let exec = joined.map_or(exec, |ph| ph.args[n]);
                             let Some(&m) = st.masks.get(&exec) else { return false };
                             let mut lanes = self.lane_edge(blk.preds[n], b);
@@ -10789,33 +10808,49 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            loop {
-                let before = set.len();
-                for (b, blk) in p.blocks.iter().enumerate() {
-                    for phi in &blk.phis {
-                        for n in 0..blk.preds.len() {
-                            if !set.contains(&(phi.value, n)) {
+            let mut relay_cache: Map<(usize, usize, usize), bool> = Map::default();
+            let mut dead_relay = |b: usize, n: usize, e: usize| -> bool {
+                *relay_cache.entry((b, n, e)).or_insert_with(|| {
+                    let mut path = self.lane_edge(p.blocks[b].preds[n], b);
+                    path.extend(self.lane_edge(b, e));
+                    !st.bools.meet(&path)
+                })
+            };
+            let mut dependents: Map<(Value, usize), Vec<(Value, usize)>> = Map::default();
+            let mut worklist = Vec::new();
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for phi in blk.phis.iter().filter(|phi| matches!(phi.reg, Reg::S(_))) {
+                    let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
+                    for n in 0..blk.preds.len() {
+                        let item = (phi.value, n);
+                        if !set.contains(&item) {
+                            continue;
+                        }
+                        for &(e, i, k) in uses {
+                            if p.blocks[e].preds[k] == b && dead_relay(b, n, e) {
                                 continue;
                             }
-                            let on_n = self.lane_edge(blk.preds[n], b);
-                            let uses = uses.get(&phi.value).map_or(&[][..], Vec::as_slice);
-                            let ok = uses.iter().all(|&(e, i, k)| {
-                                set.contains(&(p.blocks[e].phis[i].value, k))
-                                    || p.blocks[e].preds[k] == b
-                                        && !st
-                                            .bools
-                                            .meet(&[on_n.clone(), self.lane_edge(b, e)].concat())
-                            });
-                            if !ok {
-                                set.remove(&(phi.value, n));
+                            let next = (p.blocks[e].phis[i].value, k);
+                            if !set.contains(&next) {
+                                set.remove(&item);
+                                worklist.push(item);
+                                break;
                             }
+                            dependents.entry(next).or_default().push(item);
                         }
                     }
                 }
-                if set.len() == before {
-                    return set;
+            }
+            while let Some(bad) = worklist.pop() {
+                if let Some(deps) = dependents.remove(&bad) {
+                    for dep in deps {
+                        if set.remove(&dep) {
+                            worklist.push(dep);
+                        }
+                    }
                 }
             }
+            set
         })
     }
 
@@ -15768,6 +15803,49 @@ mod tests {
                 "dx.op.wavePrefixOp.i32".to_string(),
                 vec![Some(121), None, Some(0), Some(1)]
             )]
+        );
+    }
+
+    #[test]
+    fn unneeded_edges_propagates_across_deep_sgpr_phi_chains_without_quadratic_scans() {
+        // 160 sequential per-lane diamonds carrying 32 live SGPRs (`s10..s41`) as SSA phis at
+        // every merge block before reading them at the end, plus one genuine `unneeded_edges`
+        // mask join (`s6`) read only ANDed with the taken arm's EXEC.
+        let mut w = Vec::new();
+        for r in 10..42u32 {
+            w.push(0xBE80_0300 | (r << 16) | 0x81); // s_mov_b32 sr, 1
+        }
+        w.push(0xBE86_0300); // s_mov_b32 s6, s0 (data on skip edge)
+        w.push(0x7D88_0090); // v_cmp_gt_u32 vcc_lo, 16, v0
+        w.push(0xBE88_3C6A); // s_and_saveexec_b32 s8, vcc_lo
+        w.push(0xBF88_0002); // s_cbranch_execz +2
+        w.extend([0xD4C4_0006, 0x0002_0088]); // v_cmp_gt_u32 s6, 8, v0
+        w.push(0x8706_7E06); // join: s_and_b32 s6, s6, exec_lo
+        w.push(0xBEFE_0308); // s_mov_b32 exec_lo, s8
+
+        for k in 0..160u32 {
+            let s = 10 + (k % 32);
+            w.push(0x7D88_0084); // v_cmp_gt_u32 vcc_lo, 4, v0
+            w.push(0xBE88_3C6A); // s_and_saveexec_b32 s8, vcc_lo
+            w.push(0xBF88_0001); // s_cbranch_execz +1
+            w.push(0x8000_8100 | (s << 16) | s); // s_add_u32 ss, ss, 1
+            w.push(0xBEFE_0308); // s_mov_b32 exec_lo, s8
+        }
+
+        w.extend([0xD501_0001, 0x0019_0280]); // v_cndmask_b32 v1, 0, 1, s6
+        for r in 10..42u32 {
+            w.push(0x4A02_0200 | r); // v_add_nc_u32 v1, sr, v1
+        }
+        w.push(0x3404_0082); // v_lshlrev_b32 v2, 2, v0
+        w.extend([0xD834_0000, 0x0000_0102]); // ds_write_b32 v2, v1
+        w.push(S_ENDPGM);
+
+        let started = std::time::Instant::now();
+        lowers(&w, 1 << 15).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "deep SGPR phi chain took {:?}",
+            started.elapsed()
         );
     }
 }
