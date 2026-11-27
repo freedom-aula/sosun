@@ -1609,14 +1609,21 @@ impl Metal {
             (0..3).all(|i| at[i].saturating_add(sz[i]) <= dims[i])
         };
         let fits_buffer_transfer = |what: &str, buf: (&Buffer, *const u8), t: &Texture, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize| -> Option<(usize, usize)> {
-            let align = t.format.block().1;
+            // A depth and stencil texture's rows are its 4-byte depth plane (`DepthFromDepthStencil`).
+            let plane = t.format == Format::D32FloatS8;
+            let align = if plane { 4 } else { t.format.block().1 };
             let buf_off = off(buf.0, buf.1);
-            if is_depth(t.tex.pixelFormat())
+            let rows_fit = if plane {
+                (sz[2] - 1) * slice_pitch + (sz[1] - 1) * row_pitch + sz[0] * 4 <= len && row_pitch >= sz[0] * 4
+            } else {
+                transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+            };
+            if (is_depth(t.tex.pixelFormat()) && !matches!(t.format, Format::D32FloatS8 | Format::D32Float | Format::D16Unorm))
                 || !fits_region(&t.tex, mip, slice, at, sz)
                 || buf_off % align != 0
                 || row_pitch % align != 0
                 || buf_off.saturating_add(len) > buf.0.buf.length()
-                || !transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
+                || !rows_fit
             {
                 return None;
             }
@@ -1656,6 +1663,43 @@ impl Metal {
                     dst_slice,
                     dst_origin,
                 } => {
+                    if !direct_copy(src.format, dst.format) {
+                        // Block-compressed against plain texels of the block's size, or a depth
+                        // plane against a plain 4-byte format: no view joins them, so rows go
+                        // through a buffer of our own (the command buffer keeps it alive). `sz` is
+                        // in source texels.
+                        let ((sw, sb), (dw, db)) = (src.format.block(), dst.format.block());
+                        let bytes = |f: Format, b: usize| if f == Format::D32FloatS8 { 4 } else { b };
+                        if bytes(src.format, sb) != bytes(dst.format, db) || !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz) {
+                            continue;
+                        }
+                        let (row, rows) = (sz[0].div_ceil(sw) * bytes(src.format, sb), sz[1].div_ceil(sw));
+                        let dims = tex_dims(&dst.tex, *dst_mip);
+                        let d: [usize; 3] = std::array::from_fn(|i| match i {
+                            2 => sz[2],
+                            _ if dw > sw => (sz[i] * dw).min(dims[i].saturating_sub(dst_origin[i])),
+                            _ if sw > dw => sz[i].div_ceil(sw),
+                            _ => sz[i],
+                        });
+                        if !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, d) {
+                            continue;
+                        }
+                        let Some(scratch) = self.dev.newBufferWithLength_options((row * rows * sz[2]).max(16), MTLResourceOptions::StorageModePrivate) else {
+                            continue;
+                        };
+                        let pitch = if sz[2] > 1 { row * rows } else { 0 };
+                        // SAFETY: the regions lie inside both subresources (checked above) and the
+                        // buffer holds their rows.
+                        unsafe {
+                            e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                                &src.tex, *src_slice, *src_mip, origin(*src_origin), size(*sz), &scratch, 0, row, pitch, depth_plane(src),
+                            );
+                            e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                                &scratch, 0, row, pitch, size(d), &dst.tex, *dst_slice, *dst_mip, origin(*dst_origin), depth_plane(dst),
+                            );
+                        }
+                        continue;
+                    }
                     if !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz)
                         || !fits_region(&dst.tex, *dst_mip, *dst_slice, *dst_origin, *sz)
                     {
@@ -1726,7 +1770,7 @@ impl Metal {
                     };
                     // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
                     unsafe {
-                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
                             &src.0.buf,
                             src_off,
                             *row_pitch,
@@ -1736,6 +1780,7 @@ impl Metal {
                             *dst_slice,
                             *dst_mip,
                             origin(*dst_origin),
+                            depth_plane(dst),
                         )
                     };
                 }
@@ -1766,7 +1811,7 @@ impl Metal {
                     };
                     // SAFETY: buffer bounds, pitches, alignments, and texture region are validated above.
                     unsafe {
-                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
                             &src.tex,
                             *src_slice,
                             *src_mip,
@@ -1776,6 +1821,7 @@ impl Metal {
                             dst_off,
                             *row_pitch,
                             slice_bytes,
+                            depth_plane(src),
                         )
                     };
                 }
@@ -1792,6 +1838,19 @@ impl Metal {
         e.endEncoding();
         Ok(())
     }
+}
+
+/// The blit option a copy between `t` and buffer rows takes: a depth and stencil texture's rows
+/// are its depth plane.
+fn depth_plane(t: &Texture) -> MTLBlitOption {
+    if t.format == Format::D32FloatS8 { MTLBlitOption::DepthFromDepthStencil } else { MTLBlitOption::None }
+}
+
+/// Whether a texture copies into another with one texture-to-texture blit: the same format, or
+/// two plain formats of one texel size (through a view).
+pub fn direct_copy(a: Format, b: Format) -> bool {
+    let plain = |f: Format| f.block().0 == 1 && !f.is_depth();
+    a == b || (plain(a) && plain(b) && a.block() == b.block())
 }
 
 /// `ExecuteIndirect` with a count buffer runs record `index` only while `index < count`, both read
