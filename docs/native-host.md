@@ -437,6 +437,8 @@ A program with register-relative moves (`v_movrel*`, `v_swaprel`) is structured 
 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
+Translations of 40 s to minutes (27 November; 24 to 48 KB pixel shaders, one of which held the first world frame past the title's watchdog) were three searches in lowering, none of them new: the shaders were refused in 30 ms until descriptor tracing followed dwords swapped by XORs, and then reached them. `lower_graphics` lowered the whole program again for each join with an incoming value that has no DXIL form (574 times for one shader): `fill_phis` now reports all the joins a pass finds. `live_edges` looked for an earlier visit of a join in a list of all of them, and went through one join with tens of thousands of sets of known branches: visits are kept as a set, and those that know least go first, so each join is gone through about once. `descriptor_data` searched every descriptor's sources for each load read as data: one table (`load_use`). Over the 36,197 dumped containers the slowest translation went from 526 s to 2.8 s (a compute program), with the same translations and refusals. Tests: `joins_without_a_value_are_found_in_one_pass` and `live_edges_visit_each_join_about_once` (`gfx_refusal_tests`) bound the work, not the time.
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

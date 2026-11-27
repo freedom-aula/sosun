@@ -153,8 +153,10 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// Phis whose incoming value has no DXIL form were read: redo with them missing. All that
+    /// one pass finds, not the first: a pass for each made a program with some hundreds of
+    /// them take that many times as long (tens of seconds).
+    Retry(Vec<(Value, Why)>),
     Fail(ShaderError),
 }
 
@@ -163,21 +165,37 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_graphics(parts, false)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Lowering passes of this thread's last [`lower_graphics`].
+    pub(super) static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Joins [`Lower::live_edges`] went through, with what it knew each time, in that lowering.
+    pub(super) static LIVE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    #[cfg(test)]
+    PASSES.set(0);
+    #[cfg(test)]
+    LIVE_VISITS.set(0);
     // Compute programs hold masks the structurisation cannot see into
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
     loop {
+        #[cfg(test)]
+        PASSES.set(PASSES.get() + 1);
         match Lower::new(parts, &bad, console, guessed).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
+            Err(Stop::Retry(phis)) => {
+                for (v, why) in phis {
+                    if bad.insert(v, why).is_some() {
+                        return Err(ShaderError::Unsupported {
+                            offset: 0,
+                            what: "a phi that does not settle",
+                        });
+                    }
                 }
             }
             Err(Stop::Fail(ShaderError::Unsupported {
@@ -280,6 +298,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
+    /// [`Lower::load_use`], made at the first descriptor load read as data.
+    load_uses: std::cell::OnceCell<Map<Site, (Site, u8)>>,
     data_phis: Vec<(V, usize, usize)>,
     /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
     /// incoming values are still to fill (block, phi index, lane).
@@ -1044,6 +1064,7 @@ impl<'a> Lower<'a> {
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
+            load_uses: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
@@ -6106,6 +6127,26 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Where the program uses the descriptor that load `site` reads, and the load's first
+    /// dword of it: the first resource descriptor (in their order) with that load among its
+    /// sources. One table for all loads: searching every descriptor's sources for each load
+    /// read as data, and again for each load of the same address, took a pixel shader with
+    /// some hundreds of each tens of seconds.
+    fn load_use(&self, site: Site) -> Option<(Site, u8)> {
+        let uses = self.load_uses.get_or_init(|| {
+            let mut uses = Map::default();
+            for d in self.x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+                for l in d.source.leaves() {
+                    if let Source::Loaded { load, first } = *l {
+                        uses.entry(load).or_insert((d.site, first));
+                    }
+                }
+            }
+            uses
+        });
+        uses.get(&site).copied()
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -6151,19 +6192,7 @@ impl<'a> Lower<'a> {
         // read only as data takes it from a load of the same descriptor that
         // the program uses (the compiler loads a descriptor again rather than
         // keep it, and queries sizes in loops of their own).
-        let use_of = |site: Site| {
-            self.x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .find_map(|d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
+        let use_of = |site: Site| self.load_use(site);
         // The VGPR a waterfall loop reads the first lane of.
         let lane_source = |v: Value| {
             let i = self.def_inst(v)?;
@@ -13653,20 +13682,35 @@ impl<'a> Lower<'a> {
     fn live_edges(&self) -> Set<(Value, usize)> {
         const MAX_KNOWN: usize = 4;
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        // Visits waiting, by how many conditions they know: those that know least go first,
+        // so that what knows more finds them done and stops (in any other order one join was
+        // gone through for tens of thousands of sets of conditions).
+        let mut work: [Vec<(Value, Vec<(Bool, bool)>)>; MAX_KNOWN + 1] = Default::default();
+        work[0] = self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         let mut live = Set::default();
-        let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
-        while let Some((v, known)) = work.pop() {
+        // By join, what was known each time it was gone through, sorted: a set, so finding
+        // an earlier visit that knew no more is 16 lookups (the subsets of at most `MAX_KNOWN`
+        // conditions), not a search of every earlier visit (thousands at one join made a
+        // pixel shader take minutes).
+        let mut seen = Map::<Value, Set<Vec<(Bool, bool)>>>::default();
+        while let Some((v, known)) = work.iter_mut().find_map(|w| w.pop()) {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             let done = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+            let mut sorted = known.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let subset = |bits: u32| -> Vec<(Bool, bool)> {
+                (0..sorted.len()).filter(|n| bits >> n & 1 != 0).map(|n| sorted[n]).collect()
+            };
+            if (0..1u32 << sorted.len()).any(|bits| done.contains(&subset(bits))) {
                 continue;
             }
-            done.push(known.clone());
+            done.insert(sorted);
+            #[cfg(test)]
+            LIVE_VISITS.set(LIVE_VISITS.get() + 1);
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
@@ -13695,7 +13739,7 @@ impl<'a> Lower<'a> {
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
                 if self.phi_at.contains_key(&arg) {
-                    work.push((arg, k));
+                    work[k.len()].push((arg, k));
                 }
             }
         }
@@ -13870,7 +13914,8 @@ impl<'a> Lower<'a> {
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+        let mut retry = Vec::new();
+        'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
@@ -13898,7 +13943,8 @@ impl<'a> Lower<'a> {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if read => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        retry.push((phi.value, "an SCC joined with SGPR values"));
+                        continue 'phi;
                     }
                     // A lane mask joined with data at a join every lane
                     // enters along one edge: the register holds the mask's
@@ -13913,14 +13959,21 @@ impl<'a> Lower<'a> {
                             || self.x.st.highs.contains_key(&arg))
                         && self.uniform_join(b, |_| true) =>
                     {
-                        self.mask_dword(arg)
-                            .map_err(|w| Stop::Retry(phi.value, w))?
+                        match self.mask_dword(arg) {
+                            Ok(x) => x,
+                            Err(why) => {
+                                retry.push((phi.value, why));
+                                continue 'phi;
+                            }
+                        }
                     }
                     (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
+                        retry.push((phi.value, why));
+                        continue 'phi;
                     }
                     _ if read => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        retry.push((phi.value, "a join of mismatched values"));
+                        continue 'phi;
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
@@ -13928,6 +13981,9 @@ impl<'a> Lower<'a> {
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        if !retry.is_empty() {
+            return Err(Stop::Retry(retry));
         }
         while let Some((x, b, i, lane)) = self.pending_spills.pop() {
             let mut incoming = Vec::new();

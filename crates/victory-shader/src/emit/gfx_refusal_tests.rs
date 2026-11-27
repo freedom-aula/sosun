@@ -49,6 +49,78 @@ fn packed_fmac_takes_constant_operands() {
     }
 }
 
+/// Joins of values with no DXIL form are all found by one lowering pass, however many there are:
+/// a pass for each made pixel shaders with some hundreds of them take 40 s instead of 0.2 s.
+/// Here a branch's arm copies a descriptor's dword (nothing the host has) to 32 SGPRs, each
+/// joined after it with what it held on entry and copied to a VGPR nothing reads.
+#[test]
+fn joins_without_a_value_are_found_in_one_pass() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let program = |joins: u32| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBE8C_0380, // s_mov_b32 s12, 0
+            0xBF06_800C, // s_cmp_eq_u32 s12, 0
+            0xBF85_0000 | joins, // s_cbranch_scc1 past the arm
+        ];
+        code.extend((0..joins).map(|k| 0xBE80_0308 | (20 + k) << 16)); // s_mov_b32 s(20 + k), s8
+        code.extend((0..joins).map(|k| 0x7E00_0200 | (1 + k) << 17 | (20 + k))); // v_mov_b32 v(1 + k), s(20 + k)
+        code.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    for joins in [1, 32] {
+        translate_with(&program(joins), Options::default()).unwrap();
+        assert_eq!(lower::PASSES.get(), 2, "{joins} joins");
+    }
+}
+
+/// The search for the join edges a read can be reached over goes through each join about once:
+/// what knows least goes first. Here two SGPRs are swapped in the arm of each of 12 branches
+/// in a row, so each join is reached along many paths with different branches known.
+#[test]
+fn live_edges_visit_each_join_about_once() {
+    use crate::native::tests::{fspx, fspx_resource};
+    const BRANCHES: u32 = 12;
+    let mut code = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBE8C_0380, // s_mov_b32 s12, 0
+        0xBE94_0381, // s_mov_b32 s20, 1
+        0xBE95_0382, // s_mov_b32 s21, 2
+    ];
+    for k in 0..BRANCHES {
+        code.extend([
+            0xBF06_800C | k << 8, // s_cmp_eq_u32 s12, k
+            0xBF85_0003,          // s_cbranch_scc1 past the swap
+            0xBE96_0314,          // s_mov_b32 s22, s20
+            0xBE94_0315,          // s_mov_b32 s20, s21
+            0xBE95_0316,          // s_mov_b32 s21, s22
+        ]);
+    }
+    code.extend([
+        0x7E02_0214, // v_mov_b32 v1, s20
+        0x7E04_0215, // v_mov_b32 v2, s21
+        0xE070_0000,
+        0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ]);
+    let table = [fspx_resource(3, 3, 0, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+    translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default()).unwrap();
+    let visits = lower::LIVE_VISITS.get();
+    assert!(visits <= 3 * BRANCHES as usize, "{visits} visits");
+    assert!(visits >= BRANCHES as usize, "{visits} visits");
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
