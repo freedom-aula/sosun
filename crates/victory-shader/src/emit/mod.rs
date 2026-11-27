@@ -531,7 +531,8 @@ pub fn emit_with(
     if !pixel && options.extra_params != 0 {
         let mut row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
         for n in (0..32u32).filter(|n| options.extra_params >> n & 1 != 0) {
-            if outputs.iter().any(|e| e.kind == 0 && e.index == n) {
+            // By name: a `HALF` element (`graphics::HALF`) of another parameter may have index n.
+            if outputs.iter().any(|e| e.kind == 0 && e.index == n && e.name == "TEXCOORD") {
                 continue;
             }
             outputs.push(container::SigElement {

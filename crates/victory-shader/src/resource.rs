@@ -638,7 +638,7 @@ impl<'a> Tracer<'a> {
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
+                            None => self.xor_undone(inst, k, &o).or(Some(Term::Value(v))),
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -2745,6 +2745,41 @@ impl Tracer<'_> {
 
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
+    /// What dword `k` of `s_xor_b32/b64 d, x, y` leaves when `x` is `a ^ b` and `y` holds what `b`
+    /// (or `a`) does: the other one. The title's compiler swaps descriptor dwords between SGPRs in
+    /// three XORs.
+    fn xor_undone(&self, inst: &Inst, k: usize, o: &[Option<Term>]) -> Option<Term> {
+        let xor = |inst: &Inst, k: usize| -> Option<[Value; 2]> {
+            let pair = match inst.name() {
+                "s_xor_b32" => false,
+                "s_xor_b64" => true,
+                _ => return None,
+            };
+            let Fields::Sop { src, .. } = &inst.fields else { return None };
+            let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src[..] else {
+                return None;
+            };
+            if k > usize::from(pair) || a == NULL || b == NULL {
+                return None;
+            }
+            Some([inst.read(Reg::S(a + k as u8))?, inst.read(Reg::S(b + k as u8))?])
+        };
+        let [x, y] = xor(inst, k)?;
+        for (x, y) in [(x, y), (y, x)] {
+            let Some(def) = self.def(x) else { continue };
+            let Some(j) = def.writes.iter().position(|w| w.1 == x) else { continue };
+            let Some([a, b]) = xor(def, j) else { continue };
+            let (a, b, y) = (o[a.0 as usize], o[b.0 as usize], o[y.0 as usize]);
+            if y.is_some() && y == b {
+                return a;
+            }
+            if y.is_some() && y == a {
+                return b;
+            }
+        }
+        None
+    }
+
     fn restored(&self, inst: &Inst) -> Option<Moved> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
@@ -3214,6 +3249,45 @@ pub(crate) mod tests {
                        with 0xc000fffe)"
             }
         );
+    }
+
+    /// The title's compiler swaps descriptor dwords between SGPRs in three XORs (32 and 64 bits):
+    /// swapped there and back, the descriptor is the loaded one.
+    #[test]
+    fn descriptors_swapped_by_xors_are_the_loaded_ones() {
+        let swap32 = [0x8909_0D09, 0x890D_0D09, 0x8909_0D09]; // s9 <-> s13
+        let swap64 = [0x898A_0E0A, 0x898E_0E0A, 0x898A_0E0A]; // s[10:11] <-> s[14:15]
+        let words = |swaps: &[u32]| -> Vec<u8> {
+            [
+                &[
+                    0xBE88_0304, // s_mov_b32 s8, s4
+                    0xBE89_0380, // s_mov_b32 s9, 0
+                    0xF408_0204,
+                    0xFA00_0160, // s_load_dwordx4 s[8:11], s[8:9], 0x160
+                    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                    0xBE8D_0380, // s_mov_b32 s13, 0
+                    0xBE8E_0480, // s_mov_b64 s[14:15], 0
+                ][..],
+                swaps,
+                &[
+                    0xE078_1000,
+                    0x8002_0007, // buffer_store_dwordx4 v[0:3], v7, s[8:11], 0 offen
+                    S_ENDPGM,
+                ],
+            ]
+            .concat()
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect()
+        };
+        let run = |swaps: &[u32]| {
+            let p = crate::ir::build(&words(swaps), false, 256).unwrap();
+            track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
+        };
+        let there_and_back = [swap32, swap32, swap64, swap64].concat();
+        run(&there_and_back).unwrap();
+        // Swapped once, its second dword is the zero.
+        assert!(run(&swap32).is_err());
     }
 
     /// Immediate sampler words the compilers make with bit masks (32 and
