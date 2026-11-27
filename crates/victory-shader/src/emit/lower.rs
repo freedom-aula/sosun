@@ -6277,7 +6277,9 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        // An image's fields are its view's own size, level 0 of the host view, writable or not:
+        // Metal answers the undefined level DXC writes for a UAV with 0 (see `image_op`).
+        let mip = if image.is_some() {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -11435,12 +11437,18 @@ impl<'a> Lower<'a> {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
+            //
+            // A writable image's query takes the program's level too, not the
+            // undefined one DXC writes for a UAV: Metal answers that with 0,
+            // which gave the title's sun-shadow min/max program a 0x0 image
+            // (whole 16x16 tiles lit or shadowed together; seen under D3DMetal
+            // in halfwave50/VIctory-macOS-halfwave50 0f3ed38, measured here by
+            // `a_size_query_of_a_writable_image_reads_its_size`).
+            // guess: on the console a level past a writable view's one reads
+            // 0, as it does here; level 0, which those programs ask for, is
+            // the view's own size on both.
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
-                self.s.m.undef(self.s.t.i32)
-            } else {
-                addr_val(self, 0)?
-            };
+            let mip = addr_val(self, 0)?;
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
