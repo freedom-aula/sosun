@@ -52,6 +52,12 @@ You need your own copy of the game. Windowed, for a person: `tools/macos/run-nat
 
 ## How to work
 
+Before any work, book it (details in `CONTRIBUTING.md`, "Claim it before you start"):
+
+- Find or open the issue for the task. Skip it if it has an assignee or the `claimed` label, or if `gh pr list --state open --search "<issue number> in:title,body"` shows a pull request for it.
+- Comment `/claim` on the issue, then open a draft pull request with `Refs #<issue>` as soon as you have a first commit. A claim with no pull request after 24 hours expires.
+- When the pull request is up and green, pick the next task the same way. Never start a second task on an issue someone else holds.
+
 1. Reproduce with a headless run and the trace variables. Read the log and the image dumps.
 2. Hold one hypothesis at a time and prove it with a trace or dump before changing code.
 3. Fix it in the shared code, with a unit test that fails without the fix.
