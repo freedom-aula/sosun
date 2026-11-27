@@ -96,9 +96,18 @@ const LAST_USED: &str = "last-used";
 /// Build folders kept: this build's and the newest others (about 400 MB each).
 const KEEP_BUILDS: usize = 3;
 
+/// A folder stamped this recently is never deleted: another run (the other `game-run.sh` slot
+/// shares the cache folder) may still be using it.
+const IN_USE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Deletes the build folders of `parent` (named by 16 hex digits) but the `keep` used last,
-/// `current` always among them. A folder never stamped counts by its own time.
+/// `current` always among them, and any stamped within [`IN_USE`]. A folder never stamped counts
+/// by its own time.
 fn prune(parent: &std::path::Path, current: &std::path::Path, keep: usize) {
+    prune_at(parent, current, keep, std::time::SystemTime::now());
+}
+
+fn prune_at(parent: &std::path::Path, current: &std::path::Path, keep: usize, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     let mut builds: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
@@ -114,8 +123,8 @@ fn prune(parent: &std::path::Path, current: &std::path::Path, keep: usize) {
         .collect();
     builds.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut kept = usize::from(builds.iter().any(|(_, p)| p == current));
-    for (_, p) in builds {
-        if p == current {
+    for (used, p) in builds {
+        if p == current || now.duration_since(used).is_ok_and(|age| age < IN_USE) {
             continue;
         }
         if kept < keep {
@@ -751,8 +760,10 @@ mod tests {
         }
         std::fs::create_dir(dir.path().join("not-a-build")).unwrap();
         std::fs::write(dir.path().join(FIRST_BINDS_FILE), b"x").unwrap();
-        // The oldest is the one in use.
-        prune(dir.path(), &builds[0], 3);
+        // The oldest is the one in use. Stamps are from 1970; a run within the hour keeps all.
+        prune_at(dir.path(), &builds[0], 3, t(10));
+        assert!(builds.iter().all(|b| b.exists()), "used within the hour");
+        prune_at(dir.path(), &builds[0], 3, t(4 + 2 * 3600));
         let left: Vec<bool> = builds.iter().map(|b| b.exists()).collect();
         assert_eq!(left, [true, false, false, true, true]);
         assert!(dir.path().join("not-a-build").exists() && dir.path().join(FIRST_BINDS_FILE).exists());
