@@ -179,9 +179,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         }
     };
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    let id = file_id(&file);
     let file = Instance::create(
         Object::new("dstorage file", &FILE_VTABLE),
-        File { file, path: name },
+        File { file, path: name, id },
     );
     put(out, file)
 }
@@ -343,6 +344,23 @@ struct File {
     file: std::fs::File,
     /// As the title named it (diagnostics).
     path: String,
+    /// The volume and inode the file is on: requests of one pack share
+    /// read-ahead blocks whatever object they came through, and two files
+    /// never share one. `None` off Unix, where the cache is off.
+    id: Option<(u64, u64)>,
+}
+
+/// The file's identity for the read-ahead cache.
+#[cfg(unix)]
+fn file_id(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = file.metadata().ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_file: &std::fs::File) -> Option<(u64, u64)> {
+    None
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -706,6 +724,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let (hits, misses, read) = readahead::take_stats();
             tracing::info!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -718,6 +737,9 @@ impl Lanes {
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 staged_mib = self.staged >> 20,
+                readahead_hits = hits,
+                readahead_misses = misses,
+                readahead_read_mb = read / 1_000_000,
                 footprint_mib = footprint(),
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -1279,10 +1301,303 @@ fn read_source(request: &Request) -> std::io::Result<Cow<'static, [u8]>> {
     Ok(Cow::Owned(bytes))
 }
 
+/// The shared read-ahead cache: the title streams its pack files in many small
+/// pieces in roughly ascending order, and the host's volume (an external disk)
+/// serves a 128 KiB read barely slower than a 20 KiB one — a miss reads a
+/// whole aligned block, the pieces after it are hits, and a run of ascending
+/// misses reads up to a MiB ahead in one go. `VICTORY_READAHEAD_MB` caps the
+/// cache (0 turns it off); the direct path stays for reads of a block or more.
+mod readahead {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// A block's size: small enough a stray read wastes little, large enough
+    /// that a resource's pieces share one.
+    pub(super) const BLOCK: u64 = 128 << 10;
+    /// Reads of this size or less go through the cache; bigger ones are
+    /// single-shot with no reuse to offer it.
+    pub(super) const MAX: usize = 1 << 20;
+    /// Blocks an ascending miss reads: the stream's next pieces are hits.
+    const RUN: u64 = 8;
+    /// The whole cache's budget.
+    const BUDGET: u64 = 256 << 20;
+
+    struct Cache {
+        /// (file id, block) to its bytes, with the tick it was last used at.
+        blocks: HashMap<(u64, u64), (u64, Arc<Vec<u8>>)>,
+        /// The keys least-recently-used first.
+        order: VecDeque<(u64, u64)>,
+        bytes: u64,
+        budget: u64,
+        tick: u64,
+        /// Each file's last miss, for the ascending-run readahead.
+        last: HashMap<u64, u64>,
+        /// Diagnostics.
+        hits: u64,
+        misses: u64,
+        read: u64,
+    }
+
+    fn cache() -> Option<&'static Mutex<Cache>> {
+        static CACHE: OnceLock<Option<Mutex<Cache>>> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let budget = budget();
+            (budget > 0).then(|| {
+                Mutex::new(Cache {
+                    blocks: HashMap::new(),
+                    order: VecDeque::new(),
+                    bytes: 0,
+                    budget,
+                    tick: 0,
+                    last: HashMap::new(),
+                    hits: 0,
+                    misses: 0,
+                    read: 0,
+                })
+            })
+        })
+        .as_ref()
+    }
+
+    /// Takes the read-ahead counters since the last call, for the load's summary.
+    pub(super) fn take_stats() -> (u64, u64, u64) {
+        cache().map_or((0, 0, 0), |c| {
+            let mut c = c.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                std::mem::take(&mut c.hits),
+                std::mem::take(&mut c.misses),
+                std::mem::take(&mut c.read),
+            )
+        })
+    }
+
+    /// Fills `out` from `offset` of the file, through the cache. A file whose
+    /// identity cannot be read bypasses it.
+    pub(super) fn fill(
+        file: &std::fs::File,
+        id: (u64, u64),
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        let Some(lock) = cache() else {
+            return fill_at(out, offset, |buf, at| read_at(file, buf, at)).and_then(|n| {
+                (n == out.len())
+                    .then_some(())
+                    .ok_or(std::io::ErrorKind::UnexpectedEof.into())
+            });
+        };
+        let mut done = 0;
+        while done < out.len() {
+            // Where the next unfilled byte sits: its block, and how far in.
+            let at = offset + done as u64;
+            let block = at / BLOCK;
+            let skip = (at % BLOCK) as usize;
+            let bytes = get(lock, file, id, block)?;
+            let take = bytes.len().saturating_sub(skip).min(out.len() - done);
+            if take == 0 {
+                // The block ended short of the need: the file's end.
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            out[done..done + take].copy_from_slice(&bytes[skip..skip + take]);
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// A block's bytes: the cache's, or the file's with readahead.
+    fn get(
+        lock: &Mutex<Cache>,
+        file: &std::fs::File,
+        id: (u64, u64),
+        block: u64,
+    ) -> std::io::Result<Arc<Vec<u8>>> {
+        let key = (id.0.wrapping_mul(31).wrapping_add(id.1), block);
+        let mut c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        c.tick += 1;
+        if c.blocks.contains_key(&key) {
+            let now = c.tick;
+            c.hits += 1;
+            c.order.retain(|&k| k != key);
+            c.order.push_back(key);
+            if let Some((tick, bytes)) = c.blocks.get_mut(&key) {
+                *tick = now;
+                return Ok(bytes.clone());
+            }
+        }
+        c.misses += 1;
+        // An ascending run — the last miss just below this one — reads ahead.
+        let run = if c.last.get(&key.0).is_some_and(|&l| block > l && block - l <= RUN) {
+            RUN
+        } else {
+            1
+        };
+        c.last.insert(key.0, block);
+        drop(c);
+        let at = block * BLOCK;
+        let mut bytes = vec![0; (run * BLOCK) as usize];
+        let n = fill_at(&mut bytes, at, |buf, at| read_at(file, buf, at))?;
+        // A short read is the file's end: the entry is what was read, no more.
+        bytes.truncate(n);
+        let mut c = lock.lock().unwrap_or_else(|e| e.into_inner());
+        c.read += n as u64;
+        // The span as one entry per block it covers: a later request starting
+        // inside it is a hit from its own first block on.
+        let whole = n / BLOCK as usize;
+        for i in 0..whole as u64 {
+            let k = (key.0, block + i);
+            let part = bytes[(i * BLOCK) as usize..][..BLOCK as usize].to_vec();
+            insert(&mut c, k, Arc::new(part));
+        }
+        let rest = n % BLOCK as usize;
+        if rest > 0 {
+            let k = (key.0, block + whole as u64);
+            let part = bytes[whole * BLOCK as usize..].to_vec();
+            insert(&mut c, k, Arc::new(part));
+        }
+        let mine = if whole > 0 {
+            bytes[..BLOCK as usize].to_vec()
+        } else {
+            bytes
+        };
+        Ok(Arc::new(mine))
+    }
+
+    /// Puts a block in, evicting the least-recently-used over the budget.
+    fn insert(c: &mut Cache, key: (u64, u64), bytes: Arc<Vec<u8>>) {
+        if let Some((_, old)) = c.blocks.insert(key, (c.tick, bytes.clone())) {
+            c.bytes -= old.len() as u64;
+        } else {
+            c.order.push_back(key);
+        }
+        c.bytes += bytes.len() as u64;
+        while c.bytes > c.budget && c.order.len() > 1 {
+            let Some(front) = c.order.pop_front() else { break };
+            if let Some((_, old)) = c.blocks.remove(&front) {
+                c.bytes = c.bytes.saturating_sub(old.len() as u64);
+            }
+        }
+    }
+
+    fn budget() -> u64 {
+        std::env::var("VICTORY_READAHEAD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(BUDGET, |mb| mb << 20)
+    }
+
+    /// Reads at `offset` without moving a file position, as the request path does.
+    fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        {
+            file.seek_read(buf, offset)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::FileExt::read_at(file, buf, offset)
+        }
+    }
+
+    /// `fill_at` of the request path, copied for this private module.
+    fn fill_at(
+        out: &mut [u8],
+        offset: u64,
+        mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        let mut done = 0;
+        while done < out.len() {
+            let Some(at) = offset.checked_add(done as u64) else {
+                return Err(std::io::ErrorKind::InvalidInput.into());
+            };
+            match read(&mut out[done..], at) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(done)
+    }
+
+    #[cfg(all(test, unix))]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering as Seq};
+
+        /// A file with a known body, opened as the requests open theirs. Each
+        /// test's file is its own, and stays alive for the process: the cache
+        /// is keyed by the file's identity, and an inode freed and handed to a
+        /// later file would bring its stale blocks with it.
+        fn temp(body: &[u8]) -> (std::fs::File, (u64, u64)) {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Seq::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("victory-readahead-{}-{n}", std::process::id()));
+            std::fs::write(&path, body).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            let m = file.metadata().unwrap();
+            std::mem::forget(file.try_clone().unwrap());
+            (file, (m.dev(), m.ino()))
+        }
+
+        /// Pieces of one block are hits after the first; an ascending run
+        /// fills the blocks ahead; a later piece is served from them.
+        #[test]
+        fn pieces_of_a_run_are_hits() {
+            let body: Vec<u8> = (0..(BLOCK as usize * 3)).map(|i| (i % 251) as u8).collect();
+            let (file, id) = temp(&body);
+            let mut out = [0u8; 20_000];
+            fill(&file, id, 100, &mut out).unwrap();
+            assert_eq!(&out, &body[100..100 + out.len()]);
+            let mut out = [0u8; 30_000];
+            fill(&file, id, 30_000, &mut out).unwrap();
+            assert_eq!(&out, &body[30_000..30_000 + out.len()]);
+            let (hits, _, _) = take_stats();
+            assert!(hits >= 2, "the second piece is a hit: {hits}");
+        }
+
+        /// A read that starts inside a block is served from where it starts,
+        /// not from the block's first byte.
+        #[test]
+        fn a_read_starts_where_it_says() {
+            let body: Vec<u8> = (0..(BLOCK as usize * 2)).map(|i| (i % 251) as u8).collect();
+            let (file, id) = temp(&body);
+            let mut out = [0u8; 4_096];
+            fill(&file, id, 100_000, &mut out).unwrap();
+            assert_eq!(&out, &body[100_000..100_000 + out.len()]);
+        }
+
+        /// A read past the end of the file is `UnexpectedEof`, as the direct
+        /// path's `Ok(0)` is.
+        #[test]
+        fn past_the_end_is_unexpected_eof() {
+            let (file, id) = temp(&[7; 100]);
+            let mut out = [0u8; 200];
+            assert!(matches!(
+                fill(&file, id, 0, &mut out),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof
+            ));
+        }
+
+        /// A read across a block boundary gets both blocks' pieces.
+        #[test]
+        fn a_read_across_a_boundary_is_whole() {
+            let body: Vec<u8> = (0..(BLOCK as usize * 2)).map(|i| (i % 251) as u8).collect();
+            let (file, id) = temp(&body);
+            let start = BLOCK as usize - 2_048;
+            let mut out = [0u8; 4_096];
+            fill(&file, id, start as u64, &mut out).unwrap();
+            assert_eq!(&out, &body[start..start + out.len()]);
+        }
+    }
+}
+
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
+/// Fills `out` (the source size) from the request's file or memory. File
+/// reads of a MiB or less go through the read-ahead cache; the direct path
+/// stays for the big ones, which have no reuse to offer it.
 fn read_into(request: &Request, out: &mut [u8]) -> std::io::Result<()> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
@@ -1292,11 +1607,13 @@ fn read_into(request: &Request, out: &mut [u8]) -> std::io::Result<()> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let file = &state.file;
     let started = std::time::Instant::now();
-    let result = fill_at(out, request.offset, |buf, at| read_at(file, buf, at));
+    let result = match (state.id, out.len() <= readahead::MAX) {
+        (Some(id), true) => readahead::fill(file, id, request.offset, out),
+        _ => fill_at(out, request.offset, |buf, at| read_at(file, buf, at)),
+    };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }
