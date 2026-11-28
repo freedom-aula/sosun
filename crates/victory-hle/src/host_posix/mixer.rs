@@ -218,12 +218,7 @@ impl Mixer {
         }
     }
 
-    pub fn add_source(
-        &mut self,
-        channels: usize,
-        rate: u32,
-        output: Option<VoiceId>,
-    ) -> VoiceId {
+    pub fn add_source(&mut self, channels: usize, rate: u32, output: Option<VoiceId>) -> VoiceId {
         let id = self.next;
         self.next += 1;
         self.sources.insert(
@@ -250,7 +245,13 @@ impl Mixer {
     pub fn add_submix(&mut self, output: Option<VoiceId>) -> VoiceId {
         let id = self.next;
         self.next += 1;
-        self.submixes.insert(id, Submix { volume: 1.0, output });
+        self.submixes.insert(
+            id,
+            Submix {
+                volume: 1.0,
+                output,
+            },
+        );
         id
     }
 
@@ -265,10 +266,6 @@ impl Mixer {
 
     pub fn submix(&mut self, id: VoiceId) -> Option<&mut Submix> {
         self.submixes.get_mut(&id)
-    }
-
-    pub fn is_submix(&self, id: VoiceId) -> bool {
-        self.submixes.contains_key(&id)
     }
 
     /// The gain from a voice's output to the speakers (0 if the chain does
@@ -311,7 +308,15 @@ impl Mixer {
             .collect();
         for (id, s) in &mut self.sources {
             if s.running && !s.queue.is_empty() {
-                mix(s, gains[id], self.rate, self.channels, out, frames, &mut events);
+                mix(
+                    s,
+                    gains[id],
+                    self.rate,
+                    self.channels,
+                    out,
+                    frames,
+                    &mut events,
+                );
             }
         }
         events
@@ -321,7 +326,10 @@ impl Mixer {
     /// log line needs to say whether the graph is carrying anything.
     pub fn running(&self) -> (usize, usize) {
         (
-            self.sources.values().filter(|s| s.running && !s.queue.is_empty()).count(),
+            self.sources
+                .values()
+                .filter(|s| s.running && !s.queue.is_empty())
+                .count(),
             self.sources
                 .values()
                 .map(|s| if s.running { s.queue.len() } else { 0 })
@@ -339,15 +347,15 @@ impl Mixer {
 fn surround_gains(c: usize) -> (f32, f32) {
     const H: f32 = std::f32::consts::FRAC_1_SQRT_2;
     match c {
-        0 => (1.0, 0.0),         // front left
-        1 => (0.0, 1.0),         // front right
-        2 => (H, H),              // front center: dialogue
-        3 => (0.5, 0.5),          // LFE
-        4 => (H, 0.0),            // back left
-        5 => (0.0, H),            // back right
-        6 => (H, 0.0),            // side left
-        7 => (0.0, H),            // side right
-        _ => (H, H),              // height and beyond: the middle
+        0 => (1.0, 0.0), // front left
+        1 => (0.0, 1.0), // front right
+        2 => (H, H),     // front center: dialogue
+        3 => (0.5, 0.5), // LFE
+        4 => (H, 0.0),   // back left
+        5 => (0.0, H),   // back right
+        6 => (H, 0.0),   // side left
+        7 => (0.0, H),   // side right
+        _ => (H, H),     // height and beyond: the middle
     }
 }
 
@@ -550,7 +558,12 @@ mod tests {
             .iter()
             .flat_map(|x| ((x * 32767.0) as i16).to_le_bytes())
             .collect();
-        let format = Format { channels: 1, rate: RATE, bits: 16, float: false };
+        let format = Format {
+            channels: 1,
+            rate: RATE,
+            bits: 16,
+            float: false,
+        };
         assert_eq!(format.frame_bytes(), 2);
         let samples = decode(format, &pcm).unwrap();
         assert_eq!(samples.len(), 4800);
@@ -584,7 +597,9 @@ mod tests {
         let mut m = Mixer::new(RATE, 2);
         // A 24 kHz voice is played at twice its length in frames.
         let slow = m.add_source(1, 24_000, Some(MASTER));
-        m.source(slow).unwrap().submit(buffer(tone(440.0, 24_000, 2400), 1, 1));
+        m.source(slow)
+            .unwrap()
+            .submit(buffer(tone(440.0, 24_000, 2400), 1, 1));
         m.source(slow).unwrap().running = true;
         let mut out = vec![0.0; 2 * 4800];
         let events = m.render(&mut out);
@@ -647,14 +662,20 @@ mod tests {
         }
         // Stopped: everything goes.
         let flushed = s.flush();
-        assert_eq!(flushed.iter().map(|e| e.context).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(
+            flushed.iter().map(|e| e.context).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
         for ctx in 1..=3 {
             s.submit(buffer(vec![0.1; 10], 1, ctx));
         }
         s.running = true;
         // Running: the one playing stays.
         let flushed = s.flush();
-        assert_eq!(flushed.iter().map(|e| e.context).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(
+            flushed.iter().map(|e| e.context).collect::<Vec<_>>(),
+            [2, 3]
+        );
         assert_eq!(s.state().1, 1);
         let mut looped = buffer(vec![0.2; 10], 1, 9);
         looped.loop_end = 10;
@@ -665,15 +686,30 @@ mod tests {
         s.exit_loop();
         let mut out = vec![0.0; 30];
         let events = m.render(&mut out);
-        assert!(events.iter().any(|e| e.notice == Notice::BufferEnd && e.context == 9));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.notice == Notice::BufferEnd && e.context == 9)
+        );
         assert!(!events.iter().any(|e| e.notice == Notice::LoopEnd));
     }
 
     #[test]
     fn pcm_decodes_in_every_width() {
-        let f = |bits, float| Format { channels: 1, rate: RATE, bits, float };
-        assert_eq!(decode(f(8, false), &[0, 128, 255]).unwrap(), [-1.0, 0.0, 127.0 / 128.0]);
-        assert_eq!(decode(f(16, false), &[0, 0x80, 0xFF, 0x7F]).unwrap()[0], -1.0);
+        let f = |bits, float| Format {
+            channels: 1,
+            rate: RATE,
+            bits,
+            float,
+        };
+        assert_eq!(
+            decode(f(8, false), &[0, 128, 255]).unwrap(),
+            [-1.0, 0.0, 127.0 / 128.0]
+        );
+        assert_eq!(
+            decode(f(16, false), &[0, 0x80, 0xFF, 0x7F]).unwrap()[0],
+            -1.0
+        );
         assert_eq!(decode(f(24, false), &[0, 0, 0x40]).unwrap(), [0.5]);
         assert_eq!(decode(f(32, false), &[0, 0, 0, 0x80]).unwrap(), [-1.0]);
         assert_eq!(decode(f(32, true), &0.25f32.to_le_bytes()).unwrap(), [0.25]);
@@ -696,7 +732,10 @@ mod tests {
         for _ in 0..10 {
             m.render(&mut out);
             let played = m.source(v).unwrap().state().2;
-            assert!(played >= prev, "samples played regressed: {prev} -> {played}");
+            assert!(
+                played >= prev,
+                "samples played regressed: {prev} -> {played}"
+            );
             prev = played;
         }
         // 100 base frames + 2 loops of 50 frames = 200 frames total.
@@ -748,14 +787,26 @@ mod tests {
         let mut m = Mixer::new(RATE, 2);
         let v = m.add_source(6, RATE, Some(MASTER));
         // One frame: FL=0, FR=0, FC=1, LFE=0, BL=0, BR=0 — pure center.
-        m.source(v).unwrap().submit(buffer(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 6, 0));
+        m.source(v)
+            .unwrap()
+            .submit(buffer(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 6, 0));
         m.source(v).unwrap().running = true;
         let mut out = vec![0.0; 2];
         m.render(&mut out);
-        assert!((out[0] - H).abs() < 1e-6, "left carries the center at 0.707, not {}", out[0]);
-        assert!((out[1] - H).abs() < 1e-6, "right carries the center at 0.707, not {}", out[1]);
+        assert!(
+            (out[0] - H).abs() < 1e-6,
+            "left carries the center at 0.707, not {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - H).abs() < 1e-6,
+            "right carries the center at 0.707, not {}",
+            out[1]
+        );
         // A back-left-only frame stays out of the right speaker.
-        m.source(v).unwrap().submit(buffer(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 6, 1));
+        m.source(v)
+            .unwrap()
+            .submit(buffer(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 6, 1));
         m.source(v).unwrap().running = true;
         let mut out = vec![0.0; 2];
         m.render(&mut out);
@@ -775,7 +826,10 @@ mod tests {
         m.source(v).unwrap().running = true;
         let mut out = vec![0.0; 2 * 4];
         m.render(&mut out);
-        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6), "dry at unity, not silence");
+        assert!(
+            out.iter().all(|&x| (x - 0.5).abs() < 1e-6),
+            "dry at unity, not silence"
+        );
 
         // A chain that runs out before the mastering voice (a submix loop)
         // must not hang or zero the voice either.
@@ -788,7 +842,10 @@ mod tests {
         m.source(v).unwrap().running = true;
         let mut out = vec![0.0; 4];
         m.render(&mut out);
-        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6), "a looping chain falls back to dry");
+        assert!(
+            out.iter().all(|&x| (x - 0.25).abs() < 1e-6),
+            "a looping chain falls back to dry"
+        );
 
         // A live chain still applies its submix volume: the dry fallback is
         // only for chains that reach nothing.
@@ -800,7 +857,10 @@ mod tests {
         m.source(v).unwrap().running = true;
         let mut out = vec![0.0; 4];
         m.render(&mut out);
-        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6), "the live submix still halves");
+        assert!(
+            out.iter().all(|&x| (x - 0.5).abs() < 1e-6),
+            "the live submix still halves"
+        );
     }
 
     #[test]
@@ -824,14 +884,20 @@ mod tests {
         for _ in 0..80 {
             out.fill(0.0);
             let events = m.render(&mut out);
-            loops += events.iter().filter(|e| e.notice == Notice::LoopEnd).count();
+            loops += events
+                .iter()
+                .filter(|e| e.notice == Notice::LoopEnd)
+                .count();
             let sounded = out.iter().any(|&x| x != 0.0);
             if !sounded && loops > 0 {
                 silence_after_sound = true;
             }
             assert!(sounded, "the looped buffer is still playing");
         }
-        assert!(loops >= 80, "every pass over the loop region announces itself: {loops}");
+        assert!(
+            loops >= 80,
+            "every pass over the loop region announces itself: {loops}"
+        );
         assert!(!silence_after_sound);
         // Its state never reports the queue empty.
         assert_eq!(m.source(v).unwrap().state().1, 1, "the buffer stays queued");

@@ -32,7 +32,7 @@ pub fn start_mem_watch() {
         return;
     };
     std::thread::spawn(move || {
-        let base = (at & !0xfff) as usize;
+        let base = at & !0xfff;
         let mut last: Vec<Option<usize>> = vec![None; 512];
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -45,7 +45,11 @@ pub fn start_mem_watch() {
                 *old = now;
             }
             if !lines.is_empty() {
-                tracing::warn!("mem watch: {} changed: {}", lines.len(), lines[..lines.len().min(24)].join("; "));
+                tracing::warn!(
+                    "mem watch: {} changed: {}",
+                    lines.len(),
+                    lines[..lines.len().min(24)].join("; ")
+                );
             }
         }
     });
@@ -57,15 +61,20 @@ pub fn start_mem_watch() {
 pub fn start_hold_byte() {
     let Some((at, value)) = std::env::var("VICTORY_HOLD_BYTE").ok().and_then(|v| {
         let (a, b) = v.split_once(':')?;
-        Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, u8::from_str_radix(b, 16).ok()?))
+        Some((
+            usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+            u8::from_str_radix(b, 16).ok()?,
+        ))
     }) else {
         return;
     };
     tracing::warn!("holding byte {at:#x} at {value:#x}");
-    std::thread::spawn(move || loop {
-        // SAFETY: debugging aid; the address is title data the user named.
-        unsafe { (at as *mut u8).write_volatile(value) };
-        std::thread::sleep(Duration::from_millis(250));
+    std::thread::spawn(move || {
+        loop {
+            // SAFETY: debugging aid; the address is title data the user named.
+            unsafe { (at as *mut u8).write_volatile(value) };
+            std::thread::sleep(Duration::from_millis(250));
+        }
     });
 }
 
@@ -140,7 +149,9 @@ fn report() {
         let moved = crate::nullsink::MOVED.load(std::sync::atomic::Ordering::Relaxed);
         if moved > 0 {
             let sunk = crate::nullsink::SUNK.load(std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!("null-pointer writes moved so far: {moved} (allocations handed the sink: {sunk})");
+            tracing::warn!(
+                "null-pointer writes moved so far: {moved} (allocations handed the sink: {sunk})"
+            );
             for site in crate::nullsink::sites() {
                 let at = unwind::image_base_of(site.rip as usize)
                     .map(|base| format!("image+{:#x}", site.rip as usize - base))
@@ -152,7 +163,11 @@ fn report() {
                             .get(slot)
                             .copied()
                             .unwrap_or("r");
-                        let name = if name == "r" { format!("r{slot}") } else { name.into() };
+                        let name = if name == "r" {
+                            format!("r{slot}")
+                        } else {
+                            name.into()
+                        };
                         format!(" through {name} ({value:#x})")
                     }
                     None => String::new(),
@@ -168,7 +183,10 @@ fn report() {
         }
         if let Some((at, n)) = std::env::var("VICTORY_DUMP_MEM").ok().and_then(|v| {
             let (a, n) = v.split_once(',')?;
-            Some((usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?, n.parse::<usize>().ok()?))
+            Some((
+                usize::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+                n.parse::<usize>().ok()?,
+            ))
         }) {
             let words: Vec<String> = (0..n)
                 .map(|i| read_checked(at + 8 * i).map_or("-".into(), |x| format!("{x:x}")))
@@ -281,11 +299,19 @@ fn read_into(at: usize, out: &mut [u64]) -> bool {
 pub(crate) fn read_checked(at: usize) -> Option<usize> {
     unsafe extern "C" {
         static mach_task_self_: u32;
-        fn mach_vm_read_overwrite(task: u32, address: u64, size: u64, data: u64, out: *mut u64) -> i32;
+        fn mach_vm_read_overwrite(
+            task: u32,
+            address: u64,
+            size: u64,
+            data: u64,
+            out: *mut u64,
+        ) -> i32;
     }
     let (mut v, mut got) = (0usize, 0u64);
     // SAFETY: `v` is 8 writable bytes; the kernel checks the source.
-    let r = unsafe { mach_vm_read_overwrite(mach_task_self_, at as u64, 8, &raw mut v as u64, &mut got) };
+    let r = unsafe {
+        mach_vm_read_overwrite(mach_task_self_, at as u64, 8, &raw mut v as u64, &mut got)
+    };
     (r == 0 && got == 8).then_some(v)
 }
 
@@ -320,16 +346,30 @@ impl Snapshot<'_> {
 /// Stops the thread, copies its registers and stack into `raw` and lets it go on. The stopped
 /// thread may hold any lock (the unwind tables', the allocator's, the log's), so nothing between
 /// the suspend and the resume locks, allocates or logs: only reads and kernel calls.
-fn snapshot(teb: usize, port: super::threadctl::ThreadPort, raw: &mut [u64]) -> Option<Snapshot<'_>> {
+fn snapshot(
+    teb: usize,
+    port: super::threadctl::ThreadPort,
+    raw: &mut [u64],
+) -> Option<Snapshot<'_>> {
     if !port.suspend() {
         return None;
     }
     let (limit, base) = (read(teb, OFF_STACK_LIMIT), read(teb, OFF_STACK_BASE));
-    let in_host = [OFF_IN_HOST, OFF_IN_HOST_RET, OFF_IN_HOST_CTX, OFF_IN_HOST_RBP].map(|off| read(teb, off));
+    let in_host = [
+        OFF_IN_HOST,
+        OFF_IN_HOST_RET,
+        OFF_IN_HOST_CTX,
+        OFF_IN_HOST_RBP,
+    ]
+    .map(|off| read(teb, off));
     let mut ctx = Context::zeroed();
     let have = in_host[0] == 0 && port.context(&mut ctx);
     // In a host call: from below the bridge's frame (the registers and arguments it pushed).
-    let sp = if in_host[0] != 0 { in_host[3].wrapping_sub(0x100) } else { ctx.gpr[RSP] as usize } & !7;
+    let sp = if in_host[0] != 0 {
+        in_host[3].wrapping_sub(0x100)
+    } else {
+        ctx.gpr[RSP] as usize
+    } & !7;
     let mut words = 0;
     if (limit..base).contains(&sp) {
         let n = ((base - sp) / 8).min(raw.len());
@@ -338,7 +378,12 @@ fn snapshot(teb: usize, port: super::threadctl::ThreadPort, raw: &mut [u64]) -> 
         }
     }
     port.resume();
-    Some(Snapshot { in_host, ctx: have.then_some(ctx), start: sp, stack: &raw[..words] })
+    Some(Snapshot {
+        in_host,
+        ctx: have.then_some(ctx),
+        start: sp,
+        stack: &raw[..words],
+    })
 }
 
 /// The call chain from `ctx` over the copied stack. The unwinder reads memory at the addresses
@@ -382,14 +427,16 @@ fn describe(id: u32, s: &Snapshot) -> String {
     let [target, ret, stub, rbp] = s.in_host;
     {
         if target != 0 {
-            let name = traced_name(stub)
-                .map_or(format!("host function {target:#x}"), |(dll, name, slot)| {
+            let name = traced_name(stub).map_or(
+                format!("host function {target:#x}"),
+                |(dll, name, slot)| {
                     if name.is_empty() {
                         format!("{dll} method {slot:#x}")
                     } else {
                         format!("{dll}!{name}")
                     }
-                });
+                },
+            );
             line += &format!("in {name}");
             // The bridge's frame: the title's rbp is at [rbp], the return
             // address at [rbp + 8], the title's rsp after it at rbp + 16.
@@ -409,24 +456,38 @@ fn describe(id: u32, s: &Snapshot) -> String {
                         // Not into the image: only data.
                         let words: Vec<String> = (0..4)
                             .filter(|_| !(0x1_4000_0000..0x1_4600_0000).contains(&v))
-                            .map(|w| read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}")))
+                            .map(|w| {
+                                read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}"))
+                            })
                             .collect();
                         format!("{n}={v:#x} [{}]", words.join(" "))
                     })
                     .collect();
                 let arg = |off: usize| s.word(rbp - off).unwrap_or(0);
-                line += &format!(" args {:#x} {:#x} regs {}", arg(0x100), arg(0xF8), regs.join(" "));
+                line += &format!(
+                    " args {:#x} {:#x} regs {}",
+                    arg(0x100),
+                    arg(0xF8),
+                    regs.join(" ")
+                );
             }
             // VICTORY_DUMP_STACK=1: the title's stack words above the call, and 4 qwords behind
             // each that points at data (not at the image's code).
-            if std::env::var_os("VICTORY_DUMP_STACK").is_some() && chain.len() > 2 && !read_all_bases(&chain) {
+            if std::env::var_os("VICTORY_DUMP_STACK").is_some()
+                && chain.len() > 2
+                && !read_all_bases(&chain)
+            {
                 let mut out = Vec::new();
                 for i in 0..96 {
                     let at = rbp + 16 + 8 * i;
                     let Some(v) = s.word(at) else { break };
                     let data = (0x1_4600_0000..0x7fff_ffff_0000).contains(&v) && v & 7 == 0;
                     let words: Vec<String> = if data {
-                        (0..4).map(|w| read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}"))).collect()
+                        (0..4)
+                            .map(|w| {
+                                read_checked(v + 8 * w).map_or("-".into(), |x| format!("{x:x}"))
+                            })
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -442,7 +503,10 @@ fn describe(id: u32, s: &Snapshot) -> String {
                 line += &format!("in host code at {:#x}", ctx.rip);
             }
         }
-        let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
+        let base = chain
+            .first()
+            .and_then(|&pc| unwind::image_base_of(pc))
+            .unwrap_or(0);
         let offsets: Vec<usize> = chain.iter().map(|&pc| pc.wrapping_sub(base)).collect();
         format!("{line}, title image+ {offsets:x?}")
     }
@@ -463,13 +527,19 @@ pub fn caller_chain() -> Vec<usize> {
     ctx.gpr[RBP] = unsafe { (rbp as *const u64).read() };
     let bounds = Some((read(teb, OFF_STACK_LIMIT), read(teb, OFF_STACK_BASE)));
     let chain = super::seh::backtrace(ctx, bounds);
-    let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
+    let base = chain
+        .first()
+        .and_then(|&pc| unwind::image_base_of(pc))
+        .unwrap_or(0);
     chain.iter().map(|&pc| pc.wrapping_sub(base)).collect()
 }
 
 /// Whether the chain is not the main wait loop's (the stack dump is for one thread).
 fn read_all_bases(chain: &[usize]) -> bool {
-    let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);
+    let base = chain
+        .first()
+        .and_then(|&pc| unwind::image_base_of(pc))
+        .unwrap_or(0);
     !chain.iter().any(|&pc| pc.wrapping_sub(base) == 0x1d83996)
 }
 
@@ -482,15 +552,19 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
     static SPEC: OnceLock<Option<(usize, Vec<usize>)>> = OnceLock::new();
     let spec = SPEC.get_or_init(|| {
         let v = std::env::var("VICTORY_TRAP_WRITES").ok()?;
-        let mut it = v.split(',').filter_map(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
+        let mut it = v
+            .split(',')
+            .filter_map(|x| usize::from_str_radix(x.trim_start_matches("0x"), 16).ok());
         let page = it.next()?;
         Some((page & !0xfff, it.collect()))
     });
-    let Some((page, watched)) = spec else { return false };
-    if r.code != 0xc000_0005 || r.information[0] != 1 || (r.information[1] as usize) & !0xfff != *page {
+    let Some((page, watched)) = spec else {
+        return false;
+    };
+    if r.code != 0xc000_0005 || r.information[0] != 1 || r.information[1] & !0xfff != *page {
         return false;
     }
-    let at = r.information[1] as usize;
+    let at = r.information[1];
     if watched.contains(&(at & !7)) {
         let base = unwind::image_base_of(c.rip as usize).unwrap_or(0);
         let chain = super::seh::backtrace(*c, None);
@@ -507,10 +581,9 @@ pub fn write_trap(c: &Context, r: &super::seh::context::ExceptionRecord) -> bool
 
 /// Starts the thread that closes the trapped page again.
 pub fn start_write_trap() {
-    let Some(page) = std::env::var("VICTORY_TRAP_WRITES")
-        .ok()
-        .and_then(|v| usize::from_str_radix(v.split(',').next()?.trim_start_matches("0x"), 16).ok())
-    else {
+    let Some(page) = std::env::var("VICTORY_TRAP_WRITES").ok().and_then(|v| {
+        usize::from_str_radix(v.split(',').next()?.trim_start_matches("0x"), 16).ok()
+    }) else {
         return;
     };
     unsafe extern "C" {
@@ -565,8 +638,10 @@ mod tests {
         let (snapped_tx, snapped_rx) = channel();
         let (line_tx, line_rx) = channel();
         std::thread::spawn(move || {
-            let (_, port, id) =
-                super::super::teb::live_threads().into_iter().find(|t| t.0 == teb).unwrap();
+            let (_, port, id) = super::super::teb::live_threads()
+                .into_iter()
+                .find(|t| t.0 == teb)
+                .unwrap();
             let mut raw = vec![0u64; STACK_WORDS];
             let s = snapshot(teb, port, &mut raw).unwrap();
             snapped_tx.send((s.ctx.is_some(), s.stack.len())).unwrap();
@@ -580,7 +655,9 @@ mod tests {
         // Unwinding and formatting come after, once the holder runs again and lets go.
         assert!(line_rx.recv_timeout(Duration::from_millis(200)).is_err());
         release_tx.send(()).unwrap();
-        let line = line_rx.recv_timeout(Duration::from_secs(20)).expect("the thread was not resumed");
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the thread was not resumed");
         assert!(line.contains("in host code at"), "{line}");
         drop(release_tx);
         holder.join().unwrap();
@@ -596,11 +673,19 @@ mod tests {
         let mut stack = [0u64; 12];
         stack[4] = start as u64 + 0x40;
         stack[5] = fake.base() as u64 + 0x107;
-        let s = Snapshot { in_host: [0; 4], ctx: None, start, stack: &stack };
+        let s = Snapshot {
+            in_host: [0; 4],
+            ctx: None,
+            start,
+            stack: &stack,
+        };
         let mut ctx = Context::zeroed();
         ctx.rip = fake.base() as u64 + 0x105;
         ctx.gpr[RSP] = start as u64;
-        assert_eq!(chain_over(&s, ctx), [fake.base() + 0x105, fake.base() + 0x107]);
+        assert_eq!(
+            chain_over(&s, ctx),
+            [fake.base() + 0x105, fake.base() + 0x107]
+        );
         // The snapshot itself keeps the thread's own values.
         assert_eq!(s.word(start + 0x20), Some(start + 0x40));
         assert_eq!(s.word(start + 0x60), None);

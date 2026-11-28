@@ -113,6 +113,7 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -196,13 +197,21 @@ pub(crate) fn sync_heaps() {
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let (first, last) = (
+                    (page as u64 - start) / step,
+                    (end as u64 - start).div_ceil(step),
+                );
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.sync_slots(
+                    first as u32,
+                    last.min(u64::from(heap.desc.count)) as u32,
+                    start,
+                    step,
+                );
             }
         }
     }
@@ -227,7 +236,12 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| {
+                slots
+                    .iter()
+                    .filter(|&&i| i < heap.desc.count)
+                    .filter_map(|&i| host.unmade_placed(i))
+            })
             .collect()
     };
     #[cfg(test)]
@@ -572,10 +586,12 @@ pub(crate) fn record(handle: u64, view: View) {
 #[cfg(target_os = "macos")]
 pub(crate) fn span(this: This) -> Option<(u64, bool, usize)> {
     let h = heap(this);
-    matches!(h.desc.kind, VIEWS_KIND | SAMPLERS).then(|| (h.start, h.samplers(), h.desc.count as usize))
+    matches!(h.desc.kind, VIEWS_KIND | SAMPLERS)
+        .then(|| (h.start, h.samplers(), h.desc.count as usize))
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(test, windows))]
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
@@ -606,12 +622,17 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
+#[cfg(windows)]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            tag == VIEW_TAG
+                && views
+                    .list
+                    .get(i as usize)
+                    .is_some_and(|(_, current)| *current == generation)
         })
         .collect()
 }
@@ -936,27 +957,43 @@ pub(crate) mod tests {
             desc,
         };
         let whole_volume = explicit([28, 8, 0, 0, u32::MAX, 0]);
-        assert_eq!(whole_volume.native_rtv_subresource(Tex3d, 4, 2, 1), Some((0, 0)));
+        assert_eq!(
+            whole_volume.native_rtv_subresource(Tex3d, 4, 2, 1),
+            Some((0, 0))
+        );
         let base_volume = explicit([28, 8, 0, 0, 4, 0]);
-        assert_eq!(base_volume.native_rtv_subresource(Tex3d, 4, 2, 1), Some((0, 0)));
+        assert_eq!(
+            base_volume.native_rtv_subresource(Tex3d, 4, 2, 1),
+            Some((0, 0))
+        );
         assert_eq!(base_volume.native_rtv_subresource(Tex3d, 3, 2, 1), None);
         let nonbase_volume = explicit([28, 8, 0, 1, 1, 0]);
         assert_eq!(nonbase_volume.native_rtv_subresource(Tex3d, 4, 2, 1), None);
         let array_1d = explicit([28, 3, 1, 1, 1, 0]);
-        assert_eq!(array_1d.native_rtv_subresource(Tex1d, 2, 2, 1), Some((1, 1)));
+        assert_eq!(
+            array_1d.native_rtv_subresource(Tex1d, 2, 2, 1),
+            Some((1, 1))
+        );
         assert_eq!(array_1d.native_rtv_subresource(Tex2d, 2, 2, 1), None);
         let texture_2d = explicit([28, 4, 1, 0, 0, 0]);
         assert_eq!(texture_2d.native_rtv_subresource(Tex2d, 1, 2, 4), None);
-        assert_eq!(texture_2d.native_rtv_subresource(Tex2d, 2, 2, 1), Some((1, 0)));
+        assert_eq!(
+            texture_2d.native_rtv_subresource(Tex2d, 2, 2, 1),
+            Some((1, 0))
+        );
     }
 
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
-    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+    #[cfg(windows)]
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> =
+        std::sync::Mutex::new(None);
 
     /// The work [`WHILE_MAKING`] runs.
+    #[cfg(windows)]
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    #[cfg(windows)]
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
         if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
@@ -1081,7 +1118,11 @@ pub(crate) mod tests {
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
-            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
             let slot = memory as u64 + 5 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).

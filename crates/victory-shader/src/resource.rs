@@ -204,7 +204,11 @@ pub(crate) fn track_graphics(
                 let (param, dword) = t.param_of(reg)?;
                 Some((v, param, dword))
             })
-            .chain(t.spilled.iter().map(|(&v, &(param, dword))| (v, param, dword)))
+            .chain(
+                t.spilled
+                    .iter()
+                    .map(|(&v, &(param, dword))| (v, param, dword)),
+            )
             .collect(),
         ..Resources::default()
     };
@@ -1032,7 +1036,11 @@ impl<'a> Tracer<'a> {
         // carry); a fixed-offset load still needs `hi` zero, as the console's
         // own tables give (and a guessed vertex shader's rebase check needs).
         let dynamic = s.dynamic.or(extra.dynamic);
-        let heap_high = if heap { self.param_word(param, 1) } else { None };
+        let heap_high = if heap {
+            self.param_word(param, 1)
+        } else {
+            None
+        };
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && heap_high.is_some_and(|h| self.carried(hi, h)))
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
@@ -1067,7 +1075,10 @@ impl<'a> Tracer<'a> {
         let hi = match hi {
             Term::Value(v) => match self.sop2(v, &["s_and_b32"]) {
                 Some((_, [t, Term::Const(mask)] | [Term::Const(mask), t]))
-                    if self.possible_bits(t, 1) & !mask == 0 => t,
+                    if self.possible_bits(t, 1) & !mask == 0 =>
+                {
+                    t
+                }
                 _ => hi,
             },
             _ => hi,
@@ -1206,7 +1217,13 @@ impl<'a> Tracer<'a> {
         // that names its own format (`tbuffer_load_format_*`), which reads
         // the raw view by bytes; `buffer_load_format_*` reads the view's
         // elements, which the cleared stride would change.
-        let own_format = matches!(inst.fields, Fields::Buffer { format: Some(_), .. });
+        let own_format = matches!(
+            inst.fields,
+            Fields::Buffer {
+                format: Some(_),
+                ..
+            }
+        );
         if (own_format || !inst.name().contains("format"))
             && let Some(raw) = self.made_raw(&words)
         {
@@ -1286,7 +1303,11 @@ impl<'a> Tracer<'a> {
                 });
             }
             if let Term::Const(w2) = w2 {
-                return Ok(Source::Built { address, bits, words: [w2, w3] });
+                return Ok(Source::Built {
+                    address,
+                    bits,
+                    words: [w2, w3],
+                });
             }
         }
         let loaded = |w: &Term| {
@@ -1313,11 +1334,11 @@ impl<'a> Tracer<'a> {
         let Some((load, Some(start))) = reference else {
             return changed_why(0, Change::OtherLoad);
         };
-        let Some((k, word)) = words
-            .iter()
-            .enumerate()
-            .find(|&(k, w)| load.writes.get(start + k).is_none_or(|x| *w != Term::Value(x.1)))
-        else {
+        let Some((k, word)) = words.iter().enumerate().find(|&(k, w)| {
+            load.writes
+                .get(start + k)
+                .is_none_or(|x| *w != Term::Value(x.1))
+        }) else {
             return changed_why(0, Change::OtherLoad);
         };
         let kind = match *word {
@@ -1330,9 +1351,11 @@ impl<'a> Tracer<'a> {
                     Change::Selected
                 }
                 Some(n)
-                    if ["s_and", "s_or", "s_xor", "s_nand", "s_nor", "s_xnor", "s_bfi", "s_bfm"]
-                        .iter()
-                        .any(|p| n.starts_with(p))
+                    if [
+                        "s_and", "s_or", "s_xor", "s_nand", "s_nor", "s_xnor", "s_bfi", "s_bfm",
+                    ]
+                    .iter()
+                    .any(|p| n.starts_with(p))
                         || n.starts_with("s_bitset") =>
                 {
                     Change::Masked
@@ -1406,7 +1429,13 @@ impl<'a> Tracer<'a> {
         }
         let Some((inst, [a, b])) = self.sop2(
             v,
-            &["s_and_b32", "s_or_b32", "s_lshl_b32", "s_add_u32", "s_addc_u32"],
+            &[
+                "s_and_b32",
+                "s_or_b32",
+                "s_lshl_b32",
+                "s_add_u32",
+                "s_addc_u32",
+            ],
         ) else {
             return u32::MAX;
         };
@@ -1420,7 +1449,9 @@ impl<'a> Tracer<'a> {
             },
             // A carry can set every bit below the most significant possible bit.
             _ => {
-                let max = bits(a).saturating_add(bits(b)).saturating_add(u32::from(inst.name() == "s_addc_u32"));
+                let max = bits(a)
+                    .saturating_add(bits(b))
+                    .saturating_add(u32::from(inst.name() == "s_addc_u32"));
                 u32::MAX.checked_shr(max.leading_zeros()).unwrap_or(0)
             }
         }
@@ -1471,10 +1502,18 @@ impl<'a> Tracer<'a> {
         let args = match taken.iter().position(|&t| t) {
             Some(first) if taken.contains(&false) => edge(first, joins, known).and_then(|live| {
                 (0..preds.len())
-                    .map(|j| if taken[j] { edge(j, joins, known) } else { Ok(live.clone()) })
+                    .map(|j| {
+                        if taken[j] {
+                            edge(j, joins, known)
+                        } else {
+                            Ok(live.clone())
+                        }
+                    })
                     .collect::<Result<_, _>>()
             }),
-            _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
+            _ => (0..preds.len())
+                .map(|j| edge(j, joins, known))
+                .collect::<Result<_, _>>(),
         };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
@@ -2389,22 +2428,46 @@ fn changed_why(dword: usize, kind: Change) -> &'static str {
     macro_rules! how {
         ($d:literal) => {
             match kind {
-                Change::Constant => concat!("a descriptor changed after loading: dword ", $d,
-                    " is a constant"),
-                Change::OtherLoad => concat!("a descriptor changed after loading: dword ", $d,
-                    " comes from another load or place in it"),
-                Change::Masked => concat!("a descriptor changed after loading: dword ", $d,
-                    " masked or merged (s_and, s_or, s_bfi...)"),
-                Change::Offset => concat!("a descriptor changed after loading: dword ", $d,
-                    " added to (s_add, s_sub...)"),
-                Change::Scaled => concat!("a descriptor changed after loading: dword ", $d,
-                    " shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)"),
-                Change::Selected => concat!("a descriptor changed after loading: dword ", $d,
-                    " chosen by a select or a join"),
-                Change::Input => concat!("a descriptor changed after loading: dword ", $d,
-                    " is a program input"),
-                Change::Computed => concat!("a descriptor changed after loading: dword ", $d,
-                    " computed otherwise"),
+                Change::Constant => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " is a constant"
+                ),
+                Change::OtherLoad => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " comes from another load or place in it"
+                ),
+                Change::Masked => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " masked or merged (s_and, s_or, s_bfi...)"
+                ),
+                Change::Offset => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " added to (s_add, s_sub...)"
+                ),
+                Change::Scaled => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " shifted, multiplied or extracted (s_lshl, s_mul, s_bfe...)"
+                ),
+                Change::Selected => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " chosen by a select or a join"
+                ),
+                Change::Input => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " is a program input"
+                ),
+                Change::Computed => concat!(
+                    "a descriptor changed after loading: dword ",
+                    $d,
+                    " computed otherwise"
+                ),
             }
         };
     }
@@ -2599,12 +2662,22 @@ pub(crate) fn vertex_roots_match_rebased(
     for (b, block) in p.blocks.iter().enumerate() {
         for inst in &block.insts {
             let address = |t: &Tracer<'_>| match &inst.fields {
-                Fields::Smem { base, offset, soffset, .. } if inst.name().starts_with("s_load_") => {
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } if inst.name().starts_with("s_load_") => {
                     t.smem_address(inst, base, *offset, soffset).map(Some)
                 }
-                Fields::Flat { addr, saddr, offset, .. } if inst.name().starts_with("global_") => {
-                    t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset).map(Some)
-                }
+                Fields::Flat {
+                    addr,
+                    saddr,
+                    offset,
+                    ..
+                } if inst.name().starts_with("global_") => t
+                    .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                    .map(Some),
                 Fields::Smem { base: rsrc, .. } | Fields::Buffer { rsrc, .. }
                     if inst.name().starts_with("s_buffer_")
                         || inst.name().starts_with("buffer_load_")
@@ -2626,8 +2699,9 @@ pub(crate) fn vertex_roots_match_rebased(
                 // descriptor parameter.
                 (Ok(Some(old_a)), Ok(Some(new_a)))
                     if old_a.param == MEMORY
-                        && relative.get(new_a.param).is_some_and(|r|
-                            matches!(r.root, RootType::Table | RootType::Descriptor)) =>
+                        && relative.get(new_a.param).is_some_and(|r| {
+                            matches!(r.root, RootType::Table | RootType::Descriptor)
+                        }) =>
                 {
                     found = true;
                 }
@@ -2640,12 +2714,7 @@ pub(crate) fn vertex_roots_match_rebased(
 
 impl Tracer<'_> {
     /// Collects `s_load_dword*` and `global_load_dword*` sites feeding descriptor `words`.
-    fn collect_descriptor_loads(
-        &self,
-        words: &[Term],
-        seen: &mut Vec<Value>,
-        out: &mut Vec<Site>,
-    ) {
+    fn collect_descriptor_loads(&self, words: &[Term], seen: &mut Vec<Value>, out: &mut Vec<Site>) {
         for &w in words {
             let Term::Value(v) = w else { continue };
             if seen.contains(&v) || seen.len() >= 256 {
@@ -2676,12 +2745,7 @@ impl Tracer<'_> {
     }
 
     /// Follows per-lane descriptor values (VGPRs from `global_load_dword*`, `v_cndmask_b32`, phis).
-    fn collect_lane_descriptor_loads(
-        &self,
-        t: Term,
-        seen: &mut Vec<Value>,
-        out: &mut Vec<Site>,
-    ) {
+    fn collect_lane_descriptor_loads(&self, t: Term, seen: &mut Vec<Value>, out: &mut Vec<Site>) {
         let Term::Value(v) = self.lane_term(t) else {
             return;
         };
@@ -2780,19 +2844,30 @@ impl Tracer<'_> {
                 "s_xor_b64" => true,
                 _ => return None,
             };
-            let Fields::Sop { src, .. } = &inst.fields else { return None };
-            let [Operand::Scalar { code: a, .. }, Operand::Scalar { code: b, .. }] = src[..] else {
+            let Fields::Sop { src, .. } = &inst.fields else {
+                return None;
+            };
+            let [
+                Operand::Scalar { code: a, .. },
+                Operand::Scalar { code: b, .. },
+            ] = src[..]
+            else {
                 return None;
             };
             if k > usize::from(pair) || a == NULL || b == NULL {
                 return None;
             }
-            Some([inst.read(Reg::S(a + k as u8))?, inst.read(Reg::S(b + k as u8))?])
+            Some([
+                inst.read(Reg::S(a + k as u8))?,
+                inst.read(Reg::S(b + k as u8))?,
+            ])
         };
         let [x, y] = xor(inst, k)?;
         for (x, y) in [(x, y), (y, x)] {
             let Some(def) = self.def(x) else { continue };
-            let Some(j) = def.writes.iter().position(|w| w.1 == x) else { continue };
+            let Some(j) = def.writes.iter().position(|w| w.1 == x) else {
+                continue;
+            };
             let Some([a, b]) = xor(def, j) else { continue };
             let (a, b, y) = (o[a.0 as usize], o[b.0 as usize], o[y.0 as usize]);
             if y.is_some() && y == b {
@@ -2985,12 +3060,18 @@ pub(crate) mod tests {
             let words = [
                 0x8004_A004, // s_add_u32 s4, s4, 32
                 hi,
-                0x8705_FF05, mask, // s_and_b32 s5, s5, mask
-                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
-                0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+                0x8705_FF05,
+                mask, // s_and_b32 s5, s5, mask
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xE070_0000,
+                0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
                 S_ENDPGM,
             ];
-            let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let code = words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>();
             let p = crate::ir::build(&code, false, 256).unwrap();
             track(&p, &[param(Table, 4, 1)], HwStage::Cs, lanes(&p).as_ref())
         };
@@ -2999,9 +3080,11 @@ pub(crate) mod tests {
         // Clearing the carry changes the address.
         assert!(run(carried, 0xfe).is_err());
         // A masked arbitrary input can still name memory outside the heap.
-        assert!(matches!(run(0xBE85_0300, 0xff), // s_mov_b32 s5, s0
+        assert!(matches!(
+            run(0xBE85_0300, 0xff), // s_mov_b32 s5, s0
             Err(ShaderError::Unsupported {
-                what: "an address into a descriptor heap with an untracked high half", ..
+                what: "an address into a descriptor heap with an untracked high half",
+                ..
             })
         ));
     }
@@ -4672,11 +4755,18 @@ pub(crate) mod tests {
             0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
             S_ENDPGM,
         ];
-        let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let code = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[param(ResourceHeap, 10, 2)], HwStage::Vs, lanes(&p).as_ref())
-            .err()
-            .expect("expected refusal");
+        let err = track(
+            &p,
+            &[param(ResourceHeap, 10, 2)],
+            HwStage::Vs,
+            lanes(&p).as_ref(),
+        )
+        .expect_err("expected refusal");
         assert!(
             err.to_string()
                 .contains("an address into a descriptor heap with an untracked high half"),

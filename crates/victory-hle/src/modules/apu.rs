@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE as Handle};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 #[cfg(not(windows))]
 use crate::host_posix::{CloseHandle, CreateEventW, SetEvent};
 #[cfg(not(windows))]
-type HANDLE = *mut c_void;
+type Handle = *mut c_void;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -71,7 +71,7 @@ pub struct ConnectInput {
 #[repr(C)]
 pub struct ConnectOutput {
     memory: *mut c_void,
-    result_event: HANDLE,
+    result_event: Handle,
 }
 
 /// What every command starts with, and what its result echoes.
@@ -133,7 +133,7 @@ unsafe impl Send for ApuResult {}
 pub struct Connection {
     memory: *mut u8,
     layout: Layout,
-    event: HANDLE,
+    event: Handle,
     options: u32,
     per_stream: u32,
     state: Mutex<State>,
@@ -203,10 +203,16 @@ impl Second {
                 "APU: Opus commands in the last second"
             );
         }
-        *self = Second { logged: Some(now), ..Second::new() };
+        *self = Second {
+            logged: Some(now),
+            ..Second::new()
+        };
     }
 }
 
+// shortcut: the Win32 calls are `windows_sys`'s unsafe ones on Windows and
+// safe POSIX stand-ins elsewhere, so their blocks read as unused off Windows.
+#[cfg_attr(not(windows), allow(unused_unsafe))]
 pub extern "system" fn XApuConnect(
     input: *const ConnectInput,
     output: *mut ConnectOutput,
@@ -288,6 +294,9 @@ pub extern "system" fn XApuConnect(
     S_OK
 }
 
+// shortcut: the Win32 calls are `windows_sys`'s unsafe ones on Windows and
+// safe POSIX stand-ins elsewhere, so their blocks read as unused off Windows.
+#[cfg_attr(not(windows), allow(unused_unsafe))]
 pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     if handle.is_null() {
         return E_INVALIDARG;
@@ -303,6 +312,9 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     S_OK
 }
 
+// shortcut: the Win32 calls are `windows_sys`'s unsafe ones on Windows and
+// safe POSIX stand-ins elsewhere, so their blocks read as unused off Windows.
+#[cfg_attr(not(windows), allow(unused_unsafe))]
 pub extern "system" fn XApuEnqueueCommand(
     handle: *mut Connection,
     command: *const CommandId,

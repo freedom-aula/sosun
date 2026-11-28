@@ -24,7 +24,10 @@ fn title() -> Option<Title<Metal>> {
         eprintln!("skipped: Metal Shader Converter not installed");
         return None;
     }
-    Some(Title::new(Metal::new().unwrap(), Arc::new(PoolTable::default())))
+    Some(Title::new(
+        Metal::new().unwrap(),
+        Arc::new(PoolTable::default()),
+    ))
 }
 
 /// A translated shader as plain data: our own DXIL, no title arguments.
@@ -60,7 +63,10 @@ fn the_host_translates_for_32_lane_waves() {
 
 #[test]
 fn group_sizes_come_from_the_converted_container() {
-    assert_eq!(shaders::threads_of(&read("tests/affine.dxil")), Some([64, 1, 1]));
+    assert_eq!(
+        shaders::threads_of(&read("tests/affine.dxil")),
+        Some([64, 1, 1])
+    );
     assert_eq!(shaders::threads_of(b"junk"), None);
 }
 
@@ -96,7 +102,10 @@ fn a_compute_pipeline_put_off_is_made_by_a_later_use() {
         assert!(asks < 3000, "never made: {:?}", t.shaders);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!((t.shaders.put_off, t.shaders.pipelines, t.shaders.refusals()), (asks, 1, 0));
+    assert_eq!(
+        (t.shaders.put_off, t.shaders.pipelines, t.shaders.refusals()),
+        (asks, 1, 0)
+    );
 }
 
 /// What the host cannot give a shader is refused, counted by reason, and logged once; nothing
@@ -112,17 +121,32 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
         // The same refusal twice is two refusals of one reason.
         assert!(matches!(t.compute_pipe(s, "x"), Pipe::Refused));
     }
-    let ShaderStats { refused, pipelines, .. } = t.shaders.clone();
+    let ShaderStats {
+        refused, pipelines, ..
+    } = t.shaders.clone();
     assert_eq!(pipelines, 0);
     assert_eq!(refused.len(), 2, "{refused:?}");
-    assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
-    assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
+    assert!(
+        refused
+            .iter()
+            .any(|(why, _)| why.contains("marks the pages"))
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|(why, _)| why.contains("thread group") || why.contains("conversion"))
+    );
     // Compute shaders get the page table; a graphics pipeline does not yet.
     let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
     vs.memory = true;
     let g = Graphics::default();
     assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
+    assert!(
+        t.shaders
+            .refused
+            .iter()
+            .any(|(why, _)| why.contains("graphics pipeline"))
+    );
     t.refused_translation("y", "no DXIL part".into());
     assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
 }
@@ -138,7 +162,11 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     let reads = state::vertex_inputs(&vs.dxil).unwrap();
     assert_eq!(
         reads,
-        [("POSITION".to_owned(), 0), ("TEXCOORD".to_owned(), 0), ("COLOR".to_owned(), 0)]
+        [
+            ("POSITION".to_owned(), 0),
+            ("TEXCOORD".to_owned(), 0),
+            ("COLOR".to_owned(), 0)
+        ]
     );
 
     // A stream with the layout, a target and blending on.
@@ -172,7 +200,7 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     // and a later use picks it up.
     t.compile_wait = std::time::Duration::ZERO;
     let mut asks = 0;
-    let pipe = loop {
+    let _pipe = loop {
         let pipe = t.render_pipe(&vs, Some(&ps), &g, "tri");
         if matches!(pipe, Pipe::Render(..)) {
             break pipe;
@@ -184,7 +212,10 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     assert!(asks > 0);
     assert_eq!((t.shaders.put_off, t.shaders.refusals()), (asks, 0));
     t.compile_wait = std::time::Duration::MAX;
-    assert!(matches!(t.render_pipe(&vs, Some(&ps), &g, "tri again"), Pipe::Render(..)));
+    assert!(matches!(
+        t.render_pipe(&vs, Some(&ps), &g, "tri again"),
+        Pipe::Render(..)
+    ));
     assert_eq!((t.shaders.pipelines, t.shaders.cached), (1, 1));
 
     // A different state is a different pipeline; a layout the shader's input is missing from is
@@ -192,7 +223,10 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     let mut no_layout = Graphics::default();
     // SAFETY: as above, only the formats.
     unsafe { no_layout.read(15, rts.as_ptr()) };
-    assert!(matches!(t.render_pipe(&vs, Some(&ps), &no_layout, "bare"), Pipe::Refused));
+    assert!(matches!(
+        t.render_pipe(&vs, Some(&ps), &no_layout, "bare"),
+        Pipe::Refused
+    ));
     // A pixel stage with arguments of its own is converted with the host's layout of them: this
     // fixture (plain HLSL with a texture at t0, not translator output) is then refused, as its
     // texture is in no host layout.
@@ -203,7 +237,20 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
         root: victory_shader::RootType::Constants,
         dword: 0,
     });
-    assert!(matches!(t.render_pipe(&vs, Some(&args), &g, "args"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.starts_with("args") && why.contains("root signature")));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("layout lacks")));
+    assert!(matches!(
+        t.render_pipe(&vs, Some(&args), &g, "args"),
+        Pipe::Refused
+    ));
+    assert!(
+        t.shaders
+            .refused
+            .iter()
+            .any(|(why, _)| why.starts_with("args") && why.contains("root signature"))
+    );
+    assert!(
+        t.shaders
+            .refused
+            .iter()
+            .any(|(why, _)| why.contains("layout lacks"))
+    );
 }

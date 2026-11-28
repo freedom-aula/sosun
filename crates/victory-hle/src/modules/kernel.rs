@@ -844,6 +844,7 @@ mod tests {
         assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
     }
 
+    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }

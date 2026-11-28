@@ -222,8 +222,17 @@ struct Level {
 
 /// Detiles every mip of every slice of `tiled` (a texture's whole memory): the levels detiled,
 /// and the error that stopped it short if one did.
-fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (Vec<Level>, Result<(), String>) {
-    let slices = if dimension == Dimension::Tex3d { 1 } else { layout.slices };
+fn detile(
+    layout: &Layout,
+    dimension: Dimension,
+    format: u32,
+    tiled: &[u8],
+) -> (Vec<Level>, Result<(), String>) {
+    let slices = if dimension == Dimension::Tex3d {
+        1
+    } else {
+        layout.slices
+    };
     let n = layout.desc.element_bytes as usize;
     let mut levels = Vec::new();
     for mip in 0..layout.mips.len() as u32 {
@@ -234,10 +243,19 @@ fn detile(layout: &Layout, dimension: Dimension, format: u32, tiled: &[u8]) -> (
         for slice in 0..slices {
             let mut texels = vec![0u8; slice_pitch * depth];
             if let Err(e) = layout.detile(tiled, mip, slice, &mut texels, row, slice_pitch) {
-                return (levels, Err(format!("detile mip {mip} slice {slice}: {e:?}")));
+                return (
+                    levels,
+                    Err(format!("detile mip {mip} slice {slice}: {e:?}")),
+                );
             }
             to_host(format, &mut texels);
-            levels.push(Level { mip: mip as usize, slice: slice as usize, texels, row, slice_pitch });
+            levels.push(Level {
+                mip: mip as usize,
+                slice: slice as usize,
+                texels,
+                row,
+                slice_pitch,
+            });
         }
     }
     (levels, Ok(()))
@@ -289,7 +307,14 @@ fn download<B: ResourceBackend>(
         let depth = layout.subresource_depth(mip).max(1) as usize;
         let mut linear = vec![0u8; slice_pitch * depth];
         for slice in 0..slices {
-            backend.read_texture(tex, mip as usize, slice as usize, &mut linear, row, slice_pitch);
+            backend.read_texture(
+                tex,
+                mip as usize,
+                slice as usize,
+                &mut linear,
+                row,
+                slice_pitch,
+            );
             from_host(info.format, &mut linear);
             layout
                 .tile(tiled, mip, slice, &linear, row, slice_pitch)
@@ -406,14 +431,22 @@ fn watch<R>(f: impl FnOnce(&mut Watch) -> R) -> R {
 }
 
 fn watch_in<R>(watched: &Watched, f: impl FnOnce(&mut Watch) -> R) -> R {
-    f(watched.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+    f(watched
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default())
 }
 
 /// One round of the scanner: hashes the memory of each texture `watched` lists, without holding
 /// it, and marks those that changed since they were last read whole.
 fn scan_round(watched: &Watched, buf: &mut [u8]) {
     let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
-        let Watch { entries, seen, partial, .. } = w;
+        let Watch {
+            entries,
+            seen,
+            partial,
+            ..
+        } = w;
         seen.retain(|k, _| entries.contains_key(k));
         partial.retain(|k| entries.contains_key(k));
         entries.iter().map(|(&k, &v)| (k, v)).collect()
@@ -421,15 +454,19 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
     for &(key, entry) in &list {
         let (at, size, target, _) = entry;
         // What it is compared with; `None` (skipped) if it was released since the list.
-        let known = |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
-        let Some((before, was_partial)) = watch_in(watched, |w| known(w).map(|b| (b, w.partial.contains(&key)))) else {
+        let known =
+            |w: &Watch| (w.entries.get(&key) == Some(&entry)).then(|| w.seen.get(&key).copied());
+        let Some((before, was_partial)) =
+            watch_in(watched, |w| known(w).map(|b| (b, w.partial.contains(&key))))
+        else {
             continue;
         };
         let mut h = blake3::Hasher::new();
         let mut unreadable = false;
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
-            unreadable |= !read_texture_bytes_known((at + off) as *const u8, &mut buf[..n], was_partial);
+            unreadable |=
+                !read_texture_bytes_known((at + off) as *const u8, &mut buf[..n], was_partial);
             h.update(&buf[..n]);
         }
         let h = h.finalize();
@@ -461,13 +498,15 @@ fn start_scanner() {
             // hot is seen a few submissions later without it.
             return;
         }
-        let _ = std::thread::Builder::new().name("victory texture scan".into()).spawn(|| {
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                scan_round(&WATCH, &mut buf);
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name("victory texture scan".into())
+            .spawn(|| {
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    scan_round(&WATCH, &mut buf);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
     });
 }
 
@@ -623,7 +662,13 @@ fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
 ///
 /// shortcut: when sampled, a write that misses every sampled window goes unseen until the
 /// scanner's next round; a texture the title rewrites whole (a movie's planes) is caught at once.
-fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut seen: impl FnMut(&[u8])) {
+fn probe_read(
+    at: usize,
+    size: usize,
+    whole: bool,
+    scratch: &mut Vec<u8>,
+    mut seen: impl FnMut(&[u8]),
+) {
     if whole || size <= PROBE_PAGES * PROBE_SAMPLE {
         const CHUNK: usize = 1 << 20;
         let cap = size.min(CHUNK);
@@ -651,10 +696,16 @@ fn probe_read(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>, mut se
 }
 
 /// For the trace: hot textures a probe read whole, and their bytes.
-static WHOLE_PROBES: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static WHOLE_PROBES: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 /// For the trace: placements that took the place of another at their address, and those of them
 /// that had been at that address before.
-static REPLACED: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static REPLACED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Probes `keys` round-robin from `cursor`, each at most once. An expired deadline, or
 /// `WHOLE_BUDGET` of whole reads, stops the round after at least `MIN_SYNC_HOT` probes (no deadline:
@@ -676,13 +727,19 @@ fn probe_round<B: ResourceBackend>(
     let mut whole = 0;
     let mut spare = 0;
     while left > 0 && !keys.is_empty() {
-        if probed >= MIN_SYNC_HOT && until.is_some_and(|until| std::time::Instant::now() >= until || whole >= WHOLE_BUDGET) {
+        if probed >= MIN_SYNC_HOT
+            && until
+                .is_some_and(|until| std::time::Instant::now() >= until || whole >= WHOLE_BUDGET)
+        {
             break;
         }
         left -= 1;
         let idx = *cursor % keys.len();
         let key = keys[idx];
-        let Some(t) = textures.get_mut(&key).filter(|t| if blank { t.blank } else { t.hot > 0 }) else {
+        let Some(t) = textures
+            .get_mut(&key)
+            .filter(|t| if blank { t.blank } else { t.hot > 0 })
+        else {
             keys.swap_remove(idx);
             continue;
         };
@@ -703,7 +760,8 @@ fn probe_round<B: ResourceBackend>(
             let changed = before != Some(sampled);
             if !changed && t.uploads >= 2 && t.info.size <= PROBE_WHOLE {
                 let every = if t.sampled_sees_writes {
-                    WHOLE_EVERY << u32::from(t.unchanged_whole.saturating_sub(1)).min(WHOLE_BACKOFF_MAX)
+                    WHOLE_EVERY
+                        << u32::from(t.unchanged_whole.saturating_sub(1)).min(WHOLE_BACKOFF_MAX)
                 } else {
                     1
                 };
@@ -720,7 +778,8 @@ fn probe_round<B: ResourceBackend>(
                     dirty.insert(key);
                     whole += t.info.size;
                     WHOLE_PROBES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    WHOLE_PROBES[1].fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
+                    WHOLE_PROBES[1]
+                        .fetch_add(t.info.size as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if changed {
@@ -778,16 +837,28 @@ impl<B: PresentBackend> Title<B> {
     /// Retiles the host texture of `key` into its title memory.
     fn write_back(&mut self, key: usize) {
         // Not a texture (a buffer view), or released since: nothing to copy.
-        let Some(t) = self.textures.get_mut(&key) else { return };
+        let Some(t) = self.textures.get_mut(&key) else {
+            return;
+        };
         let info = &t.info;
         // Render and depth targets are left out: nothing says the title reads one.
         if info.flags & UNORDERED_ACCESS == 0 || info.render_target() {
             return;
         }
-        let described = (info.format, info.width, info.height, info.depth_or_layers, info.size);
+        let described = (
+            info.format,
+            info.width,
+            info.height,
+            info.depth_or_layers,
+            info.size,
+        );
         if info.size > BACK_LIMIT {
             if self.back.logged.insert(key) {
-                tracing::info!(texture = key, ?described, "a GPU-written texture is too large to copy back");
+                tracing::info!(
+                    texture = key,
+                    ?described,
+                    "a GPU-written texture is too large to copy back"
+                );
             }
             return;
         }
@@ -808,7 +879,9 @@ impl<B: PresentBackend> Title<B> {
             return;
         }
         // Through the pool's own mapping; `None` when the title unmapped the memory meanwhile.
-        let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else { return };
+        let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else {
+            return;
+        };
         // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.
@@ -835,11 +908,14 @@ impl<B: PresentBackend> Title<B> {
     /// the least recently used are dropped.
     fn gpu_cache_cap() -> Option<u64> {
         static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-        *CAP.get_or_init(|| {
-            match std::env::var("VICTORY_MAX_GPU_CACHE_MB") {
-                Ok(v) => v.trim().parse::<u64>().ok().filter(|&mb| mb > 0).map(|mb| mb << 20),
-                Err(_) => Some(1536 << 20),
-            }
+        *CAP.get_or_init(|| match std::env::var("VICTORY_MAX_GPU_CACHE_MB") {
+            Ok(v) => v
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&mb| mb > 0)
+                .map(|mb| mb << 20),
+            Err(_) => Some(1536 << 20),
         })
     }
 
@@ -868,7 +944,9 @@ impl<B: PresentBackend> Title<B> {
         let mut evicted = 0u64;
         let mut freed = 0u64;
         for victim in evict_order(&mirrors, serial, cap, Self::EVICT_AFTER_PRESENTS) {
-            let Some(t) = self.textures.remove(&victim) else { continue };
+            let Some(t) = self.textures.remove(&victim) else {
+                continue;
+            };
             evicted += 1;
             freed += t.info.size as u64;
             // As a release, minus the forgetfulness: the description goes back so the next use
@@ -910,7 +988,13 @@ impl<B: PresentBackend> Title<B> {
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
             if !seen.contains(&info.format) {
                 seen.push(info.format);
-                tracing::warn!(format = info.format, w = info.width, h = info.height, flags = info.flags, "a title texture format the host does not represent (first of this format)");
+                tracing::warn!(
+                    format = info.format,
+                    w = info.width,
+                    h = info.height,
+                    flags = info.flags,
+                    "a title texture format the host does not represent (first of this format)"
+                );
             }
             return false;
         };
@@ -930,7 +1014,17 @@ impl<B: PresentBackend> Title<B> {
         if !desc.format.is_depth() {
             // Render targets too: what the title (CPU, DMA) writes into their memory is uploaded
             // when it changes, as it is not otherwise seen (a GPU write never changes title memory).
-            watch(|w| w.entries.insert(key, (info.memory as usize, info.size, info.render_target(), serial)));
+            watch(|w| {
+                w.entries.insert(
+                    key,
+                    (
+                        info.memory as usize,
+                        info.size,
+                        info.render_target(),
+                        serial,
+                    ),
+                )
+            });
             start_scanner();
             // Debugging (VICTORY_MAGENTA=1): render targets start magenta, so a frame that stays so
             // was never drawn into, and a black one was drawn black.
@@ -940,7 +1034,9 @@ impl<B: PresentBackend> Title<B> {
                 let row = m.width as usize * n;
                 let pixel = [0xffu8, 0, 0xff, 0xff];
                 let linear: Vec<u8> = (0..row * m.height as usize).map(|i| pixel[i % 4]).collect();
-                self.host.backend.upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
+                self.host
+                    .backend
+                    .upload_texture(&tex, 0, 0, &linear, row, row * m.height as usize);
             }
             if !info.render_target() {
                 self.unloaded.insert(key);
@@ -972,7 +1068,10 @@ impl<B: PresentBackend> Title<B> {
 
     /// The format of the host texture of title texture `key`.
     pub fn format_of(&self, key: usize) -> Option<Format> {
-        self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+        self.textures
+            .get(&key)
+            .and_then(|t| t.info.desc())
+            .map(|d| d.format)
     }
 
     /// The host texture of title texture `key`.
@@ -1046,7 +1145,11 @@ impl<B: PresentBackend> Title<B> {
         let effective = srgb.unwrap_or(own);
         let mut formats = srgb.into_iter().chain([own]).collect::<Vec<_>>();
         if twin {
-            let twin = effective.float_write_twin().into_iter().chain(formats).collect::<Vec<_>>();
+            let twin = effective
+                .float_write_twin()
+                .into_iter()
+                .chain(formats)
+                .collect::<Vec<_>>();
             formats = twin;
         }
         for format in formats {
@@ -1067,7 +1170,9 @@ impl<B: PresentBackend> Title<B> {
                     t.target_views.push((view, texture.clone()));
                     return Some((texture, format));
                 }
-                Err(e) => tracing::warn!(error = %e, ?view, "no host view for a render target view"),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?view, "no host view for a render target view")
+                }
             }
         }
         None
@@ -1110,12 +1215,16 @@ impl<B: PresentBackend> Title<B> {
         {
             if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
                 // Whether two descriptions keep taking one address from each other.
-                static WERE: std::sync::Mutex<Option<std::collections::HashSet<(u64, usize)>>> = std::sync::Mutex::new(None);
+                static WERE: std::sync::Mutex<Option<std::collections::HashSet<(u64, usize)>>> =
+                    std::sync::Mutex::new(None);
                 let mut were = WERE.lock().unwrap_or_else(|e| e.into_inner());
                 let were = were.get_or_insert_default();
                 were.insert((address, old));
                 REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                REPLACED[1].fetch_add(u64::from(were.contains(&(address, key))), std::sync::atomic::Ordering::Relaxed);
+                REPLACED[1].fetch_add(
+                    u64::from(were.contains(&(address, key))),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             self.host.forget_resource(old);
             self.texture_released(old);
@@ -1192,13 +1301,34 @@ impl<B: PresentBackend> Title<B> {
         // the ones that changed lately first, then the blank ones.
         let started = std::time::Instant::now();
         let until = budget.map(|budget| started + budget);
-        probe_round(&mut self.textures, &mut self.hot_keys, &mut self.hot_cursor, until, false, &mut self.probe_buf, &mut dirty);
+        probe_round(
+            &mut self.textures,
+            &mut self.hot_keys,
+            &mut self.hot_cursor,
+            until,
+            false,
+            &mut self.probe_buf,
+            &mut dirty,
+        );
         // The blank ones get a budget of their own: a busy movie must not starve its next planes.
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
-        probe_round(&mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, true, &mut self.probe_buf, &mut dirty);
+        probe_round(
+            &mut self.textures,
+            &mut self.blank_keys,
+            &mut self.blank_cursor,
+            until,
+            true,
+            &mut self.probe_buf,
+            &mut dirty,
+        );
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
-            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
+            SyncCost {
+                probe: [hot - started, hot.elapsed()],
+                hot: self.hot_keys.len() as u64,
+                ..Default::default()
+            }
+            .log();
             self.log_mirror();
         }
         let unloaded = std::mem::take(&mut self.unloaded);
@@ -1233,7 +1363,11 @@ impl<B: PresentBackend> Title<B> {
             .textures
             .values()
             .fold((0u64, 0u64), |(n, b), t| (n + 1, b + t.info.size as u64));
-        tracing::info!(textures = n, mib = bytes >> 20, "texture mirrors of title memory");
+        tracing::info!(
+            textures = n,
+            mib = bytes >> 20,
+            "texture mirrors of title memory"
+        );
     }
 
     pub(super) fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
@@ -1269,7 +1403,11 @@ impl<B: PresentBackend> Title<B> {
             ..
         } = self;
         let started = std::time::Instant::now();
-        let mut cost = SyncCost { batches: 1, prepare: prepared.took, ..Default::default() };
+        let mut cost = SyncCost {
+            batches: 1,
+            prepare: prepared.took,
+            ..Default::default()
+        };
         let mut read = Vec::new();
         for r in prepared.ready {
             cost.textures += 1;
@@ -1280,7 +1418,10 @@ impl<B: PresentBackend> Title<B> {
             cost.unreadable += u64::from(r.unreadable);
             // Released while it was read (its key may name another texture by now).
             // Or a copy into it was recorded while it was read: the GPU's from now on.
-            let Some(t) = textures.get_mut(&r.key).filter(|t| t.serial == r.serial && !t.kept_from_memory()) else {
+            let Some(t) = textures
+                .get_mut(&r.key)
+                .filter(|t| t.serial == r.serial && !t.kept_from_memory())
+            else {
                 continue;
             };
             let key = r.key;
@@ -1433,7 +1574,8 @@ impl Job {
         let read = started.elapsed();
         let hash = blake3::hash(tiled);
         let hashed = started.elapsed();
-        let levels = (self.last != Some(hash)).then(|| detile(&self.layout, self.dimension, self.format, tiled));
+        let levels = (self.last != Some(hash))
+            .then(|| detile(&self.layout, self.dimension, self.format, tiled));
         Ready {
             key: self.key,
             serial: self.serial,
@@ -1460,19 +1602,26 @@ pub(super) fn prepare(jobs: &[Job]) -> Prepared {
             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let Some(job) = jobs.get(i) else { break };
             let ready = job.read(&mut tiled);
-            done.lock().unwrap_or_else(|e| e.into_inner()).push((i, ready));
+            done.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((i, ready));
         }
     };
     std::thread::scope(|s| {
         for _ in 1..SYNC_THREADS.min(jobs.len()) {
             // Without the thread, the others (this one at least) read its share.
-            let _ = std::thread::Builder::new().name("victory texture read".into()).spawn_scoped(s, work);
+            let _ = std::thread::Builder::new()
+                .name("victory texture read".into())
+                .spawn_scoped(s, work);
         }
         work();
     });
     let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
     done.sort_by_key(|&(i, _)| i);
-    Prepared { ready: done.into_iter().map(|(_, r)| r).collect(), took: started.elapsed() }
+    Prepared {
+        ready: done.into_iter().map(|(_, r)| r).collect(),
+        took: started.elapsed(),
+    }
 }
 
 /// What syncing textures cost: logged with `VICTORY_TRACE_TEXTURE_SYNC=1`, summed over each second.
@@ -1504,13 +1653,26 @@ struct SyncCost {
 
 impl SyncCost {
     fn log(self) {
-        static SUM: std::sync::Mutex<Option<(std::time::Instant, [u64; 14])>> = std::sync::Mutex::new(None);
+        static SUM: std::sync::Mutex<Option<(std::time::Instant, [u64; 14])>> =
+            std::sync::Mutex::new(None);
         let mut sum = SUM.lock().unwrap_or_else(|e| e.into_inner());
         let (since, s) = sum.get_or_insert_with(|| (std::time::Instant::now(), [0; 14]));
         let us = |d: std::time::Duration| d.as_micros() as u64;
         let add = [
-            self.batches, self.textures, self.first, self.unchanged, self.blank, self.unreadable, self.bytes,
-            us(self.probe[0]), us(self.probe[1]), us(self.upload), us(self.prepare), us(self.read), us(self.hash), us(self.detile),
+            self.batches,
+            self.textures,
+            self.first,
+            self.unchanged,
+            self.blank,
+            self.unreadable,
+            self.bytes,
+            us(self.probe[0]),
+            us(self.probe[1]),
+            us(self.upload),
+            us(self.prepare),
+            us(self.read),
+            us(self.hash),
+            us(self.detile),
         ];
         s.iter_mut().zip(add).for_each(|(s, a)| *s += a);
         static HOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1518,14 +1680,32 @@ impl SyncCost {
             HOT.store(self.hot, std::sync::atomic::Ordering::Relaxed);
         }
         if since.elapsed().as_secs() >= 1 {
-            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let take =
+                |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before); budget deferred {} ({} MiB)",
-                since.elapsed().as_secs_f32(), s[0], s[1], s[2], s[3], s[4], s[5], s[6] >> 20,
-                take(&HOT), s[7] / 1000, take(&WHOLE_PROBES[0]), take(&WHOLE_PROBES[1]) >> 20, s[8] / 1000, s[9] / 1000,
-                s[10] / 1000, s[11] / 1000, s[12] / 1000, s[13] / 1000,
-                take(&REPLACED[0]), take(&REPLACED[1]),
-                take(&DEFERRED[0]), take(&DEFERRED[1]) >> 20
+                since.elapsed().as_secs_f32(),
+                s[0],
+                s[1],
+                s[2],
+                s[3],
+                s[4],
+                s[5],
+                s[6] >> 20,
+                take(&HOT),
+                s[7] / 1000,
+                take(&WHOLE_PROBES[0]),
+                take(&WHOLE_PROBES[1]) >> 20,
+                s[8] / 1000,
+                s[9] / 1000,
+                s[10] / 1000,
+                s[11] / 1000,
+                s[12] / 1000,
+                s[13] / 1000,
+                take(&REPLACED[0]),
+                take(&REPLACED[1]),
+                take(&DEFERRED[0]),
+                take(&DEFERRED[1]) >> 20
             );
             *sum = None;
         }
@@ -1560,7 +1740,11 @@ fn evict_order(mirrors: &[(usize, u64, u64)], serial: u64, cap: u64, after: u64)
 }
 
 fn keys_to_sync(unloaded: &HashSet<usize>, dirty: &HashSet<usize>) -> Vec<usize> {
-    unloaded.iter().chain(dirty.difference(unloaded)).copied().collect()
+    unloaded
+        .iter()
+        .chain(dirty.difference(unloaded))
+        .copied()
+        .collect()
 }
 
 /// `VICTORY_TEXTURE_SYNC_BUDGET_MB`: the most texture memory one submission's sync reads,
@@ -1599,8 +1783,10 @@ fn within_budget(jobs: &mut Vec<Job>, budget: u64) -> Vec<Job> {
 }
 
 /// What the sync budget deferred: jobs and bytes, taken by the trace line each second.
-static DEFERRED: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static DEFERRED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// The textures of a title host, by title resource key.
 pub type Textures<B> = HashMap<usize, Tracked<B>>;
@@ -1705,7 +1891,10 @@ mod tests {
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
-        Watched::new(Some(Watch { entries: entries.into(), ..Default::default() }))
+        Watched::new(Some(Watch {
+            entries: entries.into(),
+            ..Default::default()
+        }))
     }
 
     fn dirty_this_round(watched: &Watched) -> std::collections::HashSet<usize> {
@@ -1749,6 +1938,7 @@ mod tests {
     /// What a submission read whole is what the scanner compares with: it reports the write after
     /// it, not that content once more.
     #[test]
+    #[allow(unused_assignments)] // the scanner reads through the watched pointer, not `bytes`
     fn scanner_compares_with_what_a_submission_read() {
         let mut bytes = [3u8];
         let w = watched([(1, (bytes.as_ptr() as usize, bytes.len(), false, 0))]);
@@ -1765,6 +1955,7 @@ mod tests {
     /// again) starts over: its first sight is its baseline. Compared with the old texture's hash
     /// it counted as written, and its memory was uploaded over what the GPU had drawn into it.
     #[test]
+    #[allow(unused_assignments)] // the scanner reads through the watched pointer, not `bytes`
     fn scanner_starts_over_for_a_render_target_made_again_under_a_released_key() {
         let mut bytes = [3u8];
         let entry = |serial| (bytes.as_ptr() as usize, bytes.len(), true, serial);
@@ -1779,10 +1970,17 @@ mod tests {
             w.entries.insert(1, new);
         });
         bytes[0] = 6;
-        assert!(dirty_this_round(&w).is_empty(), "the new texture's first sight is not a change");
+        assert!(
+            dirty_this_round(&w).is_empty(),
+            "the new texture's first sight is not a change"
+        );
         assert_eq!(seen(&w)[&1], blake3::hash(&bytes));
         bytes[0] = 7;
-        assert_eq!(dirty_this_round(&w), [1].into(), "a write into it after that is");
+        assert_eq!(
+            dirty_this_round(&w),
+            [1].into(),
+            "a write into it after that is"
+        );
     }
 
     /// Every mip, array slice and depth slice goes up and comes back where it was: 1D, 2D and 3D,
@@ -1790,7 +1988,9 @@ mod tests {
     #[test]
     fn download_undoes_upload_for_every_mip_and_slice() {
         use victory_formats::texture::{Desc, Swizzle};
-        let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+        let Ok(metal) = victory_metal::metal::Metal::new() else {
+            return;
+        };
         use Dimension::{Tex1d, Tex2d, Tex3d};
         // (dimension, DXGI format, element bytes, width, height, depth or layers, mips)
         let shapes = [
@@ -1804,11 +2004,30 @@ mod tests {
         ];
         let mut ran = 0;
         for (dimension, format, element_bytes, width, height, depth, mips) in shapes {
-            for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_S, Swizzle::SW_64KB_D_X] {
-                let what = format!("{dimension:?} {format} {width}x{height}x{depth} mips {mips} {swizzle:?}");
-                let desc = Desc { dimension, width, height, depth, mips, element_bytes, block: 1, samples: 1, swizzle };
+            for swizzle in [
+                Swizzle::LINEAR,
+                Swizzle::SW_4KB_S,
+                Swizzle::SW_64KB_S,
+                Swizzle::SW_64KB_D_X,
+            ] {
+                let what = format!(
+                    "{dimension:?} {format} {width}x{height}x{depth} mips {mips} {swizzle:?}"
+                );
+                let desc = Desc {
+                    dimension,
+                    width,
+                    height,
+                    depth,
+                    mips,
+                    element_bytes,
+                    block: 1,
+                    samples: 1,
+                    swizzle,
+                };
                 // Not every mode exists for every shape.
-                let Ok(layout) = Layout::new(&desc) else { continue };
+                let Ok(layout) = Layout::new(&desc) else {
+                    continue;
+                };
                 let mut want = vec![0u8; layout.size as usize];
                 let slices = if dimension == Tex3d { 1 } else { layout.slices };
                 let tiled = (0..layout.mips.len() as u32).all(|mip| {
@@ -1817,8 +2036,12 @@ mod tests {
                     let pitch = row * m.height as usize;
                     (0..slices).all(|slice| {
                         let n = pitch * layout.subresource_depth(mip).max(1) as usize;
-                        let linear: Vec<u8> = (0..n).map(|i| (i % 251) as u8 ^ (mip * 37 + slice * 11) as u8).collect();
-                        layout.tile(&mut want, mip, slice, &linear, row, pitch).is_ok()
+                        let linear: Vec<u8> = (0..n)
+                            .map(|i| (i % 251) as u8 ^ (mip * 37 + slice * 11) as u8)
+                            .collect();
+                        layout
+                            .tile(&mut want, mip, slice, &linear, row, pitch)
+                            .is_ok()
                     })
                 });
                 if !tiled {
@@ -1965,7 +2188,10 @@ mod tests {
         // Flip a byte outside sampled windows: whole mode catches it.
         mem[42] = 0;
         mem[1000] = 0xCD;
-        assert_ne!(h0_whole, probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch));
+        assert_ne!(
+            h0_whole,
+            probe_hash(mem.as_ptr() as usize, mem.len(), true, &mut scratch)
+        );
     }
 
     #[test]
@@ -2042,7 +2268,10 @@ mod tests {
                 next_region(at)
             },
         );
-        assert!(whole, "once every page is readable again, the partial flag clears");
+        assert!(
+            whole,
+            "once every page is readable again, the partial flag clears"
+        );
         assert_eq!((reads, queries), (1, 1));
         assert!(out[..2 * page].iter().all(|&b| b == 0x5a));
         assert!(out[2 * page..].iter().all(|&b| b == 0xa5));
@@ -2085,7 +2314,10 @@ mod evict_tests {
         assert_eq!(evict_order(&mirrors, 20, 500, AFTER), [1, 2]);
         // The grace window: used four presents back is still protected.
         let mirrors = [(1, 100, 16)];
-        assert!(evict_order(&mirrors, 20, 50, AFTER).is_empty(), "within the window");
+        assert!(
+            evict_order(&mirrors, 20, 50, AFTER).is_empty(),
+            "within the window"
+        );
         // Five back is not.
         let mirrors = [(1, 100, 15)];
         assert_eq!(evict_order(&mirrors, 20, 50, AFTER), [1], "past the window");

@@ -143,7 +143,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -183,14 +186,17 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 
 /// Waits recorded after commands: the title list goes on in a new host
 /// list, which runs once the wait holds.
+#[cfg(windows)]
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
 /// lists: D3D12 lets a list be reset as soon as it is submitted (Grand
 /// Theft Auto VI does, 0-21 times a world frame).
+#[cfg(windows)]
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts and early resets since the last call (the frame line).
+#[cfg(windows)]
 pub(crate) fn take_cuts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (CUTS.swap(0, Relaxed), EARLY_RESETS.swap(0, Relaxed))
@@ -203,24 +209,62 @@ pub(crate) fn take_cuts() -> (u64, u64) {
 /// title list records into (the queue runs each once its waits hold,
 /// `crate::hold`); bottom-of-pipe writes recorded before it land when the
 /// part before it has run.
-extern "system" fn wait32(this: This, address: u64, comparison: u32, reference: u32, mask: u32, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 4, comparison, reference: u64::from(reference), mask: u64::from(mask) });
+extern "system" fn wait32(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u32,
+    mask: u32,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 4,
+            comparison,
+            reference: u64::from(reference),
+            mask: u64::from(mask),
+        },
+    );
 }
-pub(crate) extern "system" fn wait64(this: This, address: u64, comparison: u32, reference: u64, _flags: u32) {
-    wait(this, crate::hold::ValueWait { address, bytes: 8, comparison, reference, mask: u64::MAX });
+pub(crate) extern "system" fn wait64(
+    this: This,
+    address: u64,
+    comparison: u32,
+    reference: u64,
+    _flags: u32,
+) {
+    wait(
+        this,
+        crate::hold::ValueWait {
+            address,
+            bytes: 8,
+            comparison,
+            reference,
+            mask: u64::MAX,
+        },
+    );
 }
 
 fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
-        let Some(current) = host_list(this) else { return };
+        let Some(current) = host_list(this) else {
+            return;
+        };
         if !current.is_empty() {
-            let Some(next) = next_segment(this) else { return };
+            let Some(next) = next_segment(this) else {
+                return;
+            };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            list.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cut(next);
             next.defer_wait(wait);
             return;
         }
@@ -274,9 +318,15 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     for (k, h) in hosts.iter_mut().enumerate() {
         if std::sync::Arc::strong_count(h) > 1 {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+            tracing::debug!(
+                segment = k,
+                "a list reset while a queue still holds part of it: that part keeps its own host list"
+            );
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
+            match spare
+                .map(Ok)
+                .or_else(|| crate::host::host().map(|host| host.new_list()))
+            {
                 Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
                 _ => continue,
             }
@@ -312,8 +362,15 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
 /// descriptor slots and title-memory page table. Freed once that host list
 /// (the list's last held one, so the last to run) is gone.
 #[cfg(windows)]
-fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>, state: crate::draw::State) {
-    struct Kept(#[allow(dead_code)] Vec<Upload>, #[allow(dead_code)] crate::draw::State);
+fn leave(
+    to: Option<std::sync::Arc<crate::host::HostList>>,
+    uploads: Vec<Upload>,
+    state: crate::draw::State,
+) {
+    struct Kept(
+        #[allow(dead_code)] Vec<Upload>,
+        #[allow(dead_code)] crate::draw::State,
+    );
     // SAFETY: only dropped, with the host list, after it has run.
     unsafe impl Send for Kept {}
     if let Some(held) = to {
@@ -488,11 +545,20 @@ extern "system" fn list_release(this: This) -> u32 {
     if !this.is_null() && object::refs(this) == 1 {
         // SAFETY: the title passes one of our lists.
         let list = unsafe { &*this.cast::<List>() };
-        let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
+        let held = list
+            .hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rfind(|h| std::sync::Arc::strong_count(h) > 1)
+            .cloned();
         if held.is_some() {
             EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!("a list released while a queue still holds part of it: that part runs on its own");
-            let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
+            tracing::debug!(
+                "a list released while a queue still holds part of it: that part runs on its own"
+            );
+            let uploads =
+                std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
             leave(held, uploads, state);
         }
@@ -507,6 +573,7 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+#[cfg_attr(not(windows), allow(unused_variables))]
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
@@ -526,7 +593,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     {
         let held = restart(this);
         // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = unsafe { &(*this.cast::<List>()).state }
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
@@ -610,6 +679,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
+#[cfg(windows)]
 const UAV_BARRIER: Barrier = Barrier {
     kind: 2,
     flags: 0,
@@ -619,6 +689,7 @@ const UAV_BARRIER: Barrier = Barrier {
 };
 
 /// Returns the console's barrier "actions" (none).
+#[cfg_attr(not(windows), allow(unused_variables))]
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
@@ -627,7 +698,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
+        list.note_op(|| {
+            format!(
+                "barrier kinds {:?}",
+                barriers.iter().map(|b| b.kind).collect::<Vec<_>>()
+            )
+        });
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -778,6 +854,7 @@ extern "system" fn copy_texture_region(
     #[cfg(target_os = "macos")]
     // SAFETY: the title passes both locations and an optional box (null is tolerated).
     if let (Some(&d), Some(&s)) = unsafe { (dst.as_ref(), src.as_ref()) } {
+        // SAFETY: the optional box, as above.
         let b = unsafe { source_box.as_ref().copied() };
         if !crate::native::glue::copy_texture_region(this, d, [x, y, z], s, b) {
             crate::native::glue::dropped_op("CopyTextureRegion", d.resource, s.resource);
@@ -887,11 +964,19 @@ extern "system" fn copy_texture_region(
 impl CopyLocation {
     /// A placed footprint in `resource` (tests).
     pub(crate) fn placed(resource: This, footprint: crate::resource::PlacedFootprint) -> Self {
-        Self { resource, kind: 1, footprint }
+        Self {
+            resource,
+            kind: 1,
+            footprint,
+        }
     }
     /// Subresource 0 of `resource` (tests).
     pub(crate) fn whole(resource: This) -> Self {
-        Self { resource, kind: 0, footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0) }
+        Self {
+            resource,
+            kind: 0,
+            footprint: crate::resource::PlacedFootprint::new(0, 0, 0, 0, 0),
+        }
     }
 }
 
@@ -899,15 +984,27 @@ impl CopyLocation {
 impl CopyLocation {
     /// Subresource `index` of `resource` (the index shares the footprint's first dword).
     pub(crate) fn sub(resource: This, index: u32) -> Self {
-        let footprint = crate::resource::PlacedFootprint { offset: index.into(), format: 0, width: 0, height: 0, depth: 0, row_pitch: 0 };
-        Self { resource, kind: 0, footprint }
+        let footprint = crate::resource::PlacedFootprint {
+            offset: index.into(),
+            format: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+            row_pitch: 0,
+        };
+        Self {
+            resource,
+            kind: 0,
+            footprint,
+        }
     }
 }
 
 /// Texture read backs since the last frame-rate line: how many, bytes
 /// (diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// (texture, buffer) pairs read back so far, each logged once (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -918,7 +1015,13 @@ static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex
 /// run its rows go into the title's buffer (the title reads them on the CPU
 /// after its fence).
 #[cfg(windows)]
-pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src: &CopyLocation, source_box: *const [u32; 6]) {
+pub(crate) fn read_back(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    at: [u32; 3],
+    src: &CopyLocation,
+    source_box: *const [u32; 6],
+) {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
     };
@@ -930,18 +1033,33 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
             return;
         }};
     }
-    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+    let (Some(host), Some(texture)) = (
+        crate::host::host(),
+        crate::resource::host_resource(src.resource),
+    ) else {
         refused!("no host texture");
     };
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
     let size = match b {
-        Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
+        Some(b) => [
+            b.right.saturating_sub(b.left),
+            b.bottom.saturating_sub(b.top),
+            b.back.saturating_sub(b.front),
+        ],
         None => {
             // A subresource index shares the footprint's first dword.
             let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
-            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
-            [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
+            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                u32::from(desc.DepthOrArraySize)
+            } else {
+                1
+            };
+            [
+                ((desc.Width >> mip) as u32).max(1),
+                (desc.Height >> mip).max(1),
+                (depth >> mip).max(1),
+            ]
         }
     };
     // The host takes footprints of 256-byte pitches only (as the console).
@@ -958,7 +1076,10 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let (Some(title), Some((buffer, data))) = (
+        buffer_range(dst.resource, dst.footprint.offset, len),
+        list.readback(host, len),
+    ) else {
         return;
     };
     if crate::texture::title_written(&texture) {
@@ -972,7 +1093,8 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
     #[cfg(feature = "diagnostics")]
     {
         let text = || {
-            let mem = crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
+            let mem =
+                crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
             format!(
                 "read back {:?} (mem {mem:#x}, {}x{} f{} sub {}) {size:?} at {at:?} into {:?}+{:#x}, {len} bytes",
                 src.resource,
@@ -1337,7 +1459,9 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         // translation (`Options::thread_counts`) before relying on it.
         if threads {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("DispatchX with thread counts runs them as group counts"));
+            ONCE.call_once(|| {
+                tracing::warn!("DispatchX with thread counts runs them as group counts")
+            });
         }
         state::dispatch(this, x, y, z);
     }
@@ -1464,7 +1588,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1556,8 +1683,10 @@ unsafe impl Send for Upload {}
 
 /// Live list upload blocks and their bytes (the statistics).
 #[cfg(windows)]
-pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
@@ -1597,7 +1726,8 @@ mod state {
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         // SAFETY: the title passes four floats or null.
-        with_state(this, |list, s| s.blend_factor(list, unsafe { factor.as_ref() }));
+        let factor = unsafe { factor.as_ref() };
+        with_state(this, |list, s| s.blend_factor(list, factor));
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         with_state(this, |list, s| s.stencil_ref(list, reference));
@@ -1823,7 +1953,13 @@ mod state {
         glue::targets(this, &handles, depth);
     }
 
-    pub(super) extern "system" fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
+    pub(super) extern "system" fn draw(
+        this: This,
+        vertices: u32,
+        instances: u32,
+        first: u32,
+        first_instance: u32,
+    ) {
         super::count_draw();
         glue::draw(this, vertices, instances, first, first_instance);
     }
@@ -1889,7 +2025,12 @@ mod state {
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
         glue::root_constants(this, true, slot, offset, &[value]);
     }
-    pub(super) extern "system" fn graphics_constant(this: This, slot: u32, value: u32, offset: u32) {
+    pub(super) extern "system" fn graphics_constant(
+        this: This,
+        slot: u32,
+        value: u32,
+        offset: u32,
+    ) {
         glue::root_constants(this, false, slot, offset, &[value]);
     }
     pub(super) extern "system" fn compute_constants(
@@ -1964,7 +2105,8 @@ extern "system" fn draw(_: This) {
 /// Commands the native host drops, by kind: mesh dispatches, indirect mesh dispatches, indirect
 /// executions, texture copies and resolves.
 #[cfg(target_os = "macos")]
-pub(crate) static DROPPED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) static DROPPED_KINDS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// The totals of [`DROPPED_KINDS`].
 #[cfg(target_os = "macos")]
@@ -1977,26 +2119,6 @@ pub(crate) fn dropped_kinds() -> (u64, u64, u64, u64, u64) {
 #[cfg(target_os = "macos")]
 pub(crate) fn indirect_dropped() -> u64 {
     INDIRECT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(target_os = "macos")]
-fn drop_kind(kind: usize) {
-    DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let what = ["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)];
-    crate::native::glue::warn_once(what);
-    crate::native::glue::trace_reason(what);
-}
-
-#[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
-    drop_kind(0);
-    draw(this);
-}
-
-#[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u64, _payload: u64) {
-    drop_kind(if indirect != 0 { 1 } else { 0 });
-    draw(this);
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
@@ -2029,7 +2151,12 @@ extern "system" fn execute_indirect(
         && trace_dispatch_flags()
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(?words, "an indirect dispatch of type 105 runs its counts as group counts"));
+        ONCE.call_once(|| {
+            tracing::warn!(
+                ?words,
+                "an indirect dispatch of type 105 runs its counts as group counts"
+            )
+        });
     }
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
@@ -2076,7 +2203,10 @@ extern "system" fn execute_indirect(
     crate::native::glue::trace_reason("an indirect execution of a signature the host does not run");
     #[cfg(target_os = "macos")]
     if crate::native::glue::tracing_targets() {
-        crate::native::glue::trace_drop_pipe(format!("indirect {args:?} under {:?}", bound_pipeline(this)));
+        crate::native::glue::trace_drop_pipe(format!(
+            "indirect {args:?} under {:?}",
+            bound_pipeline(this)
+        ));
     }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -2099,7 +2229,10 @@ extern "system" fn execute_indirect(
 fn bound_pipeline(this: This) -> Option<Vec<String>> {
     let p = crate::native::glue::with_list(this, |_, l| l.pipeline)?;
     crate::pipeline::native_stages(p as This).map(|(s, g)| {
-        let mut v: Vec<String> = s.iter().map(|(st, sh)| format!("{st} {}", sh.hash)).collect();
+        let mut v: Vec<String> = s
+            .iter()
+            .map(|(st, sh)| format!("{st} {}", sh.hash))
+            .collect();
         v.push(format!("graphics state: {}", g.is_some()));
         v
     })
@@ -2111,6 +2244,7 @@ fn bound_pipeline(_: This) -> Option<Vec<String>> {
 }
 
 /// Indirect executions dropped since the last call.
+#[cfg(windows)]
 pub(crate) fn take_indirect() -> u64 {
     INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
@@ -2132,7 +2266,6 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2148,8 +2281,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         #[cfg(feature = "diagnostics")]
         if !_groups.is_null() {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
-            let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
-            list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+            let groups =
+                unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
+            list.note_op(|| {
+                format!(
+                    "barrier groups {:?}",
+                    groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()
+                )
+            });
         }
         // SAFETY: the same layout; no resource named.
         let barrier =
@@ -2167,7 +2306,13 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
     defer_write(this, address, Written::Value(u64::from(value)), 4);
 }
-pub(crate) extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+pub(crate) extern "system" fn write64(
+    this: This,
+    address: u64,
+    value: u64,
+    _flush: u32,
+    flags: u32,
+) {
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2353,12 +2498,23 @@ mod tests {
         let null = std::ptr::null();
         let heap = [1u32, 0, 0, 0, 0];
         let mut allocator = null;
-        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
         let mut list = null;
-        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list),
+            S_OK
+        );
         let mut storage = [0u64; 14];
         let handle = storage.as_mut_ptr() as u64;
-        let rect = Rect { left: 1, top: 1, right: 2, bottom: 2 };
+        let rect = Rect {
+            left: 1,
+            top: 1,
+            right: 2,
+            bottom: 2,
+        };
         let release = |o| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         // Resource dimension, height, samples, mips, DSV dimension, full-clear support.
         for (dimension, height, samples, mips, view_dimension, supported) in [
@@ -2368,28 +2524,79 @@ mod tests {
         ] {
             // Public D3D12_RESOURCE_DESC ABI: one layer, D32_FLOAT_S8X24_UINT,
             // ALLOW_DEPTH_STENCIL. Multisampled resources have just one mip.
-            let desc = [dimension, 0, 16, height | (1 << 32) | (mips << 48),
-                20 | (samples << 32), 0, 2];
+            let desc = [
+                dimension,
+                0,
+                16,
+                height | (1 << 32) | (mips << 48),
+                20 | (samples << 32),
+                0,
+                2,
+            ];
             let mut resource = null;
-            assert_eq!(create_committed(null, heap.as_ptr().cast::<HeapProperties>(), 0,
-                desc.as_ptr().cast::<ResourceDesc>(), 0x10, null.cast(),
-                &PAGEABLE_IIDS[0], &mut resource), S_OK);
+            assert_eq!(
+                create_committed(
+                    null,
+                    heap.as_ptr().cast::<HeapProperties>(),
+                    0,
+                    desc.as_ptr().cast::<ResourceDesc>(),
+                    0x10,
+                    null.cast(),
+                    &PAGEABLE_IIDS[0],
+                    &mut resource
+                ),
+                S_OK
+            );
             for flags in [1, 2, 3] {
                 for (view, count, rectangles, expected) in [
-                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, &rect as *const Rect, false),
-                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, null.cast(), false),
-                    (Some([20, view_dimension, 0, 1, 0, 0]), 0, null.cast(), false),
-                    (Some([20, view_dimension + 1, 0, 0, 1, 1]), 0, null.cast(), false),
+                    (
+                        Some([20, view_dimension, 0, 0, 0, 0]),
+                        1,
+                        &rect as *const Rect,
+                        false,
+                    ),
+                    (
+                        Some([20, view_dimension, 0, 0, 0, 0]),
+                        1,
+                        null.cast(),
+                        false,
+                    ),
+                    (
+                        Some([20, view_dimension, 0, 1, 0, 0]),
+                        0,
+                        null.cast(),
+                        false,
+                    ),
+                    (
+                        Some([20, view_dimension + 1, 0, 0, 1, 1]),
+                        0,
+                        null.cast(),
+                        false,
+                    ),
                     (Some([20, 0, 0, 0, 0, 0]), 0, null.cast(), false),
-                    (Some([20, view_dimension, 0, 0, 0, 0]), 0, &rect as *const Rect, supported),
+                    (
+                        Some([20, view_dimension, 0, 0, 0, 0]),
+                        0,
+                        &rect as *const Rect,
+                        supported,
+                    ),
                     (None, 0, null.cast(), supported),
                 ] {
-                    crate::native::glue::with_list(list, |_, l| l.list.reset()).expect("Metal device");
-                    crate::descriptor::create_dsv(null, resource,
-                        view.as_ref().map_or(null.cast(), std::ptr::from_ref), handle);
+                    crate::native::glue::with_list(list, |_, l| l.list.reset())
+                        .expect("Metal device");
+                    crate::descriptor::create_dsv(
+                        null,
+                        resource,
+                        view.as_ref().map_or(null.cast(), std::ptr::from_ref),
+                        handle,
+                    );
                     clear_dsv(list, handle, flags, 0.25, 173, count, rectangles);
-                    let recorded = crate::native::glue::with_list(list, |_, l| !l.list.is_empty()).unwrap();
-                    assert_eq!(recorded, expected, "dimension={dimension}, samples={samples}, flags={flags}, view={view:?}, count={count}");
+                    let recorded =
+                        crate::native::glue::with_list(list, |_, l| !l.list.is_empty()).unwrap();
+                    assert_eq!(
+                        recorded, expected,
+                        "dimension={dimension}, samples={samples}, flags={flags}, view={view:?}, count={count}"
+                    );
                 }
             }
             release(resource);

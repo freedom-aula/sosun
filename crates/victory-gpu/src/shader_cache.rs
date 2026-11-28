@@ -107,17 +107,28 @@ fn prune(parent: &std::path::Path, current: &std::path::Path, keep: usize) {
     prune_at(parent, current, keep, std::time::SystemTime::now());
 }
 
-fn prune_at(parent: &std::path::Path, current: &std::path::Path, keep: usize, now: std::time::SystemTime) {
-    let Ok(entries) = std::fs::read_dir(parent) else { return };
+fn prune_at(
+    parent: &std::path::Path,
+    current: &std::path::Path,
+    keep: usize,
+    now: std::time::SystemTime,
+) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
     let mut builds: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
             p.is_dir()
-                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()))
         })
         .map(|p| {
-            let used = std::fs::metadata(p.join(LAST_USED)).or_else(|_| std::fs::metadata(&p)).and_then(|m| m.modified());
+            let used = std::fs::metadata(p.join(LAST_USED))
+                .or_else(|_| std::fs::metadata(&p))
+                .and_then(|m| m.modified());
             (used.unwrap_or(std::time::UNIX_EPOCH), p)
         })
         .collect();
@@ -157,16 +168,27 @@ pub fn native_shader(
 
 /// The native host's build key for translations made with `settings`: [`build`] and the settings.
 fn native_key(settings: &str) -> [u8; 32] {
-    *blake3::Hasher::new().update(build()).update(settings.as_bytes()).finalize().as_bytes()
+    *blake3::Hasher::new()
+        .update(build())
+        .update(settings.as_bytes())
+        .finalize()
+        .as_bytes()
 }
 
 /// Whether the native host's cache holds the translation of `container` with `settings` (as
 /// [`native_shader`] would key it), without reading or translating it.
 pub fn native_present(container: &[u8], settings: &str) -> bool {
-    let Some(cache) = NATIVE.get() else { return false };
-    let converter = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+    let Some(cache) = NATIVE.get() else {
+        return false;
+    };
+    let converter = Translate {
+        translate: |_: &[u8]| Err::<HostShader, String>(String::new()),
+        ran: AtomicBool::new(false),
+    };
     let input = [&native_key(settings)[..], container].concat();
-    cache.path_for(&victory_pipeline::CacheKey::new(&converter, &input)).is_file()
+    cache
+        .path_for(&victory_pipeline::CacheKey::new(&converter, &input))
+        .is_file()
 }
 
 /// Shaders found in the cache and translated since the start (both hosts). The slow-translation
@@ -222,11 +244,13 @@ fn atomic_locks() -> bool {
 /// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
 fn bias_as_gradients() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_BIAS_AS_GRADIENTS").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => under_wine(),
-    })
+    *ON.get_or_init(
+        || match std::env::var("VICTORY_BIAS_AS_GRADIENTS").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => under_wine(),
+        },
+    )
 }
 
 /// Whether translations take wave64 programs to run in 32-lane host waves:
@@ -361,7 +385,10 @@ fn cached(
                 break;
             }
         };
-        if let Some(shader) = crate::read_file(&path).ok().and_then(|b| decode(unseal(&b)?)) {
+        if let Some(shader) = crate::read_file(&path)
+            .ok()
+            .and_then(|b| decode(unseal(&b)?))
+        {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
@@ -692,7 +719,10 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0.clone(), true));
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (refused.0.clone(), true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
 
         // A cut-short refusal still decodes (to a shorter reason); the sum
@@ -747,17 +777,26 @@ mod tests {
         };
         let first = Cache::open(dir.path()).unwrap();
         let input = [&native_key(&settings())[..], b"container"].concat();
-        let probe = Translate { translate: |_: &[u8]| Err::<HostShader, String>(String::new()), ran: AtomicBool::new(false) };
+        let probe = Translate {
+            translate: |_: &[u8]| Err::<HostShader, String>(String::new()),
+            ran: AtomicBool::new(false),
+        };
         let path = first.path_for(&victory_pipeline::CacheKey::new(&probe, &input));
         assert!(!path.is_file());
-        assert_eq!(cached(&first, &native_key(&settings()), b"container", translate).1, false);
+        assert!(!cached(&first, &native_key(&settings()), b"container", translate).1);
         // Where `native_present` looks: the entry `cached` wrote.
         assert!(path.is_file());
         drop(first);
         let second = Cache::open(dir.path()).unwrap();
-        assert_eq!(cached(&second, &native_key(&settings()), b"container", translate).1, true);
+        assert!(cached(&second, &native_key(&settings()), b"container", translate).1);
         assert_eq!(runs.load(Ordering::Relaxed), 1);
-        let rect = format!("{:?}", victory_shader::emit::Options { rect_list: true, ..crate::native::shaders::options() });
+        let rect = format!(
+            "{:?}",
+            victory_shader::emit::Options {
+                rect_list: true,
+                ..crate::native::shaders::options()
+            }
+        );
         assert_ne!(native_key(&settings()), native_key(&rect));
     }
 
@@ -767,7 +806,9 @@ mod tests {
     fn old_build_folders_are_pruned() {
         let dir = tempfile::tempdir().unwrap();
         let t = |s: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + s);
-        let builds: Vec<PathBuf> = (0..5).map(|n| dir.path().join(format!("{n:016x}"))).collect();
+        let builds: Vec<PathBuf> = (0..5)
+            .map(|n| dir.path().join(format!("{n:016x}")))
+            .collect();
         for (n, b) in builds.iter().enumerate() {
             std::fs::create_dir_all(b.join("translated")).unwrap();
             let f = std::fs::File::create(b.join(LAST_USED)).unwrap();
@@ -781,7 +822,9 @@ mod tests {
         prune_at(dir.path(), &builds[0], 3, t(4 + 2 * 3600));
         let left: Vec<bool> = builds.iter().map(|b| b.exists()).collect();
         assert_eq!(left, [true, false, false, true, true]);
-        assert!(dir.path().join("not-a-build").exists() && dir.path().join(FIRST_BINDS_FILE).exists());
+        assert!(
+            dir.path().join("not-a-build").exists() && dir.path().join(FIRST_BINDS_FILE).exists()
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -56,16 +56,24 @@ impl Archive {
                 make(false).ok()?
             }
         };
-        let list = NSArray::from_retained_slice(&[archive.clone()]);
-        let archive = Arc::new(Archive { archive, list, path, added: AtomicU32::new(0), changing: RwLock::new(()) });
-        let weak = Arc::downgrade(&archive);
-        let _ = std::thread::Builder::new().name("pipeline-archive".into()).spawn(move || {
-            loop {
-                std::thread::sleep(SAVE_EVERY);
-                let Some(a) = weak.upgrade() else { return };
-                a.save();
-            }
+        let list = NSArray::from_retained_slice(std::slice::from_ref(&archive));
+        let archive = Arc::new(Archive {
+            archive,
+            list,
+            path,
+            added: AtomicU32::new(0),
+            changing: RwLock::new(()),
         });
+        let weak = Arc::downgrade(&archive);
+        let _ = std::thread::Builder::new()
+            .name("pipeline-archive".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(SAVE_EVERY);
+                    let Some(a) = weak.upgrade() else { return };
+                    a.save();
+                }
+            });
         Some(archive)
     }
 
@@ -107,14 +115,21 @@ impl Archive {
         d.setBinaryArchives(None);
         let p = compile_render(dev, d, crash_key)?;
         self.add("render pipeline added to the archive", || {
-            self.archive.addRenderPipelineFunctionsWithDescriptor_error(d).is_ok()
+            self.archive
+                .addRenderPipelineFunctionsWithDescriptor_error(d)
+                .is_ok()
         });
         Ok(p)
     }
 
     /// As [`Self::render`], for a mesh pipeline. Without this each run compiled every mesh pipeline
     /// again on the frame that first draws with it: seconds each at the first frame of the world.
-    pub(crate) fn mesh(&self, dev: &Dev, d: &MTLMeshRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
+    pub(crate) fn mesh(
+        &self,
+        dev: &Dev,
+        d: &MTLMeshRenderPipelineDescriptor,
+        crash_key: &str,
+    ) -> Result<RenderPso, String> {
         let started = Instant::now();
         if let Some(p) = self.archived_mesh(dev, d) {
             note(started, "mesh pipeline from the archive");
@@ -123,7 +138,9 @@ impl Archive {
         d.setBinaryArchives(None);
         let p = compile_mesh(dev, d, crash_key)?;
         self.add("mesh pipeline added to the archive", || {
-            self.archive.addMeshRenderPipelineFunctionsWithDescriptor_error(d).is_ok()
+            self.archive
+                .addMeshRenderPipelineFunctionsWithDescriptor_error(d)
+                .is_ok()
         });
         Ok(p)
     }
@@ -161,7 +178,9 @@ impl Archive {
         d.setBinaryArchives(None);
         let p = compile_compute(dev, d, crash_key)?;
         self.add("compute pipeline added to the archive", || {
-            self.archive.addComputePipelineFunctionsWithDescriptor_error(d).is_ok()
+            self.archive
+                .addComputePipelineFunctionsWithDescriptor_error(d)
+                .is_ok()
         });
         Ok(p)
     }
@@ -176,8 +195,12 @@ impl Archive {
         }
         let started = Instant::now();
         let _reading = self.read();
-        let tmp = self.path.with_extension(format!("{}.tmp", std::process::id()));
-        if self.archive.serializeToURL_error(&url(&tmp)).is_err() || std::fs::rename(&tmp, &self.path).is_err() {
+        let tmp = self
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
+        if self.archive.serializeToURL_error(&url(&tmp)).is_err()
+            || std::fs::rename(&tmp, &self.path).is_err()
+        {
             let _ = std::fs::remove_file(&tmp);
         }
         note(started, "pipeline archive written");
@@ -229,7 +252,9 @@ fn compile_with_deadline<P: 'static>(
     };
     let late_key = crash_key.to_owned();
     let started = Instant::now();
-    let made = with_deadline(COMPILE_DEADLINE, job, move |r| remember_crash(&r.0, &late_key));
+    let made = with_deadline(COMPILE_DEADLINE, job, move |r| {
+        remember_crash(&r.0, &late_key)
+    });
     note(started, what);
     let Some(Sendable(r)) = made else {
         return Err(format!(
@@ -244,10 +269,19 @@ fn compile_with_deadline<P: 'static>(
 /// Compiles the render pipeline `d` on a thread of its own, waiting at most `COMPILE_DEADLINE`.
 /// A compile that ends in a compiler crash, in time or after, is remembered under `crash_key`
 /// ([`crate::disk::remember_crash`]), so later runs refuse it at once.
-pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
+pub(crate) fn compile_render(
+    dev: &Dev,
+    d: &MTLRenderPipelineDescriptor,
+    crash_key: &str,
+) -> Result<RenderPso, String> {
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("render pipeline compiled", crash_key, move || {
+        // Borrow the whole `Sendable` (whose `unsafe impl Send` covers the
+        // Metal objects), not just `job.0`: precise capture (RFC 2229) would
+        // otherwise grab only the raw, `!Send` tuple. A borrow, not a move,
+        // because the retry makes this an `Fn`.
+        let job = &job;
         let (dev, d) = &job.0;
         dev.newRenderPipelineStateWithDescriptor_error(d)
             .map_err(|e| e.localizedDescription().to_string())
@@ -255,29 +289,50 @@ pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_k
 }
 
 /// As [`compile_render`], for a mesh render pipeline descriptor.
-pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor, crash_key: &str) -> Result<RenderPso, String> {
+pub(crate) fn compile_mesh(
+    dev: &Dev,
+    d: &MTLMeshRenderPipelineDescriptor,
+    crash_key: &str,
+) -> Result<RenderPso, String> {
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("mesh pipeline compiled", crash_key, move || {
+        // As in `compile_render`: borrowed, so the capture stays on the `Sendable`.
+        let job = &job;
         let (dev, d) = &job.0;
-        dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
-            .map_err(|e| e.localizedDescription().to_string())
+        dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+            d,
+            MTLPipelineOption::None,
+            None,
+        )
+        .map_err(|e| e.localizedDescription().to_string())
     })
 }
 
 /// As [`compile_render`], for a compute pipeline descriptor.
-pub(crate) fn compile_compute(dev: &Dev, d: &MTLComputePipelineDescriptor, crash_key: &str) -> Result<ComputePso, String> {
+pub(crate) fn compile_compute(
+    dev: &Dev,
+    d: &MTLComputePipelineDescriptor,
+    crash_key: &str,
+) -> Result<ComputePso, String> {
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("compute pipeline compiled", crash_key, move || {
+        // As in `compile_render`: borrowed, so the capture stays on the `Sendable`.
+        let job = &job;
         let (dev, d) = &job.0;
-        dev.newComputePipelineStateWithDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
-            .map_err(|e| e.localizedDescription().to_string())
+        dev.newComputePipelineStateWithDescriptor_options_reflection_error(
+            d,
+            MTLPipelineOption::None,
+            None,
+        )
+        .map_err(|e| e.localizedDescription().to_string())
     })
 }
 
 fn is_compiler_crash(error: &str) -> bool {
-    error.contains("XPC_ERROR_CONNECTION_INTERRUPTED") || error.contains("Compiler encountered an internal error")
+    error.contains("XPC_ERROR_CONNECTION_INTERRUPTED")
+        || error.contains("Compiler encountered an internal error")
 }
 
 /// Logs slow pipeline work, as `msc` does a slow conversion: the frame's thread waits for it.
@@ -354,11 +409,15 @@ mod tests {
     #[test]
     fn recognizes_reported_metal_compiler_failures() {
         assert!(is_compiler_crash("Compiler encountered an internal error"));
-        assert!(is_compiler_crash("Compilation failed: Compiler encountered an internal error."));
+        assert!(is_compiler_crash(
+            "Compilation failed: Compiler encountered an internal error."
+        ));
         assert!(is_compiler_crash(
             "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED"
         ));
-        assert!(!is_compiler_crash("Fragment input mismatching vertex shader output type"));
+        assert!(!is_compiler_crash(
+            "Fragment input mismatching vertex shader output type"
+        ));
         assert!(!is_compiler_crash("not enough memory to create pipeline"));
     }
 
@@ -379,13 +438,25 @@ mod tests {
             }
             fragment float4 test_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
         "#;
-        let library = dev.newLibraryWithSource_options_error(&NSString::from_str(source), None).expect("test shaders");
+        let library = dev
+            .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+            .expect("test shaders");
         let d = MTLMeshRenderPipelineDescriptor::new();
         // SAFETY: the functions are of the stages they are set as; the descriptor has attachment 0.
         unsafe {
-            d.setMeshFunction(library.newFunctionWithName(&NSString::from_str("test_mesh")).as_deref());
-            d.setFragmentFunction(library.newFunctionWithName(&NSString::from_str("test_fragment")).as_deref());
-            d.colorAttachments().objectAtIndexedSubscript(0).setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+            d.setMeshFunction(
+                library
+                    .newFunctionWithName(&NSString::from_str("test_mesh"))
+                    .as_deref(),
+            );
+            d.setFragmentFunction(
+                library
+                    .newFunctionWithName(&NSString::from_str("test_fragment"))
+                    .as_deref(),
+            );
+            d.colorAttachments()
+                .objectAtIndexedSubscript(0)
+                .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
         }
         d
     }
@@ -393,7 +464,9 @@ mod tests {
     /// A mesh pipeline is compiled once: a later run finds it in the archive's file.
     #[test]
     fn a_mesh_pipeline_is_kept_in_the_archive() {
-        let Some(dev) = MTLCreateSystemDefaultDevice() else { return };
+        let Some(dev) = MTLCreateSystemDefaultDevice() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let first = Archive::open_in(&dev, dir.path()).unwrap();
         assert!(first.archived_mesh(&dev, &mesh_descriptor(&dev)).is_none());
@@ -407,7 +480,9 @@ mod tests {
 
     #[test]
     fn compute_archive_hits_after_flush_across_reloaded_libraries() {
-        let Some(m) = crate::metal::Metal::new().ok() else { return };
+        let Some(m) = crate::metal::Metal::new().ok() else {
+            return;
+        };
         let Some(msc) = m.msc().ok() else { return };
         let affine = include_bytes!("../tests/affine.dxil");
         let (_, lib) = msc.convert(affine, None).unwrap();

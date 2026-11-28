@@ -2,6 +2,10 @@
 //! the mapped images' unwind data, the unhandled-exception filter, and the
 //! jump back into title code with a `CONTEXT`.
 
+// The api module's exports take the title's raw out-pointers, null-checked
+// where a miss is tolerated.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -297,7 +301,11 @@ pub fn backtrace(start: Context, bounds: Bounds) -> Vec<usize> {
     let mut u = start;
     let mut chain = vec![u.rip as usize];
     for _ in 0..24 {
-        let pc = if chain.len() == 1 { u.rip } else { u.rip.wrapping_sub(1) } as usize;
+        let pc = if chain.len() == 1 {
+            u.rip
+        } else {
+            u.rip.wrapping_sub(1)
+        } as usize;
         if !stack_ok(&u, bounds) {
             break;
         }
@@ -385,11 +393,17 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             tracing::warn!(
                 code = format_args!("{:#010x}", r.code),
                 at = format_args!("{:#x}", c.rip),
-                image = format_args!("{:#x?}", unwind::image_base_of(c.rip as usize).map(|b| c.rip as usize - b)),
+                image = format_args!(
+                    "{:#x?}",
+                    unwind::image_base_of(c.rip as usize).map(|b| c.rip as usize - b)
+                ),
                 info = format_args!("{:x?}", &r.information[..2]),
-                rax = format_args!("{:#x}", g[0]), rcx = format_args!("{:#x}", g[1]),
-                rdx = format_args!("{:#x}", g[2]), rsp = format_args!("{:#x}", g[4]),
-                r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
+                rax = format_args!("{:#x}", g[0]),
+                rcx = format_args!("{:#x}", g[1]),
+                rdx = format_args!("{:#x}", g[2]),
+                rsp = format_args!("{:#x}", g[4]),
+                r8 = format_args!("{:#x}", g[8]),
+                r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
             // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts). An access violation
@@ -401,7 +415,10 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 std::env::var("VICTORY_PEEK"),
                 unwind::image_base_of(c.rip as usize),
             ) {
-                for rva in list.split(',').filter_map(|v| usize::from_str_radix(v.trim(), 16).ok()) {
+                for rva in list
+                    .split(',')
+                    .filter_map(|v| usize::from_str_radix(v.trim(), 16).ok())
+                {
                     // Beyond the image: an absolute address.
                     let at = if rva > 0x1000_0000 { rva } else { base + rva };
                     let v = (at as *const u64).read_unaligned();
@@ -651,7 +668,12 @@ unsafe extern "C" fn unwind_ex(
                     unsafe {
                         call_win64(
                             u.handler,
-                            &[rec as u64, u.frame, &raw mut frame_ctx as u64, &raw mut dc as u64],
+                            &[
+                                rec as u64,
+                                u.frame,
+                                &raw mut frame_ctx as u64,
+                                &raw mut dc as u64,
+                            ],
                         );
                         (*rec).flags &= !(EXCEPTION_COLLIDED_UNWIND | EXCEPTION_TARGET_UNWIND);
                     }
@@ -863,7 +885,9 @@ pub mod api {
                 };
                 match verdict {
                     EXCEPTION_CONTINUE_SEARCH => continue,
-                    EXCEPTION_CONTINUE_EXECUTION => return EXCEPTION_CONTINUE_EXECUTION_DISPOSITION,
+                    EXCEPTION_CONTINUE_EXECUTION => {
+                        return EXCEPTION_CONTINUE_EXECUTION_DISPOSITION;
+                    }
                     _ => {}
                 }
             }

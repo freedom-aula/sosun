@@ -411,16 +411,43 @@ fn texture_views_and_sampler_filters() {
 
     // A format Metal cannot cast the texture to is an error, not Metal's assertion (a title view
     // left over a resource object the title made anew); one of the same texel size is a view.
-    let view = |format| m.create_texture_view(&t, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
-    for format in [Format::R8Unorm, Format::Bc1, Format::Rgba16Float, Format::D32Float] {
+    let view = |format| {
+        m.create_texture_view(
+            &t,
+            &ViewDesc {
+                format,
+                mips: (0, 1),
+                slices: (0, 1),
+            },
+        )
+    };
+    for format in [
+        Format::R8Unorm,
+        Format::Bc1,
+        Format::Rgba16Float,
+        Format::D32Float,
+    ] {
         assert!(view(format).is_err(), "{format:?}");
     }
     for format in [Format::R32Uint, Format::Rgb10a2Unorm, Format::Bgra8Unorm] {
         assert!(view(format).is_ok(), "{format:?}");
     }
     let bc = m.create_texture(&d2(Format::Bc7, 4, 4)).unwrap();
-    let view = |format| m.create_texture_view(&bc, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
-    assert!(view(Format::Bc7Srgb).is_ok() && view(Format::Bc3).is_err() && view(Format::Rgba32Float).is_err());
+    let view = |format| {
+        m.create_texture_view(
+            &bc,
+            &ViewDesc {
+                format,
+                mips: (0, 1),
+                slices: (0, 1),
+            },
+        )
+    };
+    assert!(
+        view(Format::Bc7Srgb).is_ok()
+            && view(Format::Bc3).is_err()
+            && view(Format::Rgba32Float).is_err()
+    );
 
     // Filters: a 2x2 texture, red 0 | 255 (both rows), sampled on a 4x4 grid. Nearest only ever
     // returns the two texel values; linear blends between the texel centres.
@@ -499,14 +526,29 @@ fn texture_over_zero_copy_memory() {
 #[test]
 fn packed_16_bit_channel_order() {
     let Some(m) = backend() else { return };
-    let rgba = [[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    let rgba = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
     for (f, px, want) in [
-        (Format::Bgr5a1Unorm, [0x001fu16, 0x03e0, 0x7c00, 0x8000], rgba),
+        (
+            Format::Bgr5a1Unorm,
+            [0x001fu16, 0x03e0, 0x7c00, 0x8000],
+            rgba,
+        ),
         (Format::Abgr4Unorm, [0x00f0, 0x0f00, 0xf000, 0x000f], rgba),
     ] {
         let t = m.create_texture(&d2(f, 2, 2)).unwrap();
         m.upload_texture(&t, 0, 0, bytes(&px), 4, 0);
-        let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [2, 2], z: 1, filter: Filter::Nearest };
+        let g = Grid {
+            m: &m,
+            dxil: &fixture("sample2d"),
+            g: [2, 2],
+            z: 1,
+            filter: Filter::Nearest,
+        };
         assert_eq!(g.run(&t), want, "{f:?}");
     }
 }
@@ -568,8 +610,16 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
         }];
         run(&m, &w);
         let out: Vec<u32> = a.read(dst, N);
-        assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7));
-        assert!(out[N / 2..].iter().all(|v| *v == 0), "groups past the record's count do not run");
+        assert!(
+            out[..N / 2]
+                .iter()
+                .enumerate()
+                .all(|(i, v)| *v == i as u32 * 5 + 7)
+        );
+        assert!(
+            out[N / 2..].iter().all(|v| *v == 0),
+            "groups past the record's count do not run"
+        );
     }
 }
 
@@ -640,12 +690,28 @@ fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
             count: None,
         }];
         let blits = vec![
-            BlitOp::Fill { dst: (&a.buf, a.at(0) as *const u8), len: 0, value: 0xaa },
-            BlitOp::Copy { src: (&a.buf, a.at(0) as *const u8), dst: (&a.buf, a.at(64) as *const u8), len: 0 },
+            BlitOp::Fill {
+                dst: (&a.buf, a.at(0) as *const u8),
+                len: 0,
+                value: 0xaa,
+            },
+            BlitOp::Copy {
+                src: (&a.buf, a.at(0) as *const u8),
+                dst: (&a.buf, a.at(64) as *const u8),
+                len: 0,
+            },
         ];
         let passes = [Pass::Compute(&dispatches), Pass::Blit(blits)];
         let signals = [(&fence, 1)];
-        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        m.submit_passes(
+            &q,
+            &PassSubmission {
+                waits: &[],
+                passes: &passes,
+                signals: &signals,
+            },
+        )
+        .unwrap();
         assert!(m.wait(&fence, 1, 5000));
     }
 }
@@ -679,7 +745,7 @@ fn texture_blit_ops_copy_between_textures_and_buffers() {
         unordered_access: false,
     };
     let tex_a = m.create_texture(&desc).unwrap();
-    let mut srgb_desc = desc.clone();
+    let mut srgb_desc = desc;
     srgb_desc.format = Format::Rgba8UnormSrgb;
     let tex_b = m.create_texture(&srgb_desc).unwrap();
     let dst_off = 0x10000;
@@ -719,8 +785,15 @@ fn texture_blit_ops_copy_between_textures_and_buffers() {
             slice_pitch: pitch * 4,
         },
     ])];
-    m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] })
-        .unwrap();
+    m.submit_passes(
+        &q,
+        &PassSubmission {
+            waits: &[],
+            passes: &passes,
+            signals: &[(&f, 1)],
+        },
+    )
+    .unwrap();
     assert!(m.wait(&f, 1, 5000));
 
     let out: Vec<u8> = a.read(dst_off, 3 * pitch + 16);

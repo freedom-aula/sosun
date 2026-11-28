@@ -671,7 +671,8 @@ fn footprint() -> Option<u64> {
         rest: [0; 40],
     };
     let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
-    let ok = task_info(mach_task_self(), TASK_VM_INFO, &mut info, &mut count);
+    // SAFETY: this task's own info, into a `TaskVmInfo` of the declared count.
+    let ok = unsafe { task_info(mach_task_self(), TASK_VM_INFO, &mut info, &mut count) };
     (ok == 0).then(|| info.rest[15] >> 20)
 }
 
@@ -1318,6 +1319,8 @@ fn read_source(request: &Request) -> std::io::Result<Cow<'static, [u8]>> {
 /// cache (0 turns it off); the direct path stays for reads of a block or more.
 mod readahead {
     use std::collections::{HashMap, VecDeque};
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
     use std::sync::{Arc, Mutex, OnceLock};
 
     /// A block's size: small enough a stray read wastes little, large enough
@@ -1331,9 +1334,11 @@ mod readahead {
     /// The whole cache's budget.
     const BUDGET: u64 = 256 << 20;
 
+    /// (file id, block) to its bytes, with the tick it was last used at.
+    type Blocks = HashMap<(u64, u64), (u64, Arc<Vec<u8>>)>;
+
     struct Cache {
-        /// (file id, block) to its bytes, with the tick it was last used at.
-        blocks: HashMap<(u64, u64), (u64, Arc<Vec<u8>>)>,
+        blocks: Blocks,
         /// The keys least-recently-used first.
         order: VecDeque<(u64, u64)>,
         bytes: u64,

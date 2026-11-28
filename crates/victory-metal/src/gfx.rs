@@ -74,18 +74,31 @@ pub struct Texture {
 
 impl Clone for Texture {
     fn clone(&self) -> Self {
-        Texture { tex: self.tex.clone(), format: self.format }
+        Texture {
+            tex: self.tex.clone(),
+            format: self.format,
+        }
     }
 }
 
 /// What a CPU transfer of a `w` x `h` x `d` mip needs of `format`: `(row bytes, total bytes)`, or the
 /// reason the pitches or the `len` bytes cannot hold it. Metal asserts (and may write past the buffer)
 /// when the row pitch is short, so a refused transfer is skipped.
-fn transfer_need(format: Format, [w, h, d]: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> Result<usize, (usize, usize)> {
+fn transfer_need(
+    format: Format,
+    [w, h, d]: [usize; 3],
+    row_pitch: usize,
+    slice_pitch: usize,
+    len: usize,
+) -> Result<usize, (usize, usize)> {
     let row = format.row_bytes(w);
     let rows = h.div_ceil(format.block().0);
     let image = (rows - 1) * row_pitch + row;
-    let total = if d > 1 { (d - 1) * slice_pitch + image } else { image };
+    let total = if d > 1 {
+        (d - 1) * slice_pitch + image
+    } else {
+        image
+    };
     if row_pitch < row || (d > 1 && slice_pitch < image) || len < total {
         return Err((row, total));
     }
@@ -94,16 +107,33 @@ fn transfer_need(format: Format, [w, h, d]: [usize; 3], row_pitch: usize, slice_
 
 /// Whether the transfer fits; else logs it (the backtrace once) and says to skip it.
 #[allow(clippy::too_many_arguments)]
-fn transfer_fits(what: &str, t: &Texture, mip: usize, dims: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize) -> bool {
+fn transfer_fits(
+    what: &str,
+    t: &Texture,
+    mip: usize,
+    dims: [usize; 3],
+    row_pitch: usize,
+    slice_pitch: usize,
+    len: usize,
+) -> bool {
     static FIRST: std::sync::Once = std::sync::Once::new();
     let Err((row, total)) = transfer_need(t.format, dims, row_pitch, slice_pitch, len) else {
         return true;
     };
     tracing::warn!(
         "{what} skipped: {:?} {:?} mip {mip} region {}x{}x{} row_pitch {row_pitch} slice_pitch {slice_pitch} buffer {len} bytes, needs row {row} total {total}",
-        t.format, t.tex.pixelFormat(), dims[0], dims[1], dims[2]
+        t.format,
+        t.tex.pixelFormat(),
+        dims[0],
+        dims[1],
+        dims[2]
     );
-    FIRST.call_once(|| tracing::warn!("first refused transfer, called from:\n{}", std::backtrace::Backtrace::force_capture()));
+    FIRST.call_once(|| {
+        tracing::warn!(
+            "first refused transfer, called from:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        )
+    });
     false
 }
 
@@ -235,7 +265,11 @@ fn castable(from: Format, to: Format) -> bool {
     if matches!(to, D32Float | D32FloatS8 | D16Unorm) {
         return false;
     }
-    if from.block().0 == 1 { from.block() == to.block() } else { twin(from) == twin(to) }
+    if from.block().0 == 1 {
+        from.block() == to.block()
+    } else {
+        twin(from) == twin(to)
+    }
 }
 
 fn tex_type(d: TexDim) -> MTLTextureType {
@@ -576,7 +610,9 @@ impl Metal {
                 set.commit();
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
-                    c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
+                    c.heap_allocations = c
+                        .heap_allocations
+                        .max(heap.alloc_counts.borrow().len() as u64);
                     c.heap_set_bytes = c.heap_set_bytes.max(set.allocatedSize());
                 });
             }
@@ -719,7 +755,11 @@ impl Metal {
         );
         // A mesh pipeline's first stage takes what a vertex shader would.
         let mesh = pipeline.mesh.is_some();
-        let first = if mesh { MTLRenderStages::Mesh } else { MTLRenderStages::Vertex };
+        let first = if mesh {
+            MTLRenderStages::Mesh
+        } else {
+            MTLRenderStages::Vertex
+        };
         // SAFETY: setBytes copies the bytes before returning.
         unsafe {
             if !root.is_empty() {
@@ -735,10 +775,7 @@ impl Metal {
                 e.setFragmentBytes_length_atIndex(p, fragment.len(), ARGUMENT_BUFFER);
             }
         }
-        for (t, stage) in [
-            (vs, first),
-            (ps, MTLRenderStages::Fragment),
-        ] {
+        for (t, stage) in [(vs, first), (ps, MTLRenderStages::Fragment)] {
             if let Some(t) = StaticSamplers::table(t) {
                 e.useResource_usage_stages(t, MTLResourceUsage::Read, stage);
             }
@@ -872,7 +909,10 @@ impl ResourceBackend for Metal {
             .dev
             .newTextureWithDescriptor(&td)
             .ok_or("newTextureWithDescriptor failed")?;
-        Ok(Texture { tex, format: d.format })
+        Ok(Texture {
+            tex,
+            format: d.format,
+        })
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
@@ -917,7 +957,10 @@ impl ResourceBackend for Metal {
                 .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
-        Ok(Texture { tex, format: title_format })
+        Ok(Texture {
+            tex,
+            format: title_format,
+        })
     }
 
     fn create_texture_over_memory(
@@ -947,7 +990,10 @@ impl ResourceBackend for Metal {
             .buf
             .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, row_pitch)
             .ok_or("buffer-backed texture refused (offset, pitch or format)")?;
-        Ok(Texture { tex, format: d.format })
+        Ok(Texture {
+            tex,
+            format: d.format,
+        })
     }
 
     fn linear_alignment(&self, f: Format) -> usize {
@@ -969,7 +1015,15 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
-        if !transfer_fits("upload_texture", t, mip, [w, h, d], row_pitch, slice_pitch, data.len()) {
+        if !transfer_fits(
+            "upload_texture",
+            t,
+            mip,
+            [w, h, d],
+            row_pitch,
+            slice_pitch,
+            data.len(),
+        ) {
             return;
         }
         let region = MTLRegion {
@@ -1004,7 +1058,15 @@ impl ResourceBackend for Metal {
             (t.tex.height() >> mip).max(1),
             (t.tex.depth() >> mip).max(1),
         );
-        if !transfer_fits("read_texture", t, mip, [w, h, d], row_pitch, slice_pitch, out.len()) {
+        if !transfer_fits(
+            "read_texture",
+            t,
+            mip,
+            [w, h, d],
+            row_pitch,
+            slice_pitch,
+            out.len(),
+        ) {
             return;
         }
         let region = MTLRegion {
@@ -1049,7 +1111,11 @@ fn crash_key(d: &RenderPipelineDesc<'_>) -> String {
 /// run inside its own autorelease pool by `submit_passes`.
 impl Metal {
     /// [`Self::submit_passes`]: the body, run inside its own autorelease pool.
-    fn submit_passes_pooled(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+    fn submit_passes_pooled(
+        &self,
+        queue: &Queue,
+        work: &PassSubmission<'_, Self>,
+    ) -> Result<(), String> {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
@@ -1095,7 +1161,9 @@ impl Metal {
                 started: Cell::new(false),
             }
         });
-        let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
+        let order = order
+            .as_ref()
+            .and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
         // A pass that cannot be encoded must not take the submission's fence signals and
         // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
@@ -1111,9 +1179,19 @@ impl Metal {
                     self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
                 }
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
-                Pass::ClearColorRects { target, color, rects } => {
-                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
-                }
+                Pass::ClearColorRects {
+                    target,
+                    color,
+                    rects,
+                } => self.encode_color_clear_rects(
+                    &cb,
+                    target,
+                    *color,
+                    rects,
+                    set_on_queue,
+                    order,
+                    &mut attached_heaps,
+                ),
             };
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
@@ -1132,44 +1210,59 @@ impl Metal {
         }
         let owed = std::sync::Arc::new(Owed::new(queue, work, set_on_queue));
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
-        flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
+        flights().push_back(Flight {
+            serial,
+            queue: queue_id,
+            since: std::time::Instant::now(),
+            owed: owed.clone(),
+        });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
         let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
         if let Some((s, l, enc)) = &tinfo {
-            IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
+            IN_FLIGHT
+                .lock()
+                .unwrap()
+                .insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
         }
-        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            // SAFETY: Metal passes the command buffer that completed.
-            let done = unsafe { done.as_ref() };
-            landed(serial, queue_id, done.error().is_some());
-            if let Some((s, l, enc)) = &tinfo {
-                let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
-                if done.error().is_none()
-                    && let Some(t) = started
-                    && t.elapsed().as_secs_f64() > 1.0
-                    && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
-                {
-                    tracing::warn!(
-                        "metal: slow command buffer {l} took {:.3}s (gpu {:.3}s, kernel {:.3}s) | {enc}",
-                        t.elapsed().as_secs_f64(),
-                        done.GPUEndTime() - done.GPUStartTime(),
-                        done.kernelEndTime() - done.kernelStartTime()
-                    );
-                }
-            }
-            if let Some(e) = done.error() {
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < if trace { 200 } else { 20 } {
-                    if trace {
-                        trace_failure(done, &e);
-                    } else {
-                        eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+        let failed = block2::RcBlock::new(
+            move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                // SAFETY: Metal passes the command buffer that completed.
+                let done = unsafe { done.as_ref() };
+                landed(serial, queue_id, done.error().is_some());
+                if let Some((s, l, enc)) = &tinfo {
+                    let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
+                    if done.error().is_none()
+                        && let Some(t) = started
+                        && t.elapsed().as_secs_f64() > 1.0
+                        && TRACE_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100
+                    {
+                        tracing::warn!(
+                            "metal: slow command buffer {l} took {:.3}s (gpu {:.3}s, kernel {:.3}s) | {enc}",
+                            t.elapsed().as_secs_f64(),
+                            done.GPUEndTime() - done.GPUStartTime(),
+                            done.kernelEndTime() - done.kernelStartTime()
+                        );
                     }
                 }
-                owed.recover();
-            }
-        });
+                if let Some(e) = done.error() {
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        < if trace { 200 } else { 20 }
+                    {
+                        if trace {
+                            trace_failure(done, &e);
+                        } else {
+                            eprintln!(
+                                "metal: command buffer failed: {e:?} ({})",
+                                e.localizedDescription()
+                            );
+                        }
+                    }
+                    owed.recover();
+                }
+            },
+        );
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
@@ -1198,14 +1291,33 @@ impl GraphicsBackend for Metal {
         let state = format!(
             "{} {:?}",
             d.vs.len(),
-            (d.vs_layout, d.ps_layout, d.attributes, d.streams, d.color, d.depth, d.depth_test, d.cull, d.color_state, d.dual_source, d.stencil, d.raster)
+            (
+                d.vs_layout,
+                d.ps_layout,
+                d.attributes,
+                d.streams,
+                d.color,
+                d.depth,
+                d.depth_test,
+                d.cull,
+                d.color_state,
+                d.dual_source,
+                d.stencil,
+                d.raster
+            )
         );
-        let key = *blake3::Hasher::new().update(d.vs).update(d.ps.unwrap_or_default()).update(state.as_bytes()).finalize().as_bytes();
+        let key = *blake3::Hasher::new()
+            .update(d.vs)
+            .update(d.ps.unwrap_or_default())
+            .update(state.as_bytes())
+            .finalize()
+            .as_bytes();
         let made = crate::metal::within(&self.compiling_render, key, wait, || {
             let (compiler, owned) = (self.compiler()?, OwnedDesc::of(d));
             Ok(move || compiler.render(&owned.desc()))
         })?;
-        made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
+        made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh)))
+            .transpose()
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
@@ -1215,12 +1327,8 @@ impl GraphicsBackend for Metal {
         // objects pile up until some outer pool drains — megabytes a submission, gigabytes over
         // a load, of nothing but garbage waiting. The pool here drains at the end of every
         // submission, as the present's and the compile threads' already do.
-        objc2::rc::autoreleasepool(|_| {
-            self.submit_passes_pooled(queue, work)
-        })
+        objc2::rc::autoreleasepool(|_| self.submit_passes_pooled(queue, work))
     }
-
-
 }
 
 impl RenderPipeline {
@@ -1231,7 +1339,10 @@ impl RenderPipeline {
 }
 
 /// Formats, write masks and blending of the colour targets.
-fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &RenderPipelineDesc<'_>) {
+fn color_attachments(
+    arr: &MTLRenderPipelineColorAttachmentDescriptorArray,
+    d: &RenderPipelineDesc<'_>,
+) {
     for (i, f) in d.color.iter().enumerate() {
         // SAFETY: colour attachment index below 8.
         let a = unsafe { arr.objectAtIndexedSubscript(i) };
@@ -1266,7 +1377,12 @@ fn color_attachments(arr: &MTLRenderPipelineColorAttachmentDescriptorArray, d: &
 
 impl Metal {
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
-    fn finish_render(&self, d: &RenderPipelineDesc<'_>, pso: RenderState, mesh: Option<MTLSize>) -> Result<RenderPipeline, String> {
+    fn finish_render(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+        pso: RenderState,
+        mesh: Option<MTLSize>,
+    ) -> Result<RenderPipeline, String> {
         let has_stencil = d.depth == Some(Format::D32FloatS8);
         let depth = (d.depth_test.is_some() || (d.stencil.is_some() && has_stencil)).then(|| {
             let dd = MTLDepthStencilDescriptor::new();
@@ -1372,7 +1488,10 @@ impl crate::metal::Compiler {
         layout: Option<&victory_backend::backend::RootLayout>,
         dual_source: bool,
     ) -> Result<(i32, Retained<ProtocolObject<dyn MTLFunction>>), String> {
-        let (stage, lib) = self.msc.convert_with(dxil, None, layout, dual_source).map_err(|e| e.to_string())?;
+        let (stage, lib) = self
+            .msc
+            .convert_with(dxil, None, layout, dual_source)
+            .map_err(|e| e.to_string())?;
         let l = crate::metal::load_library(&self.dev, &lib)?;
         let name = l
             .functionNames()
@@ -1383,20 +1502,25 @@ impl crate::metal::Compiler {
     }
 
     /// The pipeline state of `d` and, for a mesh pipeline, its thread-group size.
-    pub(crate) fn render(&self, d: &RenderPipelineDesc<'_>) -> Result<(RenderState, Option<MTLSize>), String> {
+    pub(crate) fn render(
+        &self,
+        d: &RenderPipelineDesc<'_>,
+    ) -> Result<(RenderState, Option<MTLSize>), String> {
         // A pipeline that crashed Metal's compiler on an earlier run would only crash it again.
         if crate::disk::crashed(crash_key(d).as_bytes()) {
             return Err("Metal's compiler crashed on it on an earlier run".into());
         }
         let (stage, vf) = self.stage_function(d.vs, d.vs_layout, false)?;
-        let ff = d
-            .ps
-            .map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
-            .transpose()?
-            .map(|f| f.1);
+        let ff =
+            d.ps.map(|ps| self.stage_function(ps, d.ps_layout, d.dual_source))
+                .transpose()?
+                .map(|f| f.1);
         let has_stencil = d.depth == Some(Format::D32FloatS8);
         let (pso, mesh) = if stage == crate::msc::STAGE_MESH {
-            let [x, y, z] = self.msc.mesh_threads(d.vs, d.vs_layout).map_err(|e| e.to_string())?;
+            let [x, y, z] = self
+                .msc
+                .mesh_threads(d.vs, d.vs_layout)
+                .map_err(|e| e.to_string())?;
             let md = MTLMeshRenderPipelineDescriptor::new();
             // SAFETY: both functions are the converter's, of the stages they are set as.
             unsafe {
@@ -1473,7 +1597,6 @@ impl crate::metal::Compiler {
     }
 }
 
-
 /// What a submission owes the title once it completes: the order event, the title's fence signals
 /// and its value writes (fills). A command buffer the GPU fails does none of them, so the queue and
 /// every fence and barrier word waiting on it would hang; `recover` pays them from the CPU.
@@ -1503,12 +1626,22 @@ impl Owed {
                     // may have changed since), when a title needs a failed copy's data upgrade
                     // to a replay that checks the source is unchanged.
                     if let BlitOp::Fill { dst, len, value } = op {
-                        fills.push((dst.0.buf.clone(), dst.1 as usize - dst.0.base as usize, *len, *value));
+                        fills.push((
+                            dst.0.buf.clone(),
+                            dst.1 as usize - dst.0.base as usize,
+                            *len,
+                            *value,
+                        ));
                     }
                 }
             }
         }
-        Owed { recovery: std::sync::Once::new(), events, fills, signals: work.signals.len() }
+        Owed {
+            recovery: std::sync::Once::new(),
+            events,
+            fills,
+            signals: work.signals.len(),
+        }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
@@ -1562,7 +1695,8 @@ pub(crate) static FLIGHTS_IN_TESTS: std::sync::RwLock<()> = std::sync::RwLock::n
 /// serial Metal failed and when.
 static FLIGHTS: std::sync::Mutex<std::collections::VecDeque<Flight>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
-static FAILURES: std::sync::Mutex<Vec<(usize, u64, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+static FAILURES: std::sync::Mutex<Vec<(usize, u64, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn flights() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Flight>> {
     FLIGHTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -1609,7 +1743,9 @@ fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::
         let mut flying = flights();
         let is_lost = |f: &Flight| {
             f.since.elapsed() >= anyway
-                || failures.iter().any(|(q, s, at)| *q == f.queue && f.serial < *s && at.elapsed() >= behind_a_failure)
+                || failures.iter().any(|(q, s, at)| {
+                    *q == f.queue && f.serial < *s && at.elapsed() >= behind_a_failure
+                })
         };
         let (lost, kept): (Vec<Flight>, Vec<Flight>) = flying.drain(..).partition(is_lost);
         *flying = kept.into();
@@ -1672,11 +1808,14 @@ fn trace_failure(cb: &ProtocolObject<dyn MTLCommandBuffer>, e: &objc2_foundation
     let label = cb.label().map(|l| l.to_string()).unwrap_or_default();
     let mut encoders = String::new();
     // SAFETY: the key is a Metal constant; the value is an NSArray of encoder infos.
-    let infos = e.userInfo().objectForKey(unsafe { MTLCommandBufferEncoderInfoErrorKey });
+    let infos = e
+        .userInfo()
+        .objectForKey(unsafe { MTLCommandBufferEncoderInfoErrorKey });
     if let Some(infos) = infos {
         // SAFETY: Metal documents the value as an array of `MTLCommandBufferEncoderInfo`.
-        let infos: Retained<objc2_foundation::NSArray<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>> =
-            unsafe { Retained::cast_unchecked(infos) };
+        let infos: Retained<
+            objc2_foundation::NSArray<ProtocolObject<dyn MTLCommandBufferEncoderInfo>>,
+        > = unsafe { Retained::cast_unchecked(infos) };
         for i in infos.iter() {
             let st = match i.errorState() {
                 MTLCommandEncoderErrorState::Completed => "Completed",
@@ -1739,32 +1878,59 @@ impl Metal {
         }
         let off = |b: &Buffer, p: *const u8| p as usize - b.base as usize;
         let tex_dims = |t: &ProtocolObject<dyn MTLTexture>, mip: usize| {
-            [(t.width() >> mip).max(1), (t.height() >> mip).max(1), (t.depth() >> mip).max(1)]
+            [
+                (t.width() >> mip).max(1),
+                (t.height() >> mip).max(1),
+                (t.depth() >> mip).max(1),
+            ]
         };
         let tex_slices = |t: &ProtocolObject<dyn MTLTexture>| {
-            if t.textureType() == MTLTextureType::Type2DArray { t.arrayLength() } else { 1 }
+            if t.textureType() == MTLTextureType::Type2DArray {
+                t.arrayLength()
+            } else {
+                1
+            }
         };
-        let fits_region = |t: &ProtocolObject<dyn MTLTexture>, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3]| {
+        let fits_region = |t: &ProtocolObject<dyn MTLTexture>,
+                           mip: usize,
+                           slice: usize,
+                           at: [usize; 3],
+                           sz: [usize; 3]| {
             if sz.contains(&0) || mip >= t.mipmapLevelCount() || slice >= tex_slices(t) {
                 return false;
             }
             let dims = tex_dims(t, mip);
             (0..3).all(|i| at[i].saturating_add(sz[i]) <= dims[i])
         };
-        let fits_buffer_transfer = |what: &str, buf: (&Buffer, *const u8), t: &Texture, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3], row_pitch: usize, slice_pitch: usize, len: usize| -> Option<(usize, usize)> {
+        let fits_buffer_transfer = |what: &str,
+                                    buf: (&Buffer, *const u8),
+                                    t: &Texture,
+                                    mip: usize,
+                                    slice: usize,
+                                    at: [usize; 3],
+                                    sz: [usize; 3],
+                                    row_pitch: usize,
+                                    slice_pitch: usize,
+                                    len: usize|
+         -> Option<(usize, usize)> {
             // A depth and stencil texture's rows are its 4-byte depth plane (`DepthFromDepthStencil`).
             let plane = t.format == Format::D32FloatS8;
             let align = if plane { 4 } else { t.format.block().1 };
             let buf_off = off(buf.0, buf.1);
             let rows_fit = if plane {
-                (sz[2] - 1) * slice_pitch + (sz[1] - 1) * row_pitch + sz[0] * 4 <= len && row_pitch >= sz[0] * 4
+                (sz[2] - 1) * slice_pitch + (sz[1] - 1) * row_pitch + sz[0] * 4 <= len
+                    && row_pitch >= sz[0] * 4
             } else {
                 transfer_fits(what, t, mip, sz, row_pitch, slice_pitch, len)
             };
-            if (is_depth(t.tex.pixelFormat()) && !matches!(t.format, Format::D32FloatS8 | Format::D32Float | Format::D16Unorm))
+            if (is_depth(t.tex.pixelFormat())
+                && !matches!(
+                    t.format,
+                    Format::D32FloatS8 | Format::D32Float | Format::D16Unorm
+                ))
                 || !fits_region(&t.tex, mip, slice, at, sz)
-                || buf_off % align != 0
-                || row_pitch % align != 0
+                || !buf_off.is_multiple_of(align)
+                || !row_pitch.is_multiple_of(align)
                 || buf_off.saturating_add(len) > buf.0.buf.length()
                 || !rows_fit
             {
@@ -1785,15 +1951,18 @@ impl Metal {
         // already relies on that), and Metal keeps a buffer alive past the operations that
         // use it, so replacing the pool's handle when it grows is safe.
         let mut staging: Option<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)> = None;
-        let mut take_staging = |this: &Self, need: usize| -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
-            if let Some((buffer, _)) = staging.as_ref().filter(|&(_, len)| *len >= need) {
-                return Some(buffer.clone());
-            }
-            let grown = need.max(staging.as_ref().map_or(16, |(_, len)| len * 2));
-            let buffer = this.dev.newBufferWithLength_options(grown, MTLResourceOptions::StorageModePrivate)?;
-            staging = Some((buffer.clone(), grown));
-            Some(buffer)
-        };
+        let mut take_staging =
+            |this: &Self, need: usize| -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+                if let Some((buffer, _)) = staging.as_ref().filter(|&(_, len)| *len >= need) {
+                    return Some(buffer.clone());
+                }
+                let grown = need.max(staging.as_ref().map_or(16, |(_, len)| len * 2));
+                let buffer = this
+                    .dev
+                    .newBufferWithLength_options(grown, MTLResourceOptions::StorageModePrivate)?;
+                staging = Some((buffer.clone(), grown));
+                Some(buffer)
+            };
         for op in ops.iter().filter(|op| nonzero(op)) {
             match op {
                 BlitOp::Copy { src, dst, len } => {
@@ -1829,11 +1998,17 @@ impl Metal {
                         // through a buffer of our own (the command buffer keeps it alive). `sz` is
                         // in source texels.
                         let ((sw, sb), (dw, db)) = (src.format.block(), dst.format.block());
-                        let bytes = |f: Format, b: usize| if f == Format::D32FloatS8 { 4 } else { b };
-                        if bytes(src.format, sb) != bytes(dst.format, db) || !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz) {
+                        let bytes =
+                            |f: Format, b: usize| if f == Format::D32FloatS8 { 4 } else { b };
+                        if bytes(src.format, sb) != bytes(dst.format, db)
+                            || !fits_region(&src.tex, *src_mip, *src_slice, *src_origin, *sz)
+                        {
                             continue;
                         }
-                        let (row, rows) = (sz[0].div_ceil(sw) * bytes(src.format, sb), sz[1].div_ceil(sw));
+                        let (row, rows) = (
+                            sz[0].div_ceil(sw) * bytes(src.format, sb),
+                            sz[1].div_ceil(sw),
+                        );
                         let dims = tex_dims(&dst.tex, *dst_mip);
                         let d: [usize; 3] = std::array::from_fn(|i| match i {
                             2 => sz[2],
@@ -1887,7 +2062,8 @@ impl Metal {
                     if src.tex.pixelFormat() != dst.tex.pixelFormat() && view.is_none() {
                         continue;
                     }
-                    let src_tex: &ProtocolObject<dyn MTLTexture> = view.as_deref().unwrap_or(&*src.tex);
+                    let src_tex: &ProtocolObject<dyn MTLTexture> =
+                        view.as_deref().unwrap_or(&*src.tex);
                     // SAFETY: bounds, mip/slice ranges, and equal pixel formats are checked above.
                     unsafe {
                         e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
@@ -1992,8 +2168,13 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            let fills = ops.iter().filter(|o| matches!(o, BlitOp::Fill { .. })).count();
-            e.setLabel(Some(&self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len()))));
+            let fills = ops
+                .iter()
+                .filter(|o| matches!(o, BlitOp::Fill { .. }))
+                .count();
+            e.setLabel(Some(
+                &self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len())),
+            ));
         }
         e.endEncoding();
         Ok(())
@@ -2003,7 +2184,11 @@ impl Metal {
 /// The blit option a copy between `t` and buffer rows takes: a depth and stencil texture's rows
 /// are its depth plane.
 fn depth_plane(t: &Texture) -> MTLBlitOption {
-    if t.format == Format::D32FloatS8 { MTLBlitOption::DepthFromDepthStencil } else { MTLBlitOption::None }
+    if t.format == Format::D32FloatS8 {
+        MTLBlitOption::DepthFromDepthStencil
+    } else {
+        MTLBlitOption::None
+    }
 }
 
 /// Whether a texture copies into another with one texture-to-texture blit: the same format, or
@@ -2135,7 +2320,10 @@ impl Metal {
             let gated = match (d.count, d.indirect) {
                 (Some(count), Some(record)) => {
                     // An open encoder left behind makes Metal abort at the next pass's encoder.
-                    Some(self.encode_gate(&e, count, record, 3, set_on_queue).inspect_err(|_| e.endEncoding())?)
+                    Some(
+                        self.encode_gate(&e, count, record, 3, set_on_queue)
+                            .inspect_err(|_| e.endEncoding())?,
+                    )
                 }
                 _ => None,
             };
@@ -2153,7 +2341,10 @@ impl Metal {
             match d.indirect {
                 Some((b, title)) => {
                     if self.names(b, set_on_queue) {
-                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                        e.useResource_usage(
+                            ProtocolObject::from_ref(&*b.buf),
+                            MTLResourceUsage::Read,
+                        );
                     }
                     let (buf, at) = match &gated {
                         Some(g) => (&**g, 0),
@@ -2169,7 +2360,10 @@ impl Metal {
                         )
                     };
                 }
-                None => e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group)),
+                None => e.dispatchThreadgroups_threadsPerThreadgroup(
+                    size(d.groups),
+                    size(d.threads_per_group),
+                ),
             }
         }
         if let Some((f, started)) = order {
@@ -2185,7 +2379,10 @@ impl Metal {
                     Some(n) => l.push_str(n),
                     None => l.push_str(&format!("{k:#x}")),
                 }
-                l.push_str(&format!(" {}x{}x{}; ", d.groups[0], d.groups[1], d.groups[2]));
+                l.push_str(&format!(
+                    " {}x{}x{}; ",
+                    d.groups[0], d.groups[1], d.groups[2]
+                ));
             }
             e.setLabel(Some(&self.cap_label(l)));
         }
@@ -2193,6 +2390,7 @@ impl Metal {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_color_clear_rects(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -2210,28 +2408,29 @@ impl Metal {
             .filter_map(|r| {
                 let (left, right) = (clip(r.left, width), clip(r.right, width));
                 let (top, bottom) = (clip(r.top, height), clip(r.bottom, height));
-                (left < right && top < bottom).then(|| ([left, top, 0], [right - left, bottom - top, 1]))
+                (left < right && top < bottom)
+                    .then(|| ([left, top, 0], [right - left, bottom - top, 1]))
             })
             .collect();
         if regions.is_empty() {
             return Ok(());
         }
-        if !matches!(target.tex.textureType(), MTLTextureType::Type2D | MTLTextureType::Type2DArray)
-            || target.tex.sampleCount() != 1
+        if !matches!(
+            target.tex.textureType(),
+            MTLTextureType::Type2D | MTLTextureType::Type2DArray
+        ) || target.tex.sampleCount() != 1
         {
             return Err("rectangular color clear requires a single-sampled 2D color target".into());
         }
-        if target.format.is_depth()
-            || !target.tex.usage().contains(MTLTextureUsage::RenderTarget)
-        {
+        if target.format.is_depth() || !target.tex.usage().contains(MTLTextureUsage::RenderTarget) {
             return Err("rectangular color clear requires a renderable color format".into());
         }
 
         // Use Metal's clear conversion in the view format, including sRGB and integer targets.
         // A retained command buffer keeps this private scratch alive until the blits finish.
-        let (max_width, max_height) = regions.iter().fold((0, 0), |(w, h), (_, size)| {
-            (w.max(size[0]), h.max(size[1]))
-        });
+        let (max_width, max_height) = regions
+            .iter()
+            .fold((0, 0), |(w, h), (_, size)| (w.max(size[0]), h.max(size[1])));
         let td = MTLTextureDescriptor::new();
         td.setPixelFormat(target.tex.pixelFormat());
         td.setStorageMode(MTLStorageMode::Private);
@@ -2242,13 +2441,19 @@ impl Metal {
             td.setHeight(max_height);
         }
         let scratch = Texture {
-            tex: self.dev.newTextureWithDescriptor(&td).ok_or("no rectangular clear texture")?,
+            tex: self
+                .dev
+                .newTextureWithDescriptor(&td)
+                .ok_or("no rectangular clear texture")?,
             format: target.format,
         };
         self.encode_render(
             cb,
             &RenderPass {
-                color: vec![ColorTarget { texture: &scratch, clear: Some(color) }],
+                color: vec![ColorTarget {
+                    texture: &scratch,
+                    clear: Some(color),
+                }],
                 depth: None,
                 draws: vec![],
             },
@@ -2296,7 +2501,9 @@ impl Metal {
             if let Some(want) = samples
                 && want != n
             {
-                return Err(format!("render targets of different sample counts: {want} and {n}"));
+                return Err(format!(
+                    "render targets of different sample counts: {want} and {n}"
+                ));
             }
             samples = Some(n);
             rt_size = (rt_size.0.min(t.width()), rt_size.1.min(t.height()));
@@ -2355,9 +2562,10 @@ impl Metal {
                     DrawCall::Mesh { .. } => 3,
                 };
                 gates.push(match (d.count, d.indirect) {
-                    (Some(count), Some(record)) => {
-                        Some(self.encode_gate(&c, count, record, words, set_on_queue).inspect_err(|_| c.endEncoding())?)
-                    }
+                    (Some(count), Some(record)) => Some(
+                        self.encode_gate(&c, count, record, words, set_on_queue)
+                            .inspect_err(|_| c.endEncoding())?,
+                    ),
                     _ => None,
                 });
             }
@@ -2392,24 +2600,29 @@ impl Metal {
                 }
             }
         }
-        let e = cb.renderCommandEncoderWithDescriptor(&desc).ok_or_else(|| {
-            // Metal refuses an encoder whose attachments disagree (size, sample count, format
-            // kind); the caller's log then says which targets the pass named.
-            let size = |t: &ProtocolObject<dyn MTLTexture>| {
-                format!("{}x{} fmt {}", t.width(), t.height(), t.pixelFormat().0)
-            };
-            let color: Vec<String> = rp.color.iter().map(|c| size(&c.texture.tex)).collect();
-            let depth = rp.depth.as_ref().map(|d| size(&d.texture.tex));
-            format!(
-                "no render encoder: {} colour {color:?}, depth {depth:?}, {} draws",
-                rp.color.len(),
-                rp.draws.len()
-            )
-        })?;
+        let e = cb
+            .renderCommandEncoderWithDescriptor(&desc)
+            .ok_or_else(|| {
+                // Metal refuses an encoder whose attachments disagree (size, sample count, format
+                // kind); the caller's log then says which targets the pass named.
+                let size = |t: &ProtocolObject<dyn MTLTexture>| {
+                    format!("{}x{} fmt {}", t.width(), t.height(), t.pixelFormat().0)
+                };
+                let color: Vec<String> = rp.color.iter().map(|c| size(&c.texture.tex)).collect();
+                let depth = rp.depth.as_ref().map(|d| size(&d.texture.tex));
+                format!(
+                    "no render encoder: {} colour {color:?}, depth {depth:?}, {} draws",
+                    rp.color.len(),
+                    rp.draws.len()
+                )
+            })?;
         if let Some((f, started)) = order
             && started.get()
         {
-            e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
+            e.waitForFence_beforeStages(
+                f,
+                MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh,
+            );
         }
         let mut named = Vec::new();
         let mut depth_set = false;
@@ -2418,10 +2631,16 @@ impl Metal {
             // The stage that reads the draw's buffers before the pixel shader.
             let first = match (d.pipeline.mesh, d.call) {
                 (Some(_), DrawCall::Mesh { .. }) => MTLRenderStages::Mesh,
-                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. }) => MTLRenderStages::Vertex,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. }) => {
+                    MTLRenderStages::Vertex
+                }
                 _ => {
                     static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| eprintln!("metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"));
+                    ONCE.call_once(|| {
+                        eprintln!(
+                            "metal: a mesh draw of a vertex pipeline, or the reverse, is dropped"
+                        )
+                    });
                     continue;
                 }
             };
@@ -2493,8 +2712,14 @@ impl Metal {
             e.setViewport(viewport);
             let scissor = match d.state.scissor {
                 Some([l, t, r, b]) => {
-                    let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
-                    let (r, b) = (r.clamp(0, tw as i32) as usize, b.clamp(0, th as i32) as usize);
+                    let (l, t) = (
+                        l.clamp(0, tw as i32) as usize,
+                        t.clamp(0, th as i32) as usize,
+                    );
+                    let (r, b) = (
+                        r.clamp(0, tw as i32) as usize,
+                        b.clamp(0, th as i32) as usize,
+                    );
                     MTLScissorRect {
                         x: l,
                         y: t,
@@ -2514,7 +2739,14 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
+            self.bind_root_render(
+                &e,
+                &d.root,
+                d.fragment_root.as_ref(),
+                &d.heaps,
+                d.pipeline,
+                &mut named,
+            );
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
@@ -2580,7 +2812,9 @@ impl Metal {
                     (DrawCall::Arrays { .. }, _) => {
                         set_index_type(&e, 0);
                         // SAFETY: as above.
-                        unsafe { e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at) };
+                        unsafe {
+                            e.drawPrimitives_indirectBuffer_indirectBufferOffset(prim, args, at)
+                        };
                     }
                     (DrawCall::Indexed { wide, .. }, Some((b, title))) => {
                         set_index_type(&e, if wide { 2 } else { 1 });
@@ -2705,7 +2939,9 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+            e.setLabel(Some(
+                &self.cap_label(format!("render: {} draws", rp.draws.len())),
+            ));
         }
         e.endEncoding();
         Ok(())
@@ -2715,12 +2951,16 @@ impl Metal {
 /// Whether a direct draw has a zero vertex, index, instance or mesh-group count.
 fn empty_draw(call: &DrawCall) -> bool {
     match *call {
-        DrawCall::Arrays { vertex_count, instance_count, .. } => {
-            vertex_count == 0 || instance_count == 0
-        }
-        DrawCall::Indexed { index_count, instance_count, .. } => {
-            index_count == 0 || instance_count == 0
-        }
+        DrawCall::Arrays {
+            vertex_count,
+            instance_count,
+            ..
+        } => vertex_count == 0 || instance_count == 0,
+        DrawCall::Indexed {
+            index_count,
+            instance_count,
+            ..
+        } => index_count == 0 || instance_count == 0,
         DrawCall::Mesh { groups } => groups.contains(&0),
     }
 }
@@ -2769,14 +3009,20 @@ mod transfer_tests {
     fn transfers_are_checked_against_the_format() {
         // RGBA16Float 4x4: a row is 32 bytes.
         assert!(transfer_need(Format::Rgba16Float, [4, 4, 1], 16, 0, 1 << 20).is_err());
-        assert_eq!(transfer_need(Format::Rgba16Float, [4, 4, 1], 32, 0, 128), Ok(128));
+        assert_eq!(
+            transfer_need(Format::Rgba16Float, [4, 4, 1], 32, 0, 128),
+            Ok(128)
+        );
         // BC1 8x8: 2 block rows of 16 bytes; the last row needs no padding.
         assert_eq!(transfer_need(Format::Bc1, [8, 8, 1], 16, 0, 32), Ok(32));
         assert!(transfer_need(Format::Bc1, [8, 8, 1], 8, 0, 1 << 20).is_err());
         // Too short a buffer, and a 3D slice pitch below one image.
         assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 1], 16, 0, 63).is_err());
         assert!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 32, 1 << 20).is_err());
-        assert_eq!(transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 64, 128), Ok(128));
+        assert_eq!(
+            transfer_need(Format::Rgba8Unorm, [4, 4, 2], 16, 64, 128),
+            Ok(128)
+        );
     }
 }
 
@@ -2785,26 +3031,46 @@ mod render_target_tests {
     use super::*;
     use objc2_foundation::NSString;
 
-    fn draw_green_triangles(metal: &Metal, target: &Texture, clear: Option<[f32; 4]>, viewports: &[Option<Viewport>]) {
+    fn draw_green_triangles(
+        metal: &Metal,
+        target: &Texture,
+        clear: Option<[f32; 4]>,
+        viewports: &[Option<Viewport>],
+    ) {
         let _flight = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
-        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+        let library = metal
+            .dev
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(
+                    r#"
             #include <metal_stdlib>
             using namespace metal;
             vertex float4 test_vertex(uint i [[vertex_id]]) {
                 return float4(i == 1 ? 3.0 : -1.0, i == 2 ? 3.0 : -1.0, 0.0, 1.0);
             }
             fragment float4 test_fragment() { return float4(0.0, 1.0, 0.0, 1.0); }
-        "#), None).expect("compile generated Metal shaders");
+        "#,
+                ),
+                None,
+            )
+            .expect("compile generated Metal shaders");
         let pipeline_desc = MTLRenderPipelineDescriptor::new();
-        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
-        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("test_vertex"))
+            .unwrap();
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("test_fragment"))
+            .unwrap();
         pipeline_desc.setVertexFunction(Some(&vertex));
         pipeline_desc.setFragmentFunction(Some(&fragment));
         // SAFETY: the descriptor has a color attachment at index 0.
         unsafe { pipeline_desc.colorAttachments().objectAtIndexedSubscript(0) }
             .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
         let pipeline = RenderPipeline {
-            pso: metal.dev.newRenderPipelineStateWithDescriptor_error(&pipeline_desc).unwrap(),
+            pso: metal
+                .dev
+                .newRenderPipelineStateWithDescriptor_error(&pipeline_desc)
+                .unwrap(),
             depth: None,
             cull: MTLCullMode::None,
             raster: Raster::default(),
@@ -2816,33 +3082,47 @@ mod render_target_tests {
         let queue = metal.create_queue().unwrap();
         let fence = metal.create_fence(0).unwrap();
         let passes = [Pass::Render(RenderPass {
-            color: vec![ColorTarget { texture: target, clear }],
+            color: vec![ColorTarget {
+                texture: target,
+                clear,
+            }],
             depth: None,
-            draws: viewports.iter().map(|&viewport| Draw {
-                pipeline: &pipeline,
-                topology: Topology::Triangles,
-                state: DrawState { viewport, ..Default::default() },
-                root: RootArgs::default(),
-                fragment_root: None,
-                heaps: Heaps::default(),
-                resources: vec![],
-                vertex_buffers: vec![],
-                index_buffer: None,
-                call: DrawCall::Arrays {
-                    vertex_count: 3,
-                    instance_count: 1,
-                    first_vertex: 0,
-                    first_instance: 0,
-                },
-                indirect: None,
-                count: None,
-            }).collect(),
+            draws: viewports
+                .iter()
+                .map(|&viewport| Draw {
+                    pipeline: &pipeline,
+                    topology: Topology::Triangles,
+                    state: DrawState {
+                        viewport,
+                        ..Default::default()
+                    },
+                    root: RootArgs::default(),
+                    fragment_root: None,
+                    heaps: Heaps::default(),
+                    resources: vec![],
+                    vertex_buffers: vec![],
+                    index_buffer: None,
+                    call: DrawCall::Arrays {
+                        vertex_count: 3,
+                        instance_count: 1,
+                        first_vertex: 0,
+                        first_instance: 0,
+                    },
+                    indirect: None,
+                    count: None,
+                })
+                .collect(),
         })];
-        metal.submit_passes(&queue, &PassSubmission {
-            passes: &passes,
-            waits: &[],
-            signals: &[(&fence, 1)],
-        }).expect("draw green triangles");
+        metal
+            .submit_passes(
+                &queue,
+                &PassSubmission {
+                    passes: &passes,
+                    waits: &[],
+                    signals: &[(&fence, 1)],
+                },
+            )
+            .expect("draw green triangles");
         assert!(metal.wait(&fence, 1, 2000), "draw did not complete");
     }
 
@@ -2859,14 +3139,26 @@ mod render_target_tests {
         for slice in 0..2 {
             for mip in 0..2 {
                 let n = 8 >> mip;
-                metal.upload_texture(&texture, mip, slice, &sentinel(mip, slice).repeat(n * n), n * 4, 0);
+                metal.upload_texture(
+                    &texture,
+                    mip,
+                    slice,
+                    &sentinel(mip, slice).repeat(n * n),
+                    n * 4,
+                    0,
+                );
             }
         }
-        let target = metal.create_texture_view(&texture, &ViewDesc {
-            format: Format::Rgba8Unorm,
-            mips: (1, 1),
-            slices: (1, 1),
-        }).expect("narrowed render target");
+        let target = metal
+            .create_texture_view(
+                &texture,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    mips: (1, 1),
+                    slices: (1, 1),
+                },
+            )
+            .expect("narrowed render target");
         assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
 
         draw_green_triangles(&metal, &target, None, &[None]);
@@ -2875,9 +3167,16 @@ mod render_target_tests {
                 let n = 8 >> mip;
                 let mut data = vec![0; n * n * 4];
                 metal.read_texture(&texture, mip, slice, &mut data, n * 4, 0);
-                let expected = if (mip, slice) == (1, 1) { [0, 255, 0, 255] } else { sentinel(mip, slice) };
-                assert!(data.as_chunks::<4>().0.iter().all(|p| *p == expected),
-                        "mip {mip} slice {slice}: expected {expected:?}, got {:?}", &data[..4]);
+                let expected = if (mip, slice) == (1, 1) {
+                    [0, 255, 0, 255]
+                } else {
+                    sentinel(mip, slice)
+                };
+                assert!(
+                    data.as_chunks::<4>().0.iter().all(|p| *p == expected),
+                    "mip {mip} slice {slice}: expected {expected:?}, got {:?}",
+                    &data[..4]
+                );
             }
         }
     }
@@ -2900,8 +3199,11 @@ mod render_target_tests {
 
         let mut pixels = [0; 16 * 16 * 4];
         metal.read_texture(&target, 0, 0, &mut pixels, 16 * 4, 0);
-        assert_eq!(pixels.as_chunks::<4>().0[8 * 16 + 12], [0, 255, 0, 255],
-                   "the second draw must reach (12, 8) outside the first viewport");
+        assert_eq!(
+            pixels.as_chunks::<4>().0[8 * 16 + 12],
+            [0, 255, 0, 255],
+            "the second draw must reach (12, 8) outside the first viewport"
+        );
     }
 }
 
@@ -2922,18 +3224,35 @@ mod owed_tests {
         q.1.set(true); // as with the pool's residency set: the order event is in play
         let fence = m.create_fence(0).unwrap();
         let passes = [Pass::Blit(vec![
-            BlitOp::Fill { dst: (&buf, at(64) as *const u8), len: 8, value: 0xAB },
-            BlitOp::Copy { src: (&buf, at(0) as *const u8), dst: (&buf, at(256) as *const u8), len: 16 },
+            BlitOp::Fill {
+                dst: (&buf, at(64) as *const u8),
+                len: 8,
+                value: 0xAB,
+            },
+            BlitOp::Copy {
+                src: (&buf, at(0) as *const u8),
+                dst: (&buf, at(256) as *const u8),
+                len: 16,
+            },
         ])];
         let (s5, s7, s9) = ([(&fence, 5)], [(&fence, 7)], [(&fence, 9)]);
-        let sub = |signals| PassSubmission { waits: &[], passes: &passes, signals };
+        let sub = |signals| PassSubmission {
+            waits: &[],
+            passes: &passes,
+            signals,
+        };
         // The recovery a submission signalling the fence to 7 would owe, built as `submit_passes` does.
         q.3.set(3);
         let owed = Owed::new(&q, &sub(&s7), true);
         owed.recover();
         // SAFETY: bounds as above.
         let bytes = unsafe { std::slice::from_raw_parts(at(60), 16) };
-        assert_eq!(bytes, [0, 0, 0, 0, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0, 0, 0, 0]);
+        assert_eq!(
+            bytes,
+            [
+                0, 0, 0, 0, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0, 0, 0, 0
+            ]
+        );
         // SAFETY: inside the region.
         assert_eq!(unsafe { *at(256) }, 0, "copies are not replayed");
         assert_eq!(m.completed(&fence), 7);
@@ -2953,9 +3272,21 @@ mod owed_tests {
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
         let q = m.create_queue().unwrap();
         let fence = m.create_fence(0).unwrap();
-        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr), len: 8, value: 0xAB }])];
+        let passes = [Pass::Blit(vec![BlitOp::Fill {
+            dst: (&buf, region.ptr),
+            len: 8,
+            value: 0xAB,
+        }])];
         let signals = [(&fence, 7)];
-        let owed = Owed::new(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }, false);
+        let owed = Owed::new(
+            &q,
+            &PassSubmission {
+                waits: &[],
+                passes: &passes,
+                signals: &signals,
+            },
+            false,
+        );
         let word = region.ptr.cast::<[u8; 8]>();
 
         owed.recover();
@@ -2981,23 +3312,50 @@ mod owed_tests {
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
         let q = m.create_queue().unwrap();
         let (never, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
-        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x5A }])];
+        let passes = [Pass::Blit(vec![BlitOp::Fill {
+            dst: (&buf, region.ptr as *const u8),
+            len: 8,
+            value: 0x5A,
+        }])];
         let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
-        m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &passes, signals: &signals }).unwrap();
+        m.submit_passes(
+            &q,
+            &PassSubmission {
+                waits: &waits,
+                passes: &passes,
+                signals: &signals,
+            },
+        )
+        .unwrap();
         // Not old enough by either rule: nothing is lost.
-        let (long, zero) = (std::time::Duration::from_secs(3600), std::time::Duration::ZERO);
+        let (long, zero) = (
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+        );
         assert_eq!(recover_lost_after(long, long), 0);
         assert_eq!(m.completed(&fence), 0);
         // Other tests' command buffers may be in flight too (those that do not mind): at least ours.
         assert!(recover_lost_after(long, zero) >= 1);
         // SAFETY: inside the region.
-        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x5A; 8]);
+        let region_bytes = unsafe { std::slice::from_raw_parts(region.ptr, 8) };
+        assert_eq!(region_bytes, [0x5A; 8]);
         assert_eq!(m.completed(&fence), 3);
         // Let it finish: a late completion of a recovered command buffer changes nothing.
         never.0.setSignaledValue(1);
         let after = [(&fence, 4)];
-        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &after }).unwrap();
-        assert!(m.wait(&fence, 4, 5000), "the queue runs on behind the recovered command buffer");
+        m.submit_passes(
+            &q,
+            &PassSubmission {
+                waits: &[],
+                passes: &[],
+                signals: &after,
+            },
+        )
+        .unwrap();
+        assert!(
+            m.wait(&fence, 4, 5000),
+            "the queue runs on behind the recovered command buffer"
+        );
     }
 
     #[test]
@@ -3011,9 +3369,21 @@ mod owed_tests {
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
         let q = m.create_queue().unwrap();
         let fence = m.create_fence(0).unwrap();
-        let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len, value: 1 }])];
+        let passes = [Pass::Blit(vec![BlitOp::Fill {
+            dst: (&buf, region.ptr as *const u8),
+            len,
+            value: 1,
+        }])];
         let signals = [(&fence, 1)];
-        let owed = Send(Owed::new(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }, false));
+        let owed = Send(Owed::new(
+            &q,
+            &PassSubmission {
+                waits: &[],
+                passes: &passes,
+                signals: &signals,
+            },
+            false,
+        ));
         let t = std::thread::spawn(move || {
             let owed = owed;
             owed.0.recover();
@@ -3024,7 +3394,10 @@ mod owed_tests {
         // SAFETY: inside the region; read as the title would once the fence is reached.
         let last = unsafe { std::ptr::read_volatile(region.ptr.add(len - 1)) };
         t.join().unwrap();
-        assert_eq!(last, 1, "the fence was reached before the fill it covers was written");
+        assert_eq!(
+            last, 1,
+            "the fence was reached before the fill it covers was written"
+        );
     }
 }
 
@@ -3035,7 +3408,10 @@ mod sampler_tests {
     #[test]
     fn dynamic_samplers_apply_the_metal_border_descriptor() {
         for (color, expected) in [
-            (BorderColor::TransparentBlack, MTLSamplerBorderColor::TransparentBlack),
+            (
+                BorderColor::TransparentBlack,
+                MTLSamplerBorderColor::TransparentBlack,
+            ),
             (BorderColor::OpaqueBlack, MTLSamplerBorderColor::OpaqueBlack),
             (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
         ] {
@@ -3047,7 +3423,10 @@ mod sampler_tests {
                 border_color: color,
                 max_anisotropy: 1,
             });
-            assert_eq!(desc.sAddressMode(), MTLSamplerAddressMode::ClampToBorderColor);
+            assert_eq!(
+                desc.sAddressMode(),
+                MTLSamplerAddressMode::ClampToBorderColor
+            );
             assert_eq!(desc.tAddressMode(), MTLSamplerAddressMode::ClampToEdge);
             assert_eq!(desc.rAddressMode(), MTLSamplerAddressMode::MirrorRepeat);
             assert_eq!(desc.borderColor(), expected);
@@ -3060,13 +3439,19 @@ mod sampler_tests {
 
         const GREEN: [u8; 4] = [0, 255, 0, 255];
         let metal = Metal::new().expect("Metal device");
-        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let source = metal
+            .create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2))
+            .unwrap();
         metal.upload_texture(&source, 0, 0, &GREEN.repeat(4), 8, 0);
         let mut output_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 1);
         output_desc.render_target = true;
         let output = metal.create_texture(&output_desc).unwrap();
 
-        let library = metal.dev.newLibraryWithSource_options_error(&NSString::from_str(r#"
+        let library = metal
+            .dev
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(
+                    r#"
             #include <metal_stdlib>
             using namespace metal;
 
@@ -3084,17 +3469,28 @@ mod sampler_tests {
                 };
                 return tex.sample(s, uv[uint(position.x)]);
             }
-        "#), None).expect("compile generated Metal shader source");
+        "#,
+                ),
+                None,
+            )
+            .expect("compile generated Metal shader source");
 
         let desc = MTLRenderPipelineDescriptor::new();
-        let vertex = library.newFunctionWithName(&NSString::from_str("test_vertex")).unwrap();
-        let fragment = library.newFunctionWithName(&NSString::from_str("test_fragment")).unwrap();
+        let vertex = library
+            .newFunctionWithName(&NSString::from_str("test_vertex"))
+            .unwrap();
+        let fragment = library
+            .newFunctionWithName(&NSString::from_str("test_fragment"))
+            .unwrap();
         desc.setVertexFunction(Some(&vertex));
         desc.setFragmentFunction(Some(&fragment));
         // SAFETY: color attachment 0 exists.
         unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) }
             .setPixelFormat(MTLPixelFormat::RGBA8Unorm);
-        let pipeline = metal.dev.newRenderPipelineStateWithDescriptor_error(&desc).unwrap();
+        let pipeline = metal
+            .dev
+            .newRenderPipelineStateWithDescriptor_error(&desc)
+            .unwrap();
         let queue = metal.dev.newCommandQueue().unwrap();
 
         let sample = |sampler: &ProtocolObject<dyn MTLSamplerState>| {
@@ -3103,7 +3499,12 @@ mod sampler_tests {
             let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
             a.setTexture(Some(&output.tex));
             a.setLoadAction(MTLLoadAction::Clear);
-            a.setClearColor(MTLClearColor { red: 1.0, green: 0.0, blue: 1.0, alpha: 1.0 });
+            a.setClearColor(MTLClearColor {
+                red: 1.0,
+                green: 0.0,
+                blue: 1.0,
+                alpha: 1.0,
+            });
             a.setStoreAction(MTLStoreAction::Store);
             let cb = queue.commandBuffer().unwrap();
             let e = cb.renderCommandEncoderWithDescriptor(&pass).unwrap();
@@ -3118,7 +3519,12 @@ mod sampler_tests {
             e.endEncoding();
             cb.commit();
             cb.waitUntilCompleted();
-            assert_eq!(cb.status(), MTLCommandBufferStatus::Completed, "{:?}", cb.error());
+            assert_eq!(
+                cb.status(),
+                MTLCommandBufferStatus::Completed,
+                "{:?}",
+                cb.error()
+            );
 
             let mut bytes = [0; 16];
             metal.read_texture(&output, 0, 0, &mut bytes, 16, 0);
@@ -3158,10 +3564,18 @@ mod sampler_tests {
             let id = resource_id(sampler.0.gpuResourceID());
             assert!(ids.insert(id), "two distinct samplers shared an ID");
             let repeated = metal.create_sampler(&key).unwrap();
-            assert_eq!(resource_id(repeated.0.gpuResourceID()), id, "repeat lookup changed cache identity");
+            assert_eq!(
+                resource_id(repeated.0.gpuResourceID()),
+                id,
+                "repeat lookup changed cache identity"
+            );
 
             let pixels = sample(&sampler.0);
-            assert_eq!(pixels, [outside, GREEN, outside, GREEN], "{mode:?}, {border_color:?}");
+            assert_eq!(
+                pixels,
+                [outside, GREEN, outside, GREEN],
+                "{mode:?}, {border_color:?}"
+            );
             println!("{mode:?} {border_color:?}: {pixels:?}");
         }
         assert_eq!(metal.samplers.borrow().len(), cached_before + cases.len());
@@ -3182,8 +3596,20 @@ mod sampler_tests {
         };
         let cases = [
             (nearest, (MetalFilter::Nearest, MetalFilter::Nearest)),
-            (SamplerDesc { min: Filter::Linear, ..nearest }, (MetalFilter::Linear, MetalFilter::Nearest)),
-            (SamplerDesc { mag: Filter::Linear, ..nearest }, (MetalFilter::Nearest, MetalFilter::Linear)),
+            (
+                SamplerDesc {
+                    min: Filter::Linear,
+                    ..nearest
+                },
+                (MetalFilter::Linear, MetalFilter::Nearest),
+            ),
+            (
+                SamplerDesc {
+                    mag: Filter::Linear,
+                    ..nearest
+                },
+                (MetalFilter::Nearest, MetalFilter::Linear),
+            ),
         ];
         let id = |key: &SamplerDesc| resource_id(m.create_sampler(key).unwrap().0.gpuResourceID());
         // Like a heap entry, keep just the ID after creating each sampler.
@@ -3192,7 +3618,10 @@ mod sampler_tests {
         for (key, expected) in cases {
             let desc = dynamic_sampler_descriptor(&key);
             assert_eq!((desc.minFilter(), desc.magFilter()), expected);
-            assert!(ids.insert(id(&key)), "distinct filter pairs shared a sampler ID");
+            assert!(
+                ids.insert(id(&key)),
+                "distinct filter pairs shared a sampler ID"
+            );
         }
         assert_eq!(id(&nearest), first, "samplers are shared by descriptor");
     }
@@ -3222,7 +3651,9 @@ mod heap_set_tests {
 
         // Metal reports allocatedSize at the last commit.
         let before = set_a.allocatedSize();
-        let texture = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 128, 128)).unwrap();
+        let texture = m
+            .create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 128, 128))
+            .unwrap();
         m.write_texture(&a, 0, &texture, 0.0);
         assert!(a.dirty.get());
         assert!(!attaches(&a, &mut first));
@@ -3249,11 +3680,18 @@ mod heap_set_tests {
             set.commit();
             set.allocationCount()
         };
-        let texture = || m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+        let texture = || {
+            m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2))
+                .unwrap()
+        };
         let (t1, t2) = (texture(), texture());
         m.write_texture(&heap, 0, &t1, 0.0);
         m.write_texture(&heap, 1, &t1, 0.0);
-        assert_eq!(held(), 2, "the heap buffer and the texture two entries name");
+        assert_eq!(
+            held(),
+            2,
+            "the heap buffer and the texture two entries name"
+        );
         m.write_texture(&heap, 0, &t2, 0.0);
         assert_eq!(held(), 3);
         m.write_texture(&heap, 1, &t2, 0.0);
@@ -3263,7 +3701,12 @@ mod heap_set_tests {
         m.clear_entry(&heap, 1);
         assert_eq!(held(), 1, "cleared entries let their texture go");
         // SAFETY: the heap buffer holds four entries of `ENTRY` bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY) };
-        assert!(bytes.iter().all(|b| *b == 0), "a cleared entry reads as one never written");
+        let bytes = unsafe {
+            std::slice::from_raw_parts(heap.buf.contents().as_ptr().cast::<u8>(), 2 * ENTRY)
+        };
+        assert!(
+            bytes.iter().all(|b| *b == 0),
+            "a cleared entry reads as one never written"
+        );
     }
 }

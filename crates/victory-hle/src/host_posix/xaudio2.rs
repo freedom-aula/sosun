@@ -22,9 +22,7 @@ use victory_loader::native;
 
 use super::coreaudio::{self, Opener, Output};
 use super::lock;
-use super::mixer::{
-    self, Buffer, Event, Format, MASTER, Mixer, Notice, VoiceId,
-};
+use super::mixer::{self, Buffer, Event, Format, MASTER, Mixer, Notice, VoiceId};
 
 type HRESULT = i32;
 
@@ -65,7 +63,13 @@ struct Second {
 
 impl Second {
     fn new() -> Second {
-        Second { passes: 0, voices: 0, queued: 0, peak: 0.0, logged: None }
+        Second {
+            passes: 0,
+            voices: 0,
+            queued: 0,
+            peak: 0.0,
+            logged: None,
+        }
     }
 
     /// Logs once a second, from the device's render thread.
@@ -79,8 +83,16 @@ impl Second {
             Some(_) => std::time::Instant::now(),
         };
         if self.passes > 0 {
-            let voices = if self.passes > 0 { self.voices / self.passes } else { 0 };
-            let queued = if self.passes > 0 { self.queued / self.passes } else { 0 };
+            let voices = if self.passes > 0 {
+                self.voices / self.passes
+            } else {
+                0
+            };
+            let queued = if self.passes > 0 {
+                self.queued / self.passes
+            } else {
+                0
+            };
             tracing::info!(
                 passes = self.passes,
                 voices,
@@ -89,7 +101,10 @@ impl Second {
                 "XAudio2: engine passes in the last second"
             );
         }
-        *self = Second { logged: Some(now), ..Second::new() };
+        *self = Second {
+            logged: Some(now),
+            ..Second::new()
+        };
     }
 }
 
@@ -108,7 +123,7 @@ struct Callbacks {
 }
 
 #[repr(C)]
-struct Engine {
+pub struct Engine {
     vtable: *const usize,
     refs: AtomicU32,
     inner: Arc<Inner>,
@@ -417,7 +432,11 @@ fn new_engine(opener: Opener) -> *mut Engine {
 }
 
 /// `XAudio2Create(IXAudio2**, flags, processor)`.
-pub extern "system" fn XAudio2Create(out: *mut *mut Engine, _flags: u32, _processor: u32) -> HRESULT {
+pub extern "system" fn XAudio2Create(
+    out: *mut *mut Engine,
+    _flags: u32,
+    _processor: u32,
+) -> HRESULT {
     create_with(out, coreaudio::open_default)
 }
 
@@ -572,8 +591,15 @@ pub(super) fn parse_format(wave: *const u8) -> Option<Format> {
             3 => true,
             _ => return None,
         };
-        (channels > 0 && rate > 0 && (float && bits == 32 || !float && matches!(bits, 8 | 16 | 24 | 32)))
-            .then_some(Format { channels, rate, bits, float })
+        (channels > 0
+            && rate > 0
+            && (float && bits == 32 || !float && matches!(bits, 8 | 16 | 24 | 32)))
+        .then_some(Format {
+            channels,
+            rate,
+            bits,
+            float,
+        })
     }
 }
 
@@ -600,7 +626,13 @@ fn first_send(inner: &Inner, sends: *const u8) -> Option<VoiceId> {
     }
 }
 
-fn voice_object(inner: &Arc<Inner>, vtable: &'static [usize], id: VoiceId, kind: Kind, format: Format) -> *mut Voice {
+fn voice_object(
+    inner: &Arc<Inner>,
+    vtable: &'static [usize],
+    id: VoiceId,
+    kind: Kind,
+    format: Format,
+) -> *mut Voice {
     Box::into_raw(Box::new(Voice {
         vtable: vtable.as_ptr(),
         inner: inner.clone(),
@@ -691,7 +723,10 @@ extern "win64" fn create_mastering_voice(
         *output = OutputState::Busy;
     }
     // 0 asks for the device's own; stereo at 48 kHz is every Mac's.
-    let (channels, rate) = (if channels == 0 { 2 } else { channels }, if rate == 0 { 48_000 } else { rate });
+    let (channels, rate) = (
+        if channels == 0 { 2 } else { channels },
+        if rate == 0 { 48_000 } else { rate },
+    );
     {
         let mut mixer = lock(&inner.mixer);
         mixer.channels = channels as usize;
@@ -719,7 +754,15 @@ extern "win64" fn create_mastering_voice(
         float: true,
     };
     // SAFETY: the title's out parameter.
-    unsafe { out.write(voice_object(inner, &MASTER_TABLE, MASTER, Kind::Master, format)) };
+    unsafe {
+        out.write(voice_object(
+            inner,
+            &MASTER_TABLE,
+            MASTER,
+            Kind::Master,
+            format,
+        ))
+    };
     S_OK
 }
 
@@ -753,7 +796,9 @@ extern "win64" fn get_voice_details(this: *mut Voice, details: *mut u32) {
         } else {
             (v.format.channels as u32, v.format.rate)
         };
-        details.cast::<[u32; 4]>().write_unaligned([0, 0, channels, rate]);
+        details
+            .cast::<[u32; 4]>()
+            .write_unaligned([0, 0, channels, rate]);
     }
 }
 
@@ -810,7 +855,11 @@ extern "win64" fn get_effect_parameters(
 ) -> HRESULT {
     S_OK
 }
-extern "win64" fn set_filter_parameters(_this: *mut Voice, _p: *const c_void, _set: u32) -> HRESULT {
+extern "win64" fn set_filter_parameters(
+    _this: *mut Voice,
+    _p: *const c_void,
+    _set: u32,
+) -> HRESULT {
     S_OK
 }
 extern "win64" fn get_filter_parameters(_this: *mut Voice, _p: *mut c_void) {}
@@ -822,7 +871,12 @@ extern "win64" fn set_output_filter_parameters(
 ) -> HRESULT {
     S_OK
 }
-extern "win64" fn get_output_filter_parameters(_this: *mut Voice, _to: *mut Voice, _p: *mut c_void) {}
+extern "win64" fn get_output_filter_parameters(
+    _this: *mut Voice,
+    _to: *mut Voice,
+    _p: *mut c_void,
+) {
+}
 
 extern "win64" fn set_volume(this: *mut Voice, volume: f32, _set: u32) -> HRESULT {
     with_voice(
@@ -851,17 +905,27 @@ extern "win64" fn set_channel_volumes(
     }
     // SAFETY: `count` floats from the title.
     let list = unsafe { std::slice::from_raw_parts(volumes, count as usize) }.to_vec();
-    with_voice(this, |_| (), |_| (), |s| {
-        if list.len() == s.channels {
-            s.channel_volumes = list;
-        }
-    });
+    with_voice(
+        this,
+        |_| (),
+        |_| (),
+        |s| {
+            if list.len() == s.channels {
+                s.channel_volumes = list;
+            }
+        },
+    );
     S_OK
 }
 
 extern "win64" fn get_channel_volumes(this: *mut Voice, count: u32, volumes: *mut f32) {
-    let list = with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.channel_volumes.clone())
-        .unwrap_or_default();
+    let list = with_voice(
+        this,
+        |_| Vec::new(),
+        |_| Vec::new(),
+        |s| s.channel_volumes.clone(),
+    )
+    .unwrap_or_default();
     for (i, v) in list.iter().take(count as usize).enumerate() {
         // SAFETY: room for `count` floats.
         unsafe { volumes.add(i).write(*v) };
@@ -882,11 +946,16 @@ extern "win64" fn set_output_matrix(
     let n = (source_channels * destination_channels) as usize;
     // SAFETY: `source * destination` floats from the title.
     let levels = unsafe { std::slice::from_raw_parts(levels, n) }.to_vec();
-    with_voice(this, |_| (), |_| (), |s| {
-        if source_channels as usize == s.channels {
-            s.matrix = Some(levels);
-        }
-    });
+    with_voice(
+        this,
+        |_| (),
+        |_| (),
+        |s| {
+            if source_channels as usize == s.channels {
+                s.matrix = Some(levels);
+            }
+        },
+    );
     S_OK
 }
 
@@ -901,12 +970,19 @@ extern "win64" fn get_output_matrix(
         this,
         |_| None,
         |_| None,
-        |s| s.matrix.clone().or_else(|| {
-            Some(mixer::default_matrix(s.channels, destination_channels as usize))
-        }),
+        |s| {
+            s.matrix.clone().or_else(|| {
+                Some(mixer::default_matrix(
+                    s.channels,
+                    destination_channels as usize,
+                ))
+            })
+        },
     )
     .flatten()
-    .unwrap_or_else(|| mixer::default_matrix(source_channels as usize, destination_channels as usize));
+    .unwrap_or_else(|| {
+        mixer::default_matrix(source_channels as usize, destination_channels as usize)
+    });
     for (i, l) in matrix
         .iter()
         .take((source_channels * destination_channels) as usize)
@@ -950,7 +1026,11 @@ extern "win64" fn source_stop(this: *mut Voice, _flags: u32, _set: u32) -> HRESU
     S_OK
 }
 
-extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *const c_void) -> HRESULT {
+extern "win64" fn source_submit(
+    this: *mut Voice,
+    buffer: *const u8,
+    _wma: *const c_void,
+) -> HRESULT {
     static SUBMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
@@ -977,7 +1057,8 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
             ),
         )
     };
-    let (flags, bytes, data, play_begin, play_length, loop_begin, loop_length, loops, context) = fields;
+    let (flags, bytes, data, play_begin, play_length, loop_begin, loop_length, loops, context) =
+        fields;
     let samples = if bytes == 0 {
         Vec::new()
     } else if data.is_null() {
@@ -991,7 +1072,11 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
         }
     };
     let frames = samples.len() / v.format.channels;
-    let end = if play_length == 0 { frames } else { play_begin + play_length };
+    let end = if play_length == 0 {
+        frames
+    } else {
+        play_begin + play_length
+    };
     if play_begin > end || end > frames {
         return XAUDIO2_E_INVALID_CALL;
     }
@@ -1022,7 +1107,8 @@ extern "win64" fn source_submit(this: *mut Voice, buffer: *const u8, _wma: *cons
 extern "win64" fn source_flush(this: *mut Voice) -> HRESULT {
     // SAFETY: the title's voice.
     let v = unsafe { &*this };
-    let events = with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.flush()).unwrap_or_default();
+    let events =
+        with_voice(this, |_| Vec::new(), |_| Vec::new(), |s| s.flush()).unwrap_or_default();
     for e in events {
         let _ = v.inner.events.send(e);
     }
@@ -1054,7 +1140,12 @@ extern "win64" fn source_set_ratio(this: *mut Voice, ratio: f32, _set: u32) -> H
     if !ratio.is_finite() || ratio <= 0.0 {
         return E_INVALIDARG;
     }
-    with_voice(this, |_| (), |_| (), |s| s.ratio = ratio.clamp(1.0 / 1024.0, 1024.0));
+    with_voice(
+        this,
+        |_| (),
+        |_| (),
+        |s| s.ratio = ratio.clamp(1.0 / 1024.0, 1024.0),
+    );
     S_OK
 }
 
@@ -1122,7 +1213,11 @@ mod tests {
         }
     }
 
-    fn open_held(_rate: u32, _channels: u32, render: coreaudio::Render) -> io::Result<Box<dyn Output>> {
+    fn open_held(
+        _rate: u32,
+        _channels: u32,
+        render: coreaudio::Render,
+    ) -> io::Result<Box<dyn Output>> {
         *lock(&PULL) = Some(render);
         Ok(Box::new(Held))
     }
@@ -1259,19 +1354,47 @@ mod tests {
         // CreateMasteringVoice(&master, 2, 48000, ...), slot 7.
         let mut master: *mut Voice = std::ptr::null_mut();
         assert_eq!(
-            call!(engine, 7, fn(*mut *mut Voice, u32, u32, u32, *const u16, *const c_void, i32) -> HRESULT,
-                &mut master, 2, 48_000, 0, std::ptr::null(), std::ptr::null(), 0),
+            call!(
+                engine,
+                7,
+                fn(*mut *mut Voice, u32, u32, u32, *const u16, *const c_void, i32) -> HRESULT,
+                &mut master,
+                2,
+                48_000,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0
+            ),
             S_OK
         );
         // A second one is refused.
         let mut again: *mut Voice = std::ptr::null_mut();
         assert_eq!(
-            call!(engine, 7, fn(*mut *mut Voice, u32, u32, u32, *const u16, *const c_void, i32) -> HRESULT,
-                &mut again, 2, 48_000, 0, std::ptr::null(), std::ptr::null(), 0),
+            call!(
+                engine,
+                7,
+                fn(*mut *mut Voice, u32, u32, u32, *const u16, *const c_void, i32) -> HRESULT,
+                &mut again,
+                2,
+                48_000,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0
+            ),
             XAUDIO2_E_INVALID_CALL
         );
         let mut mask = 0u32;
-        assert_eq!(call!(master.cast::<c_void>(), 19, fn(*mut u32) -> HRESULT, &mut mask), S_OK);
+        assert_eq!(
+            call!(
+                master.cast::<c_void>(),
+                19,
+                fn(*mut u32) -> HRESULT,
+                &mut mask
+            ),
+            S_OK
+        );
         assert_eq!(mask, 3);
 
         // Route the source through an explicit packed send to the mastering voice.
@@ -1288,15 +1411,38 @@ mod tests {
         let callback = TestCallback::new(&table, &log, 0);
         let mut voice: *mut Voice = std::ptr::null_mut();
         assert_eq!(
-            call!(engine, 5, fn(*mut *mut Voice, *const u8, u32, f32, *mut c_void, *const u8, *const c_void) -> HRESULT,
-                &mut voice, w.as_ptr(), 0, 2.0, callback.ptr(), sends.as_ptr(), std::ptr::null()),
+            call!(
+                engine,
+                5,
+                fn(
+                    *mut *mut Voice,
+                    *const u8,
+                    u32,
+                    f32,
+                    *mut c_void,
+                    *const u8,
+                    *const c_void,
+                ) -> HRESULT,
+                &mut voice,
+                w.as_ptr(),
+                0,
+                2.0,
+                callback.ptr(),
+                sends.as_ptr(),
+                std::ptr::null()
+            ),
             S_OK
         );
         // A packed XAUDIO2_VOICE_DETAILS can start on an odd address.
         #[repr(align(4))]
         struct Details([u8; 17]);
         let mut details = Details([0xA5; 17]);
-        call!(voice, 0, fn(*mut u32) -> (), details.0[1..].as_mut_ptr().cast());
+        call!(
+            voice,
+            0,
+            fn(*mut u32) -> (),
+            details.0[1..].as_mut_ptr().cast()
+        );
         assert_eq!(details.0[0], 0xA5);
         assert_eq!(&details.0[1..9], &[0; 8]);
         assert_eq!(&details.0[9..13], &1u32.to_le_bytes());
@@ -1305,8 +1451,26 @@ mod tests {
         let adpcm = wave(1, 24_000, 4, 2);
         let mut none: *mut Voice = std::ptr::null_mut();
         assert_eq!(
-            call!(engine, 5, fn(*mut *mut Voice, *const u8, u32, f32, *mut c_void, *const u8, *const c_void) -> HRESULT,
-                &mut none, adpcm.as_ptr(), 0, 2.0, callback.ptr(), std::ptr::null(), std::ptr::null()),
+            call!(
+                engine,
+                5,
+                fn(
+                    *mut *mut Voice,
+                    *const u8,
+                    u32,
+                    f32,
+                    *mut c_void,
+                    *const u8,
+                    *const c_void,
+                ) -> HRESULT,
+                &mut none,
+                adpcm.as_ptr(),
+                0,
+                2.0,
+                callback.ptr(),
+                std::ptr::null(),
+                std::ptr::null()
+            ),
             XAUDIO2_E_INVALID_CALL
         );
 
@@ -1324,11 +1488,23 @@ mod tests {
         buffer[8..16].copy_from_slice(&(pcm.as_ptr() as usize).to_le_bytes());
         buffer[36..44].copy_from_slice(&CONTEXT.to_le_bytes());
         let voice_ptr = voice.cast::<c_void>();
-        assert_eq!(call!(voice_ptr, 21, fn(*const u8, *const c_void) -> HRESULT, buffer.as_ptr(), std::ptr::null()), S_OK);
+        assert_eq!(
+            call!(
+                voice_ptr,
+                21,
+                fn(*const u8, *const c_void) -> HRESULT,
+                buffer.as_ptr(),
+                std::ptr::null()
+            ),
+            S_OK
+        );
         // Not started: silent, one buffer queued.
         let mut state = [0xA5u8; 20 + 4];
         call!(voice_ptr, 25, fn(*mut u8, u32) -> (), state.as_mut_ptr(), 0);
-        assert_eq!(usize::from_le_bytes(state[..8].try_into().unwrap()), CONTEXT);
+        assert_eq!(
+            usize::from_le_bytes(state[..8].try_into().unwrap()),
+            CONTEXT
+        );
         assert_eq!(u32::from_le_bytes(state[8..12].try_into().unwrap()), 1);
         assert!(pull(480, 2).iter().all(|&x| x == 0.0));
         // Start, half volume, and the device pulls the 50 ms (2400 output frames).
@@ -1345,7 +1521,10 @@ mod tests {
         let peak = left.iter().fold(0.0f32, |a, x| a.max(x.abs()));
         let expected = 16000.0 / 32768.0 * 0.5;
         assert!((peak - expected).abs() < 0.01, "peak {peak} vs {expected}");
-        let periods = left.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        let periods = left
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
         assert_eq!(periods, 50, "a 1 kHz tone of 50 ms");
         // The tail after the buffer is silence, and the title was told.
         assert!(left[2400..].iter().all(|&x| x == 0.0));
@@ -1566,12 +1745,24 @@ mod tests {
         assert_eq!(&performance[64..], &[0xA5; 8]);
         assert_eq!(call!(e, 1, fn() -> u32,), 2);
         let mut same: *mut c_void = std::ptr::null_mut();
-        assert_eq!(call!(e, 0, fn(*const c_void, *mut *mut c_void) -> HRESULT, std::ptr::null(), &mut same), S_OK);
+        assert_eq!(
+            call!(
+                e,
+                0,
+                fn(*const c_void, *mut *mut c_void) -> HRESULT,
+                std::ptr::null(),
+                &mut same
+            ),
+            S_OK
+        );
         assert_eq!(same, e);
         assert_eq!(call!(e, 2, fn() -> u32,), 2);
         assert_eq!(call!(e, 2, fn() -> u32,), 1);
         assert_eq!(call!(e, 2, fn() -> u32,), 0);
-        assert_eq!(lookup("xaudio2_9.dll", "#1"), lookup("xaudio2_9.dll", "XAudio2Create"));
+        assert_eq!(
+            lookup("xaudio2_9.dll", "#1"),
+            lookup("xaudio2_9.dll", "XAudio2Create")
+        );
         assert!(lookup("xaudio2_9.dll", "#1").is_some());
         assert!(lookup("xaudio2_8.dll", "#1").is_none());
         assert_eq!(XAudio2Create(std::ptr::null_mut(), 0, 0), E_INVALIDARG);

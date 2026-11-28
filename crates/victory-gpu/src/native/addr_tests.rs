@@ -231,7 +231,9 @@ impl Fixture {
 
     pub(super) fn put<T: Copy>(&self, at: usize, v: &[T]) {
         // SAFETY: inside the pool's own mapping; the GPU is idle.
-        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.mem.primary.add(at).cast(), v.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(v.as_ptr(), self.mem.primary.add(at).cast(), v.len())
+        };
     }
 
     pub(super) fn get(&self, at: usize, n: usize) -> Vec<u32> {
@@ -251,7 +253,10 @@ pub(super) fn dispatch(t: &mut Title<Metal>, shader: &HostShader, root: &[u32], 
     if heap {
         // The title's own resource heap, 8 views of 32 bytes of its descriptor memory.
         let slots = vec![0u32; 8 * 8];
-        let h = t.host.heap(HeapKind::Resource, slots.as_ptr() as u64, 8).unwrap();
+        let h = t
+            .host
+            .heap(HeapKind::Resource, slots.as_ptr() as u64, 8)
+            .unwrap();
         l.set_heaps(Some(&h), None);
     }
     l.dispatch(1, 1, 1).unwrap();
@@ -273,7 +278,10 @@ fn check_computed(f: &Fixture, src_at: usize, dst_at: usize) {
     }
     assert_eq!(f.get(dst_at + 2040, 1), [64], "the atomic");
     // Nothing else was written: the source, the pointer's target and the stretch between.
-    assert_eq!(f.get(src_at, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<u32>>());
+    assert_eq!(
+        f.get(src_at, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<u32>>()
+    );
     assert_eq!(f.get(dst_at + 256, 192), [CANARY; 192]);
     assert_eq!(f.get(dst_at + 1280, 190), [CANARY; 190]);
     assert_eq!(f.get(dst_at + 2044, 1), [CANARY]);
@@ -323,7 +331,11 @@ fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
     ] {
         dispatch(&mut t, &cs, &[lo, hi, a as u32, b as u32], false);
         assert_eq!(f.get(0x2_0000, 64), vec![want; 64], "|{a} - {b}|");
-        assert_eq!(f.get(0x2_0100, 64), vec![u32::from(want != 0); 64], "SCC of |{a} - {b}|");
+        assert_eq!(
+            f.get(0x2_0100, 64),
+            vec![u32::from(want != 0); 64],
+            "SCC of |{a} - {b}|"
+        );
     }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
@@ -338,8 +350,10 @@ fn scalar_sign_extensions_on_the_gpu() {
         0xBE85_1A02, // s_sext_i32_i16 s5, s2
         0x7E04_0204, // v_mov_b32_e32 v2, s4
         0x7E06_0205, // v_mov_b32_e32 v3, s5
-        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
-        0xDC70_8100, 0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0xDC70_8100,
+        0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:256
         0xBF81_0000, // s_endpgm
     ];
     let Some(mut t) = title() else { return };
@@ -366,9 +380,12 @@ fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
     const DPP_CMP: &[u32] = &[
         0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
         0x7E04_0D00, // v_cvt_f32_u32 v2, v0
-        0x7C08_04FA, 0xFF0C_4E02, // v_cmp_gt_f32 vcc, v2, v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
-        0xD501_0002, 0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
-        0xDC70_8000, 0x0000_0201, // global_store_dword v1, v2, s[0:1]
+        0x7C08_04FA,
+        0xFF0C_4E02, // v_cmp_gt_f32 vcc, v2, v2 quad_perm:[2,3,0,1] bound_ctrl:1 fi:1
+        0xD501_0002,
+        0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1]
         0xBF81_0000, // s_endpgm
     ];
     let Some(mut t) = title() else { return };
@@ -385,29 +402,41 @@ fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
 fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     let vertex = [
         0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
-        0xD501_0001, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
+        0xD501_0001,
+        0x01A9_FEF3,
+        0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
         0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
-        0xD501_0002, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
+        0xD501_0002,
+        0x01A9_FEF3,
+        0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
         0x7E06_0280, // v_mov_b32 v3, 0
         0x7E08_02F2, // v_mov_b32 v4, 1.0
-        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xF800_08CF,
+        0x0403_0201, // exp pos0 v1, v2, v3, v4 done
         0xBF81_0000, // s_endpgm
     ];
     let pixel = [
         0x8004_9000, // s_add_u32 s4, s0, 16
         0x8205_8080, // s_addc_u32 s5, 0, 0
-        0x8805_FF05, 0x0010_0000, // s_or_b32 s5, s5, 0x100000
+        0x8805_FF05,
+        0x0010_0000, // s_or_b32 s5, s5, 0x100000
         0xBE86_0382, // s_mov_b32 s6, 2
-        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x14fac
         0x7E00_0281, // v_mov_b32 v0, 1
-        0xE030_2004, 0x8001_0200, // buffer_load_dword v2, v0, s[4:7], 0 idxen offset:4
-        0xE030_2010, 0x8001_0300, // buffer_load_dword v3, v0, s[4:7], 0 idxen offset:16
+        0xE030_2004,
+        0x8001_0200, // buffer_load_dword v2, v0, s[4:7], 0 idxen offset:4
+        0xE030_2010,
+        0x8001_0300, // buffer_load_dword v3, v0, s[4:7], 0 idxen offset:16
         0x7E00_0282, // v_mov_b32 v0, 2
-        0xE030_2000, 0x8001_0400, // buffer_load_dword v4, v0, s[4:7], 0 idxen
-        0xF420_0202, 0xFA00_0004, // s_buffer_load_dword s8, s[4:7], 4
+        0xE030_2000,
+        0x8001_0400, // buffer_load_dword v4, v0, s[4:7], 0 idxen
+        0xF420_0202,
+        0xFA00_0004, // s_buffer_load_dword s8, s[4:7], 4
         0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
         0x7E0A_0208, // v_mov_b32 v5, s8
-        0xF800_180F, 0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
+        0xF800_180F,
+        0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
         0xBF81_0000, // s_endpgm
     ];
     let translate = |stage, words: &[u32], meta: &[u8]| {
@@ -422,12 +451,16 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     meta[0x14] = 2; // Root constants in slot 0.
     let ps = translate(HwStage::Ps, &pixel, &meta);
     use victory_metal::msc::{DEFAULT_DYLIB, Msc};
-    if !std::path::Path::new(DEFAULT_DYLIB).exists() && std::env::var_os("VICTORY_MSC_DYLIB").is_none() {
+    if !std::path::Path::new(DEFAULT_DYLIB).exists()
+        && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
+    {
         eprintln!("skipped: Metal Shader Converter not installed");
         return;
     }
     let layout = crate::native::list::Binding::of(&ps).layout().unwrap();
-    Msc::open_default().convert_with(&ps.dxil, None, Some(&layout), false).unwrap();
+    Msc::open_default()
+        .convert_with(&ps.dxil, None, Some(&layout), false)
+        .unwrap();
     let Ok(metal) = Metal::new() else {
         eprintln!("skipped the draw: no Metal device");
         return;
@@ -438,9 +471,9 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     f.put(36, &[0.5f32]); // base + 1 * stride + 4
     f.put(48, &[1.0f32]); // backing memory at the address of both out-of-bounds reads
 
-    let state = Graphics::guess_base()
-        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
-    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed fragment") else {
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed fragment")
+    else {
         panic!("{:?}", t.shaders);
     };
     let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
@@ -454,7 +487,9 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     list.draw_instanced(3, 1, 0, 0).unwrap();
     super::run(&t.host, &[&list]);
     let mut pixels = [0; 8 * 8 * 4];
-    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    t.host
+        .backend
+        .read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
     assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255]);
 }
 
@@ -466,20 +501,25 @@ fn guessed_vertex_buffer_reads_the_pool() {
     let vertex = [
         0x8004_9000, // s_add_u32 s4, s0, 16
         0x8205_8080, // s_addc_u32 s5, 0, 0
-        0x8805_FF05, 0x0008_0000, // s_or_b32 s5, s5, 0x80000 (stride 8)
+        0x8805_FF05,
+        0x0008_0000, // s_or_b32 s5, s5, 0x80000 (stride 8)
         0xBE86_0383, // s_mov_b32 s6, 3
-        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
-        0xE034_2000, 0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0xE034_2000,
+        0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
         0x7E06_0280, // v_mov_b32 v3, 0
         0x7E08_02F2, // v_mov_b32 v4, 1.0
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xF800_08CF,
+        0x0403_0201, // exp pos0 v1, v2, v3, v4 done
         0xBF81_0000, // s_endpgm
     ];
     let pixel = [
         0x7E00_02F2, // v_mov_b32 v0, 1.0
         0x7E02_02F0, // v_mov_b32 v1, 0.5
-        0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
+        0xF800_180F,
+        0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
         0xBF81_0000, // s_endpgm
     ];
     let translate = |stage, words: &[u32], meta: &[u8]| {
@@ -499,9 +539,9 @@ fn guessed_vertex_buffer_reads_the_pool() {
     // VA_B + 16: a triangle over the whole target.
     f.put(16, &[-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0]);
 
-    let state = Graphics::guess_base()
-        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
-    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed vertex") else {
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed vertex")
+    else {
         panic!("{:?}", t.shaders);
     };
     let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
@@ -515,7 +555,9 @@ fn guessed_vertex_buffer_reads_the_pool() {
     list.draw_instanced(3, 1, 0, 0).unwrap();
     super::run(&t.host, &[&list]);
     let mut pixels = [0; 8 * 8 * 4];
-    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    t.host
+        .backend
+        .read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
     for p in pixels.chunks(4) {
         assert_eq!(p, [255, 128, 128, 255]);
     }
@@ -532,20 +574,25 @@ fn guessed_vertex_buffer_reads_the_pool() {
 fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
     let vertex = [
         0xBE84_0300, // s_mov_b32 s4, s0
-        0x8805_FF01, 0x0008_0000, // s_or_b32 s5, s1, 0x80000 (stride 8)
+        0x8805_FF01,
+        0x0008_0000, // s_or_b32 s5, s1, 0x80000 (stride 8)
         0xBE86_03C1, // s_mov_b32 s6, -1 (no record limit, as the title builds them)
-        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
-        0xE034_2000, 0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0xE034_2000,
+        0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 idxen
         0x7E06_0280, // v_mov_b32 v3, 0
         0x7E08_02F2, // v_mov_b32 v4, 1.0
         0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xF800_08CF,
+        0x0403_0201, // exp pos0 v1, v2, v3, v4 done
         0xBF81_0000, // s_endpgm
     ];
     let pixel = [
         0x7E00_02F2, // v_mov_b32 v0, 1.0
         0x7E02_02F0, // v_mov_b32 v1, 0.5
-        0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
+        0xF800_180F,
+        0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
         0xBF81_0000, // s_endpgm
     ];
     let translate = |stage, words: &[u32], meta: &[u8]| {
@@ -563,15 +610,19 @@ fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
     let f = Fixture::new(&t);
     // Two title pages, at pool offsets 0x4_0000 and 0x8_0000: the pool after the first is canary.
     const VA_C: u64 = 0x7100_0000;
-    t.host.memory().mapped(VA_C as usize, 0x1_0000, &f.info, 0x4_0000);
-    t.host.memory().mapped(VA_C as usize + 0x1_0000, 0x1_0000, &f.info, 0x8_0000);
+    t.host
+        .memory()
+        .mapped(VA_C as usize, 0x1_0000, &f.info, 0x4_0000);
+    t.host
+        .memory()
+        .mapped(VA_C as usize + 0x1_0000, 0x1_0000, &f.info, 0x8_0000);
     // A triangle over the whole target: its first vertex in the first page, the others in the next.
     f.put(0x4_FFF8, &[-1.0f32, -1.0]);
     f.put(0x8_0000, &[3.0f32, -1.0, -1.0, 3.0]);
 
-    let state = Graphics::guess_base()
-        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
-    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "root view vertex") else {
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "root view vertex")
+    else {
         panic!("{:?}", t.shaders);
     };
     let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
@@ -585,7 +636,9 @@ fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
     list.draw_instanced(3, 1, 0, 0).unwrap();
     super::run(&t.host, &[&list]);
     let mut pixels = [0; 8 * 8 * 4];
-    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    t.host
+        .backend
+        .read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
     for p in pixels.chunks(4) {
         assert_eq!(p, [255, 128, 128, 255]);
     }
@@ -606,7 +659,9 @@ fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
     check_computed(&f, 0x2_0000, 0x6_0000);
 
     // VA_A now shows the pool from 0x4_0000: source at 0x4_0000, destination at 0x8_0000.
-    t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
+    t.host
+        .memory()
+        .mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
     f.put(0, &[CANARY; POOL / 4]);
     prepare_computed(&f, 0x4_0000, 0x8_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], true);
@@ -639,14 +694,22 @@ fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
     waiting.dispatch(1, 1, 1).unwrap();
     use victory_metal::backend::ComputeBackend;
     let backend = &t.host.backend;
-    let (q, gate, done) = (backend.create_queue().unwrap(), backend.create_fence(0).unwrap(), backend.create_fence(0).unwrap());
-    t.host.execute(&q, &[&waiting], &[(&gate, 1)], &[(&done, 1)]).unwrap();
+    let (q, gate, done) = (
+        backend.create_queue().unwrap(),
+        backend.create_fence(0).unwrap(),
+        backend.create_fence(0).unwrap(),
+    );
+    t.host
+        .execute(&q, &[&waiting], &[(&gate, 1)], &[(&done, 1)])
+        .unwrap();
 
     // Dispatches of memory no pool shows (nothing written), each after VA_A moved in the pool.
     let [e, g] = halves(0x55_0000_0000);
     for k in 0..12 {
         let offset = if k % 2 == 0 { 0x4_0000 } else { 0 };
-        t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, offset);
+        t.host
+            .memory()
+            .mapped(VA_A as usize, 0x8_0000, &f.info, offset);
         dispatch(&mut t, &cs, &[e, g, e, g], false);
     }
     t.host.backend.signal(&gate, 1);
@@ -685,7 +748,10 @@ fn memory_no_pool_shows_reads_zero_and_drops_writes() {
     assert!(cs.memory && !cs.memory_writes);
     // dst is mapped; src and the store target are the page after the mapping (pool 0xA_0000 if the
     // mapping went on) and a region of its own.
-    for (src, wild) in [(VA_A + 0x8_0000, VA_A + 0x9_0000), (0x55_0000_0040, 0x7F_FFFF_0000)] {
+    for (src, wild) in [
+        (VA_A + 0x8_0000, VA_A + 0x9_0000),
+        (0x55_0000_0040, 0x7F_FFFF_0000),
+    ] {
         f.put(0, &[CANARY; POOL / 4]);
         let [a, b] = halves(src);
         let [c, d] = halves(VA_A + 0x4_0000);
@@ -708,7 +774,12 @@ fn a_shader_that_marks_pages_is_refused() {
     let mut cs = shader(COMPUTED, 4);
     cs.memory_writes = true;
     assert!(matches!(t.compute_pipe(&cs, "marking"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("marks the pages")));
+    assert!(
+        t.shaders
+            .refused
+            .iter()
+            .any(|(why, _)| why.contains("marks the pages"))
+    );
 }
 
 /// `zero_copy_memory` is what removes the bitmap and its atomics; D3D12's translation has both.
@@ -741,29 +812,41 @@ const LDS_BY_M0: &[u32] = &[
     0x7E04_0280, // v_mov_b32_e32 v2, 0
     0x7E06_02C1, // v_mov_b32_e32 v3, -1
     0x7E0C_02C1, // v_mov_b32_e32 v6, -1
-    0xD834_0008, 0x0000_0202, // ds_write_b32 v2, v2 offset:8
+    0xD834_0008,
+    0x0000_0202, // ds_write_b32 v2, v2 offset:8
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     0x7D88_0094, // v_cmp_gt_u32_e32 vcc_lo, 20, v0
     0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
     0xBEFC_0388, // s_mov_b32 m0, 8
-    0xD8F8_0000, 0x0300_0000, // ds_append v3
+    0xD8F8_0000,
+    0x0300_0000, // ds_append v3
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xD8F8_0000, 0x0600_0000, // ds_append v6
+    0xD8F8_0000,
+    0x0600_0000, // ds_append v6
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     0x887E_047E, // s_or_b32 exec_lo, exec_lo, s4
-    0xDC70_8000, 0x0000_0301, // global_store_dword v1, v3, s[0:1]
-    0xDC70_8200, 0x0000_0601, // global_store_dword v1, v6, s[0:1] offset:512
-    0xD8F4_0000, 0x0900_0000, // ds_consume v9
+    0xDC70_8000,
+    0x0000_0301, // global_store_dword v1, v3, s[0:1]
+    0xDC70_8200,
+    0x0000_0601, // global_store_dword v1, v6, s[0:1] offset:512
+    0xD8F4_0000,
+    0x0900_0000, // ds_consume v9
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xDC70_8300, 0x0000_0901, // global_store_dword v1, v9, s[0:1] offset:768
+    0xDC70_8300,
+    0x0000_0901, // global_store_dword v1, v9, s[0:1] offset:768
     0xBEFC_03C0, // s_mov_b32 m0, 64
-    0xDAC0_0004, 0x0000_0000, // ds_write_addtid_b32 v0 offset:4
+    0xDAC0_0004,
+    0x0000_0000, // ds_write_addtid_b32 v0 offset:4
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xD8D8_0044, 0x0700_0001, // ds_read_b32 v7, v1 offset:68
-    0xDAC4_0004, 0x0500_0000, // ds_read_addtid_b32 v5 offset:4
+    0xD8D8_0044,
+    0x0700_0001, // ds_read_b32 v7, v1 offset:68
+    0xDAC4_0004,
+    0x0500_0000, // ds_read_addtid_b32 v5 offset:4
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xDC70_8100, 0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:256
-    0xDC70_8180, 0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:384
+    0xDC70_8100,
+    0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:256
+    0xDC70_8180,
+    0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:384
     0xBF81_0000, // s_endpgm
 ];
 
@@ -773,13 +856,18 @@ const LDS_BY_M0: &[u32] = &[
 const ADDTID_WAVE64: &[u32] = &[
     0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
     0xBEFC_03C0, // s_mov_b32 m0, 64
-    0xDAC0_0004, 0x0000_0000, // ds_write_addtid_b32 v0 offset:4
+    0xDAC0_0004,
+    0x0000_0000, // ds_write_addtid_b32 v0 offset:4
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xD8D8_0044, 0x0700_0001, // ds_read_b32 v7, v1 offset:68
-    0xDAC4_0004, 0x0500_0000, // ds_read_addtid_b32 v5 offset:4
+    0xD8D8_0044,
+    0x0700_0001, // ds_read_b32 v7, v1 offset:68
+    0xDAC4_0004,
+    0x0500_0000, // ds_read_addtid_b32 v5 offset:4
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xDC70_8400, 0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:1024
-    0xDC70_8500, 0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:1280
+    0xDC70_8400,
+    0x0000_0701, // global_store_dword v1, v7, s[0:1] offset:1024
+    0xDC70_8500,
+    0x0000_0501, // global_store_dword v1, v5, s[0:1] offset:1280
     0xBF81_0000, // s_endpgm
 ];
 
@@ -799,7 +887,10 @@ fn run_with_lds(t: &mut Title<Metal>, words: &[u32], wave64: bool, threads: u32)
             slot: 0,
         }],
         used: vec![],
-        io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [threads, 1, 1] }),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [threads, 1, 1],
+        }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
@@ -830,7 +921,9 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
     run_with_lds(&mut t, LDS_BY_M0, false, 32);
     let first: Vec<u32> = (0..32).map(|i| if i < 20 { 0 } else { u32::MAX }).collect();
     assert_eq!(f.get(0x2_0000, 32), first, "the first ds_append");
-    let second: Vec<u32> = (0..32).map(|i| if i < 20 { 20 } else { u32::MAX }).collect();
+    let second: Vec<u32> = (0..32)
+        .map(|i| if i < 20 { 20 } else { u32::MAX })
+        .collect();
     assert_eq!(f.get(0x2_0000 + 512, 32), second, "the second ds_append");
     assert_eq!(f.get(0x2_0000 + 768, 32), vec![40; 32], "ds_consume");
     let ids: Vec<u32> = (0..32).collect();
@@ -838,7 +931,11 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
     assert_eq!(f.get(0x2_0000 + 384, 32), ids, "ds_read_addtid_b32");
     run_with_lds(&mut t, ADDTID_WAVE64, true, 64);
     let ids: Vec<u32> = (0..64).collect();
-    assert_eq!(f.get(0x2_0000 + 1024, 64), ids, "wave64 ds_write_addtid_b32");
+    assert_eq!(
+        f.get(0x2_0000 + 1024, 64),
+        ids,
+        "wave64 ds_write_addtid_b32"
+    );
     assert_eq!(f.get(0x2_0000 + 1280, 64), ids, "wave64 ds_read_addtid_b32");
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
@@ -850,13 +947,18 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
 const STRIDE_CLEARED: &[u32] = &[
     0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
     0xBE85_0380, // s_mov_b32 s5, 0
-    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
-    0xF408_0302, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xF408_0302,
+    0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
     0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0x8709_FF09, 0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
-    0xE030_3000, 0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+    0x8709_FF09,
+    0xC000_FFFF, // s_and_b32 s9, s9, 0xc000ffff
+    0xE030_3000,
+    0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
     0xBF8C_3F70, // s_waitcnt vmcnt(0)
-    0xE070_1000, 0x8003_0201, // buffer_store_dword v2, v1, s[12:15], 0 offen
+    0xE070_1000,
+    0x8003_0201, // buffer_store_dword v2, v1, s[12:15], 0 offen
     0xBF81_0000, // s_endpgm
 ];
 
@@ -869,7 +971,7 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
     f.put(0x2_1000, &src);
     f.put(0x2_2000, &[0u32; 64]);
     // The title's heap: a structured SRV of 16-byte elements, then a raw UAV.
-    let records = vec![0u32; 8 * 2];
+    let records = [0u32; 8 * 2];
     let start = records.as_ptr() as u64;
     let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
     let (rs, rd) = (0x57D_0001usize, 0x57D_0002usize);
@@ -880,7 +982,13 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
     let mut uav = [0u32; 10];
     (uav[1], uav[4], uav[8]) = (1, 64, 1);
     crate::descriptor::create_srv(std::ptr::null(), rs as _, &srv, start);
-    crate::descriptor::create_uav(std::ptr::null(), rd as _, std::ptr::null(), &uav, start + 32);
+    crate::descriptor::create_uav(
+        std::ptr::null(),
+        rd as _,
+        std::ptr::null(),
+        &uav,
+        start + 32,
+    );
     assert!(t.host.mirror(start).unwrap() && t.host.mirror(start + 32).unwrap());
     let used = |kind, table_offset_dwords, stride| UsedResource {
         kind,
@@ -904,9 +1012,18 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
             user_data: 4,
             slot: 0,
         }],
-        used: vec![used(ResourceType::Srv, 0, 16), used(ResourceType::Uav, 8, 0)],
-        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
-        code: STRIDE_CLEARED.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        used: vec![
+            used(ResourceType::Srv, 0, 16),
+            used(ResourceType::Uav, 8, 0),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: STRIDE_CLEARED
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");

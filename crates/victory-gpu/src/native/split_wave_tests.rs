@@ -5,7 +5,8 @@
 //! Metal Shader Converter.
 
 use super::addr_tests::{
-    CANARY, Fixture, VA_A, dispatch, halves, title, translate_io, translate_wave, try_translate_wave,
+    CANARY, Fixture, VA_A, dispatch, halves, title, translate_io, translate_wave,
+    try_translate_wave,
 };
 use crate::native::list::NativeList;
 use crate::native::shaders;
@@ -29,17 +30,23 @@ const DST: usize = 0x6_0000;
 /// What the fast path refuses `words` for (five user SGPRs, two wave64 waves a group, which
 /// lockstep does not take).
 fn refusal(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 128, true, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 128, true, shaders::options())
+        .err()
+        .map(|e| e.to_string())
 }
 
 /// [`refusal`] of a program of 32-lane waves, one a group.
 fn refusal32(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 32, false, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 32, false, shaders::options())
+        .err()
+        .map(|e| e.to_string())
 }
 
 /// [`run`] of a program of 32-lane waves, one a group.
 fn run32(words: &[u32], flag: u32) -> Vec<u32> {
-    let Some(mut t) = title() else { return Vec::new() };
+    let Some(mut t) = title() else {
+        return Vec::new();
+    };
     let f = Fixture::new(&t);
     let cs = translate_wave(words, 5, 0, 32, false, shaders::options());
     let [c, d] = halves(VA_A + 0x4_0000);
@@ -54,7 +61,9 @@ fn run(words: &[u32], lds: u32, flag: u32) -> Vec<u32> {
 
 /// [`run`] of `threads` in a group, with `rsrc2` bits of system SGPRs and LDS.
 fn run_io(words: &[u32], rsrc2: u32, threads: u32, flag: u32) -> Vec<u32> {
-    let Some(mut t) = title() else { return Vec::new() };
+    let Some(mut t) = title() else {
+        return Vec::new();
+    };
     let f = Fixture::new(&t);
     let cs = translate_io(words, 5, rsrc2, threads, shaders::options());
     let [c, d] = halves(VA_A + 0x4_0000);
@@ -69,7 +78,8 @@ fn bpermute_reads_an_active_source_in_the_same_half() {
     // (console lanes 0 and 32). Offset 36 picks local lane 8 (8 on, 40 off).
     for (offset, lo, hi) in [(4, 1, 33), (36, 9, 0)] {
         let mut w = vec![
-            0x7E06_02FF, 124, // v_mov_b32 v3, 124
+            0x7E06_02FF,
+            124,         // v_mov_b32 v3, 124
             0x4A08_0081, // v_add_nc_u32 v4, 1, v0 (distinct nonzero data)
             V_LSHLREV_V1_2_V0,
         ];
@@ -180,7 +190,10 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
     if got.is_empty() {
         return;
     }
-    assert_eq!(got, (0..128).map(|i| i / 64 << 6 | 2).collect::<Vec<u32>>());
+    assert_eq!(
+        got,
+        (0..128).map(|i| (i / 64) << 6 | 2).collect::<Vec<u32>>()
+    );
 }
 
 /// `v_ldexp_f32` (a pixel shader of GTA VI's world was refused for it): `s0` scaled by two to
@@ -213,7 +226,12 @@ fn ldexp_scales_by_an_integer_power_of_two() {
         dispatch(&mut t, &cs, &[a.to_bits(), e as u32, c, d, 0], false);
         assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
         let got = f.get(DST, 1)[0];
-        assert_eq!(got, want.to_bits(), "ldexp({a}, {e}) = {}, want {want}", f32::from_bits(got));
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "ldexp({a}, {e}) = {}, want {want}",
+            f32::from_bits(got)
+        );
     }
 }
 
@@ -248,20 +266,30 @@ fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
     let mut w = FILL_XCHG.to_vec();
     w.extend([
         0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
-        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
-        0x4A02_02FA, 0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
-        0x4A02_02FA, 0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
-        0x4A02_02FA, 0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
-        0x4A02_02FA, 0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
-        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0xD501_0001,
+        0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x4A02_02FA,
+        0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA,
+        0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA,
+        0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA,
+        0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
         0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
-        0xD760_0004, 0x0201_0101, // v_readlane_b32 s4, v1, 0
-        0xD760_0005, 0x0201_4101, // v_readlane_b32 s5, v1, 32
-        0xD525_0003, 0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
+        0xD760_0004,
+        0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005,
+        0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD525_0003,
+        0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
         0xBEFE_0408, // s_mov_b64 exec, s[8:9]
         0x4A06_0607, // v_add_nc_u32_e32 v3, s7, v3
         V_LSHLREV_V1_2_V0,
-        0xDC70_8000, 0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
         S_ENDPGM,
     ]);
     let got = run_io(&w, 0, 96, 0);
@@ -314,9 +342,14 @@ fn a_whole_wave_product_multiplies_both_halves() {
 /// `count` threads in x, in groups of `per` lanes of 64-lane waves (`wave64`) or 32: the first
 /// `slots` dwords of `dst`. `s5` is the group id.
 fn run_threads(words: &[u32], wave64: bool, per: u32, count: u32, slots: usize) -> Vec<u32> {
-    let Some(mut t) = title() else { return Vec::new() };
+    let Some(mut t) = title() else {
+        return Vec::new();
+    };
     let f = Fixture::new(&t);
-    let options = victory_shader::emit::Options { thread_counts: true, ..shaders::options() };
+    let options = victory_shader::emit::Options {
+        thread_counts: true,
+        ..shaders::options()
+    };
     let cs = translate_wave(words, 5, 1 << 7, per, wave64, options);
     let Pipe::Compute(pso) = t.compute_pipe(&cs, "threads") else {
         panic!("not made: {:?}", t.shaders)
@@ -334,7 +367,11 @@ fn run_threads(words: &[u32], wave64: bool, per: u32, count: u32, slots: usize) 
 /// Each lane EXEC has on stores the count of EXEC's lanes at `dst[group * lanes + lane]`:
 /// `s_bcnt1_i32_b64 s6, exec` (`_b32`, `exec_lo` in 32-lane waves), `s_lshl_b32 s7, s5, 6` (5).
 fn count_of_exec(wave64: bool) -> Vec<u32> {
-    let (count, shift) = if wave64 { (0xBE86_107E, 0x8F07_8605) } else { (0xBE86_0F7E, 0x8F07_8505) };
+    let (count, shift) = if wave64 {
+        (0xBE86_107E, 0x8F07_8605)
+    } else {
+        (0xBE86_0F7E, 0x8F07_8505)
+    };
     let mut w = vec![
         count,
         0x7E04_0206, // v_mov_b32 v2, s6
@@ -393,19 +430,29 @@ fn a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them() {
     // run the section too.
     let w = [
         0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
-        0xD501_0001, 0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
-        0x4A02_02FA, 0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
-        0x4A02_02FA, 0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
-        0x4A02_02FA, 0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
-        0x4A02_02FA, 0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
-        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0xD501_0001,
+        0x0022_0080, // v_cndmask_b32_e64 v1, 0, v0, s[8:9]
+        0x4A02_02FA,
+        0xFF00_B101, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[1,0,3,2]
+        0x4A02_02FA,
+        0xFF00_4E01, // v_add_nc_u32_dpp v1, v1, v1 quad_perm:[2,3,0,1]
+        0x4A02_02FA,
+        0xFF01_4101, // v_add_nc_u32_dpp v1, v1, v1 row_half_mirror
+        0x4A02_02FA,
+        0xFF01_4001, // v_add_nc_u32_dpp v1, v1, v1 row_mirror
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
         0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
-        0xD760_0004, 0x0201_0101, // v_readlane_b32 s4, v1, 0
-        0xD760_0005, 0x0201_4101, // v_readlane_b32 s5, v1, 32
-        0xD525_0003, 0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
+        0xD760_0004,
+        0x0201_0101, // v_readlane_b32 s4, v1, 0
+        0xD760_0005,
+        0x0201_4101, // v_readlane_b32 s5, v1, 32
+        0xD525_0003,
+        0x0200_0A04, // v_add_nc_u32_e64 v3, s4, s5
         0xBEFE_0408, // s_mov_b64 exec, s[8:9]
         V_LSHLREV_V1_2_V0,
-        0xDC70_8000, 0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
         S_ENDPGM,
     ];
     let got = run_threads(&w, true, 64, 45, 64);
@@ -430,11 +477,14 @@ fn a_mask_moved_to_every_lane_before_a_branch_to_a_join_holds_their_lanes() {
         0xBE88_04C1, // s_mov_b64 s[8:9], -1
         0xBF82_0003, // s_branch to the join
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0xBEFE_0404, // join: s_mov_b64 exec, s[4:5]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let got = run(&w, 0, 0);
@@ -460,9 +510,11 @@ fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
         0x8B88_7E6A, // s_orn2_b64 s[8:9], vcc, exec: lanes 40..63 set too
         0x8788_7E08, // join: s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let got = run(&w, 0, 0);
@@ -480,22 +532,27 @@ fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
     // the only read is an AND with an EXEC they are not in. No lane sees the first join's bits
     // (the title's 1280x720 compute pass; was refused: "data, ...").
     let w = [
-        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
         skip_execz(3),
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
         S_WAITCNT_LGKM,
         0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         skip_execz(2),
-        0xD4C4_0008, 0x0202_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        0xD4C4_0008,
+        0x0202_0085, // v_cmp_gt_u32 s[8:9], 5, v0
         0x8788_7E08, // second join: s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         V_LSHLREV_V1_2_V0,
-        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -516,23 +573,28 @@ fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed()
     // to the end, so no lane sees it (the title's 1280x720 compute pass; was refused: "data,
     // ...").
     let w = [
-        0xD4C4_0008, 0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0202_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7D88_00BC, // v_cmp_gt_u32 vcc, 60, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
         skip_execz(3),
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
         S_WAITCNT_LGKM,
         0xBEFE_0404, // first join: s_mov_b64 exec, s[4:5]
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         skip_execz(2),
-        0xD4C4_0008, 0x0202_008A, // then: v_cmp_gt_u32 s[8:9], 10, v0
+        0xD4C4_0008,
+        0x0202_008A, // then: v_cmp_gt_u32 s[8:9], 10, v0
         0x8AFE_7E06, // s_andn2_b64 exec, s[6:7], exec
         skip_execz(2),
-        0xD4C4_0008, 0x0202_00B2, // else: v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0202_00B2, // else: v_cmp_gt_u32 s[8:9], 50, v0
         0xBEFE_0406, // end: s_mov_b64 exec, s[6:7]
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         V_LSHLREV_V1_2_V0,
         GLOBAL_STORE_V2_AT_V1[0],
         GLOBAL_STORE_V2_AT_V1[1],
@@ -557,7 +619,8 @@ fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() 
     // 0 (a small compute pass of the title's that holds the HDR scene colour; was refused:
     // "data, ...").
     let w = [
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], 0
         S_WAITCNT_LGKM,
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
@@ -566,7 +629,8 @@ fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() 
         0x8588_80C1, // s_cselect_b64 s[8:9], -1, 0
         0x8C88_7E08, // join: s_nand_b64 s[8:9], s[8:9], exec
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         V_LSHLREV_V1_2_V0,
         GLOBAL_STORE_V2_AT_V1[0],
         GLOBAL_STORE_V2_AT_V1[1],
@@ -588,33 +652,40 @@ fn a_mask_join_read_by_two_ands_with_execs_its_skipping_lanes_are_not_in_is_thei
     // lanes that skip each join holding the older value, read there only ANDed with the EXEC
     // of the lanes that ran the if: no lane sees the data.
     let w = [
-        0xD4C4_0008, 0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
         0xBF88_0003, // s_cbranch_execz j1
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         // j1:
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         0xBF88_0002, // s_cbranch_execz j2
-        0xD4C4_0008, 0x0002_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        0xD4C4_0008,
+        0x0002_0085, // v_cmp_gt_u32 s[8:9], 5, v0
         // j2:
         0x878A_7E08, // s_and_b64 s[10:11], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
         0x7D88_009E, // v_cmp_gt_u32 vcc, 30, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         0xBF88_0002, // s_cbranch_execz j3
-        0xD4C4_0008, 0x0002_0083, // v_cmp_gt_u32 s[8:9], 3, v0
+        0xD4C4_0008,
+        0x0002_0083, // v_cmp_gt_u32 s[8:9], 3, v0
         // j3:
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD501_0002, 0x0029_0280, // v_cndmask_b32 v2, 0, 1, s[10:11]
-        0xD501_0003, 0x0021_0480, // v_cndmask_b32 v3, 0, 2, s[8:9]
+        0xD501_0002,
+        0x0029_0280, // v_cndmask_b32 v2, 0, 1, s[10:11]
+        0xD501_0003,
+        0x0021_0480, // v_cndmask_b32 v3, 0, 2, s[8:9]
         0x3804_0702, // v_or_b32 v2, v2, v3
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -634,7 +705,8 @@ fn a_mask_a_uniform_loop_carries_round_anded_off_is_not_needed() {
     // which the loop carries round to the next if's join. The lanes that skip the inner if
     // read it ANDed off, so no lane sees the data: the lanes below 10 count 3, the rest 0.
     let w = [
-        0xD4C4_0008, 0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7E04_0280, // v_mov_b32 v2, 0
         0xBE8E_0380, // s_mov_b32 s14, 0
         // loop:
@@ -644,13 +716,16 @@ fn a_mask_a_uniform_loop_carries_round_anded_off_is_not_needed() {
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
         0xBF88_0002, // s_cbranch_execz ij
-        0xD4C4_0008, 0x0002_008A, // v_cmp_gt_u32 s[8:9], 10, v0
+        0xD4C4_0008,
+        0x0002_008A, // v_cmp_gt_u32 s[8:9], 10, v0
         // ij:
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0xD501_0003, 0x0021_0280, // v_cndmask_b32 v3, 0, 1, s[8:9]
+        0xD501_0003,
+        0x0021_0280, // v_cndmask_b32 v3, 0, 1, s[8:9]
         0x4A04_0702, // v_add_nc_u32 v2, v2, v3
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         // latch:
         0xBEFE_040A, // s_mov_b64 exec, s[10:11]
@@ -658,7 +733,8 @@ fn a_mask_a_uniform_loop_carries_round_anded_off_is_not_needed() {
         0xBF0A_830E, // s_cmp_lt_u32 s14, 3
         0xBF85_FFEC, // s_cbranch_scc1 loop
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -676,7 +752,8 @@ fn data_joined_with_a_mask_nanded_with_exec_is_set_for_lanes_outside_it() {
     // is an `s_nand` with EXEC (lanes 0..39): lanes 40..63 hold the address there but are not in
     // that EXEC, so their bits are 1 whatever it holds; lanes 0..39 get NOT of their bit, 0.
     let w = [
-        0xD4C4_000C, 0x0002_00B2, // v_cmp_gt_u32 s[12:13], 50, v0
+        0xD4C4_000C,
+        0x0002_00B2, // v_cmp_gt_u32 s[12:13], 50, v0
         0xBE88_0402, // s_mov_b64 s[8:9], s[2:3]
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
@@ -685,9 +762,11 @@ fn data_joined_with_a_mask_nanded_with_exec_is_set_for_lanes_outside_it() {
         // j:
         0x8C88_7E08, // s_nand_b64 s[8:9], s[8:9], exec
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -713,9 +792,11 @@ fn a_mask_selected_by_scc_is_scc_for_every_lane() {
         // j:
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -750,9 +831,11 @@ fn a_mask_of_the_lanes_leaving_a_loop_by_a_uniform_exit_holds_them() {
         0xBF85_FFF7, // s_cbranch_scc1 loop
         // out:
         0xBEFE_040A, // s_mov_b64 exec, s[10:11]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal(&w), None);
@@ -769,33 +852,40 @@ fn a_mask_join_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
     // As the two-AND case, but the first read is an `s_or` with EXEC, whose bits for lanes
     // outside EXEC are the data's own: still refused.
     let w = [
-        0xD4C4_0008, 0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
         0xBF88_0003, // s_cbranch_execz j1
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         // j1:
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         0xBF88_0002, // s_cbranch_execz j2
-        0xD4C4_0008, 0x0002_0085, // v_cmp_gt_u32 s[8:9], 5, v0
+        0xD4C4_0008,
+        0x0002_0085, // v_cmp_gt_u32 s[8:9], 5, v0
         // j2:
         0x888A_7E08, // s_or_b64 s[10:11], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
         0x7D88_009E, // v_cmp_gt_u32 vcc, 30, v0
         0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
         0xBF88_0002, // s_cbranch_execz j3
-        0xD4C4_0008, 0x0002_0083, // v_cmp_gt_u32 s[8:9], 3, v0
+        0xD4C4_0008,
+        0x0002_0083, // v_cmp_gt_u32 s[8:9], 3, v0
         // j3:
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD501_0002, 0x0029_0280, // v_cndmask_b32 v2, 0, 1, s[10:11]
-        0xD501_0003, 0x0021_0480, // v_cndmask_b32 v3, 0, 2, s[8:9]
+        0xD501_0002,
+        0x0029_0280, // v_cndmask_b32 v2, 0, 1, s[10:11]
+        0xD501_0003,
+        0x0021_0480, // v_cndmask_b32 v3, 0, 2, s[8:9]
         0x3804_0702, // v_or_b32 v2, v2, v3
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let why = refusal(&w).expect("refused");
@@ -807,7 +897,8 @@ fn a_mask_join_read_by_an_xor_with_exec_is_not_taken_as_anded_off() {
     // As the NAND case, but an `s_xor` with EXEC: lanes outside EXEC keep the address's bits,
     // so it is still refused.
     let w = [
-        0xD4C4_000C, 0x0002_00B2, // v_cmp_gt_u32 s[12:13], 50, v0
+        0xD4C4_000C,
+        0x0002_00B2, // v_cmp_gt_u32 s[12:13], 50, v0
         0xBE88_0402, // s_mov_b64 s[8:9], s[2:3]
         0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
         0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
@@ -816,9 +907,11 @@ fn a_mask_join_read_by_an_xor_with_exec_is_not_taken_as_anded_off() {
         // j:
         0x8988_7E08, // s_xor_b64 s[8:9], s[8:9], exec
         0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let why = refusal(&w).expect("refused");
@@ -829,7 +922,8 @@ fn a_mask_join_read_by_an_xor_with_exec_is_not_taken_as_anded_off() {
 fn a_loop_carried_mask_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
     // As the uniform loop case, but the inner join's read is an `s_or` with EXEC: still refused.
     let w = [
-        0xD4C4_0008, 0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
+        0xD4C4_0008,
+        0x0002_00B2, // v_cmp_gt_u32 s[8:9], 50, v0
         0x7E04_0280, // v_mov_b32 v2, 0
         0xBE8E_0380, // s_mov_b32 s14, 0
         // loop:
@@ -839,13 +933,16 @@ fn a_loop_carried_mask_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
         0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
         0xBF88_0002, // s_cbranch_execz ij
-        0xD4C4_0008, 0x0002_008A, // v_cmp_gt_u32 s[8:9], 10, v0
+        0xD4C4_0008,
+        0x0002_008A, // v_cmp_gt_u32 s[8:9], 10, v0
         // ij:
         0x8888_7E08, // s_or_b64 s[8:9], s[8:9], exec
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
-        0xD501_0003, 0x0021_0280, // v_cndmask_b32 v3, 0, 1, s[8:9]
+        0xD501_0003,
+        0x0021_0280, // v_cndmask_b32 v3, 0, 1, s[8:9]
         0x4A04_0702, // v_add_nc_u32 v2, v2, v3
-        0xF404_0201, 0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
+        0xF404_0201,
+        0xFA00_0000, // s_load_dwordx2 s[8:9], s[2:3], null
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         // latch:
         0xBEFE_040A, // s_mov_b64 exec, s[10:11]
@@ -853,7 +950,8 @@ fn a_loop_carried_mask_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
         0xBF0A_830E, // s_cmp_lt_u32 s14, 3
         0xBF85_FFEC, // s_cbranch_scc1 loop
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let why = refusal(&w).expect("refused");
@@ -873,9 +971,11 @@ fn a_select_of_an_address_by_scc_is_not_taken_as_a_mask() {
         // j:
         0x8788_7E08, // s_and_b64 s[8:9], s[8:9], exec
         0xBEFE_0406, // s_mov_b64 exec, s[6:7]
-        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        0xD501_0002,
+        0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     let why = refusal(&w).expect("refused");
@@ -884,7 +984,9 @@ fn a_select_of_an_address_by_scc_is_not_taken_as_a_mask() {
 
 /// [`run_io`] of a wave64 group of 64, `dwords` read back from `dst`.
 fn run_lockstep(words: &[u32], lds: u32, dwords: usize) -> Vec<u32> {
-    let Some(mut t) = title() else { return Vec::new() };
+    let Some(mut t) = title() else {
+        return Vec::new();
+    };
     let f = Fixture::new(&t);
     let cs = translate_io(words, 5, lds << 15, 64, shaders::options());
     let [c, d] = halves(VA_A + 0x4_0000);
@@ -1042,7 +1144,10 @@ fn a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep() {
     if got.is_empty() {
         return;
     }
-    assert_eq!(got[..50], (0..50).map(|i| i * (i + 1) / 2).collect::<Vec<u32>>());
+    assert_eq!(
+        got[..50],
+        (0..50).map(|i| i * (i + 1) / 2).collect::<Vec<u32>>()
+    );
     assert_eq!(got[50..], [CANARY; 14]);
 }
 
@@ -1072,7 +1177,9 @@ fn whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep() {
     if got.is_empty() {
         return;
     }
-    let want: Vec<u32> = (0..50).map(|i| if i % 16 == 0 { 32 } else { i - 1 + 32 }).collect();
+    let want: Vec<u32> = (0..50)
+        .map(|i| if i % 16 == 0 { 32 } else { i - 1 + 32 })
+        .collect();
     assert_eq!(got[..50], want);
     assert_eq!(got[50..], [CANARY; 14]);
 }
@@ -1102,9 +1209,11 @@ fn a_mask_a_32_lane_wave_starts_as_a_pairs_constant_holds_the_lanes_ored_in() {
             0xBF85_FFF7, // s_cbranch_scc1 loop
             // out:
             0xBEFE_030A, // s_mov_b32 exec_lo, s10
-            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0xD501_0002,
+            0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
             0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-            0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+            0xDC70_8000,
+            0x0002_0201, // global_store_dword v1, v2, s[2:3]
             S_ENDPGM,
         ];
         assert_eq!(refusal32(&w), None, "{zero:#x}");
@@ -1141,7 +1250,8 @@ fn a_mask_a_divergent_loop_copies_away_and_back_is_the_mask_it_entered_with() {
         0xBF89_FFF7, // s_cbranch_execnz loop
         0xBEFE_030A, // s_mov_b32 exec_lo, s10
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal32(&w), None);
@@ -1160,7 +1270,8 @@ fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
     // As the copy case, but the copy back is of another mask (the lanes below 10): after the
     // first pass VCC holds those, so lanes 10 to 19 count one pass. Refused, or that.
     let w = [
-        0xD4C4_0015, 0x0002_008A, // v_cmp_gt_u32 s21, 10, v0
+        0xD4C4_0015,
+        0x0002_008A, // v_cmp_gt_u32 s21, 10, v0
         0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
         0xBE8A_037E, // s_mov_b32 s10, exec_lo
         0x7E06_0300, // v_mov_b32 v3, v0
@@ -1178,7 +1289,8 @@ fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
         0xBF89_FFF7, // s_cbranch_execnz loop
         0xBEFE_030A, // s_mov_b32 exec_lo, s10
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     if refusal32(&w).is_some() {
@@ -1222,7 +1334,8 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
         0xBF89_FFF2, // s_cbranch_execnz loop
         0xBEFE_030A, // s_mov_b32 exec_lo, s10
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        0xDC70_8000,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3]
         S_ENDPGM,
     ];
     assert_eq!(refusal32(&w), None);

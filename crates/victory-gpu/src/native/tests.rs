@@ -266,7 +266,12 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     let mut resource = [0u32; 14];
     resource[0] = 1;
     // Made in slots 4 and 5 (mirrored there), then copied by the title to 0 and 1.
-    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start + 4 * 32);
+    crate::descriptor::create_placed_srv(
+        std::ptr::null_mut(),
+        &resource,
+        &placed(src),
+        start + 4 * 32,
+    );
     let mut uav = placed(dst);
     (uav[4], uav[6]) = (64, 0);
     crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 5 * 32);
@@ -284,7 +289,10 @@ fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     let done = h.backend.create_fence(0).unwrap();
     h.execute(&q, &[&l], &[], &[(&done, 1)]).unwrap();
     assert!(h.backend.wait(&done, 1, 10_000));
-    assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
     drop(slots);
 }
 
@@ -327,7 +335,10 @@ fn named_for_a_heap(h: &Host) -> [u64; 2] {
         h.backend.residency_counts().heap_resources - before
     };
     let named = [named(1), named(5)];
-    assert_eq!(pool.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    assert_eq!(
+        pool.read::<u32>(dst, 64),
+        (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>()
+    );
     drop(slots);
     named
 }
@@ -454,7 +465,11 @@ fn submission_retries_an_unchanged_buffer_descriptor_after_mapping() {
     let mut list = NativeList::default();
     list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
     list.set_render_targets(
-        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(
+            victory_backend::resources::Format::Rgba8Unorm,
+            1,
+            1,
+        ))],
         None,
     );
     list.set_heaps(Some(&heap), None);
@@ -509,7 +524,11 @@ fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
     let mut list = NativeList::default();
     list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
     list.set_render_targets(
-        &[Rc::new(victory_backend::resources::TextureDesc::d2(victory_backend::resources::Format::Rgba8Unorm, 1, 1))],
+        &[Rc::new(victory_backend::resources::TextureDesc::d2(
+            victory_backend::resources::Format::Rgba8Unorm,
+            1,
+            1,
+        ))],
         None,
     );
     list.set_heaps(Some(&heap), None);
@@ -639,7 +658,6 @@ fn clear_and_draw_into_render_target() {
 #[test]
 fn a_draw_with_no_render_target_is_dropped_alone() {
     let Some(h) = host() else { return };
-    const W: usize = 16;
     let pool = Pool::new(&h, 2);
     pool.write(
         0,
@@ -759,8 +777,18 @@ fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
     run(&h, &[&l]);
 
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out[..N / 2].iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..8]);
-    assert!(out[N / 2..].iter().all(|v| *v == 0), "only the record's groups ran");
+    assert!(
+        out[..N / 2]
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == i as u32 * 5 + 7),
+        "{:?}",
+        &out[..8]
+    );
+    assert!(
+        out[N / 2..].iter().all(|v| *v == 0),
+        "only the record's groups ran"
+    );
 }
 
 /// A command that names title memory outside every mapped pool is not encoded (no GPU fault) and
@@ -791,11 +819,23 @@ fn a_command_at_unmapped_title_memory_is_dropped_alone() {
     run(&h, &[&l]);
 
     assert_eq!(h.unmapped(), 2);
-    assert_eq!(pool.read::<u64>(flag, 2), [0xD6D, 0xD0E], "the value writes ran");
+    assert_eq!(
+        pool.read::<u64>(flag, 2),
+        [0xD6D, 0xD0E],
+        "the value writes ran"
+    );
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
+    assert!(
+        out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7),
+        "the second dispatch ran: {:?}",
+        &out[..4]
+    );
     let kept: Vec<u32> = pool.read(src, 16);
-    assert_eq!(kept, (0..16).collect::<Vec<u32>>(), "the copy was dropped, not run");
+    assert_eq!(
+        kept,
+        (0..16).collect::<Vec<u32>>(),
+        "the copy was dropped, not run"
+    );
 }
 
 /// A dispatch that reads a root parameter nothing was set in is dropped by itself: the value
@@ -824,7 +864,11 @@ fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
     assert_eq!(h.unset_roots(), 1);
     assert_eq!(pool.read::<u64>(flag, 1), [0xD6D], "the value write ran");
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "the second dispatch ran: {:?}", &out[..4]);
+    assert!(
+        out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7),
+        "the second dispatch ran: {:?}",
+        &out[..4]
+    );
 }
 
 /// A dispatch the host cannot give its arguments for another reason (here a root parameter that is
@@ -837,7 +881,10 @@ fn a_dispatch_the_host_cannot_prepare_is_dropped_alone() {
     let flag = 32768;
     pool.write(flag, &[0u64]);
     let pso = Rc::new(super::list::ComputePso {
-        pso: h.backend.create_compute_pipeline(&fixture_affine()).unwrap(),
+        pso: h
+            .backend
+            .create_compute_pipeline(&fixture_affine())
+            .unwrap(),
         threads: [64, 1, 1],
         binding: Some(super::list::Binding {
             dwords: 4,
@@ -865,13 +912,21 @@ fn a_dispatch_the_host_cannot_prepare_is_dropped_alone() {
 
 /// The triangle pipeline of [`clear_and_draw_into_render_target`].
 fn triangle_pipeline(h: &Host) -> Rc<<Metal as GraphicsBackend>::RenderPipeline> {
-    let attr = |format, offset| VertexAttr { format, slot: 0, offset };
+    let attr = |format, offset| VertexAttr {
+        format,
+        slot: 0,
+        offset,
+    };
     h.render_pipeline(&RenderPipelineDesc {
         vs: &fixture("tri_vs"),
         ps: Some(&fixture("tri_ps")),
         vs_layout: None,
         ps_layout: None,
-        attributes: &[attr(VertexFormat::Float2, 0), attr(VertexFormat::Float2, 8), attr(VertexFormat::Float4, 16)],
+        attributes: &[
+            attr(VertexFormat::Float2, 0),
+            attr(VertexFormat::Float2, 8),
+            attr(VertexFormat::Float4, 16),
+        ],
         streams: &[VertexStream {
             slot: 0,
             stride: 32,
@@ -918,9 +973,19 @@ fn a_dropped_command_between_two_dispatches_keeps_them_in_two_passes() {
     run(&h, &[&l]);
 
     assert_eq!(h.no_targets(), 1);
-    assert_eq!(h.passes(), 2, "the dropped draw still parts the two dispatches");
+    assert_eq!(
+        h.passes(),
+        2,
+        "the dropped draw still parts the two dispatches"
+    );
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == (i as u32 * 5 + 7) * 3 + 1), "the consumer read the producer's output: {:?}", &out[..4]);
+    assert!(
+        out.iter()
+            .enumerate()
+            .all(|(i, v)| *v == (i as u32 * 5 + 7) * 3 + 1),
+        "the consumer read the producer's output: {:?}",
+        &out[..4]
+    );
 
     // The same two dispatches around a dispatch dropped for an unset root parameter: one pass, as
     // the three would have been.
@@ -944,9 +1009,19 @@ fn a_dropped_command_between_two_dispatches_keeps_them_in_two_passes() {
     run(&h, &[&first, &unset, &last]);
 
     assert_eq!(h.unset_roots(), 1);
-    assert_eq!(h.passes(), 3, "a dropped dispatch between dispatches parts nothing");
+    assert_eq!(
+        h.passes(),
+        3,
+        "a dropped dispatch between dispatches parts nothing"
+    );
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == (i as u32 * 5 + 7) * 2), "{:?}", &out[..4]);
+    assert!(
+        out.iter()
+            .enumerate()
+            .all(|(i, v)| *v == (i as u32 * 5 + 7) * 2),
+        "{:?}",
+        &out[..4]
+    );
 }
 
 /// Two draws into the same target with a dispatch between them are two render passes, and stay two
@@ -957,7 +1032,13 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
     let Some(h) = host() else { return };
     const W: usize = 16;
     let pool = Pool::new(&h, 2);
-    let triangle = |x: f32, c: [f32; 4]| [vertex(x - 0.4, -0.5, c), vertex(x + 0.4, -0.5, c), vertex(x, 0.5, c)];
+    let triangle = |x: f32, c: [f32; 4]| {
+        [
+            vertex(x - 0.4, -0.5, c),
+            vertex(x + 0.4, -0.5, c),
+            vertex(x, 0.5, c),
+        ]
+    };
     pool.write(0, &triangle(-0.5, [1.0, 0.0, 0.0, 1.0]));
     pool.write(4096, &triangle(0.5, [0.0, 1.0, 0.0, 1.0]));
     let tri = triangle_pipeline(&h);
@@ -965,7 +1046,9 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
     let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
     rt.render_target = true;
     let color = h.texture(&rt).unwrap();
-    let white = h.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+    let white = h
+        .texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1))
+        .unwrap();
     h.backend.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
     h.register_texture(0xA11CF, &white);
 
@@ -1032,7 +1115,9 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
         let (src, dst) = (0, 16384);
         pool.write(src, &(0..N as u32).collect::<Vec<_>>());
         let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
-        let qs: Vec<_> = (0..queues).map(|_| h.backend.create_queue().unwrap()).collect();
+        let qs: Vec<_> = (0..queues)
+            .map(|_| h.backend.create_queue().unwrap())
+            .collect();
         let f = h.backend.create_fence(0).unwrap();
         let mut value = 0;
         for i in 0..submissions {
@@ -1043,19 +1128,34 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
             l.set_compute_root_view(2, pool.va(dst));
             l.dispatch((N / 64) as u32, 1, 1).unwrap();
             value += 1;
-            h.execute(&qs[i % queues], &[&l], &[(&f, value - 1)], &[(&f, value)]).unwrap();
+            h.execute(&qs[i % queues], &[&l], &[(&f, value - 1)], &[(&f, value)])
+                .unwrap();
         }
         assert!(h.backend.wait(&f, value, 10_000));
         let last = submissions as u32 + 1;
         let out: Vec<u32> = pool.read(dst, N);
-        assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * last + 1), "{:?}", &out[..4]);
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, v)| *v == i as u32 * last + 1),
+            "{:?}",
+            &out[..4]
+        );
         pool
     };
 
     let _pool = work(&on, 2, 6);
     let c = on.backend.residency_counts();
     // One pool buffer, in the set once; the set is on both queues; no dispatch names a buffer.
-    assert_eq!(c, victory_metal::metal::ResidencyCounts { use_resource: 0, added: 1, queues: 2, ..Default::default() });
+    assert_eq!(
+        c,
+        victory_metal::metal::ResidencyCounts {
+            use_resource: 0,
+            added: 1,
+            queues: 2,
+            ..Default::default()
+        }
+    );
 
     let _pool = work(&off, 2, 6);
     let c = off.backend.residency_counts();
@@ -1110,7 +1210,10 @@ fn a_released_pool_leaves_the_residency_set() {
     second.write(0, &(0..64u32).collect::<Vec<_>>());
     dispatch(&second);
     assert_eq!(h.backend.residency_counts().added, 2);
-    assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
+    assert_eq!(
+        second.read::<u32>(4096, 64),
+        (0..64).map(|i| i * 2).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1139,9 +1242,21 @@ fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
             vs_layout: None,
             ps_layout: None,
             attributes: &[
-                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
-                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
-                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+                VertexAttr {
+                    format: VertexFormat::Float2,
+                    slot: 0,
+                    offset: 0,
+                },
+                VertexAttr {
+                    format: VertexFormat::Float2,
+                    slot: 0,
+                    offset: 8,
+                },
+                VertexAttr {
+                    format: VertexFormat::Float4,
+                    slot: 0,
+                    offset: 16,
+                },
             ],
             streams: &[VertexStream {
                 slot: 0,

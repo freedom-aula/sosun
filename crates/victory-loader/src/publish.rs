@@ -6,13 +6,19 @@
 //! rename is atomic within the directory, and the staging file is removed
 //! if publication fails.
 
+#[cfg(any(test, windows))]
 use std::path::Path;
+#[cfg(any(test, windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// The Windows loader is the only user outside these tests; it publishes a
+// prepared image for LoadLibrary while the other hosts map bytes directly.
+#[cfg(any(test, windows))]
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(0);
 
 /// Writes `bytes` to `path` unless it is already there, using a staging file
 /// unique to this process and call.
+#[cfg(any(test, windows))]
 pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
@@ -22,10 +28,7 @@ pub fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("image");
     let sequence = NEXT_STAGING.fetch_add(1, Ordering::Relaxed);
-    let staging = path.with_file_name(format!(
-        ".{name}.{}.{sequence}.tmp",
-        std::process::id()
-    ));
+    let staging = path.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
     std::fs::write(&staging, bytes)?;
     if let Err(error) = std::fs::rename(&staging, path) {
         let _ = std::fs::remove_file(&staging);
@@ -59,7 +62,10 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.path() != path)
             .collect();
-        assert!(leftovers.is_empty(), "staging files were removed: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "staging files were removed: {leftovers:?}"
+        );
     }
 
     #[test]

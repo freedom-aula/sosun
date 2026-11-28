@@ -5,7 +5,7 @@
 
 use super::Pool;
 use crate::native::{glue, memory::PoolInfo};
-use crate::object::{This, S_OK, slot};
+use crate::object::{S_OK, This, slot};
 use std::time::{Duration, Instant};
 use victory_metal::mem::{Alias, page_size};
 
@@ -41,12 +41,13 @@ fn pool(id: usize, pages: usize) -> Pool {
     Pool { mem }
 }
 
-use crate::native::memory::PoolObserver as _;
-
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out: {what}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out: {what}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -68,7 +69,13 @@ impl Fence {
     fn new(initial: u64) -> Fence {
         let mut f = std::ptr::null();
         assert_eq!(
-            crate::fence::create(std::ptr::null(), initial, 0, &crate::fence::FENCE_IIDS[0], &mut f),
+            crate::fence::create(
+                std::ptr::null(),
+                initial,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut f
+            ),
             S_OK
         );
         Fence(f)
@@ -156,14 +163,22 @@ impl List {
     /// `Wait32BitValueX(address, comparison, reference, mask, flags)`.
     fn wait_for(&self, address: u64, comparison: u32, reference: u32) {
         slot::<extern "system" fn(This, u64, u32, u32, u32, u32)>(self.0, 0x238)(
-            self.0, address, comparison, reference, u32::MAX, 0,
+            self.0,
+            address,
+            comparison,
+            reference,
+            u32::MAX,
+            0,
         );
     }
     fn set_pipeline(&self, pso: This) {
         slot::<extern "system" fn(This, This)>(self.0, 0xc8)(self.0, pso);
     }
     fn close(&self) {
-        assert_eq!(slot::<extern "system" fn(This) -> HResult>(self.0, 0x48)(self.0), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HResult>(self.0, 0x48)(self.0),
+            S_OK
+        );
     }
 }
 
@@ -207,7 +222,11 @@ fn a_submitted_list_runs_and_its_fence_is_signalled() {
     assert!(f.completed() >= 1);
     wait_until("the title's copy of the fence value", || f.in_memory() >= 1);
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7), "{:?}", &out[..4]);
+    assert!(
+        out.iter().enumerate().all(|(i, v)| *v == i as u32 * 5 + 7),
+        "{:?}",
+        &out[..4]
+    );
     assert_eq!(pool.read::<u32>(done, 1), [0xD0D0]);
 }
 
@@ -239,9 +258,14 @@ fn a_wait_on_a_memory_value_cuts_the_list_and_holds_the_rest() {
 
     // The part before the wait ran; the part after it, and the Signal, did not.
     wait_until("the part before the wait", || {
-        pool.read::<u32>(a, N).iter().enumerate().all(|(i, v)| *v == i as u32 * 2)
+        pool.read::<u32>(a, N)
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == i as u32 * 2)
     });
-    assert!(nothing_for(50, || f1.completed() >= 1 || pool.read::<u32>(b, 1)[0] != 0 || pool.read::<u32>(b, N)[7] != 0));
+    assert!(nothing_for(50, || f1.completed() >= 1
+        || pool.read::<u32>(b, 1)[0] != 0
+        || pool.read::<u32>(b, N)[7] != 0));
     assert_eq!(pool.read::<u32>(b, N)[7], 0, "held behind the wait");
 
     // Another queue's list writes the value at its end.
@@ -255,7 +279,11 @@ fn a_wait_on_a_memory_value_cuts_the_list_and_holds_the_rest() {
     assert_eq!(f1.wait(1), S_OK);
     assert_eq!(f2.wait(1), S_OK);
     let out: Vec<u32> = pool.read(b, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 * 3), "{:?}", &out[..4]);
+    assert!(
+        out.iter().enumerate().all(|(i, v)| *v == i as u32 * 3),
+        "{:?}",
+        &out[..4]
+    );
     let stats = glue::stats().unwrap();
     assert!(stats.waited >= 1 && stats.pieces >= 3, "{stats:?}");
 }
@@ -278,7 +306,8 @@ fn a_queue_waits_for_a_fence_the_cpu_signals() {
     list.close();
     q.execute(&[&list]);
     q.signal(&done, 1);
-    assert!(nothing_for(50, || done.completed() >= 1 || pool.read::<u32>(dst, 1)[0] != 0));
+    assert!(nothing_for(50, || done.completed() >= 1
+        || pool.read::<u32>(dst, 1)[0] != 0));
     gate.signal(5);
     assert_eq!(done.wait(1), S_OK);
     let out: Vec<u32> = pool.read(dst, N);
@@ -305,11 +334,16 @@ fn a_queue_wait_longer_than_metals_event_wait_limit_still_runs_the_work() {
     list.close();
     q.execute(&[&list]);
     q.signal(&done, 1);
-    assert!(nothing_for(6_000, || done.completed() >= 1 || pool.read::<u32>(dst, 1)[0] != 0));
+    assert!(nothing_for(6_000, || done.completed() >= 1
+        || pool.read::<u32>(dst, 1)[0] != 0));
     gate.signal(1);
     wait_until("the work after the wait", || done.completed() >= 1);
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 + 100), "{:?}", &out[..4]);
+    assert!(
+        out.iter().enumerate().all(|(i, v)| *v == i as u32 + 100),
+        "{:?}",
+        &out[..4]
+    );
 }
 
 /// A queue's Wait for a value another queue's Signal will reach once its work has run: the
@@ -340,7 +374,13 @@ fn a_queue_waits_for_another_queues_signal() {
     q2.signal(&done, 1);
     assert_eq!(done.wait(1), S_OK);
     let out: Vec<u32> = pool.read(dst, N);
-    assert!(out.iter().enumerate().all(|(i, v)| *v == (i as u32 * 2 + 1) * 3), "{:?}", &out[..4]);
+    assert!(
+        out.iter()
+            .enumerate()
+            .all(|(i, v)| *v == (i as u32 * 2 + 1) * 3),
+        "{:?}",
+        &out[..4]
+    );
 }
 
 /// Views a title writes (`CreateShaderResourceView` of a buffer resource it made at an address of
@@ -371,8 +411,12 @@ fn buffer_views_in_a_descriptor_heap_reach_the_shader() {
     crate::descriptor::create_uav(std::ptr::null(), rd, std::ptr::null(), &uav, start + 32);
 
     let pso = crate::pipeline::test_compute(b"heap shader");
-    glue::install_compute_pipeline(pso as usize, &read("tests/fixtures/heap_rw.dxil"), [64, 1, 1])
-        .unwrap();
+    glue::install_compute_pipeline(
+        pso as usize,
+        &read("tests/fixtures/heap_rw.dxil"),
+        [64, 1, 1],
+    )
+    .unwrap();
     let (q, f) = (Queue::new(), Fence::new(0));
     let list = List::new(pso);
     slot::<extern "system" fn(This, u32, *const This)>(list.0, 0x100)(list.0, 1, &heap);
@@ -420,7 +464,12 @@ fn a_copy_runs_in_order_with_the_dispatch_it_feeds() {
     q.execute(&[&list]);
     q.signal(&f, 1);
     assert_eq!(f.wait(1), S_OK);
-    assert!(pool.read::<u32>(dst, N).iter().enumerate().all(|(i, v)| *v == i as u32 + 9));
+    assert!(
+        pool.read::<u32>(dst, N)
+            .iter()
+            .enumerate()
+            .all(|(i, v)| *v == i as u32 + 9)
+    );
 }
 
 /// A title pipeline the host refuses (here a container that does not translate) drops the work
@@ -435,7 +484,10 @@ fn a_refused_pipeline_drops_its_work_and_nothing_else() {
     pool.write(src, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dropped, &[0xAAAA_AAAAu32; N]);
     pool.write(dst, &[0u32; N]);
-    let (bad, good) = (crate::pipeline::test_compute(b"not a container"), pipeline());
+    let (bad, good) = (
+        crate::pipeline::test_compute(b"not a container"),
+        pipeline(),
+    );
     let (q, f) = (Queue::new(), Fence::new(0));
     let list = List::new(bad);
     affine(&list, 1, 1, pool.va(src), pool.va(dropped));
@@ -449,10 +501,17 @@ fn a_refused_pipeline_drops_its_work_and_nothing_else() {
     let out: Vec<u32> = pool.read(dst, N);
     assert!(out.iter().enumerate().all(|(i, v)| *v == i as u32 + 2));
     assert_eq!(pool.read::<u32>(flag, 1), [7]);
-    assert_eq!(pool.read::<u32>(dropped, 1), [0xAAAA_AAAA], "the refused pipeline's dispatch did not run");
+    assert_eq!(
+        pool.read::<u32>(dropped, 1),
+        [0xAAAA_AAAA],
+        "the refused pipeline's dispatch did not run"
+    );
     let stats = glue::shader_stats().unwrap();
     assert!(
-        stats.refused.iter().any(|(why, n)| why.contains("translation") && *n >= 1),
+        stats
+            .refused
+            .iter()
+            .any(|(why, n)| why.contains("translation") && *n >= 1),
         "{stats:?}"
     );
 }

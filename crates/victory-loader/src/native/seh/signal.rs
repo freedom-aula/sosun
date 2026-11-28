@@ -326,17 +326,17 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             // faults like the instruction would have.
             let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 15) };
             // A write to address zero.
-            if at == 0 {
-                if let Some((len, magic)) = crate::watchdog::crash_write(code) {
-                    crate::watchdog::record(rip, magic);
-                    // SAFETY: the saved rip, past the declined store.
-                    unsafe {
-                        mc.add(MC_THREAD + T_RIP * 8)
-                            .cast::<u64>()
-                            .write(rip + len as u64)
-                    };
-                    return;
-                }
+            if at == 0
+                && let Some((len, magic)) = crate::watchdog::crash_write(code)
+            {
+                crate::watchdog::record(rip, magic);
+                // SAFETY: the saved rip, past the declined store.
+                unsafe {
+                    mc.add(MC_THREAD + T_RIP * 8)
+                        .cast::<u64>()
+                        .write(rip + len as u64)
+                };
+                return;
             }
             if crate::nullsink::enabled()
                 && let Some(s) = crate::nullsink::store(code)
@@ -354,7 +354,9 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
                     unsafe { mc.add(MC_THREAD + i * 8).cast::<u64>().write(v) }
                 };
                 if let (false, Some(i)) = (s.rep, slot)
-                    && off.checked_add(s.width as u64).is_some_and(|end| end <= 64 * 1024)
+                    && off
+                        .checked_add(s.width as u64)
+                        .is_some_and(|end| end <= 64 * 1024)
                 {
                     set(i, crate::nullsink::sink() as u64 + off);
                 } else {
@@ -718,10 +720,8 @@ mod watch_tests {
         // SAFETY: inside the allocation; the watch reopens the page for the store.
         unsafe { ((p + 16) as *mut u64).write_volatile(0x1122_3344) };
         // SAFETY: as above.
-        assert_eq!(
-            unsafe { ((p + 16) as *const u64).read_volatile() },
-            0x1122_3344
-        );
+        let landed = unsafe { ((p + 16) as *const u64).read_volatile() };
+        assert_eq!(landed, 0x1122_3344);
         assert_eq!(protection(p), Protect::READ_WRITE, "reopened by the store");
         assert_eq!(stores(), before + 1, "a store into the range is a site");
         // The page stays open until the next watch: no second fault, no second count.

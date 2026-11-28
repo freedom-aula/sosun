@@ -46,6 +46,7 @@ impl<T> Paged<T> {
 
     /// The slots that hold something, in order, with their indices: the
     /// pages made are walked, the others skipped.
+    #[cfg(windows)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
         self.pages.iter().enumerate().flat_map(|(p, page)| {
             page.iter()

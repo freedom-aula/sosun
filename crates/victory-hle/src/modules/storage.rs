@@ -176,7 +176,9 @@ static VTABLE: Methods<8> = Methods([
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use crate::modules::xgameruntime::method;
 
     #[test]

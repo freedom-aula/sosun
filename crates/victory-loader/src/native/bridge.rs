@@ -349,7 +349,9 @@ fn tsc() -> u64 {
 
 /// Starts the thread that logs the profile.
 pub(crate) fn start_profile() {
-    let Some(secs) = profile_seconds() else { return };
+    let Some(secs) = profile_seconds() else {
+        return;
+    };
     std::thread::spawn(move || {
         let (t0, c0) = (std::time::Instant::now(), tsc());
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -364,7 +366,11 @@ pub(crate) fn start_profile() {
                 .filter(|(_, t)| t.calls.load(Ordering::Relaxed) > 0)
                 .collect();
             rows.sort_by_key(|r| std::cmp::Reverse(r.0));
-            tracing::warn!("profile at {:.1}s: {} methods", t0.elapsed().as_secs_f64(), rows.len());
+            tracing::warn!(
+                "profile at {:.1}s: {} methods",
+                t0.elapsed().as_secs_f64(),
+                rows.len()
+            );
             for (ticks, t) in rows.iter().take(40) {
                 tracing::warn!(
                     "profile {}!{}{:#x} calls {} total {:.1} ms max {:.2} ms",
@@ -404,7 +410,14 @@ pub(crate) fn traced_name(context: usize) -> Option<(&'static str, &'static str,
     Some((info.area, info.name, info.slot * 8))
 }
 
-extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: u64, args: *const u64) {
+extern "C" fn trace_ret(
+    info: &Traced,
+    hr: i32,
+    this: usize,
+    ret: usize,
+    start: u64,
+    args: *const u64,
+) {
     if callbacks_enabled() {
         note_callbacks(info, args);
     }
@@ -414,7 +427,11 @@ extern "C" fn trace_ret(info: &Traced, hr: i32, this: usize, ret: usize, start: 
         info.ticks.fetch_add(d, Ordering::Relaxed);
         info.longest.fetch_max(d, Ordering::Relaxed);
     }
-    if if info.name.is_empty() { trace_level() > 0 && (hr < 0 || trace_level() == 2) } else { trace_imports() } {
+    if if info.name.is_empty() {
+        trace_level() > 0 && (hr < 0 || trace_level() == 2)
+    } else {
+        trace_imports()
+    } {
         tracing::warn!(
             area = info.area,
             name = info.name,
@@ -611,8 +628,8 @@ extern "C" fn spare_slot(spare: &Spare) -> i32 {
 }
 
 /// Raw table address to its bridged copy, and the reverse set of copies.
-static TABLES: Mutex<Option<(std::collections::HashMap<usize, usize>, HashSet<usize>)>> =
-    Mutex::new(None);
+type Tables = Option<(std::collections::HashMap<usize, usize>, HashSet<usize>)>;
+static TABLES: Mutex<Tables> = Mutex::new(None);
 
 /// A copy of the method table at `raw` (`len` slots) that title code can
 /// call: each slot is a bridge stub for the host function in it (null stays
@@ -811,7 +828,8 @@ pub(crate) fn callbacks_enabled() -> bool {
 }
 
 /// Title code addresses the host has called.
-static CALLED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+static CALLED: Mutex<std::collections::BTreeSet<usize>> =
+    Mutex::new(std::collections::BTreeSet::new());
 
 /// Registered title code addresses: (import or method, argument, offset behind it, times seen).
 static REGISTERED: Mutex<std::collections::BTreeMap<usize, (String, usize, usize, u64)>> =
@@ -834,7 +852,10 @@ fn note_callbacks(info: &Traced, args: *const u64) {
         let a = a as usize;
         if in_text(a) {
             found.push((a, i, 0));
-        } else if a >= 0x10000 && a < 0x7fff_ffff_0000 && a & 7 == 0 && !info.area.contains("-crt-") {
+        } else if (0x10000..0x7fff_ffff_0000).contains(&a)
+            && a & 7 == 0
+            && !info.area.contains("-crt-")
+        {
             for k in 0..16 {
                 match super::dump::read_checked(a + 8 * k) {
                     Some(v) if in_text(v) => found.push((v, i, 8 * k)),
@@ -866,10 +887,17 @@ pub fn report_callbacks() {
         if called.contains(&t) {
             yes += 1;
         } else {
-            never.push(format!("{name} arg{arg}+{off:#x} x{n} -> {:#x}", t - 0x1_4000_0000));
+            never.push(format!(
+                "{name} arg{arg}+{off:#x} x{n} -> {:#x}",
+                t - 0x1_4000_0000
+            ));
         }
     }
-    tracing::warn!("callbacks: {} registered, {yes} called by the host, {} never", map.len(), never.len());
+    tracing::warn!(
+        "callbacks: {} registered, {yes} called by the host, {} never",
+        map.len(),
+        never.len()
+    );
     for line in never {
         tracing::warn!("never called: {line}");
     }

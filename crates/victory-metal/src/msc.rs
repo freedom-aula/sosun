@@ -30,6 +30,10 @@ type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
 /// 0 and 1, both `[[color(0)]]` (`index(0)` and `index(1)`).
 const DUAL_SOURCE_ON: u32 = 1;
 
+/// A resource's place in the top-level argument buffer: (resource type, space, register, byte
+/// offset, size), as `IRRootSignatureGetResourceLocations` gives them.
+pub type ResourceLocations = Vec<(u32, u32, u32, u32, u64)>;
+
 /// `IRShaderStageMesh`.
 pub const STAGE_MESH: i32 = 5;
 
@@ -88,7 +92,10 @@ impl Parameter {
         };
         Parameter {
             kind,
-            union: [u64::from(register) | u64::from(space) << 32, u64::from(extra)],
+            union: [
+                u64::from(register) | u64::from(space) << 32,
+                u64::from(extra),
+            ],
             visibility: 0,
         }
     }
@@ -98,7 +105,9 @@ impl Parameter {
 fn note(started: std::time::Instant, dxil: usize, hit: bool) {
     let ms = started.elapsed().as_millis();
     if ms >= 20 {
-        eprintln!("metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})");
+        eprintln!(
+            "metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})"
+        );
     }
 }
 
@@ -240,7 +249,7 @@ impl Msc {
 
     /// Where the converter lays out `l` in the top-level argument buffer: (resource type, space,
     /// register, byte offset, size) per resource, as `IRRootSignatureGetResourceLocations` gives.
-    pub fn locations(&self, l: &RootLayout) -> Result<Vec<(u32, u32, u32, u32, u64)>, ConvError> {
+    pub fn locations(&self, l: &RootLayout) -> Result<ResourceLocations, ConvError> {
         let h = self.h;
         // SAFETY: the converter's documented C API; the signature is destroyed below.
         unsafe {
@@ -311,12 +320,25 @@ impl Msc {
 
     /// The thread-group size of a mesh shader, from the converter's reflection of it (cached on
     /// disk as conversions are).
-    pub fn mesh_threads(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<[u32; 3], ConvError> {
+    pub fn mesh_threads(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+    ) -> Result<[u32; 3], ConvError> {
         let layout_text = format!("{layout:?}");
         let dir = crate::disk::dir();
-        let key = crate::disk::key(&[b"mesh threads", dxil, layout_text.as_bytes(), self.id.as_bytes()]);
+        let key = crate::disk::key(&[
+            b"mesh threads",
+            dxil,
+            layout_text.as_bytes(),
+            self.id.as_bytes(),
+        ]);
         if let Some(t) = dir.and_then(|d| crate::disk::read(d, &key)).and_then(|b| {
-            let w = |k: usize| Some(u32::from_le_bytes(b.get(k * 4..k * 4 + 4)?.try_into().ok()?));
+            let w = |k: usize| {
+                Some(u32::from_le_bytes(
+                    b.get(k * 4..k * 4 + 4)?.try_into().ok()?,
+                ))
+            };
             Some([w(0)?, w(1)?, w(2)?])
         }) {
             return Ok(t);
@@ -338,12 +360,22 @@ impl Msc {
                 if ok {
                     Ok(info.threads)
                 } else {
-                    Err(ConvError { code: u32::MAX, msg: "no mesh reflection".into() })
+                    Err(ConvError {
+                        code: u32::MAX,
+                        msg: "no mesh reflection".into(),
+                    })
                 }
             }
         })?;
         if let Some(d) = dir {
-            crate::disk::write(d, &key, &threads.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+            crate::disk::write(
+                d,
+                &key,
+                &threads
+                    .iter()
+                    .flat_map(|t| t.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
         }
         Ok(threads)
     }

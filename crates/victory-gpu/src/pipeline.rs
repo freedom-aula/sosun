@@ -136,32 +136,45 @@ fn prewarm(shader: &Arc<Shader>) {
     static DONE: AtomicUsize = AtomicUsize::new(0);
     static DXIL: AtomicUsize = AtomicUsize::new(0);
     let on = *POOL.get_or_init(|| {
-        if std::env::var_os("VICTORY_NO_SHADER_PREWARM").is_some_and(|v| !v.is_empty() && v != "0") {
+        if std::env::var_os("VICTORY_NO_SHADER_PREWARM").is_some_and(|v| !v.is_empty() && v != "0")
+        {
             return false;
         }
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
         let n = crate::prewarm::pool_size(cores);
         for i in 0..n {
-            let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
-                crate::prewarm::lower_priority();
-                loop {
-                    let s = QUEUE.pop();
-                    let held = s.native().map_or(0, |h| h.dxil.len());
-                    let dxil_mb = (DXIL.fetch_add(held, Relaxed) + held) >> 20;
-                    let n = DONE.fetch_add(1, Relaxed) + 1;
-                    if n.is_power_of_two() {
-                        tracing::info!("shaders prewarmed n={n} pending={} dxil_mb={dxil_mb}", QUEUED.load(Relaxed).saturating_sub(n));
+            let _ = std::thread::Builder::new()
+                .name(format!("shader-prewarm-{i}"))
+                .spawn(|| {
+                    crate::prewarm::lower_priority();
+                    loop {
+                        let s = QUEUE.pop();
+                        let held = s.native().map_or(0, |h| h.dxil.len());
+                        let dxil_mb = (DXIL.fetch_add(held, Relaxed) + held) >> 20;
+                        let n = DONE.fetch_add(1, Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::info!(
+                                "shaders prewarmed n={n} pending={} dxil_mb={dxil_mb}",
+                                QUEUED.load(Relaxed).saturating_sub(n)
+                            );
+                        }
                     }
-                }
-            });
+                });
         }
         let first = with_first_binds(|l| l.len());
-        tracing::info!(threads = n, first_binds = first, "shader prewarm pool started");
+        tracing::info!(
+            threads = n,
+            first_binds = first,
+            "shader prewarm pool started"
+        );
         true
     });
     if on {
         QUEUED.fetch_add(1, Relaxed);
-        QUEUE.push(shader.clone(), with_first_binds(|l| l.contains(&shader.hash)));
+        QUEUE.push(
+            shader.clone(),
+            with_first_binds(|l| l.contains(&shader.hash)),
+        );
     }
 }
 
@@ -171,7 +184,8 @@ fn with_first_binds<R>(f: impl FnOnce(&mut crate::prewarm::FirstBinds) -> R) -> 
     static LIST: Mutex<Option<crate::prewarm::FirstBinds>> = Mutex::new(None);
     let mut list = LIST.lock().unwrap_or_else(|e| e.into_inner());
     f(list.get_or_insert_with(|| {
-        let text = crate::shader_cache::first_binds_file().and_then(|p| std::fs::read_to_string(p).ok());
+        let text =
+            crate::shader_cache::first_binds_file().and_then(|p| std::fs::read_to_string(p).ok());
         crate::prewarm::FirstBinds::parse(text.as_deref().unwrap_or(""))
     }))
 }
@@ -207,7 +221,11 @@ impl Shader {
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
                 {
-                    let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir)
+                            .join(format!("{}_{}.bin", self.stage, self.hash)),
+                        &*container,
+                    );
                 }
                 // A vertex shader keeps its container: a rectangle-list draw translates it again.
                 if self.stage != "vertex" {
@@ -238,7 +256,9 @@ impl Shader {
     }
 
     /// The translation for dispatches of thread counts (`Options::thread_counts`), made on first use.
-    pub(crate) fn native_threads_shader(&self) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+    pub(crate) fn native_threads_shader(
+        &self,
+    ) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         self.threads
             .get_or_init(|| {
                 self.native()?;
@@ -262,7 +282,12 @@ impl Shader {
     }
 
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
-    pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+    pub(crate) fn translate_extra(
+        &self,
+        rect: bool,
+        extra: u32,
+        copy: [u8; 32],
+    ) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
         crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
     }
@@ -338,7 +363,10 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let mut t = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -359,7 +387,10 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    (
+        host.and_then(|host| with_resources(container, host)),
+        cached,
+    )
 }
 
 #[cfg(windows)]
@@ -406,9 +437,13 @@ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
 /// A title pipeline's stages (name, shader) and graphics state, for the native host.
 #[cfg(target_os = "macos")]
-pub(crate) fn native_stages(
-    this: This,
-) -> Option<(Vec<(&'static str, Arc<Shader>)>, Option<crate::native::state::Graphics>)> {
+type NativeStages = (
+    Vec<(&'static str, Arc<Shader>)>,
+    Option<crate::native::state::Graphics>,
+);
+
+#[cfg(target_os = "macos")]
+pub(crate) fn native_stages(this: This) -> Option<NativeStages> {
     if this.is_null() {
         return None;
     }
@@ -438,7 +473,11 @@ pub(crate) fn bound(this: This) {
         static BINDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
         let n = BINDS[usize::from(p.graphics.is_some())].fetch_add(1, Relaxed) + 1;
         if n.is_power_of_two() {
-            tracing::info!(with_state = p.graphics.is_some(), binds = n, "pipeline binds so far");
+            tracing::info!(
+                with_state = p.graphics.is_some(),
+                binds = n,
+                "pipeline binds so far"
+            );
         }
     }
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -583,7 +622,9 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
     // SAFETY: the title passes `size` bytes of shader code.
     let shader = code_of(code).map(|bytes| shader(stage, unsafe { &*bytes }))?;
     #[cfg(target_os = "macos")]
-    shader.at.store(code.code as usize, std::sync::atomic::Ordering::Relaxed);
+    shader
+        .at
+        .store(code.code as usize, std::sync::atomic::Ordering::Relaxed);
     Some(shader)
 }
 
@@ -606,7 +647,12 @@ pub(crate) fn compute_shader(this: This) -> Option<Arc<Shader>> {
 // shortcut: a container the host put together (a compute pipeline of pieces, 0x218) has none;
 // keep the pieces' addresses if one is ever dispatched with thread counts.
 #[cfg(target_os = "macos")]
-pub(crate) fn native_threads(this: This) -> (String, Result<Arc<victory_shader::emit::HostShader>, String>) {
+pub(crate) fn native_threads(
+    this: This,
+) -> (
+    String,
+    Result<Arc<victory_shader::emit::HostShader>, String>,
+) {
     if this.is_null() {
         return (String::new(), Err("no pipeline".into()));
     }
@@ -732,16 +778,28 @@ pub(crate) extern "system" fn create_unread_1c8(
                 // Pair 0 of the slot is its register image (pointer, size).
                 // SAFETY: the title passes a description of this layout, and the image's bytes.
                 let image: Vec<u32> = unsafe {
-                    let (ptr, size) = (desc.add(8).cast::<usize>().read_unaligned(), desc.add(16).cast::<usize>().read_unaligned());
+                    let (ptr, size) = (
+                        desc.add(8).cast::<usize>().read_unaligned(),
+                        desc.add(16).cast::<usize>().read_unaligned(),
+                    );
                     if ptr == 0 || size > 0x1000 {
                         Vec::new()
                     } else {
                         let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
                         if let Some(dir) = std::env::var_os("VICTORY_DUMP_DESC_DIR") {
                             let names: Vec<&str> = stages.iter().map(|s| &s.hash[..8]).collect();
-                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("regs_{}_{ptr:x}.bin", names.join("_"))), bytes);
+                            let _ = std::fs::write(
+                                std::path::Path::new(&dir)
+                                    .join(format!("regs_{}_{ptr:x}.bin", names.join("_"))),
+                                bytes,
+                            );
                         }
-                        bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect()
+                        bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|w| u32::from_le_bytes(*w))
+                            .collect()
                     }
                 };
                 return hand_out(
@@ -755,8 +813,13 @@ pub(crate) extern "system" fn create_unread_1c8(
                 static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                     // SAFETY: a debugging read of the title's description.
-                    let words: Vec<String> = (1..17).map(|i| format!("{:x}", unsafe { desc.cast::<u64>().add(i).read_unaligned() })).collect();
-                    tracing::info!(?words, reason, "a graphics description whose shader pieces could not be inferred");
+                    let qword = |i: usize| unsafe { desc.cast::<u64>().add(i).read_unaligned() };
+                    let words: Vec<String> = (1..17).map(|i| format!("{:x}", qword(i))).collect();
+                    tracing::info!(
+                        ?words,
+                        reason,
+                        "a graphics description whose shader pieces could not be inferred"
+                    );
                 }
             }
         }
@@ -789,7 +852,9 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(
+        stage, code, meta,
+    ) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
@@ -888,12 +953,20 @@ unsafe fn compute_container(root: Option<&[u8]>, record: *const u8) -> Option<Ve
         part[0x10 + 16 * i..0x20 + 16 * i].copy_from_slice(&entry);
         part.extend_from_slice(bytes);
     }
-    let header: Vec<u8> = [u32::from_le_bytes(*b"FSPX"), 1, pieces.len() as u32, part.len() as u32]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
+    let header: Vec<u8> = [
+        u32::from_le_bytes(*b"FSPX"),
+        1,
+        pieces.len() as u32,
+        part.len() as u32,
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
     part[..16].copy_from_slice(&header);
-    Some(victory_shader::dxbc::build(&[(victory_shader::FourCC::ACCC, &part)]))
+    Some(victory_shader::dxbc::build(&[(
+        victory_shader::FourCC::ACCC,
+        &part,
+    )]))
 }
 
 /// Debugging (`VICTORY_DUMP_DESC=1`): the first descriptions of each slot, with the bytes behind
@@ -909,10 +982,19 @@ fn dump_description(slot: usize, desc: *const u8) {
     }
     // SAFETY: a debugging read of the title's description and of what it points at.
     unsafe {
-        let words: Vec<u64> = (0..192).map(|i| desc.cast::<u64>().add(i).read_unaligned()).collect();
+        let words: Vec<u64> = (0..192)
+            .map(|i| desc.cast::<u64>().add(i).read_unaligned())
+            .collect();
         eprintln!("DESC {slot:#x} #{n}");
         for (i, w) in words.chunks(4).enumerate() {
-            eprintln!("  +{:#05x} {:016x} {:016x} {:016x} {:016x}", i * 32, w[0], w[1], w[2], w[3]);
+            eprintln!(
+                "  +{:#05x} {:016x} {:016x} {:016x} {:016x}",
+                i * 32,
+                w[0],
+                w[1],
+                w[2],
+                w[3]
+            );
         }
         if std::env::var_os("VICTORY_DUMP_STATE").is_some() && n < 6 {
             // The block of host pointers at the end of each stage slot: what each points at.
@@ -920,7 +1002,9 @@ fn dump_description(slot: usize, desc: *const u8) {
                 let p = words[(8 + w) / 8];
                 let q = p & 0xffff_ffff;
                 for (tag, p) in [("full", p), ("low32", q)] {
-                    if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) || (tag == "low32" && p > 0x10000) {
+                    if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p)
+                        || (tag == "low32" && p > 0x10000)
+                    {
                         let bytes = std::slice::from_raw_parts(p as *const u8, 0x100);
                         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
                         eprintln!("  STATEPTR slot0+{w:#x} {tag} {p:#x} {hex}");
@@ -931,7 +1015,10 @@ fn dump_description(slot: usize, desc: *const u8) {
         for i in 0..191 {
             let (p, len) = (words[i], words[i + 1]);
             if (0x1_0000_0000..0x7fff_ffff_ffff).contains(&p) && len > 0 && len <= 0x4000 {
-                let bytes = std::slice::from_raw_parts(p as *const u8, (len as usize).min(if n < 3 { 0x1000 } else { 48 }));
+                let bytes = std::slice::from_raw_parts(
+                    p as *const u8,
+                    (len as usize).min(if n < 3 { 0x1000 } else { 48 }),
+                );
                 if let Some(dir) = std::env::var_os("VICTORY_DUMP_DESC_DIR")
                     && n < 12
                 {
@@ -948,12 +1035,7 @@ fn dump_description(slot: usize, desc: *const u8) {
     }
 }
 
-fn create_unread_at(
-    slot: usize,
-    _desc: *const u8,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
+fn create_unread_at(slot: usize, _desc: *const u8, iid: *const Iid, out: *mut This) -> HRESULT {
     if std::env::var_os("VICTORY_GUESS_GRAPHICS").is_some() {
         tracing::info!(slot, "a pipeline created without shaders");
     }
@@ -1071,7 +1153,11 @@ fn trace_stream(stream: &[u8]) {
     }
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 40 && !seen.contains(&kinds) {
-        let hex: String = stream.iter().take(0x300).map(|b| format!("{b:02x}")).collect();
+        let hex: String = stream
+            .iter()
+            .take(0x300)
+            .map(|b| format!("{b:02x}"))
+            .collect();
         eprintln!("STREAM kinds={kinds:?} size={:#x} {hex}", stream.len());
         seen.push(kinds);
     }
@@ -1231,7 +1317,11 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+        let state = self
+            .graphics
+            .as_ref()
+            .map(|g| g.describe())
+            .unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -1256,10 +1346,12 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -1337,10 +1429,16 @@ mod changed_descriptor_tests {
         for (change, why) in [
             (&[0xBE8A_03C0][..], "dword 2 is a constant"), // s_mov_b32 s10, 64
             // s_add_u32 s8, s8, 16; s_addc_u32 s9, s9, 0
-            (&[0x8008_9008, 0x8209_8009], "dword 0 added to (s_add, s_sub...)"),
+            (
+                &[0x8008_9008, 0x8209_8009],
+                "dword 0 added to (s_add, s_sub...)",
+            ),
         ] {
-            let err = crate::native::shaders::translate(&program(change)).err().expect("refused");
-            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+            let err = crate::native::shaders::translate(&program(change)).expect_err("refused");
+            assert!(
+                err.ends_with(&format!("{prefix}{why} is not supported")),
+                "{err}"
+            );
         }
     }
 }
@@ -1375,19 +1473,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn guessed_graphics_skips_vertexless_slots_and_lowers_depth_only() {
-        let code = |words: &[u32]| -> Vec<u8> {
-            words.iter().flat_map(|w| w.to_le_bytes()).collect()
-        };
+        let code =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
         let pixel = code(&[
             0x7E00_02F2, // v_mov_b32 v0, 1.0
             0xF800_180F,
-            0, // exp mrt0 v0, v0, v0, v0 done vm
+            0,           // exp mrt0 v0, v0, v0, v0 done vm
             0xBF81_0000, // s_endpgm
         ]);
         let vertex = code(&[
             0x7E00_02F2, // v_mov_b32 v0, 1.0
             0xF800_08CF,
-            0, // exp pos0 v0, v0, v0, v0 done
+            0,           // exp pos0 v0, v0, v0, v0 done
             0xBF81_0000, // s_endpgm
         ]);
         let meta = [0u8; 0x10];
@@ -1401,13 +1498,19 @@ mod tests {
         pairs[3] = piece(&meta);
         assert!(read(&pairs).unwrap().is_empty());
         pairs[4] = piece(&vertex);
-        assert_eq!(read(&pairs).err(), Some("missing or invalid vertex code or metadata"));
+        assert_eq!(
+            read(&pairs).err(),
+            Some("missing or invalid vertex code or metadata")
+        );
         pairs[2] = [0; 2];
         pairs[3] = [0; 2];
         pairs[5] = piece(&meta);
         let depth_only = read(&pairs).unwrap();
         assert_eq!(depth_only.len(), 1);
-        assert_eq!(depth_only[0].native().unwrap().stage, victory_shader::HwStage::Vs);
+        assert_eq!(
+            depth_only[0].native().unwrap().stage,
+            victory_shader::HwStage::Vs
+        );
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
@@ -1538,10 +1641,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }
@@ -1565,7 +1674,10 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);
@@ -1583,7 +1695,11 @@ mod tests {
 /// The container the host makes from a compute description's pieces: wave32 code of 32 threads
 /// with `user_sgprs` user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) fn test_compute_container(code: &[u32], records: &[[u8; 32]], user_sgprs: u32) -> Vec<u8> {
+pub(crate) fn test_compute_container(
+    code: &[u32],
+    records: &[[u8; 32]],
+    user_sgprs: u32,
+) -> Vec<u8> {
     let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
     // Thread-group size 32, 1, 1; wave32; 16 VGPRs.
     let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, user_sgprs << 1]);
@@ -1645,10 +1761,16 @@ mod pieces_tests {
         for (step, why) in [
             (&[0x0802_0100][..], "a VALU operation it does not model"), // v_sub_f32 v1, v0, v0
             // v_mov_b32_dpp v1, v0 row_shr:1: each lane its neighbour's value.
-            (&[0x7E02_02FA, 0xFF01_1100], "a value that is no reduction or prefix"),
+            (
+                &[0x7E02_02FA, 0xFF01_1100],
+                "a value that is no reduction or prefix",
+            ),
         ] {
-            let err = crate::native::shaders::translate(&program(step)).err().expect("refused");
-            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+            let err = crate::native::shaders::translate(&program(step)).expect_err("refused");
+            assert!(
+                err.ends_with(&format!("{prefix}{why} is not supported")),
+                "{err}"
+            );
         }
     }
 
@@ -1667,7 +1789,10 @@ mod pieces_tests {
         let container =
             unsafe { compute_container(Some(&root), record.as_ptr()) }.expect("a container");
         let parsed = victory_shader::Container::parse(&container).unwrap();
-        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        let part = parsed
+            .part(victory_shader::FourCC::ACCC)
+            .expect("an ACCC part")
+            .data;
         let word = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap()) as usize;
         assert_eq!(&part[..4], b"FSPX");
         assert_eq!((word(4), word(8), word(12)), (1, 5, part.len()));
@@ -1683,7 +1808,10 @@ mod pieces_tests {
         // SAFETY: as above.
         let bare = unsafe { compute_container(None, record.as_ptr()) }.expect("a container");
         let parsed = victory_shader::Container::parse(&bare).unwrap();
-        let part = parsed.part(victory_shader::FourCC::ACCC).expect("an ACCC part").data;
+        let part = parsed
+            .part(victory_shader::FourCC::ACCC)
+            .expect("an ACCC part")
+            .data;
         assert_eq!(u32::from_le_bytes(part[8..12].try_into().unwrap()), 4);
         // A missing piece is no container.
         record[16..24].copy_from_slice(&0u64.to_le_bytes());
@@ -1728,11 +1856,17 @@ mod pieces_tests {
         let prefix = "a descriptor's address or format read as data: ";
         for (read, why) in [
             (0x7E04_020C, "a buffer's base address (dword 0)"),
-            (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
+            (
+                0x7E04_020D,
+                "a buffer's dword 1 (address high bits, stride, swizzle)",
+            ),
             (0x7E04_020F, "a buffer's dword 3 (format and type)"),
         ] {
-            let err = crate::native::shaders::translate(&program(read)).err().expect("refused");
-            assert!(err.ends_with(&format!("{prefix}{why} is not supported")), "{err}");
+            let err = crate::native::shaders::translate(&program(read)).expect_err("refused");
+            assert!(
+                err.ends_with(&format!("{prefix}{why} is not supported")),
+                "{err}"
+            );
         }
     }
 
@@ -1741,7 +1875,10 @@ mod pieces_tests {
     #[test]
     fn a_compute_shader_is_translated_again_for_thread_counts() {
         let counts = |h: &victory_shader::emit::HostShader| {
-            h.user_data.iter().filter(|u| u.slot == victory_shader::emit::DISPATCH_THREADS).count()
+            h.user_data
+                .iter()
+                .filter(|u| u.slot == victory_shader::emit::DISPATCH_THREADS)
+                .count()
         };
         let release = |p| crate::object::slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
         // `v_mov_b32 v1, <n>; s_endpgm`, a shader of its own each time.
@@ -1754,21 +1891,33 @@ mod pieces_tests {
         assert!(shader.container.lock().unwrap().is_empty());
         let (hash, again) = native_threads(p);
         assert_eq!(hash, shader.hash);
-        assert_eq!((counts(&plain), counts(&again.expect("translated again"))), (0, 1), "the count in x");
+        assert_eq!(
+            (counts(&plain), counts(&again.expect("translated again"))),
+            (0, 1),
+            "the count in x"
+        );
         release(p);
 
         // The title wrote over it since: not the shader any more.
         held = container(2);
         let p = test_compute(&held);
         *held.last_mut().unwrap() ^= 1;
-        assert_eq!(native_threads(p).1.err().as_deref(), Some("its container changed since the pipeline was made"));
+        assert_eq!(
+            native_threads(p).1.err().as_deref(),
+            Some("its container changed since the pipeline was made")
+        );
         release(p);
 
         // The title let it go (an address nothing is mapped at).
         held = container(3);
         let p = test_compute(&held);
-        pipeline(p).shaders[0].at.store(0x10, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(native_threads(p).1.err().as_deref(), Some("its container is no longer in title memory"));
+        pipeline(p).shaders[0]
+            .at
+            .store(0x10, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            native_threads(p).1.err().as_deref(),
+            Some("its container is no longer in title memory")
+        );
         release(p);
     }
 }

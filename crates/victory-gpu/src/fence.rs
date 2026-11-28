@@ -175,7 +175,9 @@ fn set_if(this: This, wanted: impl Fn(u64) -> bool, value: u64) -> HRESULT {
         if reached {
             set_event(event);
             WAITED.0.fetch_add(1, Ordering::Relaxed);
-            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            WAITED
+                .1
+                .fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });
@@ -188,21 +190,28 @@ fn set_if(this: This, wanted: impl Fn(u64) -> bool, value: u64) -> HRESULT {
 static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 
 /// Events set since the last call and how long they waited, summed.
+#[cfg(windows)]
 pub(crate) fn take_waited() -> (u64, std::time::Duration) {
     let n = WAITED.0.swap(0, Ordering::Relaxed);
-    (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
+    (
+        n,
+        std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)),
+    )
 }
 
 /// A fence's value.
+#[cfg(windows)]
 pub(crate) fn value(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 
 /// Keeps a fence alive while a queue holds a Signal of it, until
 /// [`let_go`].
+#[cfg(windows)]
 pub(crate) fn keep(this: This) {
     object::add_ref(this);
 }
+#[cfg(windows)]
 pub(crate) fn let_go(this: This) {
     release(this);
 }

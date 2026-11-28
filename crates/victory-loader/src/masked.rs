@@ -171,6 +171,10 @@ mod tests {
 }
 
 /// A decoded masked store, enough to redo it with plain stores.
+///
+/// Built on every host so its decoder stays tested, but only Windows'
+/// `patch` uses it outside the tests.
+#[cfg(any(test, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Store {
     /// Instruction length in bytes.
@@ -194,6 +198,7 @@ pub(crate) struct Store {
     pub plain: Option<(u8, u8, u8, u8, u8)>,
 }
 
+#[cfg(any(test, windows))]
 impl Store {
     fn lanes(&self) -> usize {
         match (self.ymm, self.wide_lanes) {
@@ -220,6 +225,7 @@ impl Store {
 }
 
 /// Decodes the whole masked store at `at`: its operands and length.
+#[cfg(any(test, windows))]
 pub(crate) fn decode_store(code: &[u8], at: usize) -> Option<Store> {
     let (kind, ymm) = decode(code, at)?;
     let (b1, b2, modrm) = (code[at + 1], code[at + 2], code[at + 4]);
@@ -273,12 +279,14 @@ pub(crate) fn decode_store(code: &[u8], at: usize) -> Option<Store> {
 }
 
 /// Bytes the stack moves before the trampoline's `lea`: rax, rcx, flags.
+#[cfg(windows)]
 const PUSHED: i32 = 24;
 
 /// The trampoline for `s`, placed at `at`, for the store at `site`: the
 /// same stores done one lane at a time with plain `mov`s (which Rosetta
 /// can resume after a fault), then a jump back past the store. Flags,
 /// rax, rcx and the vector registers are kept.
+#[cfg(windows)]
 pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
     let mut c = vec![0x50, 0x51, 0x9c]; // push rax; push rcx; pushfq
     // lea rax, [operand]
@@ -364,6 +372,7 @@ pub(crate) fn trampoline(s: &Store, site: u64, at: u64) -> Option<Vec<u8>> {
 }
 
 /// Restores flags, rcx and rax, and jumps back past the store.
+#[cfg(windows)]
 fn tail(mut c: Vec<u8>, site: u64, len: usize, at: u64) -> Option<Vec<u8>> {
     c.extend_from_slice(&[0x9d, 0x59, 0x58]); // popfq; pop rcx; pop rax
     let back = (site as i64) + len as i64;
@@ -375,6 +384,7 @@ fn tail(mut c: Vec<u8>, site: u64, len: usize, at: u64) -> Option<Vec<u8>> {
 
 /// The bytes that replace the store at `site`: a jump to `to`, then
 /// `nop`s to the store's length.
+#[cfg(any(test, windows))]
 pub(crate) fn jump(site: u64, len: usize, to: u64) -> Option<Vec<u8>> {
     let rel = i32::try_from(to as i64 - (site as i64 + 5)).ok()?;
     let mut c = vec![0xe9];
@@ -508,12 +518,17 @@ mod patch_tests {
         // vpmaskmovd [rsp+0x10], ymm1, ymm2: SIB and disp8.
         let s = decode_store(&[0xc4, 0xe2, 0x75, 0x8e, 0x54, 0x24, 0x10], 0).unwrap();
         assert_eq!((s.len, s.disp, s.rsp_base()), (7, 0x10, true));
+        assert_eq!((s.lane_bytes(), s.no_base()), (4, false));
         // vmaskmovpd [rip+0x100], xmm1, xmm2: RIP-relative disp32.
         let s = decode_store(&[0xc4, 0xe2, 0x71, 0x2f, 0x15, 0, 1, 0, 0], 0).unwrap();
         assert_eq!(
             (s.len, s.disp, s.rip_relative(), s.lanes()),
             (9, 0x100, true, 2)
         );
+        assert_eq!(s.lane_bytes(), 8);
+        // vpmaskmovq [rax], ymm1, ymm2: wide lanes, no SIB.
+        let s = decode_store(&[0xc4, 0xe2, 0xf5, 0x8e, 0x10], 0).unwrap();
+        assert_eq!((s.lane_bytes(), s.no_base()), (8, false));
     }
 
     #[test]
