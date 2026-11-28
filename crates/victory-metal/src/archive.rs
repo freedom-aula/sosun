@@ -212,9 +212,21 @@ unsafe impl<T> Send for Sendable<T> {}
 fn compile_with_deadline<P: 'static>(
     what: &str,
     crash_key: &str,
-    compile: impl FnOnce() -> Result<P, String> + Send + 'static,
+    compile: impl Fn() -> Result<P, String> + Send + 'static,
 ) -> Result<P, String> {
-    let job = move || Sendable(compile());
+    // Metal's compiler service restarts itself when it dies (the XPC
+    // interruption the run of 28 November saw, mid-load): one more try after
+    // a breath, so a service that came back compiles the pipeline instead of
+    // leaving it refused forever. A second crash is the pipeline's own.
+    let job = move || {
+        Sendable(match compile() {
+            Err(e) if is_compiler_crash(&e) => {
+                std::thread::sleep(Duration::from_millis(500));
+                compile()
+            }
+            r => r,
+        })
+    };
     let late_key = crash_key.to_owned();
     let started = Instant::now();
     let made = with_deadline(COMPILE_DEADLINE, job, move |r| remember_crash(&r.0, &late_key));
@@ -236,7 +248,6 @@ pub(crate) fn compile_render(dev: &Dev, d: &MTLRenderPipelineDescriptor, crash_k
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("render pipeline compiled", crash_key, move || {
-        let job = job;
         let (dev, d) = &job.0;
         dev.newRenderPipelineStateWithDescriptor_error(d)
             .map_err(|e| e.localizedDescription().to_string())
@@ -248,7 +259,6 @@ pub(crate) fn compile_mesh(dev: &Dev, d: &MTLMeshRenderPipelineDescriptor, crash
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("mesh pipeline compiled", crash_key, move || {
-        let job = job;
         let (dev, d) = &job.0;
         dev.newRenderPipelineStateWithMeshDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
             .map_err(|e| e.localizedDescription().to_string())
@@ -260,7 +270,6 @@ pub(crate) fn compile_compute(dev: &Dev, d: &MTLComputePipelineDescriptor, crash
     use objc2_foundation::NSCopying;
     let job = Sendable((dev.clone(), d.copy()));
     compile_with_deadline("compute pipeline compiled", crash_key, move || {
-        let job = job;
         let (dev, d) = &job.0;
         dev.newComputePipelineStateWithDescriptor_options_reflection_error(d, MTLPipelineOption::None, None)
             .map_err(|e| e.localizedDescription().to_string())
