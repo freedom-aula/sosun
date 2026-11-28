@@ -380,9 +380,13 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
     let pending = status_result(this, index) == E_PENDING;
     if pending {
         // Debugging: a request polled this long is stuck; say where its queue's requests are.
+        // The title spins on the entry about a million times a second, so the
+        // first report comes quickly and the rest only every ten millionth
+        // poll (about once per ten seconds of spinning) — the log stays
+        // readable while a load is stuck instead of drowning in repeats.
         static POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(5000) {
+        if n == 5000 || n.is_multiple_of(10_000_000) {
             log_pending(this, index, n);
         }
     }
@@ -449,8 +453,23 @@ struct Scheduler {
 /// Priority weights per class (low, normal, high and real-time), as the
 /// console's: about 10x per level, counted against request sizes.
 const COST: [u64; 3] = [100, 10, 1];
-/// The console's default staging buffer.
-const STAGING: u64 = 32 << 20;
+/// The staging limit: the most decompression scratch (and compressed source)
+/// the workers may hold at once. The console's dedicated decompressor has a
+/// 32 MiB staging buffer; the host has none, so this stands for the host's
+/// memory instead — 512 MiB keeps a load's requests in parallel without
+/// letting a wave of large ones evict the page cache (which is what turns a
+/// ten-second load into a black screen and a watchdog crash on a 16 GB Mac).
+const STAGING: u64 = 512 << 20;
+
+/// `VICTORY_DSTORAGE_STAGING_MB=<mib>`: the staging limit, overriding the
+/// 512 MiB default. `0` and anything unparsable leave the default.
+fn staging_limit() -> u64 {
+    std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .map_or(STAGING, |mb| mb << 20)
+}
 
 struct Lanes {
     lanes: HashMap<u64, Lane>,
@@ -528,7 +547,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_limit(),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -601,6 +620,45 @@ fn lower_priority() {
 #[cfg(not(target_os = "macos"))]
 fn lower_priority() {}
 
+/// The process's physical footprint in MiB, as Activity Monitor's "Memory"
+/// column counts it (anonymous and IOKit memory, compressed pages, and more;
+/// `task_info`'s `phys_footprint`), for the load's 5 s summary — the number
+/// that says whether the host is thrashing. `None` where it cannot be read
+/// (or off macOS, where the summary omits it).
+#[cfg(target_os = "macos")]
+fn footprint() -> Option<u64> {
+    #[repr(C)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        rest: [u64; 40],
+    }
+    // SAFETY: libSystem's documented calls, for this process only. `phys_footprint`
+    // is the sixteenth `mach_vm_size_t` of `task_vm_info` (byte offset 136):
+    // `resident_size` .. `compressed_lifetime`, then it.
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(target: u32, flavor: u32, info: *mut TaskVmInfo, count: *mut u32) -> i32;
+    }
+    const TASK_VM_INFO: u32 = 22;
+    let mut info = TaskVmInfo {
+        virtual_size: 0,
+        region_count: 0,
+        page_size: 0,
+        rest: [0; 40],
+    };
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    let ok = task_info(mach_task_self(), TASK_VM_INFO, &mut info, &mut count);
+    (ok == 0).then(|| info.rest[15] >> 20)
+}
+
+/// Off macOS the summary's `footprint_mib` says `None`.
+#[cfg(not(target_os = "macos"))]
+fn footprint() -> Option<u64> {
+    None
+}
+
 /// A worker: runs the next read of the most deserving queue. Runs below the title's own
 /// threads' priority, so a load's BCPack and zlib work never starves the title's render thread
 /// or its status-array polls (its `Sleep(1)` loop sees a finished request within a millisecond
@@ -659,6 +717,8 @@ impl Lanes {
                     format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
+                staged_mib = self.staged >> 20,
+                footprint_mib = footprint(),
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -669,37 +729,63 @@ impl Lanes {
     }
 
     /// Starts the next read of the class with the least virtual time, from
-    /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// its lane that has started the fewest bytes, if the staging limit has
+    /// room for it (or nothing else holds any). A read that does not fit is
+    /// passed over — the next lane's, and then the next class's, are tried —
+    /// so one large request at the head of a queue cannot leave every worker
+    /// asleep with reads waiting behind it; `starved` is only set when
+    /// nothing waiting fits, which is when a finish has to wake the pool.
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let mut classes = [0usize, 1, 2];
+        classes.sort_by_key(|&c| self.clock[c]);
+        let mut order: Vec<(u64, u64, u64)> = Vec::new();
+        for &class in &classes {
+            order.clear();
+            order.extend(
+                self.lanes
+                    .iter()
+                    .filter(|(_, l)| l.class == class && !l.reads.is_empty())
+                    .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id))),
+            );
+            order.sort_unstable();
+            for (_, _, id) in &order {
+                let fits = self
+                    .lanes
+                    .get(id)
+                    .and_then(|l| l.reads.front())
+                    .is_some_and(|(_, r)| {
+                        self.staged == 0 || self.staged + staging_bytes(r) <= self.staging
+                    });
+                if !fits {
+                    continue;
+                }
+                let Some(lane) = self.lanes.get_mut(id) else {
+                    continue;
+                };
+                let Some((seq, request)) = lane.reads.pop_front() else {
+                    continue;
+                };
+                let staging = staging_bytes(&request);
+                lane.running.insert(seq);
+                self.staged += staging;
+                let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+                self.now = self.clock[class];
+                self.clock[class] += size * COST[class];
+                self.lane_now[class] = lane.clock;
+                lane.clock += size;
+                return Some(Job {
+                    lane: *id,
+                    seq,
+                    request,
+                    staging,
+                });
+            }
+        }
+        if self.lanes.values().any(|l| !l.reads.is_empty()) {
             self.starved = true;
             self.refused += 1;
-            return None;
         }
-        lane.reads.pop_front();
-        lane.running.insert(seq);
-        self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
-        self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
-        lane.clock += size;
-        Some(Job {
-            lane: id,
-            seq,
-            request,
-            staging,
-        })
+        None
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -822,16 +908,36 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Staging bytes a request holds while it runs: everything the host buffers
+/// between its source and its destination. Raw reads into an address go
+/// straight to their destination and memory sources need none (as on the
+/// console), but a compressed or paged request also holds decompression
+/// scratch: the BCPack decoder's per-block records (up to twice the
+/// destination again) and the copy a paged destination takes when its pages
+/// are not one straight window. Grand Theft Auto VI's load streams requests
+/// like that by the dozen; uncounted, ten workers' worth of scratch is
+/// gigabytes at once, which is the difference between a load that fits on a
+/// 16 GB host and one that thrashes it (every `pread` then takes a disk
+/// latency, and the title's status entries never complete).
 fn staging_bytes(request: &Request) -> u64 {
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    if !buffered {
+        return 0;
     }
+    let mut bytes = 0u64;
+    if request.options & MEMORY_SOURCE == 0 {
+        bytes += u64::from(request.source_size);
+        if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
+            bytes += u64::from(request.intermediate_size);
+        }
+    }
+    if request.options & PAGE_DESTINATION != 0 {
+        bytes += u64::from(request.destination_size);
+    }
+    if request.options & BCPACK != 0 {
+        bytes += 2 * u64::from(request.destination_size);
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1710,6 +1816,65 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_counts_the_decompression_scratch_too() {
+        let mut l = lanes(1000);
+        l.lanes.insert(0, Lane::new(0, 64));
+        // A BCPack read: its source, plus twice its destination in records.
+        let mut r = request(4 << 1, std::ptr::null_mut(), 16, std::ptr::null(), 0, 0);
+        (r.destination_size, r.source_size) = (100, 40);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.unsubmitted.push(Command::Read(r));
+        // A paged raw read: its source, plus its destination as the copy.
+        let mut p = request(PAGE_DESTINATION, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        (p.destination_size, p.source_size) = (60, 20);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.unsubmitted.push(Command::Read(p));
+        // zlib and BCPack together: the intermediate stage is counted as well.
+        let mut z = request(ZLIB | 4 << 1, std::ptr::null_mut(), 16, std::ptr::null(), 0, 0);
+        (z.destination_size, z.source_size, z.intermediate_size) = (10, 4, 7);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.unsubmitted.push(Command::Read(z));
+        l.submit(0);
+        let a = l.start().unwrap();
+        assert_eq!(a.staging, 40 + 2 * 100, "the source and the records");
+        l.finish(&a, Ok(()));
+        let b = l.start().unwrap();
+        assert_eq!(b.staging, 20 + 60, "the source and the paged copy");
+        l.finish(&b, Ok(()));
+        let c = l.start().unwrap();
+        assert_eq!(c.staging, 4 + 7 + 2 * 10, "source, intermediate and records");
+    }
+
+    #[test]
+    fn a_read_that_does_not_fit_does_not_block_the_pool() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(1, Lane::new(0, 64));
+        read(&mut l, 1, ZLIB, 40);
+        read(&mut l, 1, ZLIB, 40);
+        read(&mut l, 0, ZLIB, 500); // alone it would run, but not beside anything
+        l.submit(1);
+        l.submit(0);
+        let first = l.start().unwrap();
+        assert_eq!((first.lane, first.staging), (1, 40));
+        assert!(!l.starved, "something was started, so nothing is starved");
+        // The deserving lane is the large read's now (the fewest bytes
+        // started); it does not fit, so the other lane's read goes instead.
+        let second = l.start().unwrap();
+        assert_eq!((second.lane, second.staging), (1, 40));
+        // Only the oversized read is left: nothing fits, and that is starvation.
+        assert!(l.start().is_none());
+        assert!(l.starved);
+        assert_eq!(l.refused, 1);
+        l.finish(&first, Ok(()));
+        l.finish(&second, Ok(()));
+        // With the pool empty it runs, as the console's staging would let it.
+        let alone = l.start().unwrap();
+        assert_eq!(alone.lane, 0);
+        assert_eq!(alone.staging, 500);
     }
 
     #[test]

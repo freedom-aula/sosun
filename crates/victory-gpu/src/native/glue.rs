@@ -672,12 +672,24 @@ pub(crate) fn present(queue: This, resource: This) {
     if let Some(k) = super::ambient::level() {
         let chosen = super::ambient::choose();
         with_title(|t| {
+            // The choice is worth a line when it changes, but the counts it carries
+            // (the draws into the chosen targets) twitch every frame, and the title
+            // polls its status arrays fast enough to make a log of that a flood:
+            // at most one line per five seconds.
+            let throttled = || {
+                static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                if last.is_none_or(|when| when.elapsed().as_secs() >= 5) {
+                    *last = Some(std::time::Instant::now());
+                    true
+                } else {
+                    false
+                }
+            };
+            let say = throttled();
             let depth = chosen.depth.and_then(|(key, _, draws)| {
                 let tex = t.texture_of(key)?;
-                static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
-                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-                if *last != Some((key, draws)) {
-                    *last = Some((key, draws));
+                if say {
                     let i = crate::resource::texture_info(key as This)
                         .map(|i| (i.format, i.width, i.height));
                     tracing::info!(key, draws, info = ?i, level = k, "ambient fallback: shading presents by this depth target");
@@ -686,10 +698,7 @@ pub(crate) fn present(queue: This, resource: This) {
             });
             let albedo = chosen.color.and_then(|(key, _, draws)| {
                 let tex = t.texture_of(key)?;
-                static LAST: Mutex<Option<(usize, u32)>> = Mutex::new(None);
-                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-                if *last != Some((key, draws)) {
-                    *last = Some((key, draws));
+                if say {
                     let i = crate::resource::texture_info(key as This)
                         .map(|i| (i.format, i.width, i.height));
                     tracing::info!(key, draws, info = ?i, level = k, "ambient fallback: blending this colour target in as the albedo");

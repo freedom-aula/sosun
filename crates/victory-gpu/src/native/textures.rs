@@ -825,16 +825,20 @@ impl<B: PresentBackend> Title<B> {
         self.pending.insert(key, info);
     }
 
-    /// `VICTORY_MAX_GPU_CACHE_MB` (2560 by default; `0` for no cap): the most title texture
+    /// `VICTORY_MAX_GPU_CACHE_MB` (1536 by default; `0` for no cap): the most title texture
     /// memory the host's mirrors may hold at once. The title's own heap is what it is; the
-    /// mirrors are the host's addition, and a title that streams for an hour grows them past
-    /// any bound unless the least recently used are dropped.
+    /// mirrors are the host's addition — and each costs its bytes twice over, once in the
+    /// title's memory it shadows and once in the Metal texture it holds — so on a 16 GB host,
+    /// where the title is told it has 6 GiB and macOS wants its own few, 1.5 GiB of mirrors is
+    /// what keeps the whole process clear of the compression-and-swap cliff that turns a load
+    /// into a black screen. A title that streams for an hour grows them past any bound unless
+    /// the least recently used are dropped.
     fn gpu_cache_cap() -> Option<u64> {
         static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         *CAP.get_or_init(|| {
             match std::env::var("VICTORY_MAX_GPU_CACHE_MB") {
                 Ok(v) => v.trim().parse::<u64>().ok().filter(|&mb| mb > 0).map(|mb| mb << 20),
-                Err(_) => Some(2560 << 20),
+                Err(_) => Some(1536 << 20),
             }
         })
     }
