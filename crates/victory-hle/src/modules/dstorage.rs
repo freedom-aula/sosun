@@ -182,7 +182,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let id = file_id(&file);
     let file = Instance::create(
         Object::new("dstorage file", &FILE_VTABLE),
-        File { file, path: name, id },
+        File {
+            file,
+            path: name,
+            id,
+        },
     );
     put(out, file)
 }
@@ -1178,7 +1182,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         e.0 += 1;
         e.1 += u64::from(request.source_size);
         if e.0 == 1 || e.0.is_power_of_two() {
-            tracing::info!(file = name, requests = e.0, bytes = e.1, "dstorage: reads of a file so far");
+            tracing::info!(
+                file = name,
+                requests = e.0,
+                bytes = e.1,
+                "dstorage: reads of a file so far"
+            );
         }
     }
     let bc = ((options & BCPACK) >> 1) as u8;
@@ -1340,23 +1349,24 @@ mod readahead {
 
     fn cache() -> Option<&'static Mutex<Cache>> {
         static CACHE: OnceLock<Option<Mutex<Cache>>> = OnceLock::new();
-        CACHE.get_or_init(|| {
-            let budget = budget();
-            (budget > 0).then(|| {
-                Mutex::new(Cache {
-                    blocks: HashMap::new(),
-                    order: VecDeque::new(),
-                    bytes: 0,
-                    budget,
-                    tick: 0,
-                    last: HashMap::new(),
-                    hits: 0,
-                    misses: 0,
-                    read: 0,
+        CACHE
+            .get_or_init(|| {
+                let budget = budget();
+                (budget > 0).then(|| {
+                    Mutex::new(Cache {
+                        blocks: HashMap::new(),
+                        order: VecDeque::new(),
+                        bytes: 0,
+                        budget,
+                        tick: 0,
+                        last: HashMap::new(),
+                        hits: 0,
+                        misses: 0,
+                        read: 0,
+                    })
                 })
             })
-        })
-        .as_ref()
+            .as_ref()
     }
 
     /// Takes the read-ahead counters since the last call, for the load's summary.
@@ -1426,7 +1436,11 @@ mod readahead {
         }
         c.misses += 1;
         // An ascending run — the last miss just below this one — reads ahead.
-        let run = if c.last.get(&key.0).is_some_and(|&l| block > l && block - l <= RUN) {
+        let run = if c
+            .last
+            .get(&key.0)
+            .is_some_and(|&l| block > l && block - l <= RUN)
+        {
             RUN
         } else {
             1
@@ -1471,7 +1485,9 @@ mod readahead {
         }
         c.bytes += bytes.len() as u64;
         while c.bytes > c.budget && c.order.len() > 1 {
-            let Some(front) = c.order.pop_front() else { break };
+            let Some(front) = c.order.pop_front() else {
+                break;
+            };
             if let Some((_, old)) = c.blocks.remove(&front) {
                 c.bytes = c.bytes.saturating_sub(old.len() as u64);
             }
@@ -1530,8 +1546,8 @@ mod readahead {
         fn temp(body: &[u8]) -> (std::fs::File, (u64, u64)) {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let n = NEXT.fetch_add(1, Seq::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("victory-readahead-{}-{n}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("victory-readahead-{}-{n}", std::process::id()));
             std::fs::write(&path, body).unwrap();
             let file = std::fs::File::open(&path).unwrap();
             use std::os::unix::fs::MetadataExt;
@@ -2145,12 +2161,26 @@ mod tests {
         let lane = l.lanes.get_mut(&0).unwrap();
         lane.unsubmitted.push(Command::Read(r));
         // A paged raw read: its source, plus its destination as the copy.
-        let mut p = request(PAGE_DESTINATION, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        let mut p = request(
+            PAGE_DESTINATION,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+        );
         (p.destination_size, p.source_size) = (60, 20);
         let lane = l.lanes.get_mut(&0).unwrap();
         lane.unsubmitted.push(Command::Read(p));
         // zlib and BCPack together: the intermediate stage is counted as well.
-        let mut z = request(ZLIB | 4 << 1, std::ptr::null_mut(), 16, std::ptr::null(), 0, 0);
+        let mut z = request(
+            ZLIB | 4 << 1,
+            std::ptr::null_mut(),
+            16,
+            std::ptr::null(),
+            0,
+            0,
+        );
         (z.destination_size, z.source_size, z.intermediate_size) = (10, 4, 7);
         let lane = l.lanes.get_mut(&0).unwrap();
         lane.unsubmitted.push(Command::Read(z));
@@ -2162,7 +2192,11 @@ mod tests {
         assert_eq!(b.staging, 20 + 60, "the source and the paged copy");
         l.finish(&b, Ok(()));
         let c = l.start().unwrap();
-        assert_eq!(c.staging, 4 + 7 + 2 * 10, "source, intermediate and records");
+        assert_eq!(
+            c.staging,
+            4 + 7 + 2 * 10,
+            "source, intermediate and records"
+        );
     }
 
     #[test]
@@ -2743,8 +2777,12 @@ mod tests {
         );
 
         let before = scheduler().unwrap().lock().next_id;
-        let create_q: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
+        let create_q: extern "system" fn(
+            *mut c_void,
+            *const QueueDesc,
+            *const Guid,
+            Out,
+        ) -> HRESULT = call(factory(), 0x50);
         let desc = QueueDesc {
             source_type: 0,
             capacity: 8,
