@@ -1012,6 +1012,10 @@ impl<'a> Tracer<'a> {
         let (param, _) = self
             .param_value(base)
             .ok_or("an address not from a root parameter")?;
+        let heap = matches!(
+            self.layout[param].root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        );
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => Some(
@@ -1021,9 +1025,16 @@ impl<'a> Tracer<'a> {
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
-        // base's is taken as the carry of that term (offsets below 4 GB).
+        // base's is taken as the carry of that term (offsets below 4 GB). A
+        // heap or table base's own high dword counts as that base's half when
+        // the term is computed (Grand Theft Auto VI's compute shaders index
+        // the heap with a 64-bit add: `hi` is the base's high half plus the
+        // carry); a fixed-offset load still needs `hi` zero, as the console's
+        // own tables give (and a guessed vertex shader's rebase check needs).
         let dynamic = s.dynamic.or(extra.dynamic);
+        let heap_high = if heap { self.param_word(param, 1) } else { None };
         if !self.high_half(hi, high)
+            && !(dynamic.is_some() && heap_high.is_some_and(|h| self.carried(hi, h)))
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
             return Err(if high.is_none() {
@@ -4608,6 +4619,69 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r4.scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn a_heap_indexed_by_a_64_bit_add_traces_to_the_heap() {
+        // The title's compute shaders index the resource heap with a 64-bit
+        // add: the low dword adds the index to the base's, the high one the
+        // base's own high dword plus the carry (`s_addc_u32 s13, s11, 0`).
+        // The address must trace to the ResourceHeap with the index as its
+        // dynamic term (Grand Theft Auto VI, 28 November's run: 171 shaders
+        // refused as "an address into a descriptor heap with an untracked
+        // high half").
+        let r = track_words(
+            &[
+                0x800C_090A, // s_add_u32 s12, s10, s9
+                0x820D_800B, // s_addc_u32 s13, 0, s11
+                0xF408_0406,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+                0xE030_2000,
+                0x8004_0400, // buffer_load_dword v4, v0, s[16:19], 0 idxen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 2)],
+            HwStage::Vs,
+        );
+        let const_v = r.params.iter().find(|p| p.1 == 0).unwrap().0;
+        assert_eq!(r.scalar[0].1.param, 1);
+        assert_eq!(r.scalar[0].1.dynamic, Some(const_v));
+
+        // The high dword copied whole (no carry) works the same way.
+        let r2 = track_words(
+            &[
+                0xBE8C_030A, // s_mov_b32 s12, s10
+                0xBE8D_030B, // s_mov_b32 s13, s11
+                0xF40C_0406,
+                0x1200_0000, // s_load_dwordx8 s[16:23], s[12:13], s9
+                S_ENDPGM,
+            ],
+            &[param(Constants, 9, 1), param(ResourceHeap, 10, 2)],
+            HwStage::Vs,
+        );
+        let const_v2 = r2.params.iter().find(|p| p.1 == 0).unwrap().0;
+        assert_eq!(r2.scalar[0].1.param, 1);
+        assert_eq!(r2.scalar[0].1.dynamic, Some(const_v2));
+
+        // A fixed-offset load still needs the high half zero: the table's own
+        // high dword alone (a guessed vertex shader's rebase trap) is refused.
+        let words = [
+            0xBE8C_030A, // s_mov_b32 s12, s10
+            0xBE8D_030B, // s_mov_b32 s13, s11
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            S_ENDPGM,
+        ];
+        let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(ResourceHeap, 10, 2)], HwStage::Vs, lanes(&p).as_ref())
+            .err()
+            .expect("expected refusal");
+        assert!(
+            err.to_string()
+                .contains("an address into a descriptor heap with an untracked high half"),
+            "got `{err}`"
+        );
     }
 
     #[test]

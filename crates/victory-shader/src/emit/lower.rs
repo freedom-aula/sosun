@@ -195,9 +195,16 @@ pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, Sh
                 }
             }
             Err(Stop::Fail(ShaderError::Unsupported {
-                what: "an opaque lane mask" | "a constant lane mask",
+                what: "an opaque lane mask"
+                    | "a constant lane mask"
+                    | "a lane-mask join of an untracked mask: data, on the host's lanes",
                 ..
-            })) if !console && parts.native.stage == HwStage::Cs => console = true,
+            })) if !console
+                && (parts.native.stage == HwStage::Cs
+                    || parts.native.stage == HwStage::Vs && !guessed) =>
+            {
+                console = true
+            }
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -361,6 +368,9 @@ struct Lower<'a> {
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
     console_flat: Option<V>,
+    /// Vertex: the console lane (`SV_VertexID`'s low bits), made in the entry
+    /// block.
+    vertex_lane: Option<V>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -1109,6 +1119,7 @@ impl<'a> Lower<'a> {
             halves,
             once,
             console_flat: None,
+            vertex_lane: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -3376,6 +3387,17 @@ impl<'a> Lower<'a> {
                     Some(h) => Some(self.get(h)?),
                     None => None,
                 };
+                // A vertex program's number lowered from a tracked mask is a
+                // host ballot (bits on the host waves' lanes, not the vertex
+                // ids' low bits): not readable as the console's mask.
+                if self.x.native.stage == HwStage::Vs
+                    && (self.ballot_derived(v, &mut Set::default())
+                        || self.pair_high(v).is_some_and(|h| {
+                            self.ballot_derived(h, &mut Set::default())
+                        }))
+                {
+                    return Err("an opaque lane mask");
+                }
                 let lo = self.get(v)?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
@@ -3778,6 +3800,41 @@ impl<'a> Lower<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Whether a value read as a console mask number in a vertex program
+    /// derives from a lane mask the structurisation tracks: such a number
+    /// lowers to a host ballot, whose bits are the host waves' lanes — a
+    /// vertex program's console lanes (its vertex ids' low bits) are not
+    /// those, so the number cannot be read by them. Follows scalar
+    /// instructions and joins; a load or an input is not derived.
+    fn ballot_derived(&self, v: Value, visited: &mut Set<Value>) -> bool {
+        if !visited.insert(v) {
+            return false;
+        }
+        if self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v) {
+            return true;
+        }
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            return self
+                .x
+                .p
+                .blocks[b]
+                .phis[i]
+                .args
+                .iter()
+                .any(|&a| self.ballot_derived(a, visited));
+        }
+        let Some(inst) = self.def_inst(v) else {
+            return false;
+        };
+        if !matches!(inst.fields, Fields::Sop { .. }) {
+            return false;
+        }
+        inst.reads
+            .iter()
+            .filter(|(r, _)| !matches!(r, Reg::S(c) if *c == EXEC || *c == EXEC + 1))
+            .any(|(_, v)| self.ballot_derived(*v, visited))
     }
 
     /// Whether `(lo, hi)` is a host-wave-safe lane mask in `MaskData::Host`
@@ -4564,6 +4621,23 @@ impl<'a> Lower<'a> {
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
+        }
+        // A vertex program's console lane is its vertex id's low bits: the
+        // console packs a draw's vertices into waves of `wave()` lanes in
+        // vertex order, so lane = vertex id modulo the wave size, whatever
+        // the host's own waves are (Grand Theft Auto VI's depth prepass holds
+        // its masks as numbers and joins them at edges).
+        if self.x.native.stage == HwStage::Vs && self.console_lanes {
+            if let Some(f) = self.vertex_lane {
+                return f;
+            }
+            let Val::I32(vid) = self.input(Input::VertexId) else {
+                return self.s.m.i32(0);
+            };
+            let m = self.s.m.i32(self.wave() - 1);
+            let f = self.s.m.bin(self.s.entry, Bin::And, vid, m);
+            self.vertex_lane = Some(f);
+            return f;
         }
         if self.halves {
             let f = self.console_flat();
@@ -14303,6 +14377,21 @@ impl<'a> Lower<'a> {
                 };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // A vertex program's console lanes are its vertex ids' low
+                    // bits; a number a tracked mask lowers to is a host ballot,
+                    // numbered by the host waves' lanes, which those are not: such
+                    // data keeps its refusal (a load or scalar arithmetic is the
+                    // console's number).
+                    (None, Some(&Val::I32(_)))
+                        if number
+                            && self.x.native.stage == HwStage::Vs
+                            && (self.ballot_derived(arg, &mut Set::default())
+                                || high.is_some_and(|h| {
+                                    self.ballot_derived(h.args[n], &mut Set::default())
+                                })) =>
+                    {
+                        return Err(unsupported(offset, HOST_LANES));
+                    }
                     (None, Some(&Val::I32(word))) if number => {
                         let hi = if self.x.native.wave64 {
                             match high.and_then(|h| self.vals.get(&h.args[n])) {

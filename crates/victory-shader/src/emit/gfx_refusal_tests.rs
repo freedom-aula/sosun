@@ -605,6 +605,84 @@ fn refusal1_mask_bit_tricks_lower_in_pixel_shader() {
     }
 }
 
+/// A vertex program joins lane-mask numbers it loads from memory at a uniform
+/// branch and EXECs the join (Grand Theft Auto VI's depth prepass: 20 vertex
+/// shaders refused as "a lane-mask join of an untracked mask: data, on the
+/// host's lanes"). A vertex program's console lane is its vertex id's low
+/// bits — the console packs a draw's vertices into waves in vertex order — so
+/// the join lowers with those lanes.
+#[test]
+fn a_vertex_program_joins_loaded_lane_mask_numbers() {
+    // s[0:1] = root constants (a title-memory address).
+    let code = [
+        0xF404_0200,
+        0xFA00_0040, // s_load_dwordx2 s[8:9], s[0:1], 0x40
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 past the arm
+        0xF404_0200,
+        0xFA00_0080, // s_load_dwordx2 s[8:9], s[0:1], 0x80
+        0xBE8A_2408, // s_and_saveexec_b64 s[10:11], s[8:9]
+        0x7E02_0281, // v_mov_b32_e32 v1, 1
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ];
+    let out = lower_vs(&code, true, vec![root_const(0, 2)], false)
+        .unwrap_or_else(|e| panic!("wave64: {e}"));
+    assert!(out.memory, "the mask numbers load from title memory");
+    // Wave32 console the same way, with 32-bit masks.
+    let code32 = [
+        0xF400_0200,
+        0xFA00_0040, // s_load_dword s8, s[0:1], 0x40
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 past the arm
+        0xF400_0200,
+        0xFA00_0080, // s_load_dword s8, s[0:1], 0x80
+        0xBE8A_3C08, // s_and_saveexec_b32 s10, s8
+        0x7E02_0281, // v_mov_b32_e32 v1, 1
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ];
+    let out32 = lower_vs(&code32, false, vec![root_const(0, 2)], false)
+        .unwrap_or_else(|e| panic!("wave32: {e}"));
+    assert!(out32.memory);
+}
+
+/// The other edge of that join: a number a tracked mask lowers to is a host
+/// ballot (bits on the host waves' lanes), which a vertex program's console
+/// lanes are not. Such a join keeps its refusal.
+#[test]
+fn a_vertex_program_refuses_a_join_of_ballot_derived_masks() {
+    let code = [
+        0x7D82_0085, // v_cmp_lt_u32_e32 vcc, 5, v0
+        0x8708_FF6A,
+        0x0000_00FF, // s_and_b32 s8, vcc_lo, 0xff
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0004, // s_cbranch_scc1 past the arm
+        0x7D82_0083, // v_cmp_lt_u32_e32 vcc, 3, v0
+        0x8708_FF6A,
+        0x0000_00F0, // s_and_b32 s8, vcc_lo, 0xf0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_2408, // s_and_saveexec_b64 s[10:11], s[8:9]
+        0x7E02_0281, // v_mov_b32_e32 v1, 1
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ];
+    let err = lower_vs(&code, true, vec![root_const(0, 2)], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string().contains("a lane-mask join of an untracked mask"),
+        "got `{err}`"
+    );
+}
+
 #[test]
 fn refusal1_uniform_and_quad_periodic_masks_lower_in_pixel_shader() {
     // Wave32: s_cselect_b32 -1, 0
